@@ -140,7 +140,7 @@ pub fn cmd_context_task_json(
         scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
     let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
         reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
-    let pack = comp.ctx().task_context_with_rankers(
+    let mut pack = comp.ctx().task_context_with_rankers(
         goal,
         files,
         symbols,
@@ -148,7 +148,49 @@ pub fn cmd_context_task_json(
         scorer_trait,
         reranker_trait,
     );
+    // task-state + memory enrichment (below the System IR authority line)
+    let beads_active = scc_indexer::adapters::beads::active_beads(root, 5);
+    if !beads_active.is_empty() {
+        pack.content.push_str(&format!(
+            "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n"
+        ));
+        for t in beads_active {
+            pack.content.push_str(&format!("- {t}\n"));
+        }
+    }
+    if config.integrations.hindsight {
+        let lessons = scc_indexer::adapters::hindsight::lessons(&store, 5);
+        if !lessons.is_empty() {
+            pack.content.push_str(
+                "\n# HINDSIGHT LESSONS (memory, below System IR authority — not verified facts)\n",
+            );
+            for (content, tags) in lessons {
+                let tag_str = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tags.join(", "))
+                };
+                pack.content.push_str(&format!("- {content}{tag_str}\n"));
+            }
+        }
+    }
     Ok(serde_json::to_string_pretty(&pack)?)
+}
+
+/// `scc context docs <dependency>` — external library docs via Context7
+/// (labeled external; never mixed with repository facts).
+pub fn cmd_context_docs(root: &Path, dependency: &str) -> crate::Result<()> {
+    let config = load_config(root)?;
+    if config.integrations.context7_command.is_empty() {
+        return Err(crate::CliError::Other(
+            "Context7 is not configured — set integrations.context7_command in .scc/config.yaml (e.g. 'npx -y @upstash/context7-mcp')".into(),
+        ));
+    }
+    let mut client = scc_indexer::adapters::context7::start(&config.integrations.context7_command)
+        .map_err(crate::CliError::Other)?;
+    let docs = client.docs_for(dependency).map_err(crate::CliError::Other)?;
+    print!("{docs}");
+    Ok(())
 }
 
 /// Subagent context policy (SCC-107, docs/API_AND_INTEGRATIONS.md §5):
@@ -499,9 +541,30 @@ pub fn cmd_import(root: &Path, format: &str, file: &str) -> crate::Result<()> {
                 imports: 0,
                 errors: r.errors,
             }),
+        "beads" => scc_indexer::adapters::beads::import_beads(&store, std::path::Path::new(file))
+            .map(|r| scc_indexer::adapters::ImportReport {
+                symbols: r.tasks,
+                calls: r.dependencies,
+                imports: r.active,
+                errors: r.errors,
+            }),
+        "cbm" => scc_indexer::adapters::cbm::import_cbm(&store, std::path::Path::new(file))
+            .map(|r| scc_indexer::adapters::ImportReport {
+                symbols: r.symbols,
+                calls: r.relationships,
+                imports: 0,
+                errors: r.errors,
+            }),
+        "hindsight" => scc_indexer::adapters::hindsight::import_hindsight(&store, std::path::Path::new(file))
+            .map(|r| scc_indexer::adapters::ImportReport {
+                symbols: r.lessons,
+                calls: 0,
+                imports: 0,
+                errors: r.errors,
+            }),
         other => {
             return Err(crate::CliError::Other(format!(
-                "unknown import format '{other}' (use scip, ccg, or gitnexus)"
+                "unknown import format '{other}' (use scip, ccg, gitnexus, beads, cbm, or hindsight)"
             )))
         }
     }

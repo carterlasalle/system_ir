@@ -281,6 +281,11 @@ enum ContextSub {
         #[arg(long)]
         json: bool,
     },
+    /// External library docs via Context7 (labeled external)
+    Docs {
+        /// dependency in owner/name form (e.g. fastapi/fastapi)
+        dependency: String,
+    },
     /// Subagent-scoped task pack (tight budget + scope boundaries)
     Subagent {
         goal: String,
@@ -355,6 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ContextSub::Component { id, json } => commands::cmd_context_component(&root, &id, json),
             ContextSub::Flow { id, json } => commands::cmd_context_flow(&root, &id, json),
+            ContextSub::Docs { dependency } => commands::cmd_context_docs(&root, &dependency),
             ContextSub::Subagent { goal, files, symbols, budget, json } => {
                 commands::cmd_context_subagent(&root, &goal, &files, &symbols, budget, json)
             }

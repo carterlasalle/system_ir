@@ -94,6 +94,10 @@ scc export system-ir.json | system-ir.jsonl | ccg
 scc import scip <file>       # import a SCIP index (RESOLVED facts)
 scc import ccg <file>        # import a Narsil CCG export
 scc import gitnexus <file>   # import a GitNexus-style evidence export
+scc import beads <file>      # import Beads task state (.beads/issues.jsonl)
+scc import cbm <file>        # import a codebase-memory graph.db.zst snapshot
+scc import hindsight <file>  # import a Hindsight memory-bank export
+scc context docs <owner/name>  # external library docs via Context7 (labeled)
 scc resolve --lsp            # upgrade EXTRACTED calls via pyright (Phase 7)
 scc query <terms>            # lexical search over entities + symbols
 scc checkpoint save|load     # PreCompact checkpoint (compaction recovery)
@@ -224,6 +228,12 @@ without enforcing tests, and conflicting store writers.
 - **Hermes plugin (M10)**: `scc setup hermes` installs a native plugin
   (`plugin.yaml` + `register(ctx)`) exposing the six semantic tools plus a
   bundled skill, verified with a mock-ctx contract test in CI.
+- **External adapters (SCC-202/203/204/205)**: Beads task-state import +
+  active-task enrichment, codebase-memory-mcp graph.db.zst import (zstd +
+  SQLite introspection), Hindsight lessons import with below-the-line
+  labeling, and Context7 external docs via its MCP server (`scc context
+  docs`), all opt-in via config and labeled so external/memory/task content
+  never masquerades as repository facts.
 
 ## Security
 
@@ -253,7 +263,7 @@ docs/            the specification this implements
 ## Testing
 
 ```bash
-cargo test --workspace        # 264 tests: extractor units, golden repos,
+cargo test --workspace        # 275 tests: extractor units, golden repos,
                               # incremental==cold equivalence, staleness,
                               # secrets, schema validation, MCP e2e, HTTP e2e,
                               # precision/recall, graph invariants, infra

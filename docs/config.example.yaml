@@ -27,10 +27,11 @@ runtime:
     enabled: false
 integrations:
   serena: true
-  beads: false
-  hindsight: false
+  beads: false          # import .beads/issues.jsonl; active beads enrich packs
+  hindsight: false      # import lessons; they enrich packs below the IR line
   gitnexus: false
   narsil: false
+  context7_command: ""  # e.g. 'npx -y @upstash/context7-mcp' — external docs
 security:
   redact_secrets: true
   allow_remote_models: false

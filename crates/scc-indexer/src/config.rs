@@ -96,6 +96,8 @@ pub struct IntegrationsConfig {
     pub hindsight: bool,
     pub gitnexus: bool,
     pub narsil: bool,
+    /// Shell command launching the Context7 MCP server. Empty = disabled.
+    pub context7_command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ impl Default for IntegrationsConfig {
             hindsight: false,
             gitnexus: false,
             narsil: false,
+            context7_command: String::new(),
         }
     }
 }

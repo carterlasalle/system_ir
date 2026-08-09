@@ -19,7 +19,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+pub mod beads;
+pub mod cbm;
+pub mod context7;
 pub mod gitnexus;
+pub mod hindsight;
 
 /// Adapter capability manifest (docs/SECURITY.md §6, SCC-224): every
 /// evidence provider declares its filesystem scope, network access,
