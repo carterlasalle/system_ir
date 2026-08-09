@@ -245,9 +245,7 @@ pub fn readme_purpose(content: &str) -> Option<String> {
         if t.starts_with('#') || t.starts_with("![]") || t.starts_with("<img") {
             continue;
         }
-        if paragraphs.is_empty() {
-            paragraphs.push(t.to_string());
-        } else if paragraphs.last().map(|p| p.is_empty()).unwrap_or(false) {
+        if paragraphs.is_empty() || paragraphs.last().map(|p| p.is_empty()).unwrap_or(false) {
             paragraphs.push(t.to_string());
         } else {
             let last = paragraphs.last_mut().unwrap();

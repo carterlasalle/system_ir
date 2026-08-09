@@ -255,11 +255,7 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
                 r
             } else if let Some(r) = t.strip_prefix("def ") {
                 r
-            } else if let Some(r) = t.strip_prefix("class ") {
-                r
-            } else {
-                return None;
-            }
+            } else { t.strip_prefix("class ")? }
         }
         _ => {
             let mut r = t;
@@ -270,11 +266,7 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
                 x
             } else if let Some(x) = r.strip_prefix("function ") {
                 x
-            } else if let Some(x) = r.strip_prefix("class ") {
-                x
-            } else {
-                return None;
-            }
+            } else { r.strip_prefix("class ")? }
         }
     };
     let name: String = rest

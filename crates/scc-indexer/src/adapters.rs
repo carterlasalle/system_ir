@@ -7,6 +7,7 @@
 //! not a JSON object return `Err`. All ids are content-derived and
 //! deterministic (same input, same ids) using the same blake3 schemes as
 //! `crate::write`.
+#![allow(clippy::too_many_arguments)]
 
 use crate::write::{evidence_id, rel_id};
 use scc_core::kinds;

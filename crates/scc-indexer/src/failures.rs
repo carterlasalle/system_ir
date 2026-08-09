@@ -319,11 +319,7 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
     let rest: &str = if language == "python" {
         if let Some(r) = t.strip_prefix("async def ") {
             r
-        } else if let Some(r) = t.strip_prefix("def ") {
-            r
-        } else {
-            return None;
-        }
+        } else { t.strip_prefix("def ")? }
     } else {
         let mut r = t;
         if let Some(x) = r.strip_prefix("export ") {
@@ -334,7 +330,8 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
         }
         if let Some(x) = r.strip_prefix("function ") {
             x
-        } else if let Some(x) = r.strip_prefix("const ") {
+        } else {
+            let x = r.strip_prefix("const ")?;
             let name = take_ident(x);
             if name.is_empty() {
                 return None;
@@ -343,8 +340,6 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
             if after.starts_with('=') {
                 return Some(name.to_string());
             }
-            return None;
-        } else {
             return None;
         }
     };

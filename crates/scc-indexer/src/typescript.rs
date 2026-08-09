@@ -680,8 +680,7 @@ fn is_next_http_method(name: &str) -> bool {
 /// `app/api/users/route.ts` -> `/api/users`, `app/api/users/[id]/route.ts` ->
 /// `/api/users/:id`, `pages/api/health.ts` -> `/api/health`.
 fn next_route_path(path: &str) -> String {
-    let dir = if path.starts_with("pages/api/") {
-        let rest = &path["pages/api/".len()..];
+    let dir = if let Some(rest) = path.strip_prefix("pages/api/") {
         let rest = rest
             .strip_suffix(".tsx")
             .or_else(|| rest.strip_suffix(".ts"))

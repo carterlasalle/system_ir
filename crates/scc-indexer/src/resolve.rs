@@ -241,12 +241,7 @@ pub fn resolve_calls(
             }
             ImportTarget::External { name } => {
                 for (local, imported) in &ri.names {
-                    let exported = if imported == "*" || imported == "default" {
-                        imported.clone()
-                    } else {
-                        imported.clone()
-                    };
-                    binding.insert(local.as_str(), (format!("external:{name}"), exported));
+                    binding.insert(local.as_str(), (format!("external:{name}"), imported.clone()));
                 }
             }
         }

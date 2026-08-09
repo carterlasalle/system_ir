@@ -21,6 +21,7 @@
 //! - The call-site position must sit on the callee name token (character 0 —
 //!   leading indentation — resolves to nothing), so the adapter locates the
 //!   callee text inside the source line.
+#![allow(clippy::too_many_arguments)]
 
 use crate::write::{evidence_id, rel_id};
 use scc_core::{Evidence, EvidenceType, Provenance, Relationship};

@@ -83,7 +83,8 @@ impl<'a> Writer<'a> {
         self.store.insert_entity(&fe, &[path.to_string()])?;
 
         // imports: store rows + file imports file / imports external_api edges
-        let mut imports_sql: Vec<(String, Vec<(String, String)>, u32, String)> = Vec::new();
+        type ImportRow = (String, Vec<(String, String)>, u32, String);
+        let mut imports_sql: Vec<ImportRow> = Vec::new();
         for imp in &ef.imports {
             imports_sql.push((
                 imp.module.clone(),

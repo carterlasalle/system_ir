@@ -1,5 +1,7 @@
 //! SQLite persistence for the System Context Compiler.
 //!
+#![allow(clippy::type_complexity)]
+
 //! Layer mapping (docs/DATA_STRATEGY.md):
 //! - L0 repository snapshot: `repositories`, `snapshots`, `files`
 //! - L1 evidence: `evidence`

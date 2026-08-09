@@ -107,6 +107,7 @@ pub fn entity_similarity(e: &scc_core::Entity, goal_terms: &BTreeSet<String>) ->
 /// 2. explicit: named files/symbols
 /// 3. graph expansion: containing component, flows, upstream/downstream,
 ///    ownership, invariants, tests — handled by the pack builder.
+///
 /// Pluggable semantic scorer (SCC-071): an optional provider (e.g. an
 /// embedding model) contributes a relevance signal fused into the candidate
 /// score. Providers are opt-in (`inference.enabled`); the default is the
