@@ -1,0 +1,33 @@
+schema: 1
+index:
+  ignore:
+    - vendor/**
+    - generated/**
+    - node_modules/**
+    - .git/**
+  watch: true
+languages:
+  typescript: true
+  python: true
+  go: false
+  rust: false
+context:
+  startup_tokens: 6000
+  task_tokens: 10000
+  include_low_confidence_inference: false
+inference:
+  enabled: false
+  provider: local
+runtime:
+  opentelemetry:
+    enabled: false
+integrations:
+  serena: true
+  beads: false
+  hindsight: false
+  gitnexus: false
+  narsil: false
+security:
+  redact_secrets: true
+  allow_remote_models: false
+  listen: 127.0.0.1:7777

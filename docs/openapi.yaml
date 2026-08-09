@@ -1,0 +1,105 @@
+openapi: 3.1.0
+info:
+  title: System Context Compiler API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:7777
+paths:
+  /v1/system:
+    get:
+      summary: Get compact system overview
+      responses:
+        "200":
+          description: System overview
+  /v1/context/task:
+    post:
+      summary: Compile task-specific context
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskContextRequest"
+      responses:
+        "200":
+          description: Task context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextPack"
+  /v1/components/{id}:
+    get:
+      summary: Get component context
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: Component context}
+  /v1/flows/{id}:
+    get:
+      summary: Get flow context
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: Flow context}
+  /v1/impact:
+    post:
+      summary: Compile impact context
+      responses:
+        "200": {description: Impact context}
+  /v1/verify:
+    post:
+      summary: Verify freshness and evidence integrity
+      responses:
+        "200": {description: Verification report}
+  /v1/index:
+    post:
+      summary: Start or refresh index
+      responses:
+        "202": {description: Index scheduled}
+  /v1/index/status:
+    get:
+      summary: Get index status
+      responses:
+        "200": {description: Index status}
+  /v1/runtime/traces:
+    post:
+      summary: Ingest runtime observations
+      responses:
+        "202": {description: Accepted}
+components:
+  schemas:
+    TaskContextRequest:
+      type: object
+      required: [goal]
+      properties:
+        goal: {type: string}
+        files:
+          type: array
+          items: {type: string}
+        symbols:
+          type: array
+          items: {type: string}
+        token_budget:
+          type: integer
+          minimum: 512
+          default: 8000
+    ContextPack:
+      type: object
+      required: [kind, repository_revision, content]
+      properties:
+        kind: {type: string}
+        repository_revision: {type: string}
+        content: {type: string}
+        entity_ids:
+          type: array
+          items: {type: string}
+        evidence_summary: {type: object}
+        warnings:
+          type: array
+          items: {type: string}

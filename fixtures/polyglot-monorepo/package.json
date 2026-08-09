@@ -1,0 +1,4 @@
+{
+  "name": "polyglot-monorepo",
+  "workspaces": ["web"]
+}

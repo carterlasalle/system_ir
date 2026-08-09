@@ -1,0 +1,17 @@
+[package]
+name = "scc-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "System Context Compiler graph: component/flow compilation, invariants, impact"
+
+[dependencies]
+scc-core.workspace = true
+scc-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

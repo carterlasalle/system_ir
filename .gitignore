@@ -1,0 +1,8 @@
+/target
+**/.scc/
+**/.claude/
+**/AGENTS.md
+dist/
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+sdk/python/__pycache__/

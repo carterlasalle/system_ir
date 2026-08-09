@@ -1,0 +1,353 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://system-context-compiler.dev/schema/system-ir.json",
+  "title": "System IR",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repository",
+    "snapshot",
+    "entities",
+    "relationships",
+    "flows",
+    "invariants"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "repository": {
+      "$ref": "#/$defs/repository"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/snapshot"
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entity"
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relationship"
+      }
+    },
+    "flows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/flow"
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/invariant"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "revision",
+        "indexed_at"
+      ],
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "indexed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "provenance": {
+      "enum": [
+        "EXTRACTED",
+        "RESOLVED",
+        "OBSERVED",
+        "DECLARED",
+        "INFERRED",
+        "STALE"
+      ]
+    },
+    "entity": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "attributes": {
+          "type": "object"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "required": [
+        "id",
+        "subject",
+        "predicate",
+        "object",
+        "provenance",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "flowStep": {
+      "type": "object",
+      "required": [
+        "id",
+        "order",
+        "actor",
+        "operation"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actor": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "condition": {
+          "type": "string"
+        },
+        "async": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retry_policy": {
+          "type": "string"
+        },
+        "failure_outcome": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "flow": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "steps"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "architecture",
+            "workflow",
+            "sequence",
+            "dataflow",
+            "lifecycle"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/flowStep"
+          }
+        },
+        "attributes": {
+          "type": "object"
+        }
+      }
+    },
+    "invariant": {
+      "type": "object",
+      "required": [
+        "id",
+        "statement",
+        "severity"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "statement": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "enforced_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "source",
+            "config",
+            "runtime",
+            "test",
+            "intent",
+            "history"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "extractor": {
+          "type": "string"
+        },
+        "extractor_version": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "large-ts",
+  "version": "0.1.0",
+  "main": "dist/api/server.js",
+  "scripts": { "start": "ts-node src/api/server.ts" }
+}

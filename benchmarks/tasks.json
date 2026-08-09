@@ -1,0 +1,594 @@
+{
+  "version": 1,
+  "description": "SCC context benchmark corpus (docs/TEST_PLAN.md \u00a784-87). Ground truth = entities a human needs for each task; hallucination entries must NOT surface.",
+  "tasks": [
+    {
+      "id": "http-service.rename-transcript-field",
+      "repo": "http-service-python",
+      "goal": "rename the transcript field in the api response",
+      "ground_truth": {
+        "files": [
+          "main.py",
+          "services/transcripts.py"
+        ],
+        "symbols": [
+          "handle_transcripts",
+          "TranscriptRepository"
+        ],
+        "components": [
+          "root",
+          "services"
+        ],
+        "data": [
+          "db.transcripts"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "NonexistentParser"
+        }
+      ]
+    },
+    {
+      "id": "http-service.transcript-normalization",
+      "repo": "http-service-python",
+      "goal": "change transcript normalization to preserve raw text",
+      "ground_truth": {
+        "files": [
+          "services/transcripts.py",
+          "tests/test_transcripts.py"
+        ],
+        "symbols": [
+          "Normalizer",
+          "Normalizer.normalize",
+          "TranscriptRepository"
+        ],
+        "components": [
+          "services"
+        ],
+        "tests": [
+          "test_normalization_preserves_raw"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TranscriptStore"
+        }
+      ]
+    },
+    {
+      "id": "http-service.health-check",
+      "repo": "http-service-python",
+      "goal": "add a health check endpoint",
+      "ground_truth": {
+        "files": [
+          "main.py"
+        ],
+        "symbols": [
+          "health"
+        ],
+        "components": [
+          "root"
+        ],
+        "routes": [
+          "GET /health"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "HealthMonitor"
+        }
+      ]
+    },
+    {
+      "id": "queue-worker.asr-retry",
+      "repo": "queue-worker-ts",
+      "goal": "add retry handling to the asr transcription call",
+      "ground_truth": {
+        "files": [
+          "src/asr/client.ts",
+          "src/ingest.ts"
+        ],
+        "symbols": [
+          "transcribe",
+          "consume"
+        ],
+        "components": [
+          "src"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "Retryer"
+        }
+      ]
+    },
+    {
+      "id": "queue-worker.street-vocabulary",
+      "repo": "queue-worker-ts",
+      "goal": "change street name resolution to use department vocabulary",
+      "ground_truth": {
+        "files": [
+          "src/geo/resolver.ts",
+          "src/normalize/text.ts"
+        ],
+        "symbols": [
+          "resolveStreetName",
+          "DEPARTMENT_VOCAB",
+          "normalize"
+        ],
+        "components": [
+          "src"
+        ],
+        "tests": [
+          "expands-department-street-names"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "StreetResolver"
+        }
+      ]
+    },
+    {
+      "id": "queue-worker.redis-persist",
+      "repo": "queue-worker-ts",
+      "goal": "persist normalized transcripts in redis",
+      "ground_truth": {
+        "files": [
+          "src/ingest.ts",
+          "src/cache.ts"
+        ],
+        "symbols": [
+          "consume",
+          "redis"
+        ],
+        "components": [
+          "src"
+        ],
+        "stores": [
+          "redis"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TranscriptCache"
+        }
+      ]
+    },
+    {
+      "id": "monorepo.rename-transcript-field",
+      "repo": "monorepo-acceptance",
+      "goal": "rename transcript response field in the API response",
+      "ground_truth": {
+        "files": [
+          "api/routes.ts",
+          "frontend/view.ts",
+          "worker/indexer.ts"
+        ],
+        "symbols": [
+          "renderTranscript",
+          "indexTranscripts"
+        ],
+        "components": [
+          "api",
+          "frontend",
+          "worker"
+        ],
+        "data": [
+          "prisma.transcript"
+        ],
+        "routes": [
+          "GET /api/transcripts/:id",
+          "POST /api/transcripts"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "normalizeField"
+        }
+      ]
+    },
+    {
+      "id": "monorepo.worker-indexing",
+      "repo": "monorepo-acceptance",
+      "goal": "fix the worker that indexes normalized transcripts",
+      "ground_truth": {
+        "files": [
+          "worker/indexer.ts",
+          "shared/db.ts"
+        ],
+        "symbols": [
+          "indexTranscripts"
+        ],
+        "components": [
+          "worker",
+          "shared"
+        ],
+        "data": [
+          "prisma.transcript"
+        ],
+        "tests": [
+          "indexes-normalized-text"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "WorkerPool"
+        }
+      ]
+    },
+    {
+      "id": "monorepo.new-field",
+      "repo": "monorepo-acceptance",
+      "goal": "expose a new field in the transcript api",
+      "ground_truth": {
+        "files": [
+          "api/routes.ts"
+        ],
+        "symbols": [],
+        "components": [
+          "api"
+        ],
+        "data": [
+          "prisma.transcript"
+        ],
+        "routes": [
+          "GET /api/transcripts/:id",
+          "POST /api/transcripts"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TranscriptField"
+        }
+      ]
+    },
+    {
+      "id": "py-queue.classification-fallback",
+      "repo": "py-queue-service",
+      "goal": "add a fallback when incident classification fails",
+      "ground_truth": {
+        "files": [
+          "processor.py",
+          "tests/test_processor.py"
+        ],
+        "symbols": [
+          "process_incident",
+          "classify"
+        ],
+        "components": [
+          "root"
+        ],
+        "tests": [
+          "test_fallback_on_classifier_failure"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "ClassifierClient"
+        }
+      ]
+    },
+    {
+      "id": "py-queue.store-changes",
+      "repo": "py-queue-service",
+      "goal": "change how incidents are stored in the database",
+      "ground_truth": {
+        "files": [
+          "store.py",
+          "processor.py"
+        ],
+        "symbols": [
+          "IncidentStore",
+          "IncidentStore.save_incident",
+          "process_incident"
+        ],
+        "components": [
+          "root"
+        ],
+        "data": [
+          "db.incidents"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "IncidentCache"
+        }
+      ]
+    },
+    {
+      "id": "py-queue.empty-messages",
+      "repo": "py-queue-service",
+      "goal": "make the consumer tolerate empty messages",
+      "ground_truth": {
+        "files": [
+          "consumer.py",
+          "processor.py"
+        ],
+        "symbols": [
+          "consume",
+          "process_incident"
+        ],
+        "components": [
+          "root"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "NullMessage"
+        }
+      ]
+    },
+    {
+      "id": "ts-api-web.pagination",
+      "repo": "ts-api-web",
+      "goal": "add pagination to the users list endpoint",
+      "ground_truth": {
+        "files": [
+          "server.ts",
+          "service/users.ts"
+        ],
+        "symbols": [
+          "listUsers",
+          "createUser"
+        ],
+        "components": [
+          "service"
+        ],
+        "routes": [
+          "GET /api/users"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "UserPager"
+        }
+      ]
+    },
+    {
+      "id": "ts-api-web.contract-field",
+      "repo": "ts-api-web",
+      "goal": "change the users response contract field name",
+      "ground_truth": {
+        "files": [
+          "server.ts",
+          "web/view.ts",
+          "service/users.ts"
+        ],
+        "symbols": [
+          "renderUsers",
+          "listUsers"
+        ],
+        "components": [
+          "web",
+          "service"
+        ],
+        "tests": [
+          "joins-user-names-from-the-api-response"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "UserViewModel"
+        }
+      ]
+    },
+    {
+      "id": "ts-api-web.creation-test",
+      "repo": "ts-api-web",
+      "goal": "add a test for user creation",
+      "ground_truth": {
+        "files": [
+          "server.ts",
+          "service/users.ts"
+        ],
+        "symbols": [
+          "createUser",
+          "listUsers"
+        ],
+        "components": [
+          "service"
+        ],
+        "tests": [
+          "joins-user-names-from-the-api-response"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "CreateUserTest"
+        }
+      ]
+    },
+    {
+      "id": "large-ts.new-order-endpoint",
+      "repo": "large-ts",
+      "goal": "add a new order endpoint to the api",
+      "ground_truth": {
+        "files": [
+          "src/api/server.ts",
+          "src/api/orders.ts",
+          "src/domain/orders.ts"
+        ],
+        "symbols": [
+          "listOrders",
+          "getOrder",
+          "OrderService",
+          "OrderRepo"
+        ],
+        "components": [
+          "src"
+        ],
+        "data": [
+          "db.orders"
+        ],
+        "routes": [
+          "GET /api/orders",
+          "GET /api/orders/:id"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "OrderPager"
+        }
+      ]
+    },
+    {
+      "id": "large-ts.order-total-invariant",
+      "repo": "large-ts",
+      "goal": "enforce the order total invariant in the domain",
+      "ground_truth": {
+        "files": [
+          "src/domain/orders.ts",
+          "tests/orders.test.ts"
+        ],
+        "symbols": [
+          "OrderService",
+          "OrderService.createOrder"
+        ],
+        "components": [
+          "src"
+        ],
+        "tests": [
+          "computes-order-totals-from-line-items"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TotalValidator"
+        }
+      ]
+    },
+    {
+      "id": "nextjs.transcript-response",
+      "repo": "nextjs-fullstack",
+      "goal": "change the transcript api route response",
+      "ground_truth": {
+        "files": [
+          "app/api/transcripts/route.ts",
+          "components/TranscriptView.tsx",
+          "lib/transcripts.ts"
+        ],
+        "symbols": [
+          "GET",
+          "POST",
+          "TranscriptStore",
+          "TranscriptView"
+        ],
+        "components": [
+          "app",
+          "lib",
+          "components"
+        ],
+        "routes": [
+          "GET /api/transcripts",
+          "POST /api/transcripts"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TranscriptApi"
+        }
+      ]
+    },
+    {
+      "id": "nextjs.store-pagination",
+      "repo": "nextjs-fullstack",
+      "goal": "add pagination to the transcript store",
+      "ground_truth": {
+        "files": [
+          "lib/transcripts.ts",
+          "lib/db.ts"
+        ],
+        "symbols": [
+          "TranscriptStore",
+          "TranscriptStore.list",
+          "sql"
+        ],
+        "components": [
+          "lib"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "TranscriptPager"
+        }
+      ]
+    },
+    {
+      "id": "polyglot.refund-endpoint",
+      "repo": "polyglot-monorepo",
+      "goal": "add a refund endpoint to the payment service",
+      "ground_truth": {
+        "files": [
+          "svc/payments.py",
+          "svc/server.py",
+          "svc/db.py"
+        ],
+        "symbols": [
+          "handle_payment",
+          "PaymentDb",
+          "PaymentDb.insert"
+        ],
+        "components": [
+          "svc"
+        ],
+        "data": [
+          "db.payments"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "RefundService"
+        }
+      ]
+    },
+    {
+      "id": "polyglot.web-payments",
+      "repo": "polyglot-monorepo",
+      "goal": "show payment amounts in the web layer",
+      "ground_truth": {
+        "files": [
+          "web/app.ts",
+          "web/client.ts",
+          "shared/contract.ts"
+        ],
+        "symbols": [
+          "renderPayments",
+          "api",
+          "Payment"
+        ],
+        "components": [
+          "web",
+          "shared"
+        ]
+      },
+      "hallucinations": [
+        {
+          "type": "symbol",
+          "name": "PaymentWidget"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "ts-api-web",
+  "version": "0.1.0",
+  "main": "dist/server.js",
+  "scripts": { "start": "ts-node server.ts" }
+}

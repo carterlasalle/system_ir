@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scc-sdk"
+version = "0.1.0"
+description = "Thin Python SDK for the scc (System Context Compiler) CLI"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[tool.setuptools]
+py-modules = ["scc_sdk"]

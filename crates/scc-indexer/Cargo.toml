@@ -1,0 +1,25 @@
+[package]
+name = "scc-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "System Context Compiler indexer: repository scanning and extraction"
+
+[dependencies]
+scc-core.workspace = true
+scc-store.workspace = true
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+blake3 = "1"
+globset = "0.4"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+scc-graph.workspace = true
