@@ -26,8 +26,8 @@ jobs:
           SCC_BIN=$PWD/target/debug/scc python3 plugins/hermes/test_plugin.py
       - name: SBOM (dependency inventory)
         run: |
-          cargo tree --edges normal --format '{p} {v}' > sbom-deps.txt
-          sha256sum target/release/scc > scc.sha256 || true
+          cargo tree --edges normal --format '{p}' > sbom-deps.txt
+          wc -l sbom-deps.txt
       - name: Upload SBOM
         uses: actions/upload-artifact@v4
         with:
