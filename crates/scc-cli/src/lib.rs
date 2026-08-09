@@ -7,6 +7,7 @@ pub mod benchres;
 pub mod checkpoint;
 pub mod commands;
 pub mod compress;
+pub mod embed_cli;
 pub mod httpd;
 pub mod mcp;
 pub mod plugin;
@@ -140,6 +141,12 @@ pub fn compiler<'a>(
         startup_tokens: config.context.startup_tokens,
         task_tokens: config.context.task_tokens,
         include_low_confidence_inference: config.context.include_low_confidence_inference,
+        rank_salt: format!(
+            "{}:{}:{}",
+            config.inference.enabled,
+            config.inference.embedding_model,
+            config.inference.rerank_model
+        ),
     };
     Ok(Compiler {
         store,

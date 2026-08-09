@@ -135,7 +135,19 @@ pub fn cmd_context_task_json(
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().task_context(goal, files, symbols, budget);
+    let (scorer, reranker) = crate::embed_cli::rankers(&store, &config, goal);
+    let scorer_trait: Option<&dyn scc_context::rank::SemanticScorer> =
+        scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
+    let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
+        reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
+    let pack = comp.ctx().task_context_with_rankers(
+        goal,
+        files,
+        symbols,
+        budget,
+        scorer_trait,
+        reranker_trait,
+    );
     Ok(serde_json::to_string_pretty(&pack)?)
 }
 

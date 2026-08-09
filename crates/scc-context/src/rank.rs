@@ -117,6 +117,14 @@ pub trait SemanticScorer: Send + Sync {
     fn score(&self, goal: &str, entity: &scc_core::Entity) -> f64;
 }
 
+/// Optional second-stage reranker (e.g. a separate cross-encoder model):
+/// reorders the collected candidates after lexical/semantic collection.
+/// `rerank` may reorder `candidates` in place; failures degrade gracefully
+/// (the trait method should treat errors as no-op).
+pub trait Reranker: Send + Sync {
+    fn rerank(&self, goal: &str, candidates: &mut Vec<ScoredEntity>);
+}
+
 pub fn collect_lexical_candidates(
     store: &Store,
     graph: &RealityGraph,
@@ -135,6 +143,19 @@ pub fn collect_lexical_candidates_with(
     symbols: &[String],
     limit: usize,
     scorer: Option<&dyn SemanticScorer>,
+) -> Vec<ScoredEntity> {
+    collect_lexical_candidates_full(store, graph, goal, symbols, limit, scorer, None)
+}
+
+/// `collect_lexical_candidates` with both a semantic scorer and a reranker.
+pub fn collect_lexical_candidates_full(
+    store: &Store,
+    graph: &RealityGraph,
+    goal: &str,
+    symbols: &[String],
+    limit: usize,
+    scorer: Option<&dyn SemanticScorer>,
+    reranker: Option<&dyn Reranker>,
 ) -> Vec<ScoredEntity> {
     let goal_terms = terms(goal);
     let sem = |e: &scc_core::Entity| -> f64 { scorer.map(|s| s.score(goal, e)).unwrap_or(0.0) };
@@ -256,6 +277,9 @@ pub fn collect_lexical_candidates_with(
     }
 
     out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(rr) = reranker {
+        rr.rerank(goal, &mut out);
+    }
     out.truncate(limit.max(20));
     out
 }

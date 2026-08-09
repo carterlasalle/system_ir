@@ -19,9 +19,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const FTS_ESCAPE: &str = "\"";
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];
+
+/// v3: entity embeddings (f32 vector blobs) for the optional semantic ranker.
+const MIGRATION_3: &str = r#"
+CREATE TABLE IF NOT EXISTS embeddings (
+  entity_id TEXT PRIMARY KEY,
+  vector BLOB NOT NULL,
+  model TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"#;
 
 /// v2: runtime edge aggregation columns (latency/error aggregates).
 const MIGRATION_2: &str = r#"
@@ -1395,6 +1405,47 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ------------------------------------------------------------------
+    // embeddings
+    // ------------------------------------------------------------------
+
+    pub fn put_embedding(&self, entity_id: &str, vector: &[f32], model: &str) -> Result<()> {
+        let bytes: Vec<u8> = vector
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings (entity_id, vector, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![entity_id, bytes, model, scc_core::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_embedding(&self, entity_id: &str) -> Result<Option<(Vec<f32>, String)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT vector, model FROM embeddings WHERE entity_id = ?1",
+                params![entity_id],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(bytes, model)| {
+            let v = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            (v, model)
+        }))
+    }
+
+    pub fn embedding_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?)
     }
 
     pub fn add_drift_finding(&self, kind: &str, severity: &str, message: &str) -> Result<i64> {

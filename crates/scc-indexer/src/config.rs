@@ -45,7 +45,33 @@ pub struct ContextConfig {
 #[serde(default)]
 pub struct InferenceConfig {
     pub enabled: bool,
+    /// ollama | openai | endpoint (any OpenAI-compatible API)
     pub provider: String,
+    /// Embedding model name (ollama: nomic-embed-text / all-minilm; openai:
+    /// text-embedding-3-small; endpoint: provider-specific).
+    pub embedding_model: String,
+    /// Separate rerank model (cross-encoder style). Empty = no reranking.
+    /// Only providers exposing a Cohere/Jina-style `/rerank` endpoint use it.
+    pub rerank_model: String,
+    /// Base URL of an OpenAI-compatible API. Defaults per provider:
+    /// ollama -> http://127.0.0.1:11434/v1, openai -> https://api.openai.com/v1.
+    pub base_url: String,
+    /// Environment variable name holding the API key (never stored in config
+    /// or the database; empty for local providers).
+    pub api_key_env: String,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        InferenceConfig {
+            enabled: false,
+            provider: "local".into(),
+            embedding_model: "nomic-embed-text".into(),
+            rerank_model: String::new(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,15 +163,6 @@ impl Default for ContextConfig {
             startup_tokens: 6000,
             task_tokens: 10000,
             include_low_confidence_inference: false,
-        }
-    }
-}
-
-impl Default for InferenceConfig {
-    fn default() -> Self {
-        InferenceConfig {
-            enabled: false,
-            provider: "local".into(),
         }
     }
 }

@@ -17,7 +17,11 @@ context:
   include_low_confidence_inference: false
 inference:
   enabled: false
-  provider: local
+  provider: local        # local = ollama at http://127.0.0.1:11434/v1; also: openai | endpoint
+  embedding_model: nomic-embed-text
+  rerank_model: ""       # optional separate /rerank model (Cohere/Jina style)
+  base_url: ""           # override endpoint (e.g. https://gateway.example/v1)
+  api_key_env: ""        # env var holding the key (never stored)
 runtime:
   opentelemetry:
     enabled: false

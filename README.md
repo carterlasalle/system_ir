@@ -111,6 +111,8 @@ scc context subagent <goal>  # bounded task pack with explicit scope boundaries
 scc context compress <goal> [--cmd <summarizer>] [--claims]  # compression (+typed claims)
 scc export capsule.md        # portable startup capsule (any harness)
 scc setup codex              # write AGENTS.md with the capsule
+scc setup hermes             # install the Hermes plugin (6 tools + skill)
+scc embed                    # compute entity embeddings (opt-in ranker)
 scc adapters                 # adapter capability manifests (security audit)
 scc cochange [--min-commits N]  # git co-change pairs
 ```
@@ -213,6 +215,15 @@ without enforcing tests, and conflicting store writers.
 - **Adapter manifests (SCC-224/225)**: `scc adapters` lists filesystem/
   network/subprocess/credentials per adapter; default profile enforced by
   tests.
+- **Optional semantic ranker (SCC-071)**: embeddings via any OpenAI-compatible
+  endpoint (Ollama, OpenAI, self-hosted gateways) — `inference.enabled` +
+  `scc embed` stores vectors, the task pack fuses cosine similarity, and an
+  optional separate `/rerank` model reorders top candidates. Verified live
+  against Ollama (all-minilm): embeddings surfaced 12 relevant symbols vs 6
+  lexically for a no-overlap goal. Provider failures degrade to lexical.
+- **Hermes plugin (M10)**: `scc setup hermes` installs a native plugin
+  (`plugin.yaml` + `register(ctx)`) exposing the six semantic tools plus a
+  bundled skill, verified with a mock-ctx contract test in CI.
 
 ## Security
 
@@ -242,7 +253,7 @@ docs/            the specification this implements
 ## Testing
 
 ```bash
-cargo test --workspace        # 247 tests: extractor units, golden repos,
+cargo test --workspace        # 264 tests: extractor units, golden repos,
                               # incremental==cold equivalence, staleness,
                               # secrets, schema validation, MCP e2e, HTTP e2e,
                               # precision/recall, graph invariants, infra

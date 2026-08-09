@@ -5,7 +5,7 @@
 //! (always appended) may never be cut for budget. Lower-priority sections
 //! are dropped before truncation.
 
-use crate::rank::{collect_lexical_candidates, terms};
+use crate::rank::terms;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
 use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
@@ -329,11 +329,32 @@ pub fn task(
     symbols: &[String],
     budget: usize,
 ) -> ContextPack {
+    task_with_rankers(ctx, goal, files, symbols, budget, None, None)
+}
+
+/// `task` with optional semantic scorer + reranker (SCC-071).
+pub fn task_with_rankers(
+    ctx: &ContextCompiler,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: usize,
+    scorer: Option<&dyn crate::rank::SemanticScorer>,
+    reranker: Option<&dyn crate::rank::Reranker>,
+) -> ContextPack {
     let mut pack = ContextPack::new("task", &ctx.revision());
     let goal_terms = terms(goal);
 
     // ---- candidate generation ----
-    let candidates = collect_lexical_candidates(ctx.store, ctx.graph, goal, symbols, 24);
+    let candidates = crate::rank::collect_lexical_candidates_full(
+        ctx.store,
+        ctx.graph,
+        goal,
+        symbols,
+        24,
+        scorer,
+        reranker,
+    );
     let entity_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
 
     // symbol -> file -> component

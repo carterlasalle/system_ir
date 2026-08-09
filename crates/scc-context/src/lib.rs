@@ -18,6 +18,10 @@ pub struct ContextSettings {
     pub startup_tokens: usize,
     pub task_tokens: usize,
     pub include_low_confidence_inference: bool,
+    /// Salt for the task-pack cache: derived from the active ranker
+    /// configuration so enabling/disabling embeddings invalidates cached
+    /// packs.
+    pub rank_salt: String,
 }
 
 impl Default for ContextSettings {
@@ -26,6 +30,7 @@ impl Default for ContextSettings {
             startup_tokens: 6000,
             task_tokens: 10000,
             include_low_confidence_inference: false,
+            rank_salt: String::new(),
         }
     }
 }
@@ -169,6 +174,19 @@ impl<'a> ContextCompiler<'a> {
         symbols: &[String],
         token_budget: Option<usize>,
     ) -> ContextPack {
+        self.task_context_with_rankers(goal, files, symbols, token_budget, None, None)
+    }
+
+    /// `task_context` with optional semantic scorer and reranker (SCC-071).
+    pub fn task_context_with_rankers(
+        &self,
+        goal: &str,
+        files: &[String],
+        symbols: &[String],
+        token_budget: Option<usize>,
+        scorer: Option<&dyn crate::rank::SemanticScorer>,
+        reranker: Option<&dyn crate::rank::Reranker>,
+    ) -> ContextPack {
         let budget = token_budget.unwrap_or(self.settings.task_tokens).max(512);
         // Cache: keyed by (goal, inputs, budget, revision). The store clears
         // the cache on every index/refresh, so hits are only possible while
@@ -183,6 +201,7 @@ impl<'a> ContextCompiler<'a> {
                 h.update(s.as_bytes());
             }
             h.update(budget.to_string().as_bytes());
+            h.update(self.settings.rank_salt.as_bytes());
             format!("task:{}", &h.finalize().to_hex()[..20])
         };
         let revision = self.revision();
@@ -191,7 +210,8 @@ impl<'a> ContextCompiler<'a> {
                 return pack;
             }
         }
-        let pack = packs::task(self, goal, files, symbols, budget);
+        let pack =
+            packs::task_with_rankers(self, goal, files, symbols, budget, scorer, reranker);
         if let Ok(json) = serde_json::to_string(&pack) {
             let _ = self.store.cache_put(&key, &json, &revision);
         }

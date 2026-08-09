@@ -143,6 +143,9 @@ enum Commands {
         lsp: bool,
     },
 
+    /// Compute and store entity embeddings (optional semantic ranker)
+    Embed,
+
     /// List adapter capability manifests (security audit)
     Adapters {
         #[arg(long)]
@@ -402,6 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Serve => commands::cmd_serve(&root),
         Commands::Mcp => commands::cmd_mcp(&root),
         Commands::Ingest { body } => commands::cmd_ingest_runtime(&root, &body),
+        Commands::Embed => scc_cli::embed_cli::cmd_embed(&root),
         Commands::Adapters { json } => commands::cmd_adapters(json),
         Commands::Resolve { lsp: true } => {
             // SCC-125: capture native EXTRACTED edges before the LSP pass so

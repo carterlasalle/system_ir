@@ -13,6 +13,7 @@ pub mod adapters;
 pub mod config;
 pub mod configrefs;
 pub mod configs;
+pub mod embed;
 pub mod conflicts;
 pub mod failures;
 pub mod git;
