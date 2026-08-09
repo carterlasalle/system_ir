@@ -3,9 +3,11 @@
 //! state in context packs — labeled as task state, never as system facts.
 //!
 //! Input shapes accepted (defensively):
+//!
 //! - `.beads/issues.jsonl`: one JSON object per line
 //! - `bd list/show --json` arrays, with or without the `BD_JSON_ENVELOPE`
 //!   wrapper `{"schema_version": 1, "data": ...}`
+//!
 //! Any object with `id`/`title` (or `name`) is imported.
 
 use scc_store::Store;

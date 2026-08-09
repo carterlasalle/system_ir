@@ -165,11 +165,11 @@ pub fn embed_repository(store: &Store, cfg: &EmbedConfig) -> Result<usize, Strin
         for e in store.entities_by_kind(kind).map_err(|e| e.to_string())? {
             let mut text = e.name.clone();
             if let Some(doc) = e.attributes.get("docstring").and_then(|v| v.as_str()) {
-                text.push_str(" ");
+                text.push(' ');
                 text.push_str(doc);
             }
             if let Some(resp) = e.attributes.get("responsibility").and_then(|v| v.as_str()) {
-                text.push_str(" ");
+                text.push(' ');
                 text.push_str(resp);
             }
             texts.push((e.id.clone(), text));

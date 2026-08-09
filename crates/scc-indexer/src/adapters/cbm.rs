@@ -143,24 +143,20 @@ pub fn import_cbm(store: &Store, path: &Path) -> Result<CbmReport, String> {
                         Ok((a, c, b))
                     })
                     .map_err(|e| e.to_string())?;
-                for row in rows {
-                    if let Ok((a, c, b)) = row {
-                        if a.is_empty() || b.is_empty() {
-                            continue;
-                        }
-                        let rel = scc_core::Relationship::new(
-                            crate::write::rel_id(&["cbm", &a, &c, &b]),
-                            scc_core::entity_id(&store.repo_id, "symbol", &a),
-                            c.to_ascii_lowercase(),
-                            scc_core::entity_id(&store.repo_id, "symbol", &b),
-                            scc_core::Provenance::Resolved,
-                        );
-                        if store
-                            .insert_relationship(&rel, "cbm:graph.db")
-                            .is_ok()
-                        {
-                            report.relationships += 1;
-                        }
+                for row in rows.flatten() {
+                    let (a, c, b) = row;
+                    if a.is_empty() || b.is_empty() {
+                        continue;
+                    }
+                    let rel = scc_core::Relationship::new(
+                        crate::write::rel_id(&["cbm", &a, &c, &b]),
+                        scc_core::entity_id(&store.repo_id, "symbol", &a),
+                        c.to_ascii_lowercase(),
+                        scc_core::entity_id(&store.repo_id, "symbol", &b),
+                        scc_core::Provenance::Resolved,
+                    );
+                    if store.insert_relationship(&rel, "cbm:graph.db").is_ok() {
+                        report.relationships += 1;
                     }
                 }
             }
@@ -198,20 +194,19 @@ pub fn import_cbm(store: &Store, path: &Path) -> Result<CbmReport, String> {
                         Ok((n, k, f))
                     })
                     .map_err(|e| e.to_string())?;
-                for row in rows {
-                    if let Ok((n, k, f)) = row {
-                        if n.is_empty() {
-                            continue;
-                        }
-                        let file = if f.is_empty() { "cbm".to_string() } else { f };
-                        let id = scc_core::symbol_id(&store.repo_id, &file, &n);
-                        let mut e = scc_core::Entity::new(id, "symbol", n);
-                        e.attr("kind", serde_json::json!(k.to_ascii_lowercase()));
-                        e.attr("file", serde_json::json!(file));
-                        e.attr("extractor", serde_json::json!("cbm"));
-                        if store.insert_entity(&e, &["cbm:graph.db".into()]).is_ok() {
-                            report.symbols += 1;
-                        }
+                for row in rows.flatten() {
+                    let (n, k, f) = row;
+                    if n.is_empty() {
+                        continue;
+                    }
+                    let file = if f.is_empty() { "cbm".to_string() } else { f };
+                    let id = scc_core::symbol_id(&store.repo_id, &file, &n);
+                    let mut e = scc_core::Entity::new(id, "symbol", n);
+                    e.attr("kind", serde_json::json!(k.to_ascii_lowercase()));
+                    e.attr("file", serde_json::json!(file));
+                    e.attr("extractor", serde_json::json!("cbm"));
+                    if store.insert_entity(&e, &["cbm:graph.db".into()]).is_ok() {
+                        report.symbols += 1;
                     }
                 }
             }

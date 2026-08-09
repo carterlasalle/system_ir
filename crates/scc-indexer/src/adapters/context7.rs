@@ -45,14 +45,9 @@ pub fn start(command: &str) -> Result<Context7Client, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdout = stdout;
-        loop {
-            match read_frame(&mut stdout) {
-                Ok(v) => {
-                    if tx.send(v).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(v) = read_frame(&mut stdout) {
+            if tx.send(v).is_err() {
+                break;
             }
         }
     });
