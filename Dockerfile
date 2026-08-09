@@ -10,6 +10,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/scc /usr/local/bin/scc
 VOLUME ["/data"]
+ENV SCC_STATE_DIR=/data
 WORKDIR /repo
 EXPOSE 7777
 ENTRYPOINT ["scc"]

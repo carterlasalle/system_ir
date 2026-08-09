@@ -43,20 +43,33 @@ pub enum CliError {
 
 pub type Result<T> = std::result::Result<T, CliError>;
 
+/// SCC state directory: the repo's `.scc/` by default; `SCC_STATE_DIR`
+/// relocates writable state (database, checkpoint) so the repository itself
+/// can be mounted read-only (docs/DEPLOYMENT_AND_INFRA.md §3: read-only repo
+/// + writable SCC data volume).
+pub fn state_dir(root: &Path) -> PathBuf {
+    match std::env::var("SCC_STATE_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => scc_dir(root),
+    }
+}
+
 pub fn scc_dir(root: &Path) -> PathBuf {
     root.join(SCC_DIR)
 }
 
 pub fn db_path(root: &Path) -> PathBuf {
-    scc_dir(root).join(DB_FILE)
+    state_dir(root).join(DB_FILE)
 }
 
+/// Config stays in the repo (read-only is fine): it is repository intent,
+/// not SCC state.
 pub fn config_path(root: &Path) -> PathBuf {
     scc_dir(root).join(CONFIG_FILE)
 }
 
 pub fn checkpoint_path(root: &Path) -> PathBuf {
-    scc_dir(root).join(CHECKPOINT_FILE)
+    state_dir(root).join(CHECKPOINT_FILE)
 }
 
 /// Locate the repository root: walk up from cwd looking for `.git` or an
@@ -82,7 +95,7 @@ pub fn load_config(root: &Path) -> Result<Config> {
 }
 
 pub fn open_store(root: &Path) -> Result<Store> {
-    let dir = scc_dir(root);
+    let dir = state_dir(root);
     std::fs::create_dir_all(&dir)?;
     Ok(Store::open(&db_path(root), root)?)
 }
