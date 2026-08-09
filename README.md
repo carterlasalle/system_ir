@@ -189,8 +189,15 @@ without enforcing tests, and conflicting store writers.
   the polyglot fixture — pyright resolved module roots the native index
   missed).
 - **Differential benchmark (SCC-126)**: `scc bench resolution` compares
-  native vs LSP edge sets per repo (totals: 45 resolved / 24 external /
-  4 upgrades / 4 conflicts across the corpus).
+  native vs LSP edge sets per repo (totals: 49 resolved / 20 external /
+  0 upgrades / 0 conflicts — the source-root fallback now resolves natively
+  what LSP previously caught); the strict ratio gate is exercised by the
+  benchres fixture test; the conflicts gate is the default.
+- **Full-index invalidation fix**: `scc index` now purges changed files
+  before re-extraction (found by the rename property test) — no stale edges
+  after import-target renames.
+- **Source-root fallback**: module resolution tries src/svc/lib/app/
+  services/packages roots — fixes polyglot repos natively.
 - **SDKs (SCC-089/090)**: `sdk/typescript` (@scc/sdk) and `sdk/python`
   (scc-sdk) with the six context operations; both suites pass against the
   CLI.
@@ -235,7 +242,7 @@ docs/            the specification this implements
 ## Testing
 
 ```bash
-cargo test --workspace        # 246 tests: extractor units, golden repos,
+cargo test --workspace        # 247 tests: extractor units, golden repos,
                               # incremental==cold equivalence, staleness,
                               # secrets, schema validation, MCP e2e, HTTP e2e,
                               # precision/recall, graph invariants, infra
