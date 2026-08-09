@@ -151,11 +151,13 @@ pub fn cmd_context_task_json(
     // task-state + memory enrichment (below the System IR authority line)
     let beads_active = scc_indexer::adapters::beads::active_beads(root, 5);
     if !beads_active.is_empty() {
-        pack.content.push_str(&format!(
-            "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n"
-        ));
+        pack.content.push_str(
+            "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n",
+        );
         for t in beads_active {
-            pack.content.push_str(&format!("- {t}\n"));
+            pack.content.push_str("- ");
+            pack.content.push_str(&t);
+            pack.content.push('\n');
         }
     }
     if config.integrations.hindsight {

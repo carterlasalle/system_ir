@@ -69,22 +69,20 @@ impl Reranker for CliReranker {
             .take(30)
             .map(|c| format!("{} {}", c.kind, c.name))
             .collect();
-        match rerank(&self.cfg, goal, &docs) {
-            Ok(scores) => {
-                for (c, s) in candidates.iter_mut().take(30).zip(scores.iter()) {
-                    // rerank dominates; the lexical residue keeps ties
-                    // deterministic
-                    c.score = c.score * 0.2 + s * 5.0;
-                    c.reason = format!("{} + rerank", c.reason);
-                }
-                candidates.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+        if let Ok(scores) = rerank(&self.cfg, goal, &docs) {
+            for (c, s) in candidates.iter_mut().take(30).zip(scores.iter()) {
+                // rerank dominates; the lexical residue keeps ties
+                // deterministic
+                c.score = c.score * 0.2 + s * 5.0;
+                c.reason = format!("{} + rerank", c.reason);
             }
-            Err(_) => {} // graceful degrade: keep lexical order
+            candidates.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
+        // Err: graceful degrade — keep lexical order
     }
 }
 
