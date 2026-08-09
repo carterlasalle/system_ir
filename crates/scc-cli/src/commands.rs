@@ -223,7 +223,7 @@ pub fn cmd_impact(
     Ok(())
 }
 
-pub fn cmd_verify(root: &Path, warnings_only: bool) -> crate::Result<()> {
+pub fn cmd_verify(root: &Path, warnings_only: bool, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
@@ -233,6 +233,10 @@ pub fn cmd_verify(root: &Path, warnings_only: bool) -> crate::Result<()> {
         for w in &pack.warnings {
             println!("⚠ {w}");
         }
+        return Ok(());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&pack)?);
         return Ok(());
     }
     print!("{}", pack.content);

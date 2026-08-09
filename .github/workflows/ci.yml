@@ -20,6 +20,10 @@ jobs:
         run: cargo test --workspace
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
+      - name: Hermes plugin contract test
+        run: |
+          python3 -m py_compile plugins/hermes/scc/__init__.py plugins/hermes/scc/schemas.py plugins/hermes/scc/tools.py
+          SCC_BIN=$PWD/target/debug/scc python3 plugins/hermes/test_plugin.py
       - name: SBOM (dependency inventory)
         run: |
           cargo tree --edges normal --format '{p} {v}' > sbom-deps.txt

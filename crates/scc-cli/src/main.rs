@@ -73,6 +73,8 @@ enum Commands {
         /// Only print warnings (for hooks)
         #[arg(long)]
         warnings: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show architectural drift findings
@@ -314,6 +316,8 @@ enum SetupSub {
     Codex,
     /// Write AGENTS.md + .opencode/opencode.json (SCC MCP server)
     Opencode,
+    /// Install the Hermes plugin (native tools + skill)
+    Hermes,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -371,7 +375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Impact { diff, files, symbols, json } => {
             commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json)
         }
-        Commands::Verify { warnings } => commands::cmd_verify(&root, warnings),
+        Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
         Commands::Drift { json } => commands::cmd_drift(&root, json),
         Commands::Export { format } => commands::cmd_export(&root, &format),
         Commands::Query { query, limit } => commands::cmd_query(&root, &query, limit),
@@ -393,6 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SetupSub::Claude => commands::cmd_setup_claude(&root),
             SetupSub::Codex => scc_cli::compress::cmd_setup_codex(&root),
             SetupSub::Opencode => scc_cli::compress::cmd_setup_opencode(&root),
+            SetupSub::Hermes => scc_cli::plugin_hermes::cmd_setup_hermes(&root),
         },
         Commands::Serve => commands::cmd_serve(&root),
         Commands::Mcp => commands::cmd_mcp(&root),

@@ -1,0 +1,16 @@
+name: scc
+version: 0.1.0
+description: >-
+  System Context Compiler — evidence-backed system context for coding tasks.
+  Provides system_overview, task_context, component_context, flow_context,
+  impact_context, and verify_context tools backed by the local `scc` CLI.
+provides_tools:
+  - system_overview
+  - task_context
+  - component_context
+  - flow_context
+  - impact_context
+  - verify_context
+provides_hooks:
+  - post_tool_call
+author: SCC

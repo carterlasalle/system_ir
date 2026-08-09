@@ -10,6 +10,7 @@ pub mod compress;
 pub mod httpd;
 pub mod mcp;
 pub mod plugin;
+pub mod plugin_hermes;
 pub mod resolve;
 
 use scc_context::ContextCompiler;
