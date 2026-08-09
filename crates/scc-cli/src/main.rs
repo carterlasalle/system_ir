@@ -226,6 +226,14 @@ enum BenchSub {
         #[arg(long, default_value_t = 0.0)]
         min_files: f64,
     },
+    /// Differential resolution benchmark (SCC-126): native vs LSP upgrades
+    /// over the fixture corpus, gated on upgrades and unresolved externals
+    Resolution {
+        /// Maximum allowed fraction of external call candidates left
+        /// unresolved after the LSP pass
+        #[arg(long, default_value_t = scc_cli::benchres::DEFAULT_MIN_AGREEMENT)]
+        min_agreement: f64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -304,26 +312,23 @@ enum SetupSub {
     Claude,
     /// Write AGENTS.md with the system capsule (Codex and other harnesses)
     Codex,
+    /// Write AGENTS.md + .opencode/opencode.json (SCC MCP server)
+    Opencode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Exit quietly on broken pipes (`scc status | head`) instead of panicking.
+    // Default SIGPIPE behavior: dying silently on `scc ... | head` is the
+    // standard Unix contract; ignoring it makes println! panic on EPIPE.
     unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
-    let root = cli
-        .root
-        .clone()
-        .map(|r| {
-            if r.is_absolute() {
-                r
-            } else {
-                std::env::current_dir().unwrap().join(r)
-            }
-        })
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let root = scc_cli::find_root(&root);
+    let root = match cli.root.clone() {
+        // explicit --root is exact: no upward walk
+        Some(r) if r.is_absolute() => r,
+        Some(r) => std::env::current_dir().unwrap().join(r),
+        None => scc_cli::find_root(&std::env::current_dir().unwrap()),
+    };
 
     let result = match cli.command {
         Commands::Init => commands::cmd_init(&root),
@@ -387,16 +392,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Setup { sub } => match sub {
             SetupSub::Claude => commands::cmd_setup_claude(&root),
             SetupSub::Codex => scc_cli::compress::cmd_setup_codex(&root),
+            SetupSub::Opencode => scc_cli::compress::cmd_setup_opencode(&root),
         },
         Commands::Serve => commands::cmd_serve(&root),
         Commands::Mcp => commands::cmd_mcp(&root),
         Commands::Ingest { body } => commands::cmd_ingest_runtime(&root, &body),
         Commands::Adapters { json } => commands::cmd_adapters(json),
         Commands::Resolve { lsp: true } => {
+            // SCC-125: capture native EXTRACTED edges before the LSP pass so
+            // target changes can be recorded as resolution_conflict drift
+            // findings (the upgrade preserves the evidence id, which lets the
+            // diff link each EXTRACTED edge to its RESOLVED successor).
+            let pre = {
+                let store = scc_cli::open_store(&root)?;
+                scc_cli::benchres::collect_external_edges(&store)?
+            };
             scc_cli::resolve::cmd_resolve_lsp(&root)?;
-            // upgrades changed the reality graph — rebuild the derived layer
             let store = scc_cli::open_store(&root)?;
+            // upgrades changed the reality graph — rebuild the derived layer
+            // first (recompile regenerates drift findings, so the resolution
+            // conflicts are recorded after it)
             scc_cli::recompile(&store)?;
+            let mut by_file: std::collections::BTreeMap<
+                String,
+                Vec<scc_indexer::conflicts::UpgradeRecord>,
+            > = std::collections::BTreeMap::new();
+            for (file, rec) in scc_cli::benchres::diff_upgrades(&store, &pre)? {
+                by_file.entry(file).or_default().push(rec);
+            }
+            for (file, recs) in &by_file {
+                let report =
+                    scc_indexer::conflicts::record_resolution_conflicts(&store, file, recs)?;
+                if report.conflicts > 0 {
+                    println!(
+                        "scc resolve: {} resolution conflict(s) in {file}",
+                        report.conflicts
+                    );
+                }
+            }
             Ok(())
         }
         Commands::Resolve { lsp: false } => Err(scc_cli::CliError::Other(
@@ -447,6 +480,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = std::fs::remove_dir_all(&dir);
                         Err(e)
                     }
+                }
+            }
+            BenchSub::Resolution { min_agreement } => {
+                match scc_cli::benchres::run_resolution_benchmark(min_agreement) {
+                    Ok(summary) => {
+                        scc_cli::benchres::print_summary(&summary);
+                        Ok(())
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
                 }
             }
         },

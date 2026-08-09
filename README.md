@@ -1,13 +1,15 @@
 # System Context Compiler (SCC)
 
-**Status:** MVP (Phases 1–6) + P1 system semantics + Phase 7 semantic
-precision + M0/M4 context benchmark: lifecycle/workflow views,
-Kubernetes/Terraform/GitHub Actions extraction, SCIP + Narsil CCG + GitNexus
-evidence import, LSP-based definition resolution (pyright), OpenTelemetry
-runtime reconciliation, config-reference linking, trust boundaries, CI drift
-policies, subagent context policy, RTK compression hints, pluggable
-compression, capsule export for other harnesses, and a ground-truth context
-benchmark (mean recall 1.000, localization 1.000 on the 15-task corpus).
+**Status:** MVP (Phases 1–6) + P1 + Phase 7 semantic precision + M0/M4
+benchmarks: TS+Python LSP resolution (pyright + typescript-language-server),
+resolution conflict model, differential benchmark, lifecycle/workflow views,
+Kubernetes/Terraform/GitHub Actions extraction, SCIP/Narsil CCG/GitNexus
+import, OpenTelemetry reconciliation, config refs, trust boundaries, CI
+drift policies, Git co-change, failure-pattern detection (DLQ/circuit
+breaker/except), TS+Python SDKs, subagent policy, RTK hints, constrained
+claims compression, adapter capability manifests, capsule export, Codex
+plugin, property/fuzz tests, and a 21-task/8-repo context benchmark (mean
+recall 1.000, localization 1.000).
 
 > **Give agents more repository understanding per token, not more repository text.**
 
@@ -103,10 +105,14 @@ scc runtime status           # observed edge aggregates
 scc runtime reconcile        # static-vs-observed reconciliation
 scc bench index [--files N] [--lines N]   # latency benchmark on a synthetic repo
 scc bench context [--min-recall 0.9]  # ground-truth recall/precision benchmark
+scc bench resolution         # native-vs-LSP differential benchmark
+scc bench agent --cmd <cmd>  # run the corpus through an external agent command
 scc context subagent <goal>  # bounded task pack with explicit scope boundaries
-scc context compress <goal> [--cmd <summarizer>]  # structural (+external) compression
+scc context compress <goal> [--cmd <summarizer>] [--claims]  # compression (+typed claims)
 scc export capsule.md        # portable startup capsule (any harness)
 scc setup codex              # write AGENTS.md with the capsule
+scc adapters                 # adapter capability manifests (security audit)
+scc cochange [--min-commits N]  # git co-change pairs
 ```
 
 ## Evidence and provenance
@@ -176,6 +182,30 @@ without enforcing tests, and conflicting store writers.
 - **Cross-harness onboarding**: `scc export capsule.md` renders the startup
   capsule with a machine-readable header; `scc setup codex` writes AGENTS.md
   (capsule + usage rules + authority ordering) idempotently.
+- **TS LSP resolution (SCC-121)**: typescript-language-server integration
+  with cold-start retry and import/export binding-hop for barrel re-exports.
+- **Resolution conflicts (SCC-125)**: upgrades that change the native target
+  become `resolution_conflict` drift findings (4 genuine conflicts found on
+  the polyglot fixture — pyright resolved module roots the native index
+  missed).
+- **Differential benchmark (SCC-126)**: `scc bench resolution` compares
+  native vs LSP edge sets per repo (totals: 45 resolved / 24 external /
+  4 upgrades / 4 conflicts across the corpus).
+- **SDKs (SCC-089/090)**: `sdk/typescript` (@scc/sdk) and `sdk/python`
+  (scc-sdk) with the six context operations; both suites pass against the
+  CLI.
+- **Failure patterns (SCC-058)**: except/catch fallback, circuit-breaker,
+  and DLQ detection feed symbol `failures` attributes + dlq topic entities.
+- **Git co-change (SCC-046)**: `scc cochange` reports files changed together
+  across commits; components carry `cochange` enrichment attributes.
+- **Property/fuzz tests (TEST_PLAN §6)**: proptest determinism, binary-safe
+  extractors, parser no-panic, rename stability (no dangling refs), cycle
+  termination — 6 properties, 32 cases each.
+- **250k LOC benchmark (SCC-241/244)**: cold index 96.5s (<120s bound), peak
+  RSS 217 MiB (<2GB target), incremental P95 92.4s (SCC-242).
+- **Adapter manifests (SCC-224/225)**: `scc adapters` lists filesystem/
+  network/subprocess/credentials per adapter; default profile enforced by
+  tests.
 
 ## Security
 
@@ -205,7 +235,7 @@ docs/            the specification this implements
 ## Testing
 
 ```bash
-cargo test --workspace        # 208 tests: extractor units, golden repos,
+cargo test --workspace        # 246 tests: extractor units, golden repos,
                               # incremental==cold equivalence, staleness,
                               # secrets, schema validation, MCP e2e, HTTP e2e,
                               # precision/recall, graph invariants, infra

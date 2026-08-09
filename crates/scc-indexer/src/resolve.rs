@@ -140,12 +140,15 @@ impl SymbolIndex {
                 return Some(c);
             }
         }
-        // src-layout fallback: `foo` / `a/b` may live under src/ (common for
-        // python and typescript repos)
+        // source-root fallback: `foo` / `a/b` may live under a conventional
+        // source root (src, svc, lib, app, services, packages) — common for
+        // python and typescript repos. Deterministic order; first match wins.
         if !module.starts_with('.') && !module.starts_with('/') {
-            for c in self.candidate_paths(&format!("src/{module}")) {
-                if self.all_files.contains(&c) {
-                    return Some(c);
+            for root in ["src", "svc", "lib", "app", "services", "service", "packages"] {
+                for c in self.candidate_paths(&format!("{root}/{module}")) {
+                    if self.all_files.contains(&c) {
+                        return Some(c);
+                    }
                 }
             }
         }

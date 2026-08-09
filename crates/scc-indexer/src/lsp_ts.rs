@@ -1,33 +1,38 @@
-//! LSP-based definition resolution (Phase 7, EPIC-120): upgrade EXTRACTED
-//! candidate call edges to RESOLVED using a real language server (pyright)
-//! speaking LSP 3.17 over stdio with JSON-RPC 2.0 Content-Length framing.
+//! LSP-based definition resolution for TypeScript/JavaScript (SCC-121):
+//! upgrade EXTRACTED candidate call edges to RESOLVED using
+//! `typescript-language-server` speaking LSP 3.17 over stdio with JSON-RPC
+//! 2.0 Content-Length framing.
 //!
-//! The native resolver produces `calls` relationships with provenance
-//! `EXTRACTED` when an import root looks external (e.g. a package living in a
-//! directory the native module resolver cannot see, or a member that is
-//! re-exported through a package `__init__.py`). Those edges point at
-//! `external_api` entities. Pyright performs real binding analysis and
-//! resolves the same call site to the concrete definition — the adapter then
-//! replaces the EXTRACTED edge with a RESOLVED edge to the true target
-//! symbol, carrying fresh `lsp-pyright` evidence.
+//! Same contract as `crate::lsp` (the pyright adapter): the native resolver
+//! produces `calls` relationships with provenance `EXTRACTED` when an import
+//! root looks external (e.g. a tsconfig `paths` alias the native module
+//! resolver cannot see, or a member re-exported through a barrel file).
+//! tsserver performs real binding analysis and resolves the same call site
+//! to the concrete definition — the adapter replaces the EXTRACTED edge with
+//! a RESOLVED edge to the true target symbol, carrying fresh `lsp-tsserver`
+//! evidence.
 //!
-//! Protocol notes (verified against pyright 1.1.411 on macOS):
-//! - pyright must be launched with `--cancellationReceive=file:<dir>`; without
-//!   it the background analysis worker is never created and binding-dependent
-//!   features return degenerate/empty results.
-//! - The LSP server may emit notifications before responding to `initialize`;
-//!   the reader thread forwards only responses and auto-replies to
-//!   server-initiated requests (capability registrations etc.).
+//! Protocol notes (verified against typescript-language-server 5.3.0 +
+//! typescript 7.0.2 on macOS):
+//! - tsserver is launched with `--stdio` only. The `--cancellationReceive`
+//!   flag is pyright-specific and MUST NOT be passed here.
+//! - The initialize/initialized handshake is identical to the pyright
+//!   adapter; the reader thread forwards responses, auto-replies to
+//!   server-initiated requests (workspace/configuration etc.), and skips
+//!   notifications (logMessage, publishDiagnostics, $/progress).
+//! - Definition responses are LocationLink arrays; the adapter accepts
+//!   Location | LocationLink | array | null.
 //! - The call-site position must sit on the callee name token (character 0 —
 //!   leading indentation — resolves to nothing), so the adapter locates the
 //!   callee text inside the source line.
 
+use crate::lsp::{uri_to_path, LspResult, REQUEST_TIMEOUT};
 use crate::write::{evidence_id, rel_id};
 use scc_core::{Evidence, EvidenceType, Provenance, Relationship};
 use scc_store::Store;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -35,20 +40,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Evidence extractor name stamped on upgraded edges.
-pub const LSP_EXTRACTOR: &str = "lsp-pyright";
-/// Per-request read deadline.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Aggregate result of one `resolve_call_definitions` run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LspResult {
-    /// EXTRACTED edges promoted to RESOLVED.
-    pub upgraded: usize,
-    /// Call sites the server could not resolve (empty/error/no symbol match).
-    pub unresolved: usize,
-    /// LSP error responses received for definition requests.
-    pub errors: usize,
-}
+pub const LSP_EXTRACTOR: &str = "lsp-tsserver";
 
 enum ServerMsg {
     /// A response to one of our requests (`id` + body).
@@ -66,8 +58,15 @@ enum DefOutcome {
     Error,
 }
 
-/// JSON-RPC/LSP client driving one pyright language server process.
-pub struct LspResolver {
+/// Classified response of one definition request.
+enum QueryOutcome {
+    Target(Target),
+    Empty,
+    Error,
+}
+
+/// JSON-RPC/LSP client driving one typescript-language-server process.
+pub struct TsLspResolver {
     child: Option<Child>,
     writer: Box<dyn Write + Send>,
     rx: Receiver<ServerMsg>,
@@ -75,12 +74,15 @@ pub struct LspResolver {
     next_id: u64,
     /// Absolute workspace root (cwd of the server, `file://` prefix base).
     workspace: PathBuf,
-    pyright_version: String,
+    ts_version: String,
     opened: HashSet<String>,
     stderr_join: Option<JoinHandle<()>>,
+    /// Cold-start budget: retries left while the configured TS project may
+    /// still be loading (see [`Self::definition_for`]).
+    cold_retries: u32,
 }
 
-impl Drop for LspResolver {
+impl Drop for TsLspResolver {
     fn drop(&mut self) {
         // Kill the child; the reader thread then observes EOF and exits.
         if let Some(mut child) = self.child.take() {
@@ -91,123 +93,23 @@ impl Drop for LspResolver {
 }
 
 // ---------------------------------------------------------------------------
-// wire protocol (testable without a real server)
-// ---------------------------------------------------------------------------
-
-/// Encode a JSON message as a Content-Length framed LSP message.
-pub fn encode_frame(msg: &Value) -> Vec<u8> {
-    let body = serde_json::to_vec(msg).expect("message serializes");
-    let mut out = Vec::with_capacity(body.len() + 64);
-    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-    out.extend_from_slice(&body);
-    out
-}
-
-/// Read one Content-Length framed frame body from `reader`.
-///
-/// Headers are ASCII lines terminated by `\r\n`; the frame body is exactly
-/// `Content-Length` bytes. Unknown headers are skipped. Returns `Err` on EOF
-/// or a missing/invalid Content-Length (the caller decides whether to abort).
-pub fn read_frame_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read header: {e}"))?;
-        if n == 0 {
-            return Err("EOF in headers".to_string());
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some(rest) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-        {
-            content_length = rest.trim().parse::<usize>().ok();
-        }
-    }
-    let len = content_length.ok_or_else(|| "missing Content-Length header".to_string())?;
-    let mut body = vec![0u8; len];
-    reader
-        .read_exact(&mut body)
-        .map_err(|e| format!("read body: {e}"))?;
-    Ok(body)
-}
-
-/// Read one frame and parse it as JSON. Malformed bodies are skipped: the
-/// frame boundary is known, so the stream stays in sync and the caller can
-/// continue with the next frame.
-pub fn read_frame<R: BufRead>(reader: &mut R) -> Result<Value, String> {
-    let body = read_frame_body(reader)?;
-    serde_json::from_slice(&body)
-        .map_err(|e| format!("bad JSON frame: {e}"))
-}
-
-/// Decode a `file://` URI to an absolute path (percent-decoding `%XX`).
-pub fn uri_to_path(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest); // file://localhost/...
-    if !rest.starts_with('/') {
-        return None;
-    }
-    Some(percent_decode(rest))
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // server lifecycle
 // ---------------------------------------------------------------------------
 
-/// Version of the installed pyright LSP server (`X.Y.Z`), or `None` when the
-/// `pyright-langserver` binary is absent. `pyright-langserver` is the LSP
-/// server binary shipped by the `pyright` npm package since 1.1.4xx; older
-/// packages expose the same server as `pyright --stdio`, so both are probed.
-pub fn pyright_version() -> Option<String> {
-    for bin in ["pyright-langserver", "pyright"] {
-        if let Ok(out) = Command::new(bin).arg("--version").output() {
-            if out.status.success() {
-                if let Some(v) = parse_version(&String::from_utf8_lossy(&out.stdout)) {
-                    return Some(v);
-                }
-            }
+/// Version of the installed `typescript-language-server` (`X.Y.Z`), or `None`
+/// when the binary is absent.
+pub fn tsserver_version() -> Option<String> {
+    if let Ok(out) = Command::new("typescript-language-server").arg("--version").output() {
+        if out.status.success() {
+            return parse_version(&String::from_utf8_lossy(&out.stdout));
         }
     }
     None
 }
 
 fn parse_version(text: &str) -> Option<String> {
-    // "pyright 1.1.411" / "pyright-langserver 1.1.411" / "1.1.411"
-    let mut it = text.split_whitespace();
-    for tok in it.by_ref() {
+    // "5.3.0" / "typescript-language-server 5.3.0"
+    for tok in text.split_whitespace() {
         if tok.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             return Some(tok.to_string());
         }
@@ -215,51 +117,37 @@ fn parse_version(text: &str) -> Option<String> {
     None
 }
 
-/// Spawn pyright (cwd = `workspace_root`) and complete the initialize
-/// handshake. Returns `Err` when pyright is missing or the handshake fails.
-pub fn start_pyright(workspace_root: &Path) -> Result<LspResolver, String> {
-    let version = pyright_version()
-        .ok_or_else(|| "pyright not found — install with: npm install -g pyright".to_string())?;
+/// Spawn typescript-language-server (cwd = `workspace_root`) and complete
+/// the initialize handshake. Returns `Err` when tsserver is missing or the
+/// handshake fails.
+pub fn start_tsserver(workspace_root: &Path) -> Result<TsLspResolver, String> {
+    let version = tsserver_version().ok_or_else(|| {
+        "tsserver not found — install with: npm install -g typescript-language-server typescript"
+            .to_string()
+    })?;
     let workspace = std::fs::canonicalize(workspace_root)
         .unwrap_or_else(|_| workspace_root.to_path_buf());
 
-    // Without a cancellation folder pyright never creates its background
-    // analysis worker, leaving binding-dependent features unusable.
-    let cancel_dir = std::env::temp_dir().join("scc-lsp-pyright");
-    std::fs::create_dir_all(&cancel_dir)
-        .map_err(|e| format!("cannot create pyright cancellation dir: {e}"))?;
-
-    let mut cmd = Command::new("pyright-langserver");
-    cmd.args(["--stdio", &format!("--cancellationReceive=file:{}", cancel_dir.display())])
+    let mut cmd = Command::new("typescript-language-server");
+    cmd.arg("--stdio")
         .current_dir(&workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            // Older pyright packages expose the server as `pyright --stdio`.
-            let mut cmd = Command::new("pyright");
-            cmd.arg("--stdio")
-                .current_dir(&workspace)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn()
-                .map_err(|e| format!("pyright not found — install with: npm install -g pyright ({e})"))?
-        }
-    };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot spawn typescript-language-server ({e})"))?;
 
-    let stdin = child.stdin.take().ok_or("pyright stdin unavailable")?;
-    let stdout = child.stdout.take().ok_or("pyright stdout unavailable")?;
-    let mut stderr = child.stderr.take().ok_or("pyright stderr unavailable")?;
+    let stdin = child.stdin.take().ok_or("tsserver stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("tsserver stdout unavailable")?;
+    let mut stderr = child.stderr.take().ok_or("tsserver stderr unavailable")?;
 
-    // Drain stderr so pyright never blocks on a full log pipe.
+    // Drain stderr so tsserver never blocks on a full log pipe.
     let stderr_join = std::thread::spawn(move || {
         let _ = std::io::copy(&mut stderr, &mut std::io::sink());
     });
 
-    let mut resolver = LspResolver::with_io(
+    let mut resolver = TsLspResolver::with_io(
         &workspace,
         version,
         Box::new(stdout),
@@ -270,7 +158,7 @@ pub fn start_pyright(workspace_root: &Path) -> Result<LspResolver, String> {
     Ok(resolver)
 }
 
-impl LspResolver {
+impl TsLspResolver {
     /// Build a resolver over arbitrary reader/writer transports and run the
     /// initialize handshake. `child` is optional (killed on drop).
     fn with_io(
@@ -284,7 +172,7 @@ impl LspResolver {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             loop {
-                match read_frame(&mut reader) {
+                match crate::lsp::read_frame(&mut reader) {
                     Ok(v) => {
                         let id = v.get("id").cloned();
                         if v.get("method").is_some() {
@@ -303,29 +191,31 @@ impl LspResolver {
                 }
             }
         });
-        let mut resolver = LspResolver {
+        let mut resolver = TsLspResolver {
             child,
             writer: Box::new(writer),
             rx,
             pending: HashMap::new(),
             next_id: 1,
             workspace: workspace.to_path_buf(),
-            pyright_version: version,
+            ts_version: version,
             opened: HashSet::new(),
             stderr_join: None,
+            cold_retries: 5,
         };
         resolver.initialize()?;
         Ok(resolver)
     }
 
-    /// The resolved pyright version string (evidence `extractor_version`).
-    pub fn pyright_version(&self) -> &str {
-        &self.pyright_version
+    /// The resolved typescript-language-server version string (evidence
+    /// `extractor_version`).
+    pub fn tsserver_version(&self) -> &str {
+        &self.ts_version
     }
 
     fn send(&mut self, msg: &Value) -> Result<(), String> {
         self.writer
-            .write_all(&encode_frame(msg))
+            .write_all(&crate::lsp::encode_frame(msg))
             .map_err(|e| format!("write to LSP server: {e}"))?;
         self.writer
             .flush()
@@ -364,7 +254,8 @@ impl LspResolver {
                     }
                 }
                 Ok(ServerMsg::Request(v)) => {
-                    // client/registerCapability etc.: answer and continue.
+                    // workspace/configuration, client/registerCapability etc.
+                    // tsserver treats a null result as "no configuration".
                     if let Some(rid) = v.get("id") {
                         let _ = self.send(&json!({"jsonrpc": "2.0", "id": rid, "result": null}));
                     }
@@ -421,7 +312,7 @@ impl LspResolver {
                 json!({
                     "textDocument": {
                         "uri": self.file_uri(file),
-                        "languageId": "python",
+                        "languageId": "typescript",
                         "version": 1,
                         "text": content,
                     }
@@ -445,7 +336,43 @@ impl LspResolver {
     /// Query one call site and return the resolved target path + symbol name.
     /// `DefOutcome::Error` marks an LSP error response (counted as `errors`);
     /// `DefOutcome::Empty` marks null/degenerate/out-of-workspace results.
+    ///
+    /// tsserver answers definition requests from the *inferred* project while
+    /// the configured project (tsconfig) is still loading, which makes
+    /// tsconfig `paths` aliases and barrel re-exports resolve to the local
+    /// import binding instead of the declaration. The adapter therefore
+    /// retries empty results a few times at session start (cold-start budget),
+    /// and additionally follows binding sites (see [`Self::definition_once`]).
     fn definition_for(
+        &mut self,
+        store: &Store,
+        file: &str,
+        line: u32,
+        callee: &str,
+    ) -> Result<DefOutcome, String> {
+        let mut outcome = self.definition_once(store, file, line, callee)?;
+        while matches!(outcome, DefOutcome::Empty) && self.cold_retries > 0 {
+            self.cold_retries -= 1;
+            std::thread::sleep(Duration::from_millis(400));
+            outcome = self.definition_once(store, file, line, callee)?;
+        }
+        // A cross-file resolution proves the configured project is warm;
+        // stop spending the cold-start budget. Same-file resolutions (local
+        // calls) can succeed in the inferred project, so they don't count.
+        if matches!(&outcome, DefOutcome::Resolved(path, _) if path != file) {
+            self.cold_retries = 0;
+        }
+        Ok(outcome)
+    }
+
+    /// One definition attempt: candidate positions plus import/export
+    /// binding hops. tsserver resolves call-site references to *imported*
+    /// symbols to the local import binding (the `import { x } ...` clause)
+    /// rather than the declaration when the module comes through a tsconfig
+    /// `paths` alias or a barrel re-export. When a definition lands on an
+    /// import/export line, the adapter re-queries at that token (up to two
+    /// hops) until the chain reaches a declaration.
+    fn definition_once(
         &mut self,
         store: &Store,
         file: &str,
@@ -479,20 +406,26 @@ impl LspResolver {
         push(&mut candidates, line.saturating_sub(1), 0);
 
         for (qline, qchar) in candidates {
-            let resp = self.request(
-                "textDocument/definition",
-                json!({
-                    "textDocument": {"uri": self.file_uri(file)},
-                    "position": {"line": qline, "character": qchar},
-                }),
-            )?;
-            if resp.get("error").is_some() {
-                return Ok(DefOutcome::Error);
-            }
-            let Some(target) = parse_definition_target(&resp["result"], qline, &self.file_uri(file))
-            else {
-                continue;
+            let mut target = match self.query_def(file, qline, qchar)? {
+                QueryOutcome::Target(t) => t,
+                QueryOutcome::Error => return Ok(DefOutcome::Error),
+                QueryOutcome::Empty => continue,
             };
+            // Follow import/export binding sites to the real declaration.
+            for _hop in 0..2 {
+                if !self.is_binding_site(&target) {
+                    break;
+                }
+                match self.query_def(file, target.line, target.char)? {
+                    QueryOutcome::Target(t)
+                        if t.uri != target.uri || t.line != target.line =>
+                    {
+                        target = t;
+                    }
+                    QueryOutcome::Error => return Ok(DefOutcome::Error),
+                    _ => break,
+                }
+            }
             let Some(rel_path) = self.repo_relative(&target.uri) else {
                 continue; // outside the workspace
             };
@@ -503,6 +436,34 @@ impl LspResolver {
             return Ok(DefOutcome::Resolved(rel_path, symbol));
         }
         Ok(DefOutcome::Empty)
+    }
+
+    /// Send one definition request and classify the response.
+    fn query_def(&mut self, file: &str, qline: u32, qchar: usize) -> Result<QueryOutcome, String> {
+        let resp = self.request(
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": self.file_uri(file)},
+                "position": {"line": qline, "character": qchar},
+            }),
+        )?;
+        if resp.get("error").is_some() {
+            return Ok(QueryOutcome::Error);
+        }
+        Ok(parse_definition_target(&resp["result"], qline, &self.file_uri(file))
+            .map(QueryOutcome::Target)
+            .unwrap_or(QueryOutcome::Empty))
+    }
+
+    /// Whether a definition target sits on an import/export statement — i.e.
+    /// it is a binding/barrel site rather than a declaration.
+    fn is_binding_site(&self, target: &Target) -> bool {
+        let Some(abs) = uri_to_path(&target.uri) else {
+            return false;
+        };
+        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let line = text.lines().nth(target.line as usize).unwrap_or_default();
+        line.contains("import") || line.contains("export")
     }
 
     fn repo_relative(&self, uri: &str) -> Option<String> {
@@ -537,7 +498,11 @@ impl LspResolver {
             .all_relationships()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.provenance == Provenance::Extracted && rel_ids.contains(&r.id))
+            .filter(|r| {
+                r.predicate == scc_core::predicates::CALLS
+                    && r.provenance == Provenance::Extracted
+                    && rel_ids.contains(&r.id)
+            })
             .collect();
 
         for rel in &rels {
@@ -594,7 +559,7 @@ impl LspResolver {
             revision: None,
             content_hash: None,
             extractor: Some(LSP_EXTRACTOR.to_string()),
-            extractor_version: Some(self.pyright_version.clone()),
+            extractor_version: Some(self.ts_version.clone()),
         };
         store.insert_evidence(&ev).map_err(|e| e.to_string())?;
         // Remove the EXTRACTED edge (its id encodes the old object), then
@@ -619,19 +584,25 @@ impl LspResolver {
 }
 
 /// Parse an LSP definition result (Location | LocationLink | array | null)
-/// into (uri, line). Returns `None` for null/empty results and for
-/// degenerate "definitions" that point at the query position itself.
+/// into (uri, line, token char). Returns `None` for null/empty results and
+/// for degenerate "definitions" that point at the query position itself.
 fn parse_definition_target(
     result: &Value,
     qline: u32,
     query_uri: &str,
 ) -> Option<Target> {
-    fn pick(v: &Value) -> Option<(&str, u64)> {
-        let uri = v.get("uri")?.as_str()?;
-        let range = v.get("range").or_else(|| v.get("targetRange"))?;
+    fn pick(v: &Value) -> Option<(&str, u64, u64)> {
+        let uri = v.get("uri").or_else(|| v.get("targetUri"))?.as_str()?;
+        // Token range: `range` for a Location, `targetSelectionRange` for a
+        // LocationLink (the range of the identifier itself).
+        let range = v
+            .get("targetSelectionRange")
+            .or_else(|| v.get("range"))
+            .or_else(|| v.get("targetRange"))?;
         let start = range.get("start")?;
         let line = start.get("line")?.as_u64()?;
-        Some((uri, line))
+        let character = start.get("character")?.as_u64()?;
+        Some((uri, line, character))
     }
     let entry = match result {
         Value::Null => return None,
@@ -639,8 +610,8 @@ fn parse_definition_target(
         Value::Object(_) => pick(result)?,
         _ => return None,
     };
-    let (uri, line) = entry;
-    // A definition cannot sit on the queried position (pyright returns the
+    let (uri, line, character) = entry;
+    // A definition cannot sit on the queried position (servers return the
     // queried node itself when binding is incomplete).
     if uri == query_uri && line == u64::from(qline) {
         return None;
@@ -648,6 +619,7 @@ fn parse_definition_target(
     Some(Target {
         uri: uri.to_string(),
         line: line as u32,
+        char: character as usize,
     })
 }
 
@@ -655,6 +627,7 @@ fn parse_definition_target(
 struct Target {
     uri: String,
     line: u32,
+    char: usize,
 }
 
 /// Find the smallest symbol in `file` whose [start_line, end_line] contains
@@ -679,59 +652,7 @@ mod tests {
     use scc_core::kinds;
 
     // ---------------------------------------------------------------
-    // wire protocol
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn frame_round_trip() {
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "textDocument/definition",
-            "params": {"position": {"line": 3, "character": 4}},
-        });
-        let frame = encode_frame(&msg);
-        let head = String::from_utf8_lossy(&frame[..32]);
-        assert!(head.starts_with("Content-Length: "), "{head}");
-        let mut cursor = std::io::Cursor::new(frame);
-        let parsed = read_frame(&mut cursor).unwrap();
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn frame_skips_extra_headers_and_handles_crlf() {
-        let body = br#"{"jsonrpc":"2.0","id":1,"result":null}"#;
-        let mut frame = Vec::new();
-        frame.extend_from_slice(b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n");
-        frame.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        frame.extend_from_slice(body);
-        let mut cursor = std::io::Cursor::new(frame);
-        let parsed = read_frame(&mut cursor).unwrap();
-        assert_eq!(parsed["id"], 1);
-    }
-
-    #[test]
-    fn frame_eof_and_missing_length_are_errors() {
-        let mut cursor = std::io::Cursor::new(b"Content-Type: text/plain\r\n\r\n".to_vec());
-        assert!(read_frame_body(&mut cursor).is_err());
-        let mut cursor = std::io::Cursor::new(b"".to_vec());
-        assert!(read_frame_body(&mut cursor).is_err());
-    }
-
-    #[test]
-    fn uri_to_path_decodes() {
-        assert_eq!(uri_to_path("file:///a/b.py").as_deref(), Some("/a/b.py"));
-        assert_eq!(
-            uri_to_path("file:///a/my%20file.py").as_deref(),
-            Some("/a/my file.py")
-        );
-        assert_eq!(uri_to_path("file://localhost/a.py").as_deref(), Some("/a.py"));
-        assert!(uri_to_path("http://x/y.py").is_none());
-        assert!(uri_to_path("file://relative").is_none());
-    }
-
-    // ---------------------------------------------------------------
-    // mock-server upgrade test (no pyright required)
+    // mock-server upgrade test (no tsserver required)
     // ---------------------------------------------------------------
 
     #[cfg(unix)]
@@ -739,57 +660,73 @@ mod tests {
     fn mock_server_upgrades_extracted_edge() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("a.py"), "def helper():\n    pass\n").unwrap();
-        std::fs::write(root.join("b.py"), "def main():\n    helper()\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("lib/util")).unwrap();
+        std::fs::write(
+            root.join("lib/util/impl.ts"),
+            "export function helper(x: number): number {\n    return x + 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.ts"),
+            "import { helper } from \"@app/util\";\n\nexport function main(): number {\n    return helper(1);\n}\n",
+        )
+        .unwrap();
 
         let store = seed_store(root);
         let repo = store.repository().id;
 
-        // Fake pyright: answers initialize, then returns a fixed definition
-        // pointing at a.py line 0 (0-based) for every definition request.
+        // Fake tsserver: answers initialize, then returns a fixed LocationLink
+        // pointing at lib/util/impl.ts line 0 (0-based) for every definition
+        // request.
         let (client_reader, server_writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let (server_reader, client_writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let root_owned = root.to_path_buf();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(server_reader);
             let mut writer = server_writer;
-            let mut sent_initialize = false;
             loop {
-                let msg = match read_frame(&mut reader) {
+                let msg = match crate::lsp::read_frame(&mut reader) {
                     Ok(m) => m,
                     Err(_) => break,
                 };
                 let method = msg.get("method").and_then(Value::as_str);
                 let id = msg.get("id");
                 if method == Some("initialize") {
-                    sent_initialize = true;
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {"capabilities": {"definitionProvider": true}},
                     });
-                    let _ = writer.write_all(&encode_frame(&resp));
+                    let _ = writer.write_all(&crate::lsp::encode_frame(&resp));
                 } else if method == Some("textDocument/definition") {
-                    let uri = format!("file://{}/a.py", root_owned.display());
+                    let uri = format!("file://{}/lib/util/impl.ts", root_owned.display());
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": [{
-                            "uri": uri,
-                            "range": {
-                                "start": {"line": 0, "character": 4},
-                                "end": {"line": 0, "character": 10},
+                            "targetUri": uri,
+                            "targetRange": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 1, "character": 0},
+                            },
+                            "targetSelectionRange": {
+                                "start": {"line": 0, "character": 16},
+                                "end": {"line": 0, "character": 22},
+                            },
+                            "originSelectionRange": {
+                                "start": {"line": 3, "character": 11},
+                                "end": {"line": 3, "character": 17},
                             }
                         }]
                     });
-                    let _ = writer.write_all(&encode_frame(&resp));
+                    let _ = writer.write_all(&crate::lsp::encode_frame(&resp));
                 }
                 let _ = writer.flush();
-                let _ = sent_initialize;
             }
         });
 
-        let mut resolver = LspResolver::with_io(
+        let mut resolver = TsLspResolver::with_io(
             root,
             "9.9.9".to_string(),
             Box::new(client_reader),
@@ -798,12 +735,12 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolver.resolve_call_definitions(&store, "b.py").unwrap();
+        let result = resolver.resolve_call_definitions(&store, "src/main.ts").unwrap();
         assert_eq!(result.upgraded, 1, "{result:?}");
         assert_eq!(result.unresolved, 0);
         assert_eq!(result.errors, 0);
 
-        let target = scc_core::symbol_id(&repo, "a.py", "helper");
+        let target = scc_core::symbol_id(&repo, "lib/util/impl.ts", "helper");
         let rels = store.all_relationships().unwrap();
         let upgraded: Vec<_> = rels
             .iter()
@@ -819,7 +756,7 @@ mod tests {
         assert_eq!(ev.extractor.as_deref(), Some(LSP_EXTRACTOR));
         assert_eq!(ev.extractor_version.as_deref(), Some("9.9.9"));
         assert_eq!(ev.symbol.as_deref(), Some("helper"));
-        assert_eq!(ev.start_line, Some(2));
+        assert_eq!(ev.start_line, Some(4));
 
         // the old EXTRACTED edge is gone
         assert!(!rels.iter().any(|r| r.provenance == Provenance::Extracted));
@@ -830,40 +767,40 @@ mod tests {
         std::fs::create_dir_all(&db).unwrap();
         let store = Store::open(&db.join("scc.db"), root).unwrap();
         let repo = store.repository().id;
-        let file_id = entity_id(&repo, kinds::FILE, "b.py");
+        let file_id = entity_id(&repo, kinds::FILE, "src/main.ts");
         store
             .insert_entity(
-                &scc_core::Entity::new(file_id.clone(), kinds::FILE, "b.py"),
-                &["b.py".to_string()],
+                &scc_core::Entity::new(file_id.clone(), kinds::FILE, "src/main.ts"),
+                &["src/main.ts".to_string()],
             )
             .unwrap();
-        let main_id = scc_core::symbol_id(&repo, "b.py", "main");
+        let main_id = scc_core::symbol_id(&repo, "src/main.ts", "main");
         store
             .insert_entity(
                 &scc_core::Entity::new(main_id.clone(), kinds::SYMBOL, "main"),
-                &["b.py".to_string()],
+                &["src/main.ts".to_string()],
             )
             .unwrap();
         store
-            .insert_symbol("b.py", "main", "function", None, 1, 3, true, None)
+            .insert_symbol("src/main.ts", "main", "function", None, 3, 5, true, None)
             .unwrap();
-        let ext = entity_id(&repo, kinds::EXTERNAL_API, "helper_pkg");
+        let ext = entity_id(&repo, kinds::EXTERNAL_API, "-app/util");
         store
             .insert_entity(
-                &scc_core::Entity::new(ext.clone(), kinds::EXTERNAL_API, "helper_pkg"),
-                &["b.py".to_string()],
+                &scc_core::Entity::new(ext.clone(), kinds::EXTERNAL_API, "-app/util"),
+                &["src/main.ts".to_string()],
             )
             .unwrap();
-        // a.py target symbol
+        // impl.ts target symbol
         store
-            .insert_symbol("a.py", "helper", "function", None, 1, 2, true, None)
+            .insert_symbol("lib/util/impl.ts", "helper", "function", None, 1, 2, true, None)
             .unwrap();
         let ev = Evidence {
-            id: evidence_id("b.py", "call", "helper", 2),
+            id: evidence_id("src/main.ts", "call", "helper", 4),
             r#type: EvidenceType::Source,
-            path: Some("b.py".to_string()),
+            path: Some("src/main.ts".to_string()),
             symbol: Some("helper".to_string()),
-            start_line: Some(2),
+            start_line: Some(4),
             end_line: None,
             revision: None,
             content_hash: None,
@@ -880,41 +817,46 @@ mod tests {
         )
         .with_confidence(0.8)
         .with_evidence(vec![ev.id]);
-        store.insert_relationship(&rel, "b.py").unwrap();
+        store.insert_relationship(&rel, "src/main.ts").unwrap();
         store
     }
 
     // ---------------------------------------------------------------
-    // optional integration test (requires pyright on PATH)
+    // optional integration test (requires tsserver on PATH)
     // ---------------------------------------------------------------
 
     #[test]
-    fn pyright_resolves_reexported_member() {
-        let Some(_version) = pyright_version() else {
-            eprintln!("pyright not installed — skipping integration test");
+    fn tsserver_resolves_reexported_member() {
+        let Some(_version) = tsserver_version() else {
+            eprintln!("typescript-language-server not installed — skipping integration test");
             return;
         };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // third_party/ is NOT a native source-root fallback (src/svc/lib/
-        // app/services/packages) and NOT in the default ignore list, so the
-        // native resolver stores an EXTRACTED edge that the LSP pass
-        // upgrades through extraPaths.
-        std::fs::create_dir_all(root.join("third_party/helper_pkg")).unwrap();
-        std::fs::write(root.join("pyrightconfig.json"), r#"{"extraPaths": ["third_party"]}"#).unwrap();
+        std::fs::create_dir_all(root.join("lib/util")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
-            root.join("third_party/helper_pkg/__init__.py"),
-            "from .impl import helper\n",
+            root.join("tsconfig.json"),
+            r#"{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@app/util": ["lib/util/index.ts"] }
+  },
+  "include": ["src/**/*", "lib/**/*"]
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("lib/util/index.ts"), "export { helper } from \"./impl\";\n")
+            .unwrap();
+        std::fs::write(
+            root.join("lib/util/impl.ts"),
+            "export function helper(x: number): number {\n    return x + 1;\n}\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("third_party/helper_pkg/impl.py"),
-            "def helper():\n    return 1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("b.py"),
-            "from helper_pkg import helper\n\n\ndef main():\n    helper()\n",
+            root.join("src/main.ts"),
+            "import { helper } from \"@app/util\";\n\nexport function main(): number {\n    return helper(1);\n}\n",
         )
         .unwrap();
 
@@ -924,25 +866,27 @@ mod tests {
         indexer.index().unwrap();
 
         let store = Store::open(&root.join("scc.db"), root).unwrap();
-        // native resolver must have produced an EXTRACTED edge to external_api
+        // native resolver cannot see through the tsconfig paths alias: the
+        // call must be stored as an EXTRACTED edge to external_api
         let rels = store.all_relationships().unwrap();
-        assert!(
-            rels.iter().any(|r| r.predicate == scc_core::predicates::CALLS
-                && r.provenance == Provenance::Extracted),
-            "fixture must store an EXTRACTED call edge"
-        );
+        let pre: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS)
+            .collect();
+        assert_eq!(pre.len(), 1, "fixture must store one EXTRACTED call edge");
+        assert_eq!(pre[0].provenance, Provenance::Extracted, "native resolver must miss the alias");
 
-        let mut resolver = start_pyright(root).unwrap();
-        let result = resolver.resolve_call_definitions(&store, "b.py").unwrap();
+        let mut resolver = start_tsserver(root).unwrap();
+        let result = resolver.resolve_call_definitions(&store, "src/main.ts").unwrap();
         assert!(
             result.upgraded >= 1,
-            "pyright should resolve the re-exported member: {result:?}"
+            "tsserver should resolve the re-exported member: {result:?}"
         );
 
         let rels = store.all_relationships().unwrap();
         let target = scc_core::symbol_id(
             &store.repository().id,
-            "third_party/helper_pkg/impl.py",
+            "lib/util/impl.ts",
             "helper",
         );
         let found = rels.iter().find(|r| {
@@ -953,6 +897,7 @@ mod tests {
         assert_eq!(found.provenance, Provenance::Resolved);
         let ev = store.get_evidence(&found.evidence[0]).unwrap().unwrap();
         assert_eq!(ev.extractor.as_deref(), Some(LSP_EXTRACTOR));
-        assert_eq!(ev.start_line, Some(5));
+        assert_eq!(ev.symbol.as_deref(), Some("helper"));
+        assert_eq!(ev.start_line, Some(4));
     }
 }

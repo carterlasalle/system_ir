@@ -6,12 +6,10 @@
 //! portable layer: wall time, exit status, output size, and per-task
 //! pass/fail when the agent's output contains the task's ground-truth files.
 
-use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::benchctx::{locate_fixtures_dir, BenchTask, BenchmarkCorpus, GroundTruth};
+use crate::benchctx::{locate_fixtures_dir, BenchmarkCorpus};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AgentTaskResult {
@@ -152,6 +150,7 @@ pub fn print_agent_summary(s: &AgentBenchSummary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchctx::GroundTruth;
     use std::path::PathBuf;
 
     #[test]

@@ -13,10 +13,12 @@ pub mod adapters;
 pub mod config;
 pub mod configrefs;
 pub mod configs;
+pub mod conflicts;
 pub mod failures;
 pub mod git;
 pub mod infra;
 pub mod lsp;
+pub mod lsp_ts;
 pub mod model;
 pub mod python;
 pub mod redact;
@@ -189,6 +191,13 @@ impl Indexer {
         }
 
         // ---- resolution + writing ----
+        // Purge each changed file's previous facts BEFORE re-extracting:
+        // without this, a re-extracted file whose import targets changed
+        // keeps stale edges to removed entities (docs/DATA_STRATEGY.md §6
+        // invalidation cascade). Mirrors index_paths().
+        for path in extracted.keys() {
+            self.store.purge_path(path)?;
+        }
         let mut intent: Option<configs::Intent> = None;
         for (path, (f, ef, cfg_hits, fail_hits)) in &extracted {
             let file = SourceFile::new(path.clone(), String::new()); // content re-read below
@@ -748,6 +757,59 @@ mod tests {
         let stats = idx.store.stats().unwrap();
         assert_eq!(stats["symbols"], 1);
         assert_eq!(stats["files"], 1);
+    }
+
+    #[test]
+    fn full_index_purges_changed_files_import_edges() {
+        // regression: `scc index` (full path) after an import-target rename
+        // must not leave stale edges to the removed target (SCC-031 invariant)
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/a.py"),
+            "from b import helper\n\ndef main():\n    return helper()\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.py"), "def helper():\n    return 1\n").unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+
+        // rename b.py -> renamed.py and update the importer; full re-index
+        std::fs::rename(root.join("src/b.py"), root.join("src/renamed.py")).unwrap();
+        std::fs::write(
+            root.join("src/a.py"),
+            "from renamed import helper\n\ndef main():\n    return helper()\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+
+        // no dangling relationships (targets must resolve or be known namespaces)
+        let graph = scc_graph::RealityGraph::load(&idx.store).unwrap();
+        let mut dangling = 0usize;
+        for r in graph.all_rels() {
+            let known = |id: &str| {
+                graph.entities.contains_key(id)
+                    || id.contains("/external_api/")
+                    || id.contains("/component/")
+                    || id.contains("/flow/")
+                    || id.contains("/invariant/")
+                    || id.contains("/file/")
+            };
+            if !known(&r.subject) || !known(&r.object) {
+                dangling += 1;
+            }
+        }
+        assert_eq!(dangling, 0, "full re-index must not leave dangling edges");
+        // the import now resolves to the renamed file
+        let rels = idx.store.all_relationships().unwrap();
+        assert!(
+            rels.iter().any(|r| {
+                r.predicate == scc_core::predicates::IMPORTS
+                    && r.object.contains("renamed.py")
+            }),
+            "import must point at the renamed file"
+        );
     }
 
     #[test]

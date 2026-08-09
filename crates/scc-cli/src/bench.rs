@@ -141,8 +141,8 @@ pub fn bench_index(root: &Path, files: usize, lines: usize) -> crate::Result<Ben
 
 pub fn print_report(r: &BenchReport) {
     println!("scc bench index");
-    println!("  files:       {}", r.files);
-    println!("  LOC:         {}", r.loc);
+    println!("  files:            {}", r.files);
+    println!("  LOC:              {}", r.loc);
     println!("  cold index:       {} ms", r.cold_ms);
     println!("  incremental:      {} ms", r.incremental_ms);
     println!("  incremental p95:  {} ms", r.incremental_p95_ms);

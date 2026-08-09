@@ -766,10 +766,24 @@ pub fn task(
         sections.push(Section::new("IMPLEMENTATION", impl_body, 7));
     }
 
-    // TESTS
+    // TESTS (with file locations so the agent can open them directly)
     let mut test_body = String::new();
     for tid in &tests {
-        test_body.push_str(&format!("- {}\n", entity_name(ctx.graph, tid)));
+        let file = ctx
+            .graph
+            .entities
+            .get(tid)
+            .and_then(|e| e.attributes.get("file"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if file.is_empty() {
+            test_body.push_str(&format!("- {}\n", entity_name(ctx.graph, tid)));
+        } else {
+            test_body.push_str(&format!(
+                "- {} ({file})\n",
+                entity_name(ctx.graph, tid)
+            ));
+        }
     }
     if !test_body.is_empty() {
         sections.push(Section::new("TESTS", test_body, 7));
@@ -802,6 +816,18 @@ pub fn task(
     }
     ids.extend(downstream.iter().cloned());
     ids.extend(tests.iter().cloned());
+    // the files containing included tests (agents must find them)
+    for tid in &tests {
+        if let Some(f) = ctx
+            .graph
+            .entities
+            .get(tid)
+            .and_then(|e| e.attributes.get("file"))
+            .and_then(|v| v.as_str())
+        {
+            ids.push(entity_id(&ctx.graph.repo_id, kinds::FILE, f));
+        }
+    }
     ids.extend(inv_ids.iter().cloned());
     ids.sort();
     ids.dedup();

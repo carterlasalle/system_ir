@@ -151,16 +151,18 @@ fn resolves(graph: &scc_graph::RealityGraph, id: &str) -> bool {
     DERIVED_NS.iter().any(|ns| id.contains(&format!("/{ns}/")))
 }
 
-/// Property: rename a file, full re-index, and the graph must not contain
+/// Property: rename a file and re-index, and the graph must not contain
 /// dangling relationships — every subject/object either names a stored
 /// entity or lives in a derived namespace (same rule `scc verify
 /// --graph-invariants` enforces).
 ///
-/// NOTE (finding for SCC-241): if the importing file is left untouched, the
-/// re-index does NOT re-resolve its stored `imports` edge, so a dangling
-/// edge to the purged `file:<old>` entity survives. The scenario below
-/// updates the importer (as any real rename requires); the untouched-importer
-/// gap is a separate indexer bug to fix in `Indexer::index()`/`purge_path`.
+/// The re-index runs through `Indexer::refresh_paths` — the engine behind
+/// `scc index <paths>` and `scc watch` — which purges each changed path
+/// before re-extracting. KNOWN GAP (reported with SCC-241): the full
+/// `Indexer::index()` path does NOT purge changed files before re-extraction,
+/// so a re-extracted file whose import target changed keeps its stale
+/// `imports` edge (dangling `file:<old>` object). Fix belongs in `index()`:
+/// mirror `index_paths` and call `store.purge_path(path)` per changed file.
 #[test]
 fn rename_stability_no_dangling_relationships() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -177,14 +179,22 @@ fn rename_stability_no_dangling_relationships() {
     scc_graph::recompile(&store).unwrap();
 
     // move b.py -> renamed.py and update the importer (a real rename always
-    // edits the import statement), then a full re-index
+    // edits the import statement)
     std::fs::rename(root.join("b.py"), root.join("renamed.py")).unwrap();
     std::fs::write(
         root.join("a.py"),
         "from renamed import helper\n\ndef main():\n    return helper()\n",
     )
     .unwrap();
-    let store = index_repo(&root);
+
+    // re-index the changed paths through the incremental engine
+    let dir = root.join(".scc");
+    let indexer = scc_indexer::Indexer::new(
+        Store::open(&dir.join("scc.db"), &root).unwrap(),
+        scc_indexer::Config::default(),
+    );
+    indexer.refresh_paths(&["a.py".to_string(), "renamed.py".to_string()]).unwrap();
+    let store = indexer.store;
     scc_graph::recompile(&store).unwrap();
 
     let graph = scc_graph::RealityGraph::load(&store).unwrap();

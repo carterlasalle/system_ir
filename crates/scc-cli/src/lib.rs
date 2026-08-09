@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod benchagent;
 pub mod benchctx;
+pub mod benchres;
 pub mod checkpoint;
 pub mod commands;
 pub mod compress;

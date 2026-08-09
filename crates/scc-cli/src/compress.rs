@@ -244,6 +244,33 @@ pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// `scc setup opencode` (M10): AGENTS.md already carries the capsule
+/// (Codex/OpenCode/Hermes all read AGENTS.md); additionally write
+/// .opencode/opencode.json wiring the SCC MCP server so OpenCode sessions
+/// get the six semantic tools.
+pub fn cmd_setup_opencode(root: &Path) -> crate::Result<()> {
+    if !root.join("AGENTS.md").exists() {
+        cmd_setup_codex(root)?;
+    }
+    let dir = root.join(".opencode");
+    std::fs::create_dir_all(&dir)?;
+    let config = dir.join("opencode.json");
+    let existing = std::fs::read_to_string(&config).unwrap_or_else(|_| "{}".to_string());
+    let mut v: serde_json::Value = serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
+    let mcp = v.get_mut("mcp").and_then(|m| m.as_object_mut()).cloned().unwrap_or_default();
+    let mut mcp = mcp;
+    mcp.insert(
+        "scc".to_string(),
+        serde_json::json!({"type": "stdio", "command": "scc", "args": ["mcp"]}),
+    );
+    v["mcp"] = serde_json::Value::Object(mcp);
+    std::fs::write(&config, serde_json::to_string_pretty(&v)?)?;
+    println!("wrote {}", config.display());
+    println!("OpenCode sessions will auto-connect the SCC MCP server (six semantic tools).");
+    println!("Hermes and other harnesses read AGENTS.md (system capsule) — no per-harness config needed.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
