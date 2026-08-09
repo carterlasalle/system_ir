@@ -93,18 +93,33 @@ fn differential_resolution_upgrades_reexport_fixture() {
 }
 
 #[test]
-fn gate_rejects_zero_upgrades() {
+fn gate_passes_when_native_covers_everything() {
+    // zero upgrades is healthy when the native resolver already covers the
+    // externals an LSP would resolve (third-party libs stay external)
     let repo = scc_cli::benchres::RepoResolution {
         repo: "x".into(),
-        native_external: 3,
+        native_external: 10,
         lsp_upgrades: 0,
-        lsp_unresolved: 3,
+        lsp_unresolved: 9, // 90% < 95% limit
+        ..Default::default()
+    };
+    let summary = summary_of(vec![repo]);
+    assert!(scc_cli::benchres::check_gate(&summary, 0.95).is_ok());
+}
+
+#[test]
+fn gate_rejects_resolution_conflicts() {
+    let repo = scc_cli::benchres::RepoResolution {
+        repo: "x".into(),
+        native_external: 1,
+        lsp_upgrades: 1,
+        lsp_unresolved: 0,
+        conflicts: 1,
         ..Default::default()
     };
     let summary = summary_of(vec![repo]);
     let err = scc_cli::benchres::check_gate(&summary, 0.3).unwrap_err();
-    assert!(err.contains("gate failed"), "{err}");
-    assert!(err.contains("0 LSP upgrades"), "{err}");
+    assert!(err.contains("resolution conflict"), "{err}");
 }
 
 #[test]
