@@ -381,7 +381,7 @@ mod tests {
         let files = scan_repo(root, &cfg).unwrap();
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/main.py"));
-        assert!(!paths.iter().any(|p| *p == "ignored.py"));
+        assert!(!paths.contains(&"ignored.py"));
         assert!(!paths.iter().any(|p| p.contains("node_modules")));
     }
 }

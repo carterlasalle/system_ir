@@ -198,7 +198,6 @@ fn file_in_paths(file: &str, paths: &[&str]) -> bool {
 mod tests {
     use super::*;
     use scc_core::kinds;
-    use std::path::PathBuf;
     use std::process::Command;
 
     fn store_for() -> (Store, tempfile::TempDir) {
@@ -385,6 +384,6 @@ mod tests {
         let n = enrich_components(&store, &pairs).unwrap();
         assert_eq!(n, 0);
         let comps = store.components().unwrap();
-        assert!(comps[0].attributes.get("cochange").is_none());
+        assert!(!comps[0].attributes.contains_key("cochange"));
     }
 }

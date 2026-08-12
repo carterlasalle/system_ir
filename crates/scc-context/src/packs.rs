@@ -9,7 +9,7 @@ use crate::rank::terms;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
 use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
-use scc_graph::RealityGraph;
+use scc_graph::TrustedGraphView;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 struct Section {
@@ -29,13 +29,30 @@ impl Section {
     }
 }
 
-fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> String {
+/// What the renderer actually did to fit the budget — honest accounting
+/// (P0): the pack is never silently cut; if the minimum safe result still
+/// exceeds the budget, `exceeded_soft_budget` is set and the content stays
+/// complete.
+#[derive(Debug, Clone, Default)]
+struct RenderOutcome {
+    original_tokens: usize,
+    dropped_sections: Vec<String>,
+    hard_truncated: bool,
+    exceeded_soft_budget: bool,
+}
+
+fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (String, RenderOutcome) {
     let mut sections = sections;
-    // assemble; then drop lowest-priority sections while over budget
+    let mut outcome = RenderOutcome {
+        original_tokens: estimate_tokens(&assemble(&sections)),
+        ..Default::default()
+    };
+    // assemble; then drop lowest-priority sections while over budget.
+    // Sections with priority >= 9 (invariants, ownership, contracts,
+    // failure behavior) are never dropped and never hard-truncated.
     let mut content = assemble(&sections);
     let mut tokens = estimate_tokens(&content);
     while tokens > budget {
-        // find the lowest-priority droppable section (priority < 9)
         let min_priority = sections
             .iter()
             .map(|s| s.priority)
@@ -48,7 +65,10 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> Strin
             .iter()
             .position(|s| s.priority == min_priority)
             .unwrap();
-        sections.remove(idx);
+        let dropped = sections.remove(idx).title;
+        if !outcome.dropped_sections.contains(&dropped) {
+            outcome.dropped_sections.push(dropped);
+        }
         content = assemble(&sections);
         tokens = estimate_tokens(&content);
         if sections.is_empty() {
@@ -59,10 +79,28 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> Strin
     for w in warnings {
         content.push_str(&format!("\n⚠ WARNING: {w}\n"));
     }
-    if estimate_tokens(&content) > budget {
-        content = scc_core::truncate_to_budget(&content, budget);
-    }
-    content
+    outcome.hard_truncated = false;
+    outcome.exceeded_soft_budget = estimate_tokens(&content) > budget;
+    (content, outcome)
+}
+
+/// Render a pack and record honest budget accounting on it.
+fn finish(
+    pack: &mut ContextPack,
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+) {
+    let (content, outcome) = render(sections, budget, warnings);
+    pack.content = content;
+    pack.budget = budget;
+    pack.tokens = estimate_tokens(&pack.content);
+    pack.original_tokens = outcome.original_tokens;
+    pack.dropped_sections = outcome.dropped_sections;
+    pack.hard_truncated = outcome.hard_truncated;
+    pack.exceeded_soft_budget = outcome.exceeded_soft_budget;
+    pack.truncated =
+        pack.hard_truncated || !pack.dropped_sections.is_empty() || pack.exceeded_soft_budget;
 }
 
 fn assemble(sections: &[Section]) -> String {
@@ -73,18 +111,12 @@ fn assemble(sections: &[Section]) -> String {
     out.trim_end().to_string()
 }
 
-fn entity_name(graph: &RealityGraph, id: &str) -> String {
-    graph
-        .entities
-        .get(id)
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| {
-            id.rsplit('/').next().unwrap_or(id).to_string()
-        })
+fn entity_name(view: &TrustedGraphView, id: &str) -> String {
+    view.name_of(id)
 }
 
-fn component_short(graph: &RealityGraph, id: &str) -> String {
-    let name = entity_name(graph, id);
+fn component_short(view: &TrustedGraphView, id: &str) -> String {
+    let name = entity_name(view, id);
     let name = name.strip_prefix("component:").unwrap_or(&name);
     name.to_string()
 }
@@ -146,7 +178,7 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
     }
     ident.push_str(&format!("Languages: {}\n", languages.join(", ")));
     let eps: Vec<String> = ctx
-        .graph
+        .view
         .entities_of_kind(kinds::SYMBOL)
         .into_iter()
         .filter(|e| e.attributes.contains_key("entrypoints"))
@@ -180,7 +212,7 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
 
     // BOUNDARIES / deployment units + externals
     let dus: Vec<String> = ctx
-        .graph
+        .view
         .entities_of_kind(kinds::DEPLOYMENT_UNIT)
         .into_iter()
         .map(|e| {
@@ -197,7 +229,7 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
         })
         .collect();
     let exts: Vec<String> = ctx
-        .graph
+        .view
         .entities_of_kind(kinds::EXTERNAL_API)
         .into_iter()
         .map(|e| e.name.clone())
@@ -216,7 +248,7 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
 
     // STORES
     let stores: Vec<String> = ctx
-        .graph
+        .view
         .entities_of_kind(kinds::DATA_STORE)
         .into_iter()
         .map(|e| {
@@ -244,8 +276,8 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
 
     // FLOWS
     let flows: Vec<String> = ctx
-        .graph
-        .flows
+        .view
+        .flows()
         .iter()
         .map(|f| {
             let trig = f
@@ -289,10 +321,7 @@ pub fn overview(ctx: &ContextCompiler) -> ContextPack {
     sections.push(Section::new("INDEX STATUS", ev, 5));
 
     let warnings = ctx_warnings(ctx);
-    pack.content = render(sections, ctx.settings.startup_tokens, warnings);
-    pack.tokens = estimate_tokens(&pack.content);
-    pack.budget = ctx.settings.startup_tokens;
-    pack.truncated = pack.tokens > pack.budget;
+    finish(&mut pack, sections, ctx.settings.startup_tokens, warnings);
     pack
 }
 
@@ -348,7 +377,7 @@ pub fn task_with_rankers(
     // ---- candidate generation ----
     let candidates = crate::rank::collect_lexical_candidates_full(
         ctx.store,
-        ctx.graph,
+        &ctx.view,
         goal,
         symbols,
         24,
@@ -359,7 +388,7 @@ pub fn task_with_rankers(
 
     // symbol -> file -> component
     let mut symbol_files: HashMap<String, String> = HashMap::new();
-    for e in ctx.graph.entities_of_kind(kinds::SYMBOL) {
+    for e in ctx.view.entities_of_kind(kinds::SYMBOL) {
         if let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) {
             symbol_files.insert(e.id.clone(), f.to_string());
         }
@@ -367,7 +396,7 @@ pub fn task_with_rankers(
     // component containing each file
     let mut file_component: HashMap<String, String> = HashMap::new();
     for c in ctx.store.components().unwrap_or_default() {
-        for r in ctx.graph.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+        for r in ctx.view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
             file_component.insert(r.object.clone(), c.id.clone());
         }
     }
@@ -375,7 +404,7 @@ pub fn task_with_rankers(
     let mut symbol_component: HashMap<String, String> = HashMap::new();
     for (sid, f) in &symbol_files {
         if let Some(cid) = file_component
-            .get(&entity_id(&ctx.graph.repo_id, kinds::FILE, f))
+            .get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f))
         {
             symbol_component.insert(sid.clone(), cid.clone());
         }
@@ -396,9 +425,8 @@ pub fn task_with_rankers(
             }
         } else if c.kind == kinds::ROUTE {
             if let Some(h) = ctx
-                .graph
-                .entities
-                .get(&c.id)
+                .view
+                .entity(&c.id)
                 .and_then(|e| e.attributes.get("handler"))
                 .and_then(|v| v.as_str())
             {
@@ -409,7 +437,7 @@ pub fn task_with_rankers(
         }
     }
     for f in files {
-        let fid = entity_id(&ctx.graph.repo_id, kinds::FILE, f);
+        let fid = entity_id(&ctx.view.graph.repo_id, kinds::FILE, f);
         if let Some(cid) = file_component.get(&fid) {
             affected_comps.insert(cid.clone());
         }
@@ -417,7 +445,7 @@ pub fn task_with_rankers(
 
     // flows mentioning affected components
     let mut affected_flows: Vec<(String, f64)> = Vec::new();
-    for f in &ctx.graph.flows {
+    for f in &ctx.view.flows() {
         let mut score = 0.0;
         let mentions = f.steps.iter().any(|s| {
             let hit = affected_comps.iter().any(|c| s.actor.contains(c));
@@ -445,10 +473,10 @@ pub fn task_with_rankers(
     let mut upstream: BTreeSet<String> = BTreeSet::new();
     let mut downstream: BTreeSet<String> = BTreeSet::new();
     for cid in &affected_comps {
-        for r in ctx.graph.out_pred(cid, scc_core::predicates::DEPENDS_ON) {
+        for r in ctx.view.out_pred(cid, scc_core::predicates::DEPENDS_ON) {
             downstream.insert(r.object.clone());
         }
-        for r in ctx.graph.in_pred(cid, scc_core::predicates::DEPENDS_ON) {
+        for r in ctx.view.in_pred(cid, scc_core::predicates::DEPENDS_ON) {
             upstream.insert(r.subject.clone());
         }
     }
@@ -461,7 +489,7 @@ pub fn task_with_rankers(
         .map(|(s, _)| s)
         .collect();
     for sid in &affected_syms {
-        for r in ctx.graph.out_pred(sid, scc_core::predicates::HANDLES) {
+        for r in ctx.view.out_pred(sid, scc_core::predicates::HANDLES) {
             contracts.insert(r.object.clone());
         }
     }
@@ -469,14 +497,14 @@ pub fn task_with_rankers(
     // ownership: stores owned by affected comps
     let mut owned_stores: BTreeSet<String> = BTreeSet::new();
     for cid in &affected_comps {
-        for r in ctx.graph.out_pred(cid, scc_core::predicates::OWNS) {
+        for r in ctx.view.out_pred(cid, scc_core::predicates::OWNS) {
             owned_stores.insert(r.object.clone());
         }
     }
 
     // invariants scoped to affected entities
     let mut inv_ids: BTreeSet<String> = BTreeSet::new();
-    for inv in &ctx.graph.invariants {
+    for inv in &ctx.view.invariants() {
         if inv
             .scope
             .iter()
@@ -496,7 +524,7 @@ pub fn task_with_rankers(
     // token-matching misses)
     let mut tests: BTreeSet<String> = BTreeSet::new();
     for sid in &affected_syms {
-        for r in ctx.graph.out_pred(sid, scc_core::predicates::TESTED_BY) {
+        for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
             tests.insert(r.object.clone());
         }
     }
@@ -504,9 +532,8 @@ pub fn task_with_rankers(
         let affected_files: BTreeSet<String> = affected_syms
             .iter()
             .filter_map(|sid| {
-                ctx.graph
-                    .entities
-                    .get(sid.as_str())
+                ctx.view
+                    .entity(sid.as_str())
                     .and_then(|e| e.attributes.get("file"))
                     .and_then(|v| v.as_str())
                     .map(|f| f.to_string())
@@ -534,11 +561,11 @@ pub fn task_with_rankers(
     // retries/failures in affected components
     let mut retries: Vec<String> = Vec::new();
     for cid in &affected_comps {
-        if let Some(c) = ctx.graph.entities.get(cid) {
+        if let Some(c) = ctx.view.entity(cid) {
             if let Some(rs) = c.attributes.get("retries").and_then(|v| v.as_array()) {
                 for r in rs {
                     if let Some(s) = r.as_str() {
-                        retries.push(format!("{s} [in {}]", entity_name(ctx.graph, cid)));
+                        retries.push(format!("{s} [in {}]", entity_name(&ctx.view, cid)));
                     }
                 }
             }
@@ -603,7 +630,7 @@ pub fn task_with_rankers(
     // RELEVANT COMPONENTS
     let mut comp_body = String::new();
     for cid in &affected_comps {
-        if let Some(c) = ctx.graph.entities.get(cid) {
+        if let Some(c) = ctx.view.entity(cid) {
             let resp = c
                 .attributes
                 .get("responsibility")
@@ -634,7 +661,7 @@ pub fn task_with_rankers(
     if affected_flows.len() > 1 {
         let mut body = String::new();
         for (fid, _) in affected_flows.iter().skip(1).take(4) {
-            if let Some(f) = ctx.graph.flows.iter().find(|f| &f.id == fid) {
+            if let Some(f) = ctx.view.flows().iter().find(|f| &f.id == fid) {
                 body.push_str(&format!(
                     "- {} [{}]\n",
                     f.name,
@@ -655,7 +682,7 @@ pub fn task_with_rankers(
                 "{}\n",
                 upstream
                     .iter()
-                    .map(|c| component_short(ctx.graph, c))
+                    .map(|c| component_short(&ctx.view, c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -671,7 +698,7 @@ pub fn task_with_rankers(
                 "{}\n",
                 downstream
                     .iter()
-                    .map(|c| component_short(ctx.graph, c))
+                    .map(|c| component_short(&ctx.view, c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -682,15 +709,15 @@ pub fn task_with_rankers(
     // DATA OWNERSHIP
     let mut data_body = String::new();
     for store_id in &owned_stores {
-        let name = entity_name(ctx.graph, store_id);
+        let name = entity_name(&ctx.view, store_id);
         let writers: Vec<String> = ctx
-            .graph
+            .view
             .in_pred(store_id, scc_core::predicates::WRITES)
             .into_iter()
             .map(|r| {
                 let comp = symbol_component.get(&r.subject).cloned();
-                comp.map(|c| component_short(ctx.graph, &c))
-                    .unwrap_or_else(|| entity_name(ctx.graph, &r.subject))
+                comp.map(|c| component_short(&ctx.view, &c))
+                    .unwrap_or_else(|| entity_name(&ctx.view, &r.subject))
             })
             .collect();
         let writers_disp = if writers.is_empty() {
@@ -708,7 +735,7 @@ pub fn task_with_rankers(
     // CONTRACTS
     let mut contract_body = String::new();
     for rid in &contracts {
-        if let Some(r) = ctx.graph.entities.get(rid) {
+        if let Some(r) = ctx.view.entity(rid) {
             contract_body.push_str(&format!("- {}\n", r.name));
         }
     }
@@ -719,7 +746,7 @@ pub fn task_with_rankers(
     // INVARIANTS
     let mut inv_body = String::new();
     for id in &inv_ids {
-        if let Some(inv) = ctx.graph.invariants.iter().find(|i| &i.id == id) {
+        if let Some(inv) = ctx.view.invariants().iter().find(|i| &i.id == id) {
             inv_body.push_str(&format!(
                 "- [{}] {} {}\n",
                 severity_str(inv.severity),
@@ -748,7 +775,7 @@ pub fn task_with_rankers(
     // IMPLEMENTATION
     let mut impl_body = String::new();
     for cid in &affected_comps {
-        if let Some(c) = ctx.graph.entities.get(cid) {
+        if let Some(c) = ctx.view.entity(cid) {
             if let Some(paths) = c
                 .attributes
                 .get("implementation")
@@ -769,9 +796,8 @@ pub fn task_with_rankers(
     for c in candidates.iter() {
         if c.kind == kinds::SYMBOL && seen_syms.insert(c.id.clone()) {
             let file = ctx
-                .graph
-                .entities
-                .get(&c.id)
+                .view
+                .entity(&c.id)
                 .and_then(|e| e.attributes.get("file"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -791,18 +817,17 @@ pub fn task_with_rankers(
     let mut test_body = String::new();
     for tid in &tests {
         let file = ctx
-            .graph
-            .entities
-            .get(tid)
+            .view
+            .entity(tid)
             .and_then(|e| e.attributes.get("file"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if file.is_empty() {
-            test_body.push_str(&format!("- {}\n", entity_name(ctx.graph, tid)));
+            test_body.push_str(&format!("- {}\n", entity_name(&ctx.view, tid)));
         } else {
             test_body.push_str(&format!(
                 "- {} ({file})\n",
-                entity_name(ctx.graph, tid)
+                entity_name(&ctx.view, tid)
             ));
         }
     }
@@ -828,9 +853,9 @@ pub fn task_with_rankers(
     // components (docs/CONTEXT_COMPILER.md §6)
     for c in &candidates {
         if c.kind == kinds::SYMBOL {
-            if let Some(e) = ctx.graph.entities.get(&c.id) {
+            if let Some(e) = ctx.view.entity(&c.id) {
                 if let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) {
-                    ids.push(entity_id(&ctx.graph.repo_id, kinds::FILE, f));
+                    ids.push(entity_id(&ctx.view.graph.repo_id, kinds::FILE, f));
                 }
             }
         }
@@ -840,13 +865,12 @@ pub fn task_with_rankers(
     // the files containing included tests (agents must find them)
     for tid in &tests {
         if let Some(f) = ctx
-            .graph
-            .entities
-            .get(tid)
+            .view
+            .entity(tid)
             .and_then(|e| e.attributes.get("file"))
             .and_then(|v| v.as_str())
         {
-            ids.push(entity_id(&ctx.graph.repo_id, kinds::FILE, f));
+            ids.push(entity_id(&ctx.view.graph.repo_id, kinds::FILE, f));
         }
     }
     ids.extend(inv_ids.iter().cloned());
@@ -873,10 +897,7 @@ pub fn task_with_rankers(
 
     pack.entity_ids = ids;
     pack.evidence_summary = ev_summary;
-    pack.content = render(sections, budget, all_warnings);
-    pack.budget = budget;
-    pack.tokens = estimate_tokens(&pack.content);
-    pack.truncated = pack.tokens > budget;
+    finish(&mut pack, sections, budget, all_warnings);
     pack.compression_policy = Some(compression_policy(goal));
     pack
 }
@@ -986,7 +1007,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|x| x.as_str().map(|s| entity_name(ctx.graph, s)))
+                .filter_map(|x| x.as_str().map(|s| entity_name(&ctx.view, s)))
                 .collect()
         })
         .unwrap_or_default();
@@ -1032,7 +1053,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 
     // flows this component participates in
     let mut flows: Vec<String> = Vec::new();
-    for f in &ctx.graph.flows {
+    for f in &ctx.view.flows() {
         if f.steps.iter().any(|s| s.actor.contains(&comp.id)) {
             flows.push(format!("- {} [{}]", f.name, f.trigger.clone().unwrap_or_default()));
         }
@@ -1044,10 +1065,10 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     // tests
     let mut tests: Vec<String> = Vec::new();
     for sym in &symbols {
-        for e in ctx.graph.entities_of_kind(kinds::SYMBOL) {
+        for e in ctx.view.entities_of_kind(kinds::SYMBOL) {
             if e.name == *sym {
-                for r in ctx.graph.out_pred(&e.id, scc_core::predicates::TESTED_BY) {
-                    tests.push(entity_name(ctx.graph, &r.object));
+                for r in ctx.view.out_pred(&e.id, scc_core::predicates::TESTED_BY) {
+                    tests.push(entity_name(&ctx.view, &r.object));
                 }
             }
         }
@@ -1068,8 +1089,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         5,
     ));
 
-    pack.content = render(sections, usize::MAX, ctx_warnings(ctx));
-    pack.tokens = estimate_tokens(&pack.content);
+    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
     pack
 }
 
@@ -1078,7 +1098,8 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 // ---------------------------------------------------------------------------
 
 fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
-    let Some(f) = ctx.graph.flows.iter().find(|f| f.id == fid) else {
+    let flows = ctx.view.flows();
+    let Some(f) = flows.iter().find(|f| f.id == fid) else {
         return format!("(flow {fid} not found)");
     };
     let mut body = String::new();
@@ -1087,7 +1108,7 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
     }
     let mut prev_actor: Option<String> = None;
     for s in &f.steps {
-        let actor = component_short(ctx.graph, &s.actor);
+        let actor = component_short(&ctx.view, &s.actor);
         let mut line = if prev_actor.as_ref() == Some(&actor) {
             format!("  → {}", s.operation)
         } else {
@@ -1133,8 +1154,8 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
 pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     let mut pack = ContextPack::new("flow", &ctx.revision());
     let f = ctx
-        .graph
-        .flows
+        .view
+        .flows()
         .iter()
         .find(|f| f.id == id_or_name || f.name == id_or_name)
         .cloned();
@@ -1157,8 +1178,7 @@ pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         sections.push(Section::new("ATTRIBUTES", attrs, 6));
     }
 
-    pack.content = render(sections, usize::MAX, ctx_warnings(ctx));
-    pack.tokens = estimate_tokens(&pack.content);
+    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
     pack
 }
 
@@ -1184,7 +1204,7 @@ pub fn impact(
         }
     }
 
-    let imp = match scc_graph::impact::compute_impact(ctx.graph, ctx.store, &files, &symbols) {
+    let imp = match scc_graph::impact::compute_impact(&ctx.view, ctx.store, &files, &symbols) {
         Ok(i) => i,
         Err(e) => {
             pack.content = format!("# IMPACT ERROR\n{e}\n");
@@ -1204,7 +1224,7 @@ pub fn impact(
                 "{}\n",
                 imp.components
                     .iter()
-                    .map(|c| component_short(ctx.graph, c))
+                    .map(|c| component_short(&ctx.view, c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -1222,8 +1242,8 @@ pub fn impact(
                 imp.flows
                     .iter()
                     .map(|f| {
-                        ctx.graph
-                            .flows
+                        ctx.view
+                            .flows()
                             .iter()
                             .find(|x| &x.id == f)
                             .map(|x| x.name.clone())
@@ -1245,7 +1265,7 @@ pub fn impact(
                 "{}\n",
                 imp.upstream
                     .iter()
-                    .map(|c| component_short(ctx.graph, c))
+                    .map(|c| component_short(&ctx.view, c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -1261,7 +1281,7 @@ pub fn impact(
                 "{}\n",
                 imp.downstream
                     .iter()
-                    .map(|c| component_short(ctx.graph, c))
+                    .map(|c| component_short(&ctx.view, c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -1272,7 +1292,7 @@ pub fn impact(
     let contracts: Vec<String> = imp
         .contracts
         .iter()
-        .map(|c| entity_name(ctx.graph, c))
+        .map(|c| entity_name(&ctx.view, c))
         .collect();
     sections.push(Section::new(
         "CONTRACTS",
@@ -1283,7 +1303,7 @@ pub fn impact(
     let data: Vec<String> = imp
         .data
         .iter()
-        .map(|d| entity_name(ctx.graph, d))
+        .map(|d| entity_name(&ctx.view, d))
         .collect();
     sections.push(Section::new(
         "DATA",
@@ -1295,8 +1315,8 @@ pub fn impact(
         .invariants
         .iter()
         .map(|i| {
-            ctx.graph
-                .invariants
+            ctx.view
+                .invariants()
                 .iter()
                 .find(|x| &x.id == i)
                 .map(|x| format!("[{}] {}", severity_str(x.severity), x.statement))
@@ -1314,7 +1334,7 @@ pub fn impact(
     let tests: Vec<String> = imp
         .tests
         .iter()
-        .map(|t| entity_name(ctx.graph, t))
+        .map(|t| entity_name(&ctx.view, t))
         .collect();
     sections.push(Section::new(
         "TESTS",
@@ -1332,8 +1352,7 @@ pub fn impact(
     }
 
     pack.entity_ids = imp.components.clone();
-    pack.content = render(sections, usize::MAX, ctx_warnings(ctx));
-    pack.tokens = estimate_tokens(&pack.content);
+    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
     pack
 }
 
@@ -1394,11 +1413,11 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     let mut inv = String::new();
     // 1. dangling references
     let mut dangling = 0usize;
-    for r in ctx.graph.all_rels() {
+    for r in ctx.view.all_rels() {
         // endpoints may be external_api, component, flow ids — check known
         // namespaces
         let known = |id: &str| -> bool {
-            ctx.graph.entities.contains_key(id)
+            ctx.view.entity(id).is_some()
                 || id.contains("/external_api/")
                 || id.contains("/component/")
                 || id.contains("/flow/")
@@ -1420,7 +1439,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     inv.push_str(&format!("Dangling references: {dangling}\n"));
     // 2. RESOLVED facts must have evidence
     let mut no_evidence = 0usize;
-    for r in ctx.graph.all_rels() {
+    for r in ctx.view.all_rels() {
         if r.provenance == Provenance::Resolved && r.evidence.is_empty() {
             no_evidence += 1;
         }
@@ -1430,15 +1449,15 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     ));
     // 3. critical invariants unenforced
     let unenforced = ctx
-        .graph
-        .invariants
+        .view
+        .invariants()
         .iter()
         .filter(|i| i.severity == Severity::Critical && i.enforced_by.is_empty())
         .count();
     inv.push_str(&format!("Critical invariants without enforcing tests: {unenforced}\n"));
     // 4. inferred claims
     let inferred = ctx
-        .graph
+        .view
         .all_rels()
         .iter()
         .filter(|r| r.provenance == Provenance::Inferred)
@@ -1460,14 +1479,14 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     // conflicts: conflicting writers recorded as drift; also low-confidence deps
     let mut low_conf = String::new();
     let mut lc = 0usize;
-    for r in ctx.graph.all_rels() {
+    for r in ctx.view.all_rels() {
         if r.predicate == scc_core::predicates::DEPENDS_ON && r.confidence < 0.8 {
             lc += 1;
             if lc <= 8 {
                 low_conf.push_str(&format!(
                     "- {} → {} ({:.2})\n",
-                    component_short(ctx.graph, &r.subject),
-                    component_short(ctx.graph, &r.object),
+                    component_short(&ctx.view, &r.subject),
+                    component_short(&ctx.view, &r.object),
                     r.confidence
                 ));
             }
@@ -1479,7 +1498,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     }
 
     // trust boundaries (docs/PRD.md §7, EPIC-148)
-    if let Ok(crossings) = scc_graph::boundaries::boundary_crossings(ctx.graph, ctx.store) {
+    if let Ok(crossings) = scc_graph::boundaries::boundary_crossings(ctx.view.graph, ctx.store) {
         if !crossings.is_empty() {
             let mut b = String::new();
             b.push_str(&format!("{} boundary crossing(s):\n", crossings.len()));
@@ -1534,8 +1553,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     }
     sections.push(Section::new("VERDICT", verdict, 10));
 
-    pack.content = render(sections, usize::MAX, Vec::new());
-    pack.tokens = estimate_tokens(&pack.content);
+    finish(&mut pack, sections, usize::MAX, Vec::new());
     pack
 }
 

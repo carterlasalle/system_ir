@@ -202,7 +202,11 @@ pub fn compile_components(
 
     // ---- aggregation ----
     let mut responsibilities: BTreeMap<String, Vec<(String, Provenance, f64)>> = BTreeMap::new();
-    let mut owns: BTreeMap<String, Vec<(String, Provenance, f64)>> = BTreeMap::new();
+    // Ownership claims: (target entity id, provenance, confidence, evidence).
+    // Write edges keep their own provenance; intent ownership stays DECLARED
+    // — the compiler never promotes a claim's provenance (P0, §5).
+    type OwnershipClaim = (String, Provenance, f64, Vec<String>);
+    let mut owns: BTreeMap<String, Vec<OwnershipClaim>> = BTreeMap::new();
     let mut depends: BTreeMap<String, Vec<(String, Provenance, f64, u32)>> = BTreeMap::new();
     let mut symbols_per_comp: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut evidence_per_comp: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -222,13 +226,14 @@ pub fn compile_components(
             }
         }
     }
-    // store write ownership
+    // store write ownership (RESOLVED, evidence = the write edges' evidence)
     for (sym_id, comp) in &symbol_component {
         for r in graph.out_pred(sym_id, scc_core::predicates::WRITES) {
             owns.entry(comp.clone()).or_default().push((
                 r.object.clone(),
-                Provenance::Resolved,
-                0.85,
+                r.provenance,
+                r.confidence,
+                r.evidence.clone(),
             ));
         }
     }
@@ -375,9 +380,11 @@ pub fn compile_components(
             }),
         );
 
-        let mut owned: Vec<String> = owns
+        // typed ownership claims: (target, provenance, confidence, evidence)
+        // — intent stays DECLARED, write edges keep their own provenance
+        let mut owned_claims: Vec<(String, Provenance, f64, Vec<String>)> = owns
             .get(&name)
-            .map(|v| v.iter().map(|(s, _, _)| s.clone()).collect())
+            .cloned()
             .unwrap_or_default();
         if let Some(ios) = intent_owns.get(&name) {
             for target in ios {
@@ -389,15 +396,26 @@ pub fn compile_components(
                     .find(|e| e.name.to_ascii_lowercase() == target_l)
                     .map(|e| e.id.clone());
                 if let Some(mid) = matched {
-                    if !owned.contains(&mid) {
-                        owned.push(mid);
-                    }
+                    owned_claims.push((mid, Provenance::Declared, 1.0, Vec::new()));
                 }
             }
         }
-        owned.sort();
-        owned.dedup();
-        e.attr("owns", json!(owned));
+        owned_claims.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| prov_rank(b.1).cmp(&prov_rank(a.1)))
+        });
+        let owned_json: Vec<serde_json::Value> = owned_claims
+            .iter()
+            .map(|(t, p, c, ev)| {
+                json!({
+                    "target": t,
+                    "provenance": p.as_str(),
+                    "confidence": c,
+                    "evidence": ev,
+                })
+            })
+            .collect();
+        e.attr("owns", json!(owned_json));
 
         let deps: Vec<serde_json::Value> = depends
             .get(&name)
@@ -491,16 +509,45 @@ pub fn compile_components(
         }
         if let Some(owned) = e.attributes.get("owns").and_then(|v| v.as_array()) {
             for o in owned {
-                if let Some(os) = o.as_str() {
+                let target = o.get("target").and_then(|v| v.as_str());
+                let prov = parse_prov(
+                    o.get("provenance")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("INFERRED"),
+                );
+                let conf = o
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| prov.default_confidence());
+                let claim_evidence: Vec<String> = o
+                    .get("evidence")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(os) = target {
+                    // provenance-preserving: the derived OWNS relationship
+                    // carries the claim's own provenance (DECLARED intent
+                    // never becomes a resolved ownership fact), and the rel
+                    // id includes provenance so conflicting claims coexist
+                    let prov_tag = prov.as_str().to_ascii_lowercase();
+                    let mut evidence = claim_evidence;
+                    if evidence.is_empty() {
+                        evidence = write_evidence_to(os);
+                    }
                     rels.push((
                         Relationship::new(
-                            rel(&["component_owns", &e.id, os]),
+                            rel(&["component_owns", &e.id, os, &prov_tag]),
                             e.id.clone(),
                             scc_core::predicates::OWNS,
                             os.to_string(),
-                            Provenance::Resolved,
+                            prov,
                         )
-                        .with_evidence(write_evidence_to(os)),
+                        .with_confidence(conf)
+                        .with_evidence(evidence),
                         String::new(),
                     ));
                 }
@@ -553,6 +600,104 @@ fn clear_component_relationships(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intent_ownership_stays_declared() {
+        // P0 provenance rule: DECLARED intent ownership must never be
+        // promoted to a resolved OWNS relationship by the component compiler.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+
+        // a data store, a file, and a symbol in it that writes the store
+        let repo = store.repo_id.clone();
+        let store_ent = scc_core::entity_id(&repo, kinds::DATA_STORE, "db");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(store_ent.clone(), kinds::DATA_STORE, "db"),
+                &["main.py".into()],
+            )
+            .unwrap();
+        let file = scc_core::entity_id(&repo, kinds::FILE, "main.py");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(file.clone(), kinds::FILE, "main.py"),
+                &["main.py".into()],
+            )
+            .unwrap();
+        let sym = scc_core::symbol_id(&repo, "main.py", "save");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(sym.clone(), kinds::SYMBOL, "save"),
+                &["main.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:contains",
+                    file,
+                    scc_core::predicates::CONTAINS,
+                    sym.clone(),
+                    Provenance::Extracted,
+                ),
+                "main.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:w",
+                    sym.clone(),
+                    scc_core::predicates::WRITES,
+                    store_ent.clone(),
+                    Provenance::Extracted,
+                )
+                .with_confidence(1.0),
+                "main.py",
+            )
+            .unwrap();
+
+        // intent: root component declares ownership of db too
+        let intent = vec![(
+            "component".to_string(),
+            serde_json::json!({"name": "root", "owns": ["db"]}),
+        )];
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &intent).unwrap();
+        let root_comp = comps.iter().find(|c| c.name == "root").unwrap();
+
+        // the owns attribute carries typed claims with provenance
+        let claims = root_comp.attributes.get("owns").unwrap().as_array().unwrap();
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        let declared = claims
+            .iter()
+            .find(|c| c.get("provenance").and_then(|v| v.as_str()) == Some("DECLARED"))
+            .expect("intent claim present");
+        assert_eq!(declared["target"].as_str().unwrap(), store_ent);
+        let extracted = claims
+            .iter()
+            .find(|c| c.get("provenance").and_then(|v| v.as_str()) == Some("EXTRACTED"))
+            .expect("write-edge claim present");
+        assert_eq!(extracted["target"].as_str().unwrap(), store_ent);
+
+        // relationships: DECLARED claim stays DECLARED, never RESOLVED
+        let rels = store.all_relationships().unwrap();
+        let owns: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::OWNS)
+            .collect();
+        assert_eq!(owns.len(), 2, "{rels:?}");
+        assert!(
+            owns.iter().any(|r| r.provenance == Provenance::Declared),
+            "declared ownership relationship must exist: {owns:?}"
+        );
+        assert!(
+            !owns.iter().any(|r| r.provenance == Provenance::Resolved),
+            "no provenance promotion allowed: {owns:?}"
+        );
+    }
 
     #[test]
     fn path_assignment() {

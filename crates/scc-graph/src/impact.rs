@@ -5,7 +5,7 @@
 //! tests, and a risk assessment.
 
 use crate::components::component_for_path;
-use crate::{RealityGraph, Result};
+use crate::{trust::TrustedGraphView, Result};
 use scc_core::kinds;
 use scc_core::Severity;
 use scc_store::Store;
@@ -28,11 +28,12 @@ pub struct Impact {
 }
 
 pub fn compute_impact(
-    graph: &RealityGraph,
+    view: &TrustedGraphView,
     store: &Store,
     files: &[String],
     symbols: &[String],
 ) -> Result<Impact> {
+    let graph = &view.graph;
     let mut imp = Impact::default();
 
     let file_ids: HashSet<String> = files
@@ -54,7 +55,7 @@ pub fn compute_impact(
             .collect();
         if matches.is_empty() {
             // exact entity id?
-            if graph.entities.contains_key(s) {
+            if view.entity(s).is_some() {
                 resolved_sym_ids.insert(s.clone());
             }
         } else {
@@ -63,12 +64,12 @@ pub fn compute_impact(
     }
     for id in &sym_ids {
         // symbol_id with "?" file is a miss; resolved ones are real
-        if !id.ends_with("/?/") && graph.entities.contains_key(id) {
+        if !id.ends_with("/?/") && view.entity(id).is_some() {
             resolved_sym_ids.insert(id.clone());
         }
     }
     // file symbol ids: all symbols whose file attribute is one of the files
-    for e in graph.entities_of_kind(kinds::SYMBOL) {
+    for e in view.entities_of_kind(kinds::SYMBOL) {
         if let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) {
             if file_ids.contains(&scc_core::entity_id(&graph.repo_id, kinds::FILE, f)) {
                 resolved_sym_ids.insert(e.id.clone());
@@ -127,7 +128,7 @@ pub fn compute_impact(
     }
     // also via contains relationships
     for c in &comps {
-        for r in graph.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+        for r in view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
             if file_ids.contains(&r.object) {
                 affected_comps.insert(c.id.clone());
             }
@@ -139,16 +140,16 @@ pub fn compute_impact(
     // flows containing affected components or their symbols
     let mut affected_syms: HashSet<String> = HashSet::new();
     for cid in &affected_comps {
-        for r in graph.out_pred(cid, scc_core::predicates::CONTAINS) {
+        for r in view.out_pred(cid, scc_core::predicates::CONTAINS) {
             // file ids, expand to symbols
-            for sr in graph.out_pred(&r.object, scc_core::predicates::CONTAINS) {
+            for sr in view.out_pred(&r.object, scc_core::predicates::CONTAINS) {
                 affected_syms.insert(sr.object.clone());
             }
         }
     }
     affected_syms.extend(resolved_sym_ids);
 
-    for flow in &graph.flows {
+    for flow in &view.flows() {
         let steps_mention = flow.steps.iter().any(|s| {
             affected_comps.iter().any(|c| s.actor.contains(c))
                 || affected_syms.iter().any(|sid| s.operation.contains(sid))
@@ -159,7 +160,7 @@ pub fn compute_impact(
         }
     }
     // entrypoint attribute on flows
-    for flow in &graph.flows {
+    for flow in &view.flows() {
         if let Some(ep) = flow.attributes.get("entrypoint").and_then(|v| v.as_str()) {
             if affected_syms.contains(ep) && !imp.flows.contains(&flow.id) {
                 imp.flows.push(flow.id.clone());
@@ -169,10 +170,10 @@ pub fn compute_impact(
 
     // upstream (depend on affected) / downstream (affected depends on)
     for cid in &affected_comps {
-        for r in graph.out_pred(cid, scc_core::predicates::DEPENDS_ON) {
+        for r in view.out_pred(cid, scc_core::predicates::DEPENDS_ON) {
             imp.downstream.push(r.object.clone());
         }
-        for r in graph.in_pred(cid, scc_core::predicates::DEPENDS_ON) {
+        for r in view.in_pred(cid, scc_core::predicates::DEPENDS_ON) {
             imp.upstream.push(r.subject.clone());
         }
     }
@@ -183,20 +184,20 @@ pub fn compute_impact(
 
     // contracts: routes handled by affected symbols
     for sid in &affected_syms {
-        for r in graph.out_pred(sid, scc_core::predicates::HANDLES) {
+        for r in view.out_pred(sid, scc_core::predicates::HANDLES) {
             imp.contracts.push(r.object.clone());
         }
     }
 
     // data: stores owned by affected components + accessed by affected symbols
     for cid in &affected_comps {
-        for r in graph.out_pred(cid, scc_core::predicates::OWNS) {
+        for r in view.out_pred(cid, scc_core::predicates::OWNS) {
             imp.data.push(r.object.clone());
         }
     }
     for sid in &affected_syms {
         for pred in ["reads", "writes", "queries"] {
-            for r in graph.out_pred(sid, pred) {
+            for r in view.out_pred(sid, pred) {
                 imp.data.push(r.object.clone());
             }
         }
@@ -205,7 +206,7 @@ pub fn compute_impact(
     imp.data.dedup();
 
     // invariants whose scope intersects affected entities
-    for inv in &graph.invariants {
+    for inv in &view.invariants() {
         let scoped = inv.scope.iter().any(|s| {
             affected_comps.contains(s) || imp.data.contains(s)
         });
@@ -216,7 +217,7 @@ pub fn compute_impact(
 
     // tests covering affected symbols
     for sid in &affected_syms {
-        for r in graph.out_pred(sid, scc_core::predicates::TESTED_BY) {
+        for r in view.out_pred(sid, scc_core::predicates::TESTED_BY) {
             imp.tests.push(r.object.clone());
         }
     }
@@ -320,8 +321,9 @@ mod tests {
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
-        let g = RealityGraph::load(&store).unwrap();
-        let imp = compute_impact(&g, &store, &[], &[]).unwrap();
+        let g = crate::RealityGraph::load(&store).unwrap();
+        let v = TrustedGraphView::new(&g, &store, &[], crate::TrustPolicy::default());
+        let imp = compute_impact(&v, &store, &[], &[]).unwrap();
         assert!(imp.components.is_empty());
         assert_eq!(imp.risk, "low");
     }

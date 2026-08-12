@@ -173,7 +173,7 @@ mod tests {
         let mut v = vec![0.0f32; 8];
         v[0] = 1.0;
         store.put_embedding(&e.id, &v, "test").unwrap();
-        let cfg = EmbedConfig {
+        let _cfg = EmbedConfig {
             base_url: "http://127.0.0.1:1".into(),
             model: "test".into(),
             api_key: None,

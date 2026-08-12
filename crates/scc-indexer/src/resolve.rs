@@ -468,7 +468,7 @@ fn default_symbol_name(index: &SymbolIndex, file: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Import, ImportType, SourceFile};
+    use crate::model::{Import, ImportType};
 
     fn mk_symbol(name: &str, kind: SymbolKind) -> Symbol {
         Symbol {

@@ -755,11 +755,7 @@ mod tests {
             let mut reader = BufReader::new(server_reader);
             let mut writer = server_writer;
             let mut sent_initialize = false;
-            loop {
-                let msg = match read_frame(&mut reader) {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
+            while let Ok(msg) = read_frame(&mut reader) {
                 let method = msg.get("method").and_then(Value::as_str);
                 let id = msg.get("id");
                 if method == Some("initialize") {

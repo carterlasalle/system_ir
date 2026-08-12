@@ -108,7 +108,9 @@ pub fn drift_findings(
                     .and_then(|v| v.as_array())
                     .map(|a| {
                         a.iter()
-                            .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                            .filter_map(|o| {
+                                o.get("target").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();

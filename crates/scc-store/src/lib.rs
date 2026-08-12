@@ -19,9 +19,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const FTS_ESCAPE: &str = "\"";
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];
+
+/// v4: model epoch. `context_cache.revision` becomes `epoch` — the cache is
+/// keyed on the composite model state (source/semantic/evidence/intent/
+/// runtime/derived generations), not the git revision alone, so any change
+/// to system truth invalidates stale packs (docs/SYSTEM_DESIGN.md §5).
+const MIGRATION_4: &str = r#"
+ALTER TABLE context_cache RENAME COLUMN revision TO epoch;
+"#;
 
 /// v3: entity embeddings (f32 vector blobs) for the optional semantic ranker.
 const MIGRATION_3: &str = r#"
@@ -235,6 +243,79 @@ pub struct RuntimeEdgeRow {
     pub last_observed: String,
 }
 
+/// The independent truth sources whose generations compose the model epoch.
+/// Any change to one of them invalidates previously cached context packs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelEpochKind {
+    /// Indexed file contents (snapshot completion).
+    Source,
+    /// Semantic resolver promotions (LSP/SCIP edge upgrades).
+    Semantic,
+    /// Imported external evidence (SCIP/CCG/GitNexus/Beads/CBM/Hindsight).
+    Evidence,
+    /// Declared intent (`.scc/intent.yaml` claims).
+    Intent,
+    /// Runtime trace ingestion.
+    Runtime,
+    /// Derived compilation (components/flows/invariants/drift/boundaries).
+    Derived,
+}
+
+impl ModelEpochKind {
+    pub fn meta_key(&self) -> &'static str {
+        match self {
+            ModelEpochKind::Source => "source_generation",
+            ModelEpochKind::Semantic => "semantic_generation",
+            ModelEpochKind::Evidence => "evidence_generation",
+            ModelEpochKind::Intent => "intent_generation",
+            ModelEpochKind::Runtime => "runtime_generation",
+            ModelEpochKind::Derived => "derived_generation",
+        }
+    }
+}
+
+/// Deterministic composite fingerprint of the model state. `composite()` is
+/// the canonical cache-epoch string: it changes whenever any source of
+/// system truth changes, so a previously fresh context pack can never be
+/// served after its evidence is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ModelEpoch {
+    pub source: u64,
+    pub semantic: u64,
+    pub evidence: u64,
+    pub intent: u64,
+    pub runtime: u64,
+    pub derived: u64,
+}
+
+impl ModelEpoch {
+    pub fn zero() -> ModelEpoch {
+        ModelEpoch {
+            source: 0,
+            semantic: 0,
+            evidence: 0,
+            intent: 0,
+            runtime: 0,
+            derived: 0,
+        }
+    }
+
+    /// Composite hash over every generation. Prefix identifies the scheme so
+    /// a future epoch-shape change cannot collide with old keys.
+    pub fn composite(&self, revision: &str) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"scc-model-epoch-v1");
+        h.update(self.source.to_le_bytes().as_slice());
+        h.update(self.semantic.to_le_bytes().as_slice());
+        h.update(self.evidence.to_le_bytes().as_slice());
+        h.update(self.intent.to_le_bytes().as_slice());
+        h.update(self.runtime.to_le_bytes().as_slice());
+        h.update(self.derived.to_le_bytes().as_slice());
+        h.update(revision.as_bytes());
+        format!("epoch:{}", &h.finalize().to_hex()[..24])
+    }
+}
+
 pub struct Store {
     pub conn: Connection,
     pub root: PathBuf,
@@ -328,6 +409,43 @@ impl Store {
         Ok(v)
     }
 
+    /// Bump one model-epoch generation. Called by every mutation path that
+    /// changes system truth (index completion, LSP promotion, adapter
+    /// import, intent load, runtime ingestion, derived recompilation).
+    pub fn bump_epoch(&self, kind: ModelEpochKind) -> Result<()> {
+        let key = kind.meta_key();
+        let next: u64 = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            + 1;
+        self.meta_set(key, &next.to_string())
+    }
+
+    /// Current model epoch (all generations plus the latest snapshot
+    /// revision). Never cached by the caller: it must reflect every change
+    /// immediately.
+    pub fn model_epoch(&self) -> Result<ModelEpoch> {
+        let g = |k: &str| -> Result<u64> {
+            Ok(self
+                .meta_get(k)?
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0))
+        };
+        Ok(ModelEpoch {
+            source: g(ModelEpochKind::Source.meta_key())?,
+            semantic: g(ModelEpochKind::Semantic.meta_key())?,
+            evidence: g(ModelEpochKind::Evidence.meta_key())?,
+            intent: g(ModelEpochKind::Intent.meta_key())?,
+            runtime: g(ModelEpochKind::Runtime.meta_key())?,
+            derived: g(ModelEpochKind::Derived.meta_key())?,
+        })
+    }
+
     // ------------------------------------------------------------------
     // snapshots
     // ------------------------------------------------------------------
@@ -345,6 +463,8 @@ impl Store {
             "UPDATE snapshots SET file_count = ?2, status = 'complete' WHERE id = ?1",
             params![id, file_count as i64],
         )?;
+        // the indexed source tree changed — invalidate epoch-keyed packs
+        self.bump_epoch(ModelEpochKind::Source)?;
         Ok(())
     }
 
@@ -1322,22 +1442,33 @@ impl Store {
     // context cache
     // ------------------------------------------------------------------
 
-    pub fn cache_get(&self, key: &str, revision: &str) -> Result<Option<String>> {
+    /// Canonical epoch string for cache keys: composite of every model
+    /// generation plus the latest snapshot revision. A previously fresh
+    /// pack can never be served after any source of system truth changed.
+    pub fn cache_epoch(&self) -> Result<String> {
+        let revision = self
+            .latest_snapshot()?
+            .map(|s| s.revision)
+            .unwrap_or_else(|| "not-indexed".to_string());
+        Ok(self.model_epoch()?.composite(&revision))
+    }
+
+    pub fn cache_get(&self, key: &str, epoch: &str) -> Result<Option<String>> {
         let row = self
             .conn
             .query_row(
-                "SELECT pack FROM context_cache WHERE key = ?1 AND revision = ?2",
-                params![key, revision],
+                "SELECT pack FROM context_cache WHERE key = ?1 AND epoch = ?2",
+                params![key, epoch],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(row)
     }
 
-    pub fn cache_put(&self, key: &str, pack: &str, revision: &str) -> Result<()> {
+    pub fn cache_put(&self, key: &str, pack: &str, epoch: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO context_cache (key, pack, revision, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![key, pack, revision, scc_core::now_rfc3339()],
+            "INSERT OR REPLACE INTO context_cache (key, pack, epoch, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![key, pack, epoch, scc_core::now_rfc3339()],
         )?;
         Ok(())
     }
@@ -1361,6 +1492,8 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        // declared intent changed — invalidate epoch-keyed packs
+        self.bump_epoch(ModelEpochKind::Intent)?;
         Ok(())
     }
 
@@ -1773,6 +1906,61 @@ mod tests {
         // reopen
         let s = Store::open(&db, &root).unwrap();
         assert!(s.get_entity("repo://t/component/a").unwrap().is_some());
+    }
+
+    #[test]
+    fn model_epoch_bumps_and_composites() {
+        let (s, _d) = tmp_store();
+        assert_eq!(s.model_epoch().unwrap(), ModelEpoch::zero());
+        let e0 = s.cache_epoch().unwrap();
+
+        // snapshot completion bumps the source generation
+        let id = s.begin_snapshot("abc", None).unwrap();
+        s.finish_snapshot(id, 3).unwrap();
+        let e1 = s.model_epoch().unwrap();
+        assert_eq!(e1.source, 1);
+        assert_ne!(s.cache_epoch().unwrap(), e0);
+
+        // semantic promotion is an independent generation
+        s.bump_epoch(ModelEpochKind::Semantic).unwrap();
+        let e2 = s.model_epoch().unwrap();
+        assert_eq!(e2.semantic, 1);
+        assert_eq!(e2.source, 1);
+
+        // composite differs per generation combination and includes the
+        // snapshot revision
+        let c1 = e1.composite("abc");
+        let c2 = e2.composite("abc");
+        assert_ne!(c1, c2);
+        assert_ne!(c1, e1.composite("def"));
+        // same state -> same composite (deterministic)
+        assert_eq!(c1, e1.composite("abc"));
+    }
+
+    #[test]
+    fn cache_is_keyed_on_epoch() {
+        let (s, _d) = tmp_store();
+        let e0 = s.cache_epoch().unwrap();
+        s.cache_put("task:1", "pack-A", &e0).unwrap();
+        assert_eq!(s.cache_get("task:1", &e0).unwrap().as_deref(), Some("pack-A"));
+
+        // any truth change invalidates the old epoch key
+        s.bump_epoch(ModelEpochKind::Runtime).unwrap();
+        let e1 = s.cache_epoch().unwrap();
+        assert_ne!(e0, e1);
+        assert_eq!(s.cache_get("task:1", &e1).unwrap(), None);
+        // old packs remain addressable only by their own epoch
+        assert_eq!(s.cache_get("task:1", &e0).unwrap().as_deref(), Some("pack-A"));
+    }
+
+    #[test]
+    fn intent_replacement_bumps_intent_epoch() {
+        let (s, _d) = tmp_store();
+        let before = s.model_epoch().unwrap().intent;
+        s.replace_intent_claims(&[("component".into(), serde_json::json!({"name": "a"}))])
+            .unwrap();
+        let after = s.model_epoch().unwrap();
+        assert_eq!(after.intent, before + 1);
     }
 
     #[test]

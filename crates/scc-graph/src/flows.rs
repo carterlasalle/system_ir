@@ -522,7 +522,7 @@ mod tests {
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
-        let g = RealityGraph::load(&store).unwrap();
+        let _g = RealityGraph::load(&store).unwrap();
         // a -> b -> c -> a (cycle), d
         let mk = |n: &str| scc_core::symbol_id("repo", "x.py", n);
         for (s, t) in [

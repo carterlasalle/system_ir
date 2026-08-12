@@ -111,6 +111,65 @@ fn http_service_produces_expected_ir() {
 }
 
 #[test]
+fn stale_worktree_never_serves_cached_pack() {
+    // P0 trust contract (§7): a pack cached under a clean revision must not
+    // be returned after a working-tree file changed WITHOUT re-indexing.
+    // The rebuild excludes the stale facts and warns instead.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+
+    let goal = "change transcript normalization";
+    let first = run_ok(&dir, &["context", "task", goal]);
+    assert!(first.contains("Normalizer"), "{first}");
+    assert!(!first.contains("changed since indexing"), "{first}");
+
+    // modify a source file WITHOUT indexing
+    let f = dir.join("services/transcripts.py");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("\n# working-tree change\n");
+    std::fs::write(&f, src).unwrap();
+
+    let second = run_ok(&dir, &["context", "task", goal]);
+    assert!(
+        second.contains("stale: services/transcripts.py"),
+        "stale facts must be excluded and warned: {second}"
+    );
+
+    // the exact same request after a re-index returns a fresh pack again
+    run_ok(&dir, &["index", "--quiet"]);
+    let third = run_ok(&dir, &["context", "task", goal]);
+    assert!(!third.contains("stale: services/transcripts.py"), "{third}");
+}
+
+#[test]
+fn task_cache_hits_within_an_epoch_and_misses_across() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let goal = "rename the transcript field in the api response";
+
+    let a = run_ok(&dir, &["context", "task", "--json", goal]);
+    let b = run_ok(&dir, &["context", "task", "--json", goal]);
+    assert_eq!(a, b, "same model state must serve the cached pack");
+
+    // identical re-index: rebuild is deterministic — same state yields the
+    // same pack (the epoch change invalidated the cache key, not the truth)
+    run_ok(&dir, &["index", "--quiet"]);
+    let c = run_ok(&dir, &["context", "task", "--json", goal]);
+    assert_eq!(a, c, "deterministic rebuild for identical state");
+
+    // a real source change (re-indexed) produces a genuinely new pack
+    let f = dir.join("services/transcripts.py");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("\ndef new_helper():\n    return 2\n");
+    std::fs::write(&f, src).unwrap();
+    run_ok(&dir, &["index", "--quiet"]);
+    let d = run_ok(&dir, &["context", "task", "--json", goal]);
+    assert_ne!(a, d, "changed source must produce a different pack");
+}
+
+#[test]
 fn incremental_refresh_matches_cold_cli() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -196,9 +255,8 @@ fn check_invariants_fails_on_dangling_refs() {
     let db =
         scc_store::Store::open(&workdir(repo.path()).join(".scc/scc.db"), &workdir(repo.path()))
             .unwrap();
-    for e in db.entities_by_kind("symbol").unwrap() {
+    if let Some(e) = db.entities_by_kind("symbol").unwrap().into_iter().next() {
         db.delete_entity(&e.id).unwrap();
-        break;
     }
     drop(db);
     let out = run(&workdir(repo.path()), &["check-invariants"]);

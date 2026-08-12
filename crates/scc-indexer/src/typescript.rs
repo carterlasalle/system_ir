@@ -2110,7 +2110,7 @@ export function Badge(props: { label: string }) {
         let _ = extract("src/deep.ts", &deep);
         let _ = extract("src/deep.tsx", &deep);
         // binary-ish garbage
-        let garbage: String = (0u8..255).map(|b| char::from(b)).collect();
+        let garbage: String = (0u8..255).map(char::from).collect();
         let _ = extract("src/garbage.ts", &garbage);
         let _ = extract("src/garbage.ts", "import x from './y'\u{0}\u{1}function z( { ");
     }
@@ -2142,7 +2142,7 @@ describe("suite", () => { it("works", () => {}); });
         let c = find_call(&ef.calls, "prisma.user.findMany");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].caller.as_deref(), Some("f"));
-        assert_eq!(c[0].known_receiver, true);
+        assert!(c[0].known_receiver);
     }
 
     #[test]

@@ -686,11 +686,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(server_reader);
             let mut writer = server_writer;
-            loop {
-                let msg = match crate::lsp::read_frame(&mut reader) {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
+            while let Ok(msg) = crate::lsp::read_frame(&mut reader) {
                 let method = msg.get("method").and_then(Value::as_str);
                 let id = msg.get("id");
                 if method == Some("initialize") {

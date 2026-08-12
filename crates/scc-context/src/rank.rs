@@ -4,7 +4,7 @@
 //! Deterministic and dependency-free (no embeddings in MVP).
 
 use scc_core::kinds;
-use scc_graph::RealityGraph;
+use scc_graph::TrustedGraphView;
 use scc_store::Store;
 use std::collections::BTreeSet;
 
@@ -127,30 +127,30 @@ pub trait Reranker: Send + Sync {
 
 pub fn collect_lexical_candidates(
     store: &Store,
-    graph: &RealityGraph,
+    view: &TrustedGraphView,
     goal: &str,
     symbols: &[String],
     limit: usize,
 ) -> Vec<ScoredEntity> {
-    collect_lexical_candidates_with(store, graph, goal, symbols, limit, None)
+    collect_lexical_candidates_with(store, view, goal, symbols, limit, None)
 }
 
 /// `collect_lexical_candidates` with an optional semantic scorer fused in.
 pub fn collect_lexical_candidates_with(
     store: &Store,
-    graph: &RealityGraph,
+    view: &TrustedGraphView,
     goal: &str,
     symbols: &[String],
     limit: usize,
     scorer: Option<&dyn SemanticScorer>,
 ) -> Vec<ScoredEntity> {
-    collect_lexical_candidates_full(store, graph, goal, symbols, limit, scorer, None)
+    collect_lexical_candidates_full(store, view, goal, symbols, limit, scorer, None)
 }
 
 /// `collect_lexical_candidates` with both a semantic scorer and a reranker.
 pub fn collect_lexical_candidates_full(
     store: &Store,
-    graph: &RealityGraph,
+    view: &TrustedGraphView,
     goal: &str,
     symbols: &[String],
     limit: usize,
@@ -191,7 +191,7 @@ pub fn collect_lexical_candidates_full(
         if let Ok(hits) = store.search_symbols(&query, limit) {
             let rank = limit as f64;
             for (i, (name, sig, _kind, file)) in hits.iter().enumerate() {
-                let id = scc_core::symbol_id(&graph.repo_id, file, name);
+                let id = scc_core::symbol_id(&view.graph.repo_id, file, name);
                 let mut e = scc_core::Entity::new(id.clone(), kinds::SYMBOL, name.clone());
                 e.attr("file", serde_json::json!(file));
                 if !sig.is_empty() {
@@ -211,7 +211,7 @@ pub fn collect_lexical_candidates_full(
                 }
                 if let Ok(hits) = store.search_symbols_like(&variant, 6) {
                     for (name, sig, _kind, file) in hits.iter() {
-                        let id = scc_core::symbol_id(&graph.repo_id, file, name);
+                        let id = scc_core::symbol_id(&view.graph.repo_id, file, name);
                         let mut e = scc_core::Entity::new(id.clone(), kinds::SYMBOL, name.clone());
                         e.attr("file", serde_json::json!(file));
                         if !sig.is_empty() {
@@ -229,7 +229,7 @@ pub fn collect_lexical_candidates_full(
     // (docs/CONTEXT_COMPILER.md §4 — embeddings are never truth, but they
     // may propose candidates)
     if scorer.is_some() {
-        for e in graph.entities.values() {
+        for e in view.entities() {
             let sem_score = sem(e);
             if sem_score > 0.0 {
                 push(e, 0.0, "semantic", &mut out, &mut seen);
@@ -239,20 +239,20 @@ pub fn collect_lexical_candidates_full(
 
     // explicit symbols
     for s in symbols {
-        let matches: Vec<String> = graph
+        let matches: Vec<String> = view
             .entities_of_kind(kinds::SYMBOL)
             .into_iter()
             .filter(|e| e.name == *s)
             .map(|e| e.id.clone())
             .collect();
         for id in matches {
-            if let Some(e) = graph.entities.get(&id) {
+            if let Some(e) = view.entity(&id) {
                 push(e, 2.0, "explicit-symbol", &mut out, &mut seen);
             }
         }
         // fallback: entity id directly
-        if graph.entities.contains_key(s) {
-            push(graph.entities.get(s).unwrap(), 2.0, "explicit-id", &mut out, &mut seen);
+        if view.entity(s).is_some() {
+            push(view.entity(s).unwrap(), 2.0, "explicit-id", &mut out, &mut seen);
         }
     }
 
@@ -264,13 +264,13 @@ pub fn collect_lexical_candidates_full(
         .map(|c| c.id.clone())
         .collect();
     for sid in &symbol_candidates {
-        for r in graph.in_pred(sid, "calls") {
-            if let Some(e) = graph.entities.get(&r.subject) {
+        for r in view.in_pred(sid, "calls") {
+            if let Some(e) = view.entity(&r.subject) {
                 push(e, 1.0, "upstream", &mut out, &mut seen);
             }
         }
-        for r in graph.out_pred(sid, "calls") {
-            if let Some(e) = graph.entities.get(&r.object) {
+        for r in view.out_pred(sid, "calls") {
+            if let Some(e) = view.entity(&r.object) {
                 push(e, 0.8, "downstream", &mut out, &mut seen);
             }
         }
@@ -333,10 +333,11 @@ mod tests {
         e2.attr("file", serde_json::json!("a.py"));
         store.insert_entity(&e2, &["a.py".into()]).unwrap();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let plain = collect_lexical_candidates(&store, &graph, "nothing matches", &[], 10);
+        let view = scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
+        let plain = collect_lexical_candidates(&store, &view, "nothing matches", &[], 10);
         assert_eq!(plain.len(), 0, "lexical-only finds nothing");
         let fused = collect_lexical_candidates_with(
-            &store, &graph, "nothing matches", &[], 10, Some(&BoostScorer),
+            &store, &view, "nothing matches", &[], 10, Some(&BoostScorer),
         );
         assert!(
             fused.iter().any(|c| c.name == "boosted" && c.score >= 5.0),

@@ -222,7 +222,7 @@ fn http_daemon_endpoints() {
     assert_eq!(s, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["kind"], "task");
-    let (s, body) = post("/v1/runtime/traces", r#"[{"source":"a","target":"b","count":3}]"#);
+    let (s, _body) = post("/v1/runtime/traces", r#"[{"source":"a","target":"b","count":3}]"#);
     assert_eq!(s, 202);
     let (s, body) = post("/v1/impact", r#"{"files":["main.py"]}"#);
     assert_eq!(s, 200);

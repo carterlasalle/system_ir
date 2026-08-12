@@ -297,8 +297,7 @@ mod tests {
         crate::commands::cmd_index(&root, true).unwrap();
         let fake = "python3 -c 'import json,sys; print(json.dumps({\"claims\":[{\"claim\":\"x\",\"evidence\":[\"evidence:nope\"]}]}))'";
         let err = cmd_context_compress_json_claims(&root, "helper", Some(fake.into()), None, true)
-            .err()
-            .expect("invented evidence must be rejected");
+            .expect_err("invented evidence must be rejected");
         assert!(err.to_string().contains("rejected"), "{err}");
         assert!(err.to_string().contains("evidence:nope"), "{err}");
     }

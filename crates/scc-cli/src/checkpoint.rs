@@ -77,7 +77,13 @@ pub fn capture(root: &Path) -> crate::Result<Checkpoint> {
     };
     if !modified.is_empty() {
         let graph = scc_graph::RealityGraph::load(&store)?;
-        if let Ok(imp) = scc_graph::impact::compute_impact(&graph, &store, &modified, &[]) {
+        let view = scc_graph::TrustedGraphView::new(
+            &graph,
+            &store,
+            &[],
+            scc_graph::TrustPolicy::default(),
+        );
+        if let Ok(imp) = scc_graph::impact::compute_impact(&view, &store, &modified, &[]) {
             cp.affected.components = imp.components;
             cp.affected.flows = imp.flows;
             cp.affected.contracts = imp.contracts;

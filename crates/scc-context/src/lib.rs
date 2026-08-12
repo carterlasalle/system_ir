@@ -7,8 +7,8 @@
 pub mod packs;
 pub mod rank;
 
-use scc_core::{estimate_tokens, truncate_to_budget};
-use scc_graph::RealityGraph;
+use scc_core::estimate_tokens;
+use scc_graph::{RealityGraph, TrustedGraphView, TrustPolicy};
 use scc_store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -50,6 +50,21 @@ pub struct ContextPack {
     pub tokens: usize,
     #[serde(default)]
     pub budget: usize,
+    /// Token count of the full (untruncated) pack, before budget dropping.
+    #[serde(default)]
+    pub original_tokens: usize,
+    /// Sections dropped for budget, by title (never critical sections).
+    #[serde(default)]
+    pub dropped_sections: Vec<String>,
+    /// Content was cut mid-section (never happens for critical sections).
+    #[serde(default)]
+    pub hard_truncated: bool,
+    /// The minimum safe pack exceeds the soft budget: content was NOT
+    /// silently truncated; the pack is complete and over budget.
+    #[serde(default)]
+    pub exceeded_soft_budget: bool,
+    /// True when the delivered content differs from the full pack
+    /// (dropped sections, hard truncation, or budget overshoot).
     #[serde(default)]
     pub truncated: bool,
     /// RTK output-compression policy hints (docs/API_AND_INTEGRATIONS.md §11):
@@ -69,6 +84,10 @@ impl ContextPack {
             warnings: Vec::new(),
             tokens: 0,
             budget: 0,
+            original_tokens: 0,
+            dropped_sections: Vec::new(),
+            hard_truncated: false,
+            exceeded_soft_budget: false,
             truncated: false,
             compression_policy: None,
         }
@@ -77,10 +96,13 @@ impl ContextPack {
 
 pub struct ContextCompiler<'a> {
     pub store: &'a Store,
-    pub graph: &'a RealityGraph,
+    /// Trusted view: the only way this compiler may query the reality graph.
+    /// STALE facts are excluded and surfaced as warnings; INFERRED facts
+    /// below the confidence floor are excluded unless explicitly allowed.
+    pub view: TrustedGraphView<'a>,
     pub settings: ContextSettings,
     /// Repository-relative paths whose content hash no longer matches the
-    /// indexed snapshot. Facts derived from them must be treated as STALE.
+    /// indexed snapshot (mirrored from the view for cache-key hashing).
     pub stale_paths: Vec<String>,
 }
 
@@ -91,9 +113,23 @@ impl<'a> ContextCompiler<'a> {
         settings: ContextSettings,
         stale_paths: Vec<String>,
     ) -> Self {
+        // The inferred-confidence floor is governed by
+        // `include_low_confidence_inference`: low-confidence labeled
+        // inference is excluded from trusted context by default.
+        let floor = if settings.include_low_confidence_inference {
+            0.0
+        } else {
+            0.85
+        };
+        let view = TrustedGraphView::new(
+            graph,
+            store,
+            &stale_paths,
+            TrustPolicy::default().with_inferred_floor(floor),
+        );
         ContextCompiler {
             store,
-            graph,
+            view,
             settings,
             stale_paths,
         }
@@ -116,7 +152,7 @@ impl<'a> ContextCompiler<'a> {
     pub fn evidence_summary(&self, entity_ids: &[String]) -> BTreeMap<String, usize> {
         let mut m: BTreeMap<String, usize> = BTreeMap::new();
         for id in entity_ids {
-            if let Some(e) = self.graph.entities.get(id) {
+            if let Some(e) = self.view.entity(id) {
                 for ev_id in &e.evidence {
                     if let Some(ev) = self.store.get_evidence(ev_id).ok().flatten() {
                         let path = ev.path.clone().unwrap_or_default();
@@ -137,7 +173,7 @@ impl<'a> ContextCompiler<'a> {
                 }
             }
         }
-        for r in self.graph.all_rels() {
+        for r in self.view.all_rels() {
             if entity_ids.contains(&r.subject)
                 && !r.evidence.is_empty() {
                     let key = r.provenance.as_str().to_string();
@@ -147,18 +183,22 @@ impl<'a> ContextCompiler<'a> {
         m
     }
 
-    /// Apply the token budget to a pack: never cut invariants/ownership/
-    /// failure content — those are always in the head sections.
+    /// Apply the token budget to a pack (P0 rendering contract): the pack
+    /// builder has already dropped lowest-priority sections; this records
+    /// honest accounting. Critical content is never hard-truncated — if the
+    /// minimum safe pack still exceeds the budget, the pack stays complete
+    /// and `exceeded_soft_budget` is set instead of silently cutting facts.
     pub fn apply_budget(&mut self, pack: &mut ContextPack, budget: usize) {
         pack.budget = budget;
-        pack.tokens = estimate_tokens(&pack.content);
-        if pack.tokens <= budget {
-            pack.truncated = false;
-            return;
+        if pack.original_tokens == 0 {
+            pack.original_tokens = estimate_tokens(&pack.content);
         }
-        pack.truncated = true;
-        pack.content = truncate_to_budget(&pack.content, budget);
         pack.tokens = estimate_tokens(&pack.content);
+        let over = pack.tokens > budget;
+        pack.truncated = pack.hard_truncated || !pack.dropped_sections.is_empty() || over;
+        if over && !pack.hard_truncated {
+            pack.exceeded_soft_budget = true;
+        }
     }
 
     // ---- top-level operations ----
@@ -188,9 +228,12 @@ impl<'a> ContextCompiler<'a> {
         reranker: Option<&dyn crate::rank::Reranker>,
     ) -> ContextPack {
         let budget = token_budget.unwrap_or(self.settings.task_tokens).max(512);
-        // Cache: keyed by (goal, inputs, budget, revision). The store clears
-        // the cache on every index/refresh, so hits are only possible while
-        // the model is current (docs/DATA_STRATEGY.md §6).
+        // Cache (P0 trust contract): keyed by (goal, inputs, budget,
+        // ranker salt) + the model epoch + the stale-path set. A file that
+        // changed since indexing makes the key differ even without a
+        // re-index, so a previously fresh pack can never be served after
+        // its evidence is stale.
+        let epoch = self.store.cache_epoch().unwrap_or_else(|_| "no-epoch".into());
         let key = {
             let mut h = blake3::Hasher::new();
             h.update(goal.as_bytes());
@@ -202,10 +245,16 @@ impl<'a> ContextCompiler<'a> {
             }
             h.update(budget.to_string().as_bytes());
             h.update(self.settings.rank_salt.as_bytes());
+            h.update(epoch.as_bytes());
+            let mut stale: Vec<&String> = self.stale_paths.iter().collect();
+            stale.sort();
+            for p in stale {
+                h.update(p.as_bytes());
+                h.update(b"\0");
+            }
             format!("task:{}", &h.finalize().to_hex()[..20])
         };
-        let revision = self.revision();
-        if let Ok(Some(cached)) = self.store.cache_get(&key, &revision) {
+        if let Ok(Some(cached)) = self.store.cache_get(&key, &epoch) {
             if let Ok(pack) = serde_json::from_str::<ContextPack>(&cached) {
                 return pack;
             }
@@ -213,7 +262,7 @@ impl<'a> ContextCompiler<'a> {
         let pack =
             packs::task_with_rankers(self, goal, files, symbols, budget, scorer, reranker);
         if let Ok(json) = serde_json::to_string(&pack) {
-            let _ = self.store.cache_put(&key, &json, &revision);
+            let _ = self.store.cache_put(&key, &json, &epoch);
         }
         pack
     }
