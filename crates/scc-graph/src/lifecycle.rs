@@ -193,6 +193,10 @@ pub fn compile_lifecycles(graph: &RealityGraph, store: &Store) -> Result<Vec<Flo
         attributes.insert("states".to_string(), json!(states));
         attributes.insert("transitions".to_string(), json!(transitions));
         attributes.insert("signals".to_string(), json!(signals.len()));
+        // Wave 3 §22: this view detects state-machine SIGNALS (enums,
+        // transition-verb names). It is NOT an authoritative state-machine
+        // ordering — the flag keeps agents from reading it as one.
+        attributes.insert("signals_only".to_string(), json!(true));
         out.push(Flow {
             id: entity_id(&store.repo_id, kinds::FLOW, &name),
             kind: FlowKind::Lifecycle,

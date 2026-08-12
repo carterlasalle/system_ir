@@ -56,39 +56,75 @@ pub fn cmd_resolve_lsp(root: &Path) -> crate::Result<()> {
         return Ok(());
     }
 
-    let mut resolver = match scc_indexer::lsp::start_pyright(root) {
-        Ok(r) => r,
-        Err(e) if e.contains("pyright not found") => {
-            println!("pyright not found — install with: npm install -g pyright");
-            return Ok(());
-        }
-        Err(e) => return Err(crate::CliError::Other(e)),
+    // Wave 4 §23 language-aware dispatch: .py -> pyright, TS/JS ->
+    // typescript-language-server (tsserver). Each server is started only
+    // when its language has files to resolve; missing tools degrade with a
+    // hint instead of failing the whole run.
+    let is_ts = |f: &str| {
+        f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".js") || f.ends_with(".jsx")
     };
+    let py_files: Vec<&String> = files.keys().filter(|f| f.ends_with(".py")).collect();
+    let ts_files: Vec<&String> = files.keys().filter(|f| is_ts(f)).collect();
 
     let mut upgraded = 0usize;
     let mut unresolved = 0usize;
     let mut errors = 0usize;
     let mut fatal: Option<String> = None;
 
-    for file in files.keys() {
-        match resolver.resolve_call_definitions(&store, file) {
-            Ok(r) => {
-                upgraded += r.upgraded;
-                unresolved += r.unresolved;
-                errors += r.errors;
+    if !py_files.is_empty() {
+        let mut resolver = match scc_indexer::lsp::start_pyright(root) {
+            Ok(r) => r,
+            Err(e) if e.contains("pyright not found") => {
+                println!("pyright not found — install with: npm install -g pyright");
+                return Ok(());
             }
-            Err(e) => {
-                // Protocol-level failure: report once and stop querying.
-                fatal = Some(e);
-                break;
+            Err(e) => return Err(crate::CliError::Other(e)),
+        };
+        for file in &py_files {
+            match resolver.resolve_call_definitions(&store, file) {
+                Ok(r) => {
+                    upgraded += r.upgraded;
+                    unresolved += r.unresolved;
+                    errors += r.errors;
+                }
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(resolver);
+    }
+
+    if !ts_files.is_empty() {
+        let mut resolver = match scc_indexer::lsp_ts::start_tsserver(root) {
+            Ok(r) => r,
+            Err(e) if e.contains("tsserver not found") => {
+                println!(
+                    "tsserver not found — install with: npm install -g typescript-language-server typescript"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(crate::CliError::Other(e)),
+        };
+        for file in &ts_files {
+            match resolver.resolve_call_definitions(&store, file) {
+                Ok(r) => {
+                    upgraded += r.upgraded;
+                    unresolved += r.unresolved;
+                    errors += r.errors;
+                }
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
             }
         }
     }
-    drop(resolver);
 
     if let Some(e) = fatal {
         println!("lsp error: {e}");
     }
-    println!("lsp-pyright: {upgraded} upgraded, {unresolved} unresolved, {errors} errors");
+    println!("lsp: {upgraded} upgraded, {unresolved} unresolved, {errors} errors");
     Ok(())
 }

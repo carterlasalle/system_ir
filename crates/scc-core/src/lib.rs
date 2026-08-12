@@ -97,6 +97,22 @@ pub enum FlowKind {
     Lifecycle,
 }
 
+impl FlowKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlowKind::Architecture => "architecture",
+            FlowKind::Workflow => "workflow",
+            FlowKind::Sequence => "sequence",
+            FlowKind::Dataflow => "dataflow",
+            FlowKind::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+pub fn flow_kind_str(k: &FlowKind) -> &'static str {
+    k.as_str()
+}
+
 /// Evidence source type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -289,6 +305,95 @@ impl Evidence {
             extractor_version: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical Causal FlowGraph (Wave 3 — the behavioral truth)
+// ---------------------------------------------------------------------------
+
+/// Edge kind in the canonical causal graph (P1, docs/SYSTEM_DESIGN.md §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowEdgeKind {
+    /// Sequential causality.
+    Next,
+    /// Alternative execution path (fanout from evidence: call fanout,
+    /// exception handlers, task spawn, runtime trace variants, declared).
+    Branch,
+    /// Failure edge to an error/exception handler or failure outcome.
+    Error,
+    /// Retry edge (back to the retried operation).
+    Retry,
+    /// Fallback edge to the degraded path.
+    Fallback,
+    /// Asynchronous dispatch.
+    Async,
+    /// Message/event publication.
+    Publish,
+    /// Message/event consumption.
+    Consume,
+    /// Convergence of concurrent paths.
+    Join,
+    /// Return/terminal edge.
+    Return,
+    /// Timeout edge.
+    Timeout,
+    /// Compensation/rollback edge.
+    Compensation,
+}
+
+/// One operation node in the canonical flow graph. The canonical graph
+/// retains individual operations — component-level grouping (ComponentSpan)
+/// happens only at display/context time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowNode {
+    /// Index within the graph (0-based).
+    pub id: u32,
+    /// Actor entity id (symbol or component).
+    pub actor: String,
+    /// Operation label.
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowEdge {
+    pub from: u32,
+    pub to: u32,
+    pub kind: FlowEdgeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+/// The canonical causal representation of one flow: a graph, never a
+/// flattened linear step list. Alternate execution paths are preserved as
+/// branch edges; false sequential causality is impossible by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowGraph {
+    pub id: String,
+    pub kind: FlowKind,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub nodes: Vec<FlowNode>,
+    #[serde(default)]
+    pub edges: Vec<FlowEdge>,
+    /// Node indices that start the graph.
+    #[serde(default)]
+    pub entrypoints: Vec<u32>,
+    /// Node indices with no outgoing causal edge (returns).
+    #[serde(default)]
+    pub exits: Vec<u32>,
+    #[serde(default)]
+    pub provenance_summary: BTreeMap<String, usize>,
 }
 
 // ---------------------------------------------------------------------------

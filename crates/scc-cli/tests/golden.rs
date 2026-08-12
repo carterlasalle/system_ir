@@ -143,6 +143,76 @@ fn stale_worktree_never_serves_cached_pack() {
 }
 
 #[test]
+fn canonical_flow_graph_preserves_topology() {
+    // Wave 3 exit condition: the canonical FlowGraph preserves branches,
+    // retry, and fanout exactly — alternate execution paths are never
+    // flattened into false sequential causality, and branches come from
+    // evidence (call fanout, @tenacity.retry decorators), never text
+    // heuristics.
+    let repo = copy_fixture("py-queue-service");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let out = run_ok(&dir, &["export", "flow-graphs.json"]);
+    let graphs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let graphs = graphs.as_array().unwrap();
+    assert!(!graphs.is_empty(), "at least one canonical graph");
+
+    let graph = graphs
+        .iter()
+        .find(|g| g["name"].as_str().unwrap_or("").contains("consume"))
+        .or_else(|| graphs.first())
+        .unwrap();
+
+    let kinds: Vec<&str> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+
+    // retry: the @tenacity.retry decorator must produce Retry edges
+    assert!(
+        kinds.contains(&"retry"),
+        "retry edges from decorator evidence: {kinds:?}"
+    );
+    // fanout (consume -> process_incident AND IncidentStore) is Branch edges
+    assert!(
+        kinds.contains(&"branch"),
+        "fanout from multiple call targets must be a branch: {kinds:?}"
+    );
+    // convergence of the fanout is a Join edge — no false sequential merge
+    assert!(
+        kinds.contains(&"join"),
+        "convergence must be explicit: {kinds:?}"
+    );
+    // branch edges carry structural conditions ("calls <op>"), never
+    // comma-split operation lists from generated text
+    for e in graph["edges"].as_array().unwrap() {
+        if e["kind"] == "branch" {
+            if let Some(c) = e["condition"].as_str() {
+                assert!(
+                    c.starts_with("calls "),
+                    "branch conditions are structural: {c}"
+                );
+            }
+        }
+    }
+    // exits detected
+    assert!(
+        graph["exits"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "exits detected: {graph}"
+    );
+    // provenance recorded per edge
+    assert!(
+        graph["provenance_summary"]
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false),
+        "provenance summary present"
+    );
+}
+
+#[test]
 fn atlas_describes_system_accurately() {
     // Wave 2 QA: the agent should be able to explain the system from the
     // atlas alone — purpose, architecture, flows, ownership, contracts,

@@ -1106,6 +1106,11 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
     if let Some(t) = &f.trigger {
         body.push_str(&format!("Trigger: {t}\n"));
     }
+    // Wave 3 §22: lifecycle views detect state-machine signals; they are
+    // never presented as authoritative state-machine ordering.
+    if f.attributes.get("signals_only").and_then(|v| v.as_bool()) == Some(true) {
+        body.push_str("(state-machine signals — NOT an authoritative lifecycle)\n");
+    }
     let mut prev_actor: Option<String> = None;
     for s in &f.steps {
         let actor = component_short(&ctx.view, &s.actor);

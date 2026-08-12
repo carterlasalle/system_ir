@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const FTS_ESCAPE: &str = "\"";
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5];
 
 /// v4: model epoch. `context_cache.revision` becomes `epoch` — the cache is
 /// keyed on the composite model state (source/semantic/evidence/intent/
@@ -29,6 +29,18 @@ const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4
 /// to system truth invalidates stale packs (docs/SYSTEM_DESIGN.md §5).
 const MIGRATION_4: &str = r#"
 ALTER TABLE context_cache RENAME COLUMN revision TO epoch;
+"#;
+
+/// v5: canonical causal flow graphs (Wave 3) — the behavioral truth from
+/// which the `flows` projections are derived.
+const MIGRATION_5: &str = r#"
+CREATE TABLE IF NOT EXISTS flow_graphs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  trigger TEXT,
+  graph TEXT NOT NULL
+);
 "#;
 
 /// v3: entity embeddings (f32 vector blobs) for the optional semantic ranker.
@@ -1251,6 +1263,40 @@ impl Store {
                 attributes,
                 evidence: serde_json::from_str(&ev).unwrap_or_default(),
             });
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
+    // canonical flow graphs (Wave 3)
+    // ------------------------------------------------------------------
+
+    pub fn replace_flow_graphs(&self, graphs: &[scc_core::FlowGraph]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM flow_graphs", [])?;
+        for g in graphs {
+            let kind = scc_core::flow_kind_str(&g.kind);
+            let trigger = g.trigger.clone().unwrap_or_default();
+            tx.execute(
+                "INSERT OR REPLACE INTO flow_graphs (id, kind, name, trigger, graph) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![g.id, kind, g.name, trigger, serde_json::to_string(g)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn flow_graphs(&self) -> Result<Vec<scc_core::FlowGraph>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT graph FROM flow_graphs ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let json = r?;
+            if let Ok(g) = serde_json::from_str(&json) {
+                out.push(g);
+            }
         }
         Ok(out)
     }

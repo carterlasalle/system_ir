@@ -94,7 +94,7 @@ enum Commands {
 
     /// Export the System IR
     Export {
-        /// system-ir.json | system-ir.jsonl | ccg
+        /// system-ir.json | system-ir.jsonl | ccg | flow-graphs.json
         #[arg(default_value = "system-ir.json")]
         format: String,
     },

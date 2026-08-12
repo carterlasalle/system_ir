@@ -107,7 +107,7 @@ pub fn find_symbol_by_name(graph: &RealityGraph, name: &str) -> Option<String> {
 
 /// Walk resolved call edges from an entry symbol, returning all reachable
 /// call paths (each capped by MAX_DEPTH).
-fn walk_calls(
+pub(crate) fn walk_calls(
     graph: &RealityGraph,
     entry: &str,
 ) -> Vec<Vec<String>> {

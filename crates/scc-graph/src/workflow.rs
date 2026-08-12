@@ -47,38 +47,22 @@ pub fn compile_workflows(graph: &RealityGraph, store: &Store) -> Result<Vec<Flow
         }
     }
 
-    // 2. branching sequences: any collapsed multi-operation step (", ") or a
-    //    "branches" attribute yields a workflow view; the branch step is
-    //    appended when a collapsed step was actually found.
+    // 2. branching sequences (Wave 3 §19): workflow views come ONLY from
+    //    evidence — a "branches" attribute written by compilers that
+    //    detected structural fanout (canonical FlowGraph branch edges).
+    //    Generated text is never inspected for branch markers (the old
+    //    ", "-split heuristic is gone: it invented false causality).
     for seq in &sequences {
-        let has_collapsed = seq.steps.iter().any(|s| s.operation.contains(", "));
-        let has_branches = seq.attributes.contains_key("branches");
-        if !has_collapsed && !has_branches {
+        if !seq.attributes.contains_key("branches") {
             continue;
         }
         let name = format!("{}-workflow", seq.name);
-        let mut steps = seq.steps.clone();
-        if has_collapsed {
-            steps.push(FlowStep {
-                id: format!("step:{}", steps.len() + 1),
-                order: (steps.len() + 1) as u32,
-                actor: "system".to_string(),
-                operation: "branch".to_string(),
-                condition: Some("multi-path".to_string()),
-                r#async: None,
-                timeout_ms: None,
-                retry_policy: None,
-                failure_outcome: None,
-                provenance: Some(Provenance::Inferred),
-                evidence: Vec::new(),
-            });
-        }
         out.push(Flow {
             id: entity_id(&store.repo_id, kinds::FLOW, &name),
             kind: FlowKind::Workflow,
             name,
             trigger: seq.trigger.clone(),
-            steps,
+            steps: seq.steps.clone(),
             attributes: seq.attributes.clone(),
         });
     }
@@ -306,9 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_step_yields_branch_workflow() {
+    fn collapsed_step_does_not_yield_branch_workflow() {
+        // Wave 3 §19: generated text (", " in an operation label) is NEVER
+        // evidence of a branch — the text heuristic is removed.
         let (_dir, store) = setup();
-        // "charge, refund" is a collapsed multi-operation step
         let seq = seq_flow(
             &store,
             "checkout",
@@ -319,16 +304,7 @@ mod tests {
         let graph = RealityGraph::load(&store).unwrap();
 
         let flows = compile_workflows(&graph, &store).unwrap();
-        assert_eq!(flows.len(), 1);
-        let f = &flows[0];
-        assert_eq!(f.kind, FlowKind::Workflow);
-        assert_eq!(f.name, "checkout-workflow");
-        assert_eq!(f.steps.len(), 3);
-        assert_eq!(f.steps[0].operation, "validate");
-        assert_eq!(f.steps[1].operation, "charge, refund");
-        assert_eq!(f.steps[2].operation, "branch");
-        assert_eq!(f.steps[2].condition.as_deref(), Some("multi-path"));
-        assert_eq!(f.steps[2].order, 3);
+        assert!(flows.is_empty(), "no evidence -> no branch workflow: {flows:?}");
     }
 
     #[test]
@@ -395,11 +371,16 @@ mod tests {
     #[test]
     fn workflow_views_sorted_by_name() {
         let (_dir, store) = setup();
-        // retry component "b" (flow "b-workflow") + branch flow "a" (flow "a-workflow")
+        // retry component "b" (flow "b-workflow") + evidence-branch flow "a"
         put_components(&store, &[("b", &["b"])]);
         put_symbol(&store, "retry_one", "b/x.py", &[]);
         put_symbol(&store, "backoff_two", "b/y.py", &[]);
-        let seq = seq_flow(&store, "a", &["x, y"], json!({}));
+        let seq = seq_flow(
+            &store,
+            "a",
+            &["validate", "execute"],
+            json!({ "branches": ["fast", "full"] }),
+        );
         store.replace_flows(&[seq]).unwrap();
         let graph = RealityGraph::load(&store).unwrap();
 
@@ -407,6 +388,6 @@ mod tests {
         assert_eq!(flows.len(), 2);
         let names: Vec<&str> = flows.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["a-workflow", "b-workflow"]);
-        assert_eq!(flows[0].steps.last().unwrap().operation, "branch");
+        assert_eq!(flows[0].attributes["branches"], json!(["fast", "full"]));
     }
 }

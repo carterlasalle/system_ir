@@ -6,6 +6,7 @@
 pub mod boundaries;
 pub mod cochange;
 pub mod components;
+pub mod flowgraph;
 pub mod flows;
 pub mod impact;
 pub mod invariants;
@@ -14,6 +15,20 @@ pub mod trust;
 pub mod workflow;
 
 pub use trust::{TrustedGraphView, TrustPolicy};
+
+impl RealityGraph {
+    pub fn empty() -> RealityGraph {
+        RealityGraph {
+            repo_id: String::new(),
+            entities: HashMap::new(),
+            out: HashMap::new(),
+            inn: HashMap::new(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            invariants: Vec::new(),
+        }
+    }
+}
 
 use scc_core::{Entity, Flow, Invariant, Relationship};
 use scc_store::Store;
@@ -109,6 +124,20 @@ impl RealityGraph {
     }
 }
 
+/// Map every symbol id to its component id via the component CONTAINS
+/// edges (shared by the flow graph compiler and flow projections).
+pub fn symbol_component_map(graph: &RealityGraph) -> HashMap<String, String> {
+    let mut symbol_comp: HashMap<String, String> = HashMap::new();
+    for c in &graph.components {
+        for r in graph.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+            for sr in graph.out_pred(&r.object, scc_core::predicates::CONTAINS) {
+                symbol_comp.insert(sr.object.clone(), c.id.clone());
+            }
+        }
+    }
+    symbol_comp
+}
+
 /// Staged derived compilation (P0, docs/SYSTEM_DESIGN.md §7): every stage
 /// writes its output, reloads the reality graph, and only then compiles the
 /// next stage, so drift and later stages can never be computed against a
@@ -166,9 +195,14 @@ impl<'a> CompilationPipeline<'a> {
         }
         self.store.replace_flows(&all)?;
 
-        // STAGE 3: behavioral views — lifecycle state machines and
-        // operational workflows. compile_workflows reads the sequence flows
-        // just stored, so it must run after replace_flows (reload).
+        // STAGE 3: canonical causal flow graphs (Wave 3) — the behavioral
+        // truth from which projections derive; then the behavioral views
+        // (lifecycle state machines + operational workflows) which read the
+        // stored sequence flows (reload).
+        let graph = RealityGraph::load(self.store)?;
+        let symbol_comp = symbol_component_map(&graph);
+        let graphs = flowgraph::compile_flow_graphs(&graph, self.store, &intent, &symbol_comp)?;
+        self.store.replace_flow_graphs(&graphs)?;
         let graph = RealityGraph::load(self.store)?;
         let mut lifecycles = lifecycle::compile_lifecycles(&graph, self.store)?;
         let mut workflows = workflow::compile_workflows(&graph, self.store)?;

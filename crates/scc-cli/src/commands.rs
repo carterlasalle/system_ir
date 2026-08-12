@@ -362,6 +362,12 @@ pub fn cmd_export(root: &Path, format: &str) -> crate::Result<()> {
             }
         }
         "ccg" => println!("{}", serde_json::to_string_pretty(&crate::export_ccg(&ir)?)?),
+        "flow-graphs.json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.flow_graphs()?)?
+            )
+        }
         "capsule.md" => print!("{}", crate::compress::capsule_markdown(root)?),
         other => {
             return Err(crate::CliError::Other(format!(
