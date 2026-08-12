@@ -270,6 +270,19 @@ enum BenchSub {
         #[arg(long, default_value_t = scc_cli::benchres::DEFAULT_MIN_AGREEMENT)]
         min_agreement: f64,
     },
+    /// Atlas recall benchmark (Wave 8 §57): recall of independently
+    /// documented ground truth against the startup System Atlas on real
+    /// repos (defaults: <repo-root>/benchmarks/corpus +
+    /// <repo-root>/benchmarks/ground-truth; falls back to the fixtures when
+    /// the corpus dir is absent)
+    Atlas {
+        /// Corpus directory (default: <repo-root>/benchmarks/corpus)
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Ground-truth docs directory (default: <repo-root>/benchmarks/ground-truth)
+        #[arg(long)]
+        ground_truth: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -584,6 +597,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match scc_cli::benchres::run_resolution_benchmark(min_agreement) {
                     Ok(summary) => {
                         scc_cli::benchres::print_summary(&summary);
+                        Ok(())
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
+                }
+            }
+            BenchSub::Atlas { corpus, ground_truth } => {
+                match scc_cli::benchatlas::run_atlas_bench(
+                    corpus.as_deref(),
+                    ground_truth.as_deref(),
+                ) {
+                    Ok(report) => {
+                        scc_cli::benchatlas::print_report(&report);
                         Ok(())
                     }
                     Err(e) => Err(scc_cli::CliError::Other(e)),

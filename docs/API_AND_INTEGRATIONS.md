@@ -3,19 +3,34 @@
 ## 1. Default agent API
 
 Expose only:
-1. `system_overview`
-2. `task_context`
-3. `component_context`
-4. `flow_context`
-5. `impact_context`
-6. `verify_context`
+1. `system_atlas` — the full startup architecture (primary agent operation)
+2. `system_overview`
+3. `task_context`
+4. `component_context`
+5. `flow_context`
+6. `impact_context`
+7. `verify_context`
 
 Advanced graph/evidence tools are opt-in.
 
 ## 2. MCP semantics
 
+### `system_atlas`
+The complete System Atlas: system purpose, every component (purpose,
+implementation paths, consumes/produces, upstream/downstream, ownership with
+provenance), entrypoints, primary flows, data ownership, contracts, critical
+invariants, failure/retry behavior, deployment units, trust and async
+boundaries, external systems, implementation map, evidence summary, and
+freshness warnings. Injected at session start so the agent knows the
+architecture before its first coding task.
+
+Input:
+```json
+{"token_budget": 15000}
+```
+
 ### `system_overview`
-Purpose, components, boundaries, stores, externals, flows, invariants, freshness.
+Compact capsule: purpose, components, boundaries, stores, externals, flows, invariants, freshness.
 
 ### `task_context`
 Input:

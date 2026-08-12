@@ -67,10 +67,10 @@ pub fn cmd_setup_hermes(root: &Path) -> crate::Result<()> {
     println!("  hermes plugins list          # confirm 'scc' appears");
     println!("  hermes plugins enable scc    # if not enabled");
     println!("  hermes chat");
-    println!("The six semantic tools (system_overview, task_context, component_context,");
-    println!("flow_context, impact_context, verify_context) plus the bundled skill");
-    println!("'scc-system-context' are available. The `scc` binary must be on PATH");
-    println!("(or set SCC_BIN).");
+    println!("The seven semantic tools (system_overview, system_atlas, task_context,");
+    println!("component_context, flow_context, impact_context, verify_context) plus the");
+    println!("bundled skill 'scc-system-context' are available. The `scc` binary must be");
+    println!("on PATH (or set SCC_BIN).");
     println!();
     println!("Alternative MCP wiring (instead of the native plugin):");
     println!("  mcp_servers:");
@@ -118,6 +118,7 @@ mod tests {
         let schemas = include_str!("../../../plugins/hermes/scc/schemas.py");
         for tool in [
             "SYSTEM_OVERVIEW",
+            "SYSTEM_ATLAS",
             "TASK_CONTEXT",
             "COMPONENT_CONTEXT",
             "FLOW_CONTEXT",
@@ -127,7 +128,7 @@ mod tests {
             assert!(schemas.contains(tool), "missing {tool}");
         }
         let init = include_str!("../../../plugins/hermes/scc/__init__.py");
-        assert_eq!(init.matches("ctx.register_tool(").count(), 6);
+        assert_eq!(init.matches("ctx.register_tool(").count(), 7);
         assert!(init.contains("register_skill"));
     }
 }

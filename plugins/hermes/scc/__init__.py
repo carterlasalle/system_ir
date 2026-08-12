@@ -21,6 +21,12 @@ def register(ctx):
         handler=tools.system_overview,
     )
     ctx.register_tool(
+        name="system_atlas",
+        toolset="scc",
+        schema=schemas.SYSTEM_ATLAS,
+        handler=tools.system_atlas,
+    )
+    ctx.register_tool(
         name="task_context",
         toolset="scc",
         schema=schemas.TASK_CONTEXT,

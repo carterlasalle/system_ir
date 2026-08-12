@@ -4026,7 +4026,7 @@ never auto-promote inference
 
 Mitigation:
 
-Expose six semantic tools.
+Expose seven semantic tools (system_atlas is the primary startup operation).
 
 Keep analyzers behind SCC.
 

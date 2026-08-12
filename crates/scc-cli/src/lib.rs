@@ -2,6 +2,7 @@
 
 pub mod bench;
 pub mod benchagent;
+pub mod benchatlas;
 pub mod benchctx;
 pub mod benchres;
 pub mod checkpoint;

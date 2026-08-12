@@ -107,6 +107,10 @@ pub struct ContextCompiler<'a> {
     /// Repository-relative paths whose content hash no longer matches the
     /// indexed snapshot (mirrored from the view for cache-key hashing).
     pub stale_paths: Vec<String>,
+    /// All evidence loaded once (single query) — the pack builders consult
+    /// this instead of running one SQLite query per evidence id (the atlas
+    /// on a 500k-LOC repo has hundreds of thousands of evidence rows).
+    evidence: std::cell::RefCell<Option<std::collections::HashMap<String, scc_core::Evidence>>>,
 }
 
 impl<'a> ContextCompiler<'a> {
@@ -135,7 +139,26 @@ impl<'a> ContextCompiler<'a> {
             view,
             settings,
             stale_paths,
+            evidence: std::cell::RefCell::new(None),
         }
+    }
+
+    /// One-query evidence index (id -> Evidence), built lazily. Returns a
+    /// borrow so callers never copy the full map (hundreds of thousands of
+    /// rows on large repos).
+    pub fn evidence_map(&self) -> std::cell::Ref<'_, std::collections::HashMap<String, scc_core::Evidence>> {
+        if self.evidence.borrow().is_none() {
+            *self.evidence.borrow_mut() = Some(
+                self.store
+                    .all_evidence()
+                    .ok()
+                    .map(|evs| evs.into_iter().map(|e| (e.id.clone(), e)).collect())
+                    .unwrap_or_default(),
+            );
+        }
+        std::cell::Ref::map(self.evidence.borrow(), |slot| {
+            slot.as_ref().expect("set above")
+        })
     }
 
     pub fn revision(&self) -> String {
@@ -154,10 +177,11 @@ impl<'a> ContextCompiler<'a> {
     /// Provenance accounting for a set of entity ids.
     pub fn evidence_summary(&self, entity_ids: &[String]) -> BTreeMap<String, usize> {
         let mut m: BTreeMap<String, usize> = BTreeMap::new();
+        let evmap = self.evidence_map();
         for id in entity_ids {
             if let Some(e) = self.view.entity(id) {
                 for ev_id in &e.evidence {
-                    if let Some(ev) = self.store.get_evidence(ev_id).ok().flatten() {
+                    if let Some(ev) = evmap.get(ev_id) {
                         let path = ev.path.clone().unwrap_or_default();
                         if self.is_stale_path(&path) {
                             *m.entry("STALE".into()).or_insert(0) += 1;

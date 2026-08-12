@@ -77,7 +77,8 @@ cargo clippy --workspace -- -D warnings
 cd /path/to/your/repo
 scc init                                  # .scc/config.yaml + database
 scc index                                 # cold index; incremental afterwards
-scc overview                              # startup capsule
+scc overview                              # compact startup capsule
+scc atlas                                 # FULL system architecture (agent startup)
 scc context task "change transcript normalization"
 scc setup claude                          # automatic Claude Code hooks
 ```
@@ -89,7 +90,7 @@ The full command surface is in the [CLI reference](docs/API_AND_INTEGRATIONS.md#
 ### CLI
 
 ```bash
-scc overview | context task <goal> | context component <id> | context flow <id>
+scc atlas | overview | context task <goal> | context component <id> | context flow <id>
 scc impact [--diff HEAD~1] [files...]
 scc verify | drift | ci check
 scc bench context | resolution | agent --cmd <agent-cmd> | index
@@ -106,7 +107,7 @@ The local daemon implements [`docs/openapi.yaml`](docs/openapi.yaml) on loopback
 | Surface | How to reach it |
 |---|---|
 | HTTP API | `scc serve` → `http://127.0.0.1:7777` (`/v1/system`, `/v1/context/task`, `/v1/components/{id}`, `/v1/flows/{id}`, `/v1/impact`, `/v1/verify`, `/v1/index`, `/v1/index/status`, `/v1/runtime/traces`) |
-| MCP server | `scc mcp` on stdio — exactly the six semantic tools, repository read-only |
+| MCP server | `scc mcp` on stdio — the seven semantic tools (`system_atlas`, `system_overview`, `task_context`, `component_context`, `flow_context`, `impact_context`, `verify_context`), repository read-only |
 | Health | `scc serve` → `http://127.0.0.1:7777/healthz` |
 
 ### Agent integrations
@@ -116,7 +117,7 @@ The local daemon implements [`docs/openapi.yaml`](docs/openapi.yaml) on loopback
 | Claude Code | `scc setup claude` | SessionStart capsule, task-pack injection, post-edit refresh, PreCompact checkpoint + rehydration |
 | Codex | `scc setup codex` | AGENTS.md with capsule, usage rules, authority ordering |
 | OpenCode | `scc setup opencode` | AGENTS.md + `.opencode/opencode.json` wiring the SCC MCP server |
-| Hermes | `scc setup hermes` | Native plugin: six tools + bundled `scc-system-context` skill |
+| Hermes | `scc setup hermes` | Native plugin: seven tools + bundled `scc-system-context` skill |
 
 SDKs: TypeScript (`sdk/typescript`, `@scc/sdk`) and Python (`sdk/python`, `scc-sdk`) wrapping the CLI.
 

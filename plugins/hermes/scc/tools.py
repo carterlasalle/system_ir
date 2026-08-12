@@ -41,6 +41,13 @@ def system_overview(args: dict, **kwargs) -> str:
     return json.dumps(_run(["overview"]))
 
 
+def system_atlas(args: dict, **kwargs) -> str:
+    cmd = ["atlas"]
+    if args.get("token_budget"):
+        cmd += ["--budget", str(args["token_budget"])]
+    return json.dumps(_run(cmd))
+
+
 def task_context(args: dict, **kwargs) -> str:
     cmd = ["context", "task", args.get("goal", "")]
     if args.get("files"):

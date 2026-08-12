@@ -62,11 +62,12 @@ source + config + infra + runtime + intent
 
 ## Architectural rule
 
-SCC must not expose every low-level analyzer directly to the agent. GitNexus-, Narsil-, LSP-, SCIP-, CodeQL-, Joern-, and parser-derived facts are evidence inputs. The normal agent interface should stay at roughly six semantic operations:
+SCC must not expose every low-level analyzer directly to the agent. GitNexus-, Narsil-, LSP-, SCIP-, CodeQL-, Joern-, and parser-derived facts are evidence inputs. The normal agent interface is seven semantic operations:
 
-1. `system_overview`
-2. `task_context`
-3. `component_context`
-4. `flow_context`
-5. `impact_context`
-6. `verify_context`
+1. `system_atlas` — the full startup architecture (primary agent operation)
+2. `system_overview` — compact capsule for humans/scripts
+3. `task_context`
+4. `component_context`
+5. `flow_context`
+6. `impact_context`
+7. `verify_context`

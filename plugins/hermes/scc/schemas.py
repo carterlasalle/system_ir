@@ -11,6 +11,28 @@ SYSTEM_OVERVIEW = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+SYSTEM_ATLAS = {
+    "name": "system_atlas",
+    "description": (
+        "Get the FULL System Atlas: complete architecture for session startup — "
+        "purpose, every component with implementation paths and ownership, "
+        "entrypoints, primary flows, contracts, critical invariants, failure and "
+        "retry behavior, deployment, trust and async boundaries, implementation "
+        "map, evidence and freshness. Prefer this over system_overview when "
+        "starting work in an unfamiliar repository: the agent should know the "
+        "architecture before its first coding task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "token_budget": {
+                "type": "integer",
+                "description": "Optional token budget (default context.atlas_tokens, 15000)",
+            }
+        },
+    },
+}
+
 TASK_CONTEXT = {
     "name": "task_context",
     "description": (
