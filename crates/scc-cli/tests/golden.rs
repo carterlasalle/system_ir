@@ -213,6 +213,27 @@ fn canonical_flow_graph_preserves_topology() {
 }
 
 #[test]
+fn checkpoint_captures_goal_from_active_bead() {
+    // §126: checkpoint goal/bead are populated from active task state.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    std::fs::create_dir_all(dir.join(".beads")).unwrap();
+    std::fs::write(
+        dir.join(".beads/issues.jsonl"),
+        "{\"id\":\"b7\",\"title\":\"Fix transcript normalization retry\",\"status\":\"in_progress\",\"dependencies\":[]}\n",
+    )
+    .unwrap();
+    run_ok(&dir, &["index", "--quiet"]);
+    let out = run_ok(&dir, &["checkpoint", "save", "--json"]);
+    let cp: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(cp["task"]["goal"], "Fix transcript normalization retry", "{out}");
+    assert_eq!(cp["task"]["bead"], "b7", "{out}");
+    // rehydration renders the goal
+    let loaded = run_ok(&dir, &["checkpoint", "load", "--inject"]);
+    assert!(loaded.contains("Fix transcript normalization retry"), "{loaded}");
+}
+
+#[test]
 fn atlas_describes_system_accurately() {
     // Wave 2 QA: the agent should be able to explain the system from the
     // atlas alone — purpose, architecture, flows, ownership, contracts,

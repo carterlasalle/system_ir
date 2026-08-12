@@ -52,6 +52,41 @@ fn beads_import_and_task_enrichment() {
 }
 
 #[test]
+fn import_bumps_evidence_epoch_and_invalidates_cached_context() {
+    // P0: an evidence import must change the model epoch so cached packs
+    // are never served with the pre-import facts missing. Uses the
+    // hindsight enrichment (STORE-backed — unlike beads, which reads the
+    // file directly) so the imported facts are the observable difference.
+    let repo = tempfile::TempDir::new().unwrap();
+    let root = workdir(repo.path());
+    std::fs::create_dir_all(root.join(".scc")).unwrap();
+    std::fs::write(root.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join(".scc/config.yaml"),
+        "schema: 1\nintegrations:\n  hindsight: true\n",
+    )
+    .unwrap();
+    run_ok(&root, &["index", "--quiet"]);
+
+    let before = run_ok(&root, &["context", "task", "helper"]);
+    assert!(!before.contains("HINDSIGHT LESSONS"), "{before}");
+
+    let lessons = root.join("lessons.jsonl");
+    std::fs::write(
+        &lessons,
+        "{\"id\":\"l1\",\"text\":\"root cause: sqlite busy_timeout\",\"created_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    run_ok(&root, &["import", "hindsight", "lessons.jsonl"]);
+
+    let after = run_ok(&root, &["context", "task", "helper"]);
+    assert!(
+        after.contains("HINDSIGHT LESSONS"),
+        "import must invalidate the cached pack: {after}"
+    );
+}
+
+#[test]
 fn hindsight_import_and_lesson_enrichment() {
     let repo = tempfile::TempDir::new().unwrap();
     let root = workdir(repo.path());

@@ -353,21 +353,13 @@ pub fn compile_flows(
             }
         }
 
-        // collapse consecutive same-actor steps into one
-        let mut collapsed: Vec<(String, String)> = Vec::new();
-        for (actor, op) in steps {
-            if let Some((pa, po)) = collapsed.last_mut() {
-                if pa == &actor {
-                    po.push_str(", ");
-                    po.push_str(&op);
-                    continue;
-                }
-            }
-            collapsed.push((actor, op));
-        }
-
+        // Each operation is its own step (P1 §20): collapsing consecutive
+        // same-actor operations into a comma-joined string destroyed the
+        // per-operation evidence keys and produced text that looked like
+        // branching. Canonical per-operation steps keep provenance and
+        // evidence attached.
         let mut fsteps: Vec<FlowStep> = Vec::new();
-        for (i, (actor, op)) in collapsed.iter().enumerate() {
+        for (i, (actor, op)) in steps.iter().enumerate() {
             let meta = step_evidence.get(&(actor.clone(), op.clone()));
             let prov = meta.map(|(p, _)| *p);
             let ev = meta.map(|(_, e)| e.clone()).unwrap_or_default();

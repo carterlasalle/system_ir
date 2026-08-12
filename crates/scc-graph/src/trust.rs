@@ -9,6 +9,7 @@
 //! - No transformation may strengthen a claim: the view only *filters*, it
 //!   never rewrites provenance.
 
+use crate::components::parse_prov;
 use crate::RealityGraph;
 use scc_core::{Entity, Flow, Invariant, Provenance, Relationship};
 use scc_store::Store;
@@ -241,10 +242,24 @@ impl<'a> TrustedGraphView<'a> {
         v
     }
 
-    // ---- derived tables (staleness-filtered) ----
+    // ---- derived tables (staleness + policy filtered) ----
 
-    /// Staleness-filtered flows. A flow is stale when any of its steps'
-    /// evidence is stale.
+    /// Whether a derived claim passes the trust policy. `None` provenance
+    /// (compilers that never recorded one) is treated as extracted-grade;
+    /// INFERRED claims use the provenance's default confidence when no
+    /// explicit confidence exists.
+    fn claim_allowed(&self, prov: Option<Provenance>) -> bool {
+        match prov {
+            None => true,
+            Some(p) => self.policy.allows(p, p.default_confidence()),
+        }
+    }
+
+    /// Staleness + policy filtered flows. A flow is stale when any step's
+    /// evidence is stale; steps whose provenance the policy rejects
+    /// (INFERRED below the confidence floor) are removed, and a flow left
+    /// with fewer than two steps is dropped — a low-confidence derived
+    /// interpretation must never reach the atlas as architecture.
     pub fn flows(&self) -> Vec<Flow> {
         let mut out: Vec<Flow> = Vec::new();
         for f in &self.graph.flows {
@@ -252,24 +267,46 @@ impl<'a> TrustedGraphView<'a> {
                 .steps
                 .iter()
                 .any(|s| s.evidence.iter().any(|ev| self.stale_evidence.contains(ev)));
-            if !stale {
-                out.push(f.clone());
+            if stale {
+                continue;
             }
+            let mut steps: Vec<scc_core::FlowStep> = Vec::new();
+            for s in &f.steps {
+                if !self.claim_allowed(s.provenance) {
+                    continue;
+                }
+                steps.push(s.clone());
+            }
+            if steps.is_empty() {
+                continue;
+            }
+            let mut nf = f.clone();
+            nf.steps = steps;
+            out.push(nf);
         }
         out
     }
 
+    /// Staleness + policy filtered invariants.
     pub fn invariants(&self) -> Vec<Invariant> {
         let mut out: Vec<Invariant> = Vec::new();
         for i in &self.graph.invariants {
             let stale = i.evidence.iter().any(|ev| self.stale_evidence.contains(ev));
-            if !stale {
-                out.push(i.clone());
+            if stale {
+                continue;
             }
+            if !self.claim_allowed(i.provenance) {
+                continue;
+            }
+            out.push(i.clone());
         }
         out
     }
 
+    /// Staleness + policy filtered components: responsibility/ownership/
+    /// dependency CLAIMS rejected by the policy are removed from the
+    /// attributes, so `include_low_confidence_inference: false` really
+    /// means low-confidence inferred claims never appear in the atlas.
     pub fn components(&self) -> Vec<Entity> {
         let mut out: Vec<Entity> = Vec::new();
         for c in &self.graph.components {
@@ -277,9 +314,43 @@ impl<'a> TrustedGraphView<'a> {
                 .evidence
                 .iter()
                 .any(|ev| self.stale_evidence.contains(ev));
-            if !stale {
-                out.push(c.clone());
+            if stale {
+                continue;
             }
+            let mut nc = c.clone();
+            let attr_claims = |v: &serde_json::Value, prov_key: &str| -> Option<serde_json::Value> {
+                let arr = v.as_array()?;
+                let kept: Vec<&serde_json::Value> = arr
+                    .iter()
+                    .filter(|claim| {
+                        let prov = claim
+                            .get(prov_key)
+                            .and_then(|p| p.as_str())
+                            .map(parse_prov);
+                        let conf = claim
+                            .get("confidence")
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(1.0);
+                        match prov {
+                            None => true,
+                            Some(p) => self.policy.allows(p, conf),
+                        }
+                    })
+                    .collect();
+                if kept.len() == arr.len() {
+                    None // unchanged
+                } else {
+                    Some(serde_json::Value::Array(kept.into_iter().cloned().collect()))
+                }
+            };
+            for key in ["responsibility", "owns", "depends_on"] {
+                if let Some(v) = nc.attributes.get(key).cloned() {
+                    if let Some(filtered) = attr_claims(&v, "provenance") {
+                        nc.attributes.insert(key.to_string(), filtered);
+                    }
+                }
+            }
+            out.push(nc);
         }
         out
     }
@@ -387,6 +458,92 @@ mod tests {
         let warns = v.stale_warnings();
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("main.py"));
+    }
+
+    #[test]
+    fn policy_filters_derived_claims_not_just_relationships() {
+        // P0: include_low_confidence_inference: false must strip
+        // low-confidence INFERRED claims from derived flows/components —
+        // not only from raw relationships.
+        let (store, _d) = setup();
+        let mut flow = Flow {
+            id: "repo://r/flow/f1".into(),
+            kind: scc_core::FlowKind::Lifecycle,
+            name: "svc-lifecycle".into(),
+            trigger: None,
+            steps: vec![
+                scc_core::FlowStep {
+                    id: "step:1".into(),
+                    order: 1,
+                    actor: "repo://r/component/svc".into(),
+                    operation: "svc".into(),
+                    condition: None,
+                    r#async: None,
+                    timeout_ms: None,
+                    retry_policy: None,
+                    failure_outcome: None,
+                    provenance: Some(Provenance::Inferred),
+                    evidence: vec![],
+                },
+                scc_core::FlowStep {
+                    id: "step:2".into(),
+                    order: 2,
+                    actor: "repo://r/component/svc".into(),
+                    operation: "advance".into(),
+                    condition: None,
+                    r#async: None,
+                    timeout_ms: None,
+                    retry_policy: None,
+                    failure_outcome: None,
+                    provenance: Some(Provenance::Inferred),
+                    evidence: vec![],
+                },
+            ],
+            attributes: Default::default(),
+        };
+        let _ = &mut flow;
+
+        // a component carrying a low-confidence inferred responsibility
+        let mut comp = entity("repo://r/component/svc", "component", vec![]);
+        comp.attributes.insert(
+            "responsibility".into(),
+            serde_json::json!([
+                {"text": "Handles GET /api/x", "provenance": "RESOLVED", "confidence": 1.0},
+                {"text": "Hosts the svc code module", "provenance": "INFERRED", "confidence": 0.5}
+            ]),
+        );
+        let graph = RealityGraph {
+            repo_id: "r".into(),
+            entities: Default::default(),
+            out: Default::default(),
+            inn: Default::default(),
+            components: vec![comp.clone()],
+            flows: vec![flow.clone()],
+            invariants: vec![],
+        };
+
+        // default policy (floor 0.85): inferred steps and claims vanish
+        let v = view(&store, &graph, &[]);
+        let flows = v.flows();
+        assert!(flows.is_empty(), "inferred lifecycle must not survive: {flows:?}");
+        let comps = v.components();
+        assert_eq!(comps.len(), 1);
+        let resp = comps[0].attributes["responsibility"].as_array().unwrap();
+        assert_eq!(resp.len(), 1, "low-confidence inferred claim filtered: {resp:?}");
+        assert_eq!(resp[0]["provenance"], "RESOLVED");
+
+        // explicit floor 0.0 keeps labeled inference
+        let v = TrustedGraphView::new(
+            &graph,
+            &store,
+            &[],
+            TrustPolicy::default().with_inferred_floor(0.0),
+        );
+        assert_eq!(v.flows().len(), 1, "floor 0 keeps the inferred lifecycle");
+        assert_eq!(
+            v.components()[0].attributes["responsibility"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]

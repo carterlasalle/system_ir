@@ -150,9 +150,40 @@ fn mcp_unknown_tool_returns_error() {
 #[test]
 fn context_parity_across_cli_http_mcp() {
     // P0 §10: transport must not change semantic quality — the same
-    // task_context request yields the same pack content on CLI, HTTP, MCP.
+    // task_context request yields the same pack content on CLI, HTTP, MCP,
+    // WITH embeddings + beads + hindsight ALL enabled (the transports must
+    // agree on the enriched pack, not just the default-config pack).
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());
+    // beads task state + hindsight lessons + inference path (loopback
+    // endpoint that fails closed to lexical ranking — parity must hold
+    // through the same ranker decision on every transport). The config is
+    // written FIRST so every transport sees hindsight enabled.
+    let port = 20000 + (std::process::id() % 20000) as u16;
+    let addr = format!("127.0.0.1:{port}");
+    std::fs::create_dir_all(dir.join(".scc")).unwrap();
+    std::fs::create_dir_all(dir.join(".beads")).unwrap();
+    std::fs::write(
+        dir.join(".scc/config.yaml"),
+        format!(
+            "schema: 1\nindex:\n  watch: false\ninference:\n  enabled: true\n  provider: local\n  base_url: http://127.0.0.1:1\nintegrations:\n  hindsight: true\nsecurity:\n  listen: {addr}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".beads/issues.jsonl"),
+        "{\"id\":\"b1\",\"title\":\"Fix normalization retry\",\"status\":\"in_progress\",\"dependencies\":[]}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".scc/lessons.jsonl"),
+        "{\"id\":\"l1\",\"text\":\"raw transcripts are immutable\",\"created_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    run_ok(
+        &dir,
+        &["import", "hindsight", ".scc/lessons.jsonl"],
+    );
     run_ok(&dir, &["index", "--quiet"]);
     let goal = "change transcript normalization";
 
@@ -160,15 +191,14 @@ fn context_parity_across_cli_http_mcp() {
     let cli_json = run_ok(&dir, &["context", "task", "--json", goal]);
     let cli: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
     let cli_content = cli["content"].as_str().unwrap().to_string();
-
-    // HTTP daemon
-    let port = 20000 + (std::process::id() % 20000) as u16;
-    let addr = format!("127.0.0.1:{port}");
-    std::fs::write(
-        dir.join(".scc/config.yaml"),
-        format!("schema: 1\nindex:\n  watch: false\nsecurity:\n  listen: {addr}\n"),
-    )
-    .unwrap();
+    assert!(
+        cli_content.contains("ACTIVE TASK STATE"),
+        "beads enrichment present on CLI: {cli_content}"
+    );
+    assert!(
+        cli_content.contains("HINDSIGHT LESSONS"),
+        "hindsight enrichment present on CLI: {cli_content}"
+    );
     let mut child = Command::new(scc())
         .arg("serve")
         .current_dir(&dir)

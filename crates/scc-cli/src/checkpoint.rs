@@ -75,6 +75,12 @@ pub fn capture(root: &Path) -> crate::Result<Checkpoint> {
         created_at: scc_core::now_rfc3339(),
         ..Default::default()
     };
+    // goal/bead come from the active Beads task (task state, not system
+    // facts — the checkpoint is transient session state, §126)
+    if let Some((bead, goal)) = scc_indexer::adapters::beads::active_bead(root) {
+        cp.task.bead = Some(bead);
+        cp.task.goal = goal;
+    }
     if !modified.is_empty() {
         let graph = scc_graph::RealityGraph::load(&store)?;
         let view = scc_graph::TrustedGraphView::new(

@@ -154,14 +154,17 @@ pub fn cmd_context_task(
     Ok(())
 }
 
-/// Task pack as JSON (used by the benchmark harness and integrations).
-pub fn cmd_context_task_json(
+/// THE one task-context pipeline (P0 parity): semantic rankers + beads
+/// task state + hindsight lessons applied identically on every transport.
+/// CLI, MCP, and HTTP all call this — transport cannot change semantic
+/// quality.
+pub fn build_task_pack(
     root: &Path,
     goal: &str,
     files: &[String],
     symbols: &[String],
     budget: Option<usize>,
-) -> crate::Result<String> {
+) -> crate::Result<scc_context::ContextPack> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
@@ -207,7 +210,20 @@ pub fn cmd_context_task_json(
             }
         }
     }
-    Ok(serde_json::to_string_pretty(&pack)?)
+    Ok(pack)
+}
+
+/// Task pack as JSON (used by the benchmark harness and integrations).
+pub fn cmd_context_task_json(
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: Option<usize>,
+) -> crate::Result<String> {
+    Ok(serde_json::to_string_pretty(&build_task_pack(
+        root, goal, files, symbols, budget,
+    )?)?)
 }
 
 /// `scc context docs <dependency>` — external library docs via Context7
@@ -714,8 +730,13 @@ pub fn cmd_import(root: &Path, format: &str, file: &str) -> crate::Result<()> {
         }
     }
     .map_err(crate::CliError::Other)?;
+    // P0: imported evidence changes system truth — bump the evidence model
+    // epoch (invalidating every epoch-keyed context pack/atlas) and
+    // recompile the derived layer so flows/components reflect the new facts.
+    store.bump_epoch(scc_store::ModelEpochKind::Evidence)?;
+    crate::recompile(&store)?;
     println!(
-        "imported {} symbols, {} calls, {} imports ({} errors)",
+        "imported {} symbols, {} calls, {} imports ({} errors); evidence epoch bumped, derived layer recompiled",
         report.symbols, report.calls, report.imports, report.errors
     );
     Ok(())

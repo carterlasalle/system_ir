@@ -151,13 +151,21 @@ pub fn compile_boundaries(graph: &RealityGraph, store: &Store) -> Result<Vec<(Re
 
 /// Human-readable, sorted list of boundary crossings in the form
 /// `"unitA/compA -> unitB/compB"` (external crossings read
-/// `"unit/comp -> external/name"`), for `verify`/CLI display.
+/// `"unit/comp -> external/name"`), for `verify`/CLI/Atlas display.
+///
+/// P0 correctness: this is a PURE READ of the STORED `CROSSES_BOUNDARY`
+/// relationships (inserted by `compile_boundaries` during recompile). It
+/// never mutates the database — context generation must be side-effect free.
+/// An atlas/verify run on an un-recompiled store shows the last compiled
+/// crossings; run `scc index` (or the pipeline) to refresh them.
 pub fn boundary_crossings(graph: &RealityGraph, store: &Store) -> Result<Vec<String>> {
-    let crossings = compile_boundaries(graph, store)?;
     let units = unit_dirs(graph);
     let comps = store.components()?;
     let mut lines: Vec<String> = Vec::new();
-    for (rel, _src) in crossings {
+    for rel in store.all_relationships()? {
+        if rel.predicate != scc_core::predicates::CROSSES_BOUNDARY {
+            continue;
+        }
         let Some(subj) = graph.entity(&rel.subject) else {
             continue;
         };
@@ -292,6 +300,34 @@ mod tests {
     }
 
     #[test]
+    fn display_does_not_mutate_the_store() {
+        // P0 regression: boundary_crossings() is a pure read. Calling it
+        // (atlas/verify) must not delete or add relationships.
+        let (store, _t) = store_with();
+        let _comps = setup_basic(&store);
+        let graph = RealityGraph::load(&store).unwrap();
+
+        let before = store.all_relationships().unwrap().len();
+        let lines = boundary_crossings(&graph, &store).unwrap();
+        let after = store.all_relationships().unwrap().len();
+        assert_eq!(before, after, "display must not mutate the store");
+        // the display shows the STORED crossings — none until the pipeline
+        // compiles them, so an un-recompiled store renders empty
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // after the pipeline compiles, the display renders them without
+        // touching the database again
+        crate::recompile(&store).unwrap();
+        let after_compile = store.all_relationships().unwrap().len();
+        assert!(after_compile > before, "compile inserts crossings");
+        let before2 = store.all_relationships().unwrap().len();
+        let lines2 = boundary_crossings(&graph, &store).unwrap();
+        let after2 = store.all_relationships().unwrap().len();
+        assert_eq!(before2, after2, "display must not mutate the store (2)");
+        assert!(!lines2.is_empty(), "compiled crossings render: {lines2:?}");
+    }
+
+    #[test]
     fn crossings_only_across_units() {
         let (store, _t) = store_with();
         let comps = setup_basic(&store);
@@ -410,6 +446,11 @@ mod tests {
             .unwrap();
 
         let graph = RealityGraph::load(&store).unwrap();
+        // display is a pure read of stored crossings: compile first
+        let crossings = compile_boundaries(&graph, &store).unwrap();
+        for (rel, src) in crossings {
+            store.insert_relationship(&rel, &src).unwrap();
+        }
         let lines = boundary_crossings(&graph, &store).unwrap();
         assert_eq!(
             lines,

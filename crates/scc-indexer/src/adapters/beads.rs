@@ -175,6 +175,17 @@ pub fn import_beads(store: &Store, path: &std::path::Path) -> Result<BeadsReport
 
 /// Read active bead titles from a repo's `.beads/issues.jsonl` (for task-pack
 /// enrichment). Returns up to `limit` active task titles.
+/// The first active bead as `(id, title)` — the working goal for
+/// checkpoints (docs §126: the goal field is populated from task state).
+pub fn active_bead(root: &std::path::Path) -> Option<(String, String)> {
+    let path = root.join(".beads/issues.jsonl");
+    let text = std::fs::read_to_string(&path).ok()?;
+    parse_records(&text)
+        .into_iter()
+        .find(|b| b.is_active())
+        .map(|b| (b.display_id(), b.display_title()))
+}
+
 pub fn active_beads(root: &std::path::Path, limit: usize) -> Vec<String> {
     let path = root.join(".beads/issues.jsonl");
     let Ok(text) = std::fs::read_to_string(&path) else {

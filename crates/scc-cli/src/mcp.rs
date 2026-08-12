@@ -222,10 +222,16 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
                 .map(|b| b as usize);
-            Ok(comp
-                .ctx()
-                .task_context(&goal, &arr_arg("files"), &arr_arg("symbols"), budget)
-                .content)
+            // P0 parity: the SAME enriched pipeline as CLI/HTTP (rankers +
+            // beads + hindsight), so transport cannot change quality.
+            let pack = crate::commands::build_task_pack(
+                root,
+                &goal,
+                &arr_arg("files"),
+                &arr_arg("symbols"),
+                budget,
+            )?;
+            Ok(pack.content)
         }
         "component_context" => {
             let id = str_arg("component");
