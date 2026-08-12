@@ -425,7 +425,11 @@ pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
 
     let mut static_set: BTreeSet<String> = BTreeSet::new();
     for rel in rels {
-        if rel.predicate != predicates::CALLS || rel.provenance != Provenance::Resolved {
+        // evidence-grade static edges: EXTRACTED (native candidates) and
+        // RESOLVED (LSP/SCIP proof)
+        if rel.predicate != predicates::CALLS
+            || !matches!(rel.provenance, Provenance::Extracted | Provenance::Resolved)
+        {
             continue;
         }
         if !rel.subject.contains("/symbol/") || !rel.object.contains("/symbol/") {

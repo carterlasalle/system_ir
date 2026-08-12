@@ -302,7 +302,7 @@ pub fn resolve_calls(
                             caller_id,
                             callee_id: Some(scc_core::symbol_id(repo_id, path, &m.name)),
                             callee_name: call.callee.clone(),
-                            provenance: scc_core::Provenance::Resolved,
+                            provenance: scc_core::Provenance::Extracted,
                             confidence: 0.98,
                             line: call.line,
                         });
@@ -328,7 +328,7 @@ pub fn resolve_calls(
                     caller_id,
                     callee_id: Some(scc_core::symbol_id(repo_id, path, &sym.name)),
                     callee_name: call.callee.clone(),
-                    provenance: scc_core::Provenance::Resolved,
+                    provenance: scc_core::Provenance::Extracted,
                     confidence: 0.99,
                     line: call.line,
                 });
@@ -378,7 +378,7 @@ pub fn resolve_calls(
                 caller_id,
                 callee_id,
                 callee_name: call.callee.clone(),
-                provenance: scc_core::Provenance::Resolved,
+                provenance: scc_core::Provenance::Extracted,
                 confidence: 0.95,
                 line: call.line,
             });
@@ -398,7 +398,7 @@ pub fn resolve_calls(
                         caller_id,
                         callee_id: Some(id.clone()),
                         callee_name: call.callee.clone(),
-                        provenance: scc_core::Provenance::Resolved,
+                        provenance: scc_core::Provenance::Extracted,
                         confidence: 0.97,
                         line: call.line,
                     });
@@ -429,7 +429,7 @@ pub fn resolve_calls(
                         caller_id,
                         callee_id: Some(mid.clone()),
                         callee_name: call.callee.clone(),
-                        provenance: scc_core::Provenance::Resolved,
+                        provenance: scc_core::Provenance::Extracted,
                         confidence: 0.9,
                         line: call.line,
                     });
@@ -497,7 +497,7 @@ mod tests {
         let resolved = resolve_calls("a.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "a.py", "normalize")));
-        assert_eq!(resolved[0].provenance, scc_core::Provenance::Resolved);
+        assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted, "native resolution is evidence-grade (candidate), never RESOLVED (section 26)");
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub struct Config {
 pub struct IndexConfig {
     pub ignore: Vec<String>,
     pub watch: bool,
+    /// Run the language-aware semantic backends (pyright, tsserver) after
+    /// every index, before the derived layer compiles (Wave 4 §24).
+    pub auto_resolve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +155,7 @@ impl Default for IndexConfig {
                 "coverage/**".into(),
             ],
             watch: true,
+            auto_resolve: false,
         }
     }
 }

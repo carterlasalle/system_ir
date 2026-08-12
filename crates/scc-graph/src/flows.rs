@@ -128,7 +128,9 @@ pub(crate) fn walk_calls(
         let call_targets: Vec<String> = graph
             .out_pred(&sym, scc_core::predicates::CALLS)
             .into_iter()
-            .filter(|r| r.provenance == Provenance::Resolved)
+            // evidence-grade edges only: EXTRACTED (native candidates) and
+            // RESOLVED (LSP/SCIP proof) — never INFERRED/STALE
+            .filter(|r| matches!(r.provenance, Provenance::Extracted | Provenance::Resolved))
             .map(|r| r.object.clone())
             .collect();
         if call_targets.is_empty() {

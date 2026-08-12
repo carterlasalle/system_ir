@@ -360,6 +360,7 @@ mod tests {
         let cfg = IndexConfig {
             ignore: vec!["vendor/**".into(), "generated/**".into()],
             watch: true,
+            auto_resolve: false,
         };
         assert!(is_ignored("vendor/foo/bar.py", &cfg));
         assert!(is_ignored("generated/x.ts", &cfg));

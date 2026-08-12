@@ -24,6 +24,7 @@ pub mod model;
 pub mod python;
 pub mod redact;
 pub mod resolve;
+pub mod resolver;
 pub mod runtime;
 pub mod scan;
 pub mod typescript;
@@ -678,10 +679,15 @@ mod tests {
         let stats = idx.store.stats().unwrap();
         assert_eq!(stats["symbols"], 2);
         let rels = idx.store.all_relationships().unwrap();
+        // §26: native resolution is evidence-grade (EXTRACTED candidate),
+        // never RESOLVED — semantic engines (LSP/SCIP) provide RESOLVED
         assert!(
             rels.iter().any(|r| r.predicate == scc_core::predicates::CALLS
-                && r.provenance == scc_core::Provenance::Resolved),
-            "expected a resolved call edge"
+                && matches!(
+                    r.provenance,
+                    scc_core::Provenance::Extracted | scc_core::Provenance::Resolved
+                )),
+            "expected an evidence-grade call edge"
         );
     }
 

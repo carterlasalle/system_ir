@@ -34,6 +34,10 @@ enum Commands {
         paths: Vec<String>,
         #[arg(long)]
         quiet: bool,
+        /// Run the language-aware semantic backends before recompiling
+        /// (Wave 4 lazy resolution: pyright + typescript-language-server)
+        #[arg(long)]
+        resolve: bool,
     },
 
     /// Show index status, stats, and freshness
@@ -75,6 +79,9 @@ enum Commands {
         budget: Option<usize>,
         #[arg(long)]
         json: bool,
+        /// Resolve unresolved call edges through the language backends first
+        #[arg(long)]
+        resolve: bool,
     },
 
     /// Verify freshness, evidence integrity, and drift
@@ -271,6 +278,9 @@ enum ContextSub {
         /// context.inject_task_focus is enabled; caps the focus budget.
         #[arg(long, hide = true)]
         hook: bool,
+        /// Resolve unresolved call edges through the language backends first
+        #[arg(long)]
+        resolve: bool,
     },
     /// Component context pack
     Component {
@@ -361,8 +371,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match cli.command {
         Commands::Init => commands::cmd_init(&root),
-        Commands::Index { paths, quiet } => {
-            if paths.is_empty() {
+        Commands::Index { paths, quiet, resolve } => {
+            if resolve {
+                commands::cmd_index(&root, quiet)?;
+                let rep = scc_cli::resolve_and_recompile(&root)?;
+                if !quiet {
+                    println!(
+                        "resolved: {} upgraded, {} unresolved, {} errors",
+                        rep.upgraded, rep.unresolved, rep.errors
+                    );
+                }
+                Ok(())
+            } else if paths.is_empty() {
                 commands::cmd_index(&root, quiet)
             } else {
                 commands::cmd_index_paths(&root, &paths, quiet)
@@ -372,7 +392,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => commands::cmd_watch(&root),
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {
-            ContextSub::Task { goal, files, symbols, budget, json, hook } => {
+            ContextSub::Task { goal, files, symbols, budget, json, hook, resolve } => {
+                if resolve {
+                    let rep = scc_cli::resolve_and_recompile(&root)?;
+                    eprintln!(
+                        "resolved: {} upgraded, {} unresolved, {} errors",
+                        rep.upgraded, rep.unresolved, rep.errors
+                    );
+                }
                 commands::cmd_context_task(&root, &goal, &files, &symbols, budget, json, hook)
             }
             ContextSub::Component { id, json } => commands::cmd_context_component(&root, &id, json),
@@ -401,7 +428,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Impact { diff, files, symbols, json } => {
             commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json)
         }
-        Commands::Atlas { budget, json } => commands::cmd_atlas(&root, budget, json),
+        Commands::Atlas { budget, json, resolve } => {
+            if resolve {
+                let rep = scc_cli::resolve_and_recompile(&root)?;
+                eprintln!(
+                    "resolved: {} upgraded, {} unresolved, {} errors",
+                    rep.upgraded, rep.unresolved, rep.errors
+                );
+            }
+            commands::cmd_atlas(&root, budget, json)
+        }
         Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
         Commands::Drift { json } => commands::cmd_drift(&root, json),
         Commands::Export { format } => commands::cmd_export(&root, &format),

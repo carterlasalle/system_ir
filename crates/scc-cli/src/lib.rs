@@ -173,6 +173,30 @@ pub fn index_and_recompile(root: &Path, config: &Config) -> Result<scc_indexer::
     let indexer = scc_indexer::Indexer::new(open_store(root)?, config.clone());
     let report = indexer.index()?;
     let store = open_store(root)?;
+    // Wave 4 §24 lazy semantic enrichment: when auto_resolve is on, run the
+    // language-aware backends (pyright/tsserver) before the derived layer
+    // compiles, so flows/atlas see RESOLVED edges.
+    if config.index.auto_resolve {
+        let _ = scc_indexer::resolver::resolve_repository(
+            &store,
+            root,
+            scc_indexer::resolver::MAX_CALL_SITES,
+        );
+    }
+    recompile(&store)?;
+    Ok(report)
+}
+
+/// Run semantic resolution on demand (`--resolve`), then recompile the
+/// derived layer so graphs/flows/atlas reflect the promoted edges.
+pub fn resolve_and_recompile(root: &Path) -> Result<scc_indexer::resolver::ResolveReport> {
+    let store = open_store(root)?;
+    let report = scc_indexer::resolver::resolve_repository(
+        &store,
+        root,
+        scc_indexer::resolver::MAX_CALL_SITES,
+    )
+    .map_err(CliError::Other)?;
     recompile(&store)?;
     Ok(report)
 }

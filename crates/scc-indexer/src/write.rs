@@ -106,8 +106,11 @@ impl<'a> Writer<'a> {
                 }
             };
             let target_id = entity_id(self.repo_id, kind, key);
+            // §26: native module-graph resolution is a deterministic
+            // candidate (EXTRACTED), never RESOLVED — only compiler/LSP/SCIP
+            // proof promotes an edge to RESOLVED.
             let provenance = match &ri.target {
-                crate::resolve::ImportTarget::Internal { .. } => Provenance::Resolved,
+                crate::resolve::ImportTarget::Internal { .. } => Provenance::Extracted,
                 crate::resolve::ImportTarget::External { .. } => Provenance::Extracted,
             };
             let ev = self.ev(path, "import", &ri.module, ri.line);

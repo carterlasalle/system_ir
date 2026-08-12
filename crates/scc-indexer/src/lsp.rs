@@ -615,6 +615,10 @@ impl LspResolver {
         store
             .insert_relationship(&new_rel, file)
             .map_err(|e| e.to_string())?;
+        // semantic truth changed — epoch-keyed context caches must miss
+        store
+            .bump_epoch(scc_store::ModelEpochKind::Semantic)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

@@ -153,14 +153,14 @@ pub fn compile_flow_graphs(
         syms.insert(ep.symbol_id.clone());
         for sym in syms {
             for r in graph.out_pred(&sym, scc_core::predicates::CALLS) {
-                if r.provenance == Provenance::Resolved {
+                if matches!(r.provenance, Provenance::Extracted | Provenance::Resolved) {
                     successors
                         .entry(sym.clone())
                         .or_default()
                         .insert(r.object.clone());
                     let key = (sym.clone(), r.object.clone());
                     let entry = call_rel.entry(key).or_insert((r.provenance, Vec::new()));
-                    entry.0 = Provenance::Resolved;
+                    entry.0 = r.provenance;
                     for e in &r.evidence {
                         if !entry.1.contains(e) {
                             entry.1.push(e.clone());
