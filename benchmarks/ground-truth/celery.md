@@ -1,17 +1,15 @@
 # celery
 > https://github.com/celery/celery | Python | queue+events | ~102k LOC
 
-## components
+## architecture
 - Celery — the application class in celery/app/base.py (line 252), central registry for tasks/config
 - Task — task base class in celery/app/task.py (line 206), executed by workers
-- Context — Task.request variable container (celery/app/task.py line 75)
 - Signature — task signature (args/kwargs/options) in celery/canvas.py (line 234)
 - group — parallel task group primitive (celery/canvas.py line 1493)
 - chain — sequential task chain primitive (celery/canvas.py line 1323)
 - chord — barrier primitive with header + body (celery/canvas.py _chord, line 1972)
 - AsyncResult — task result handle in celery/result.py (line 70)
 - GroupResult — group result handle (celery/result.py line 930)
-- crontab — cron-style schedule in celery/schedules.py (line 331)
 - WorkController — unmanaged worker instance (celery/worker/worker.py line 63)
 - RedisBackend — redis result backend (celery/backends/redis.py, __all__ line 38)
 - RPCBackend — amqp-based result backend (celery/backends/rpc.py line 154)
@@ -28,7 +26,7 @@
 - app.start — runs the celery CLI with argv (celery/app/base.py line 480)
 - celery -A proj worker — CLI invocation documented in examples/app/myapp.py line 16
 
-## flows
+## behavior
 - apply_async — task dispatch path first step (`apply_async -> send_task -> broker publish`, celery/app/task.py -> base.py)
 - task.retry — re-queues the task with countdown/eta (celery/app/task.py line 767)
 - chord header -> add_unlock_chord_task — fallback chord join via 'celery.chord_unlock' builtin (celery/app/builtins.py line 37)
@@ -36,7 +34,7 @@
 - Scheduler — beat scheduling path first step (`Scheduler -> ScheduleEntry -> apply_async`, celery/beat.py line 82)
 - worker consumer -> task.run — worker executes the Task body (celery/app/task.py line 527)
 
-## ownership
+## state_authority
 - app.conf — pending config dict (PendingConfiguration, celery/app/base.py line 208)
 - broker_url — broker connection setting in examples/eventlet/celeryconfig.py (line 10)
 - result_backend — result store setting in examples/gevent/celeryconfig.py (line 10)
@@ -53,6 +51,10 @@
 - broker='amqp://guest@localhost//' — amqp broker URL contract in examples/app/myapp.py (line 31)
 - redis://localhost:6379/0 — redis broker/backend URL in examples/security/mysecureapp.py (line 32)
 - name='celery.accumulate' — builtin task name in celery/app/builtins.py (line 29)
+
+## landmarks
+- Context — Task.request variable container (celery/app/task.py line 75)
+- crontab — cron-style schedule in celery/schedules.py (line 331)
 
 ## tests
 - t/unit/ — unit test suite (app, backends, bin, canvas, worker subdirs)

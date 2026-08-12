@@ -68,10 +68,11 @@ fn bench_atlas_fixtures_fallback_prints_table() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("scc bench atlas"), "{stdout}");
     assert!(stdout.contains("fixtures fallback"), "{stdout}");
-    assert!(stdout.contains("components"), "{stdout}");
-    assert!(stdout.contains("entrypoints"), "{stdout}");
-    assert!(stdout.contains("overall"), "{stdout}");
-    assert!(stdout.contains("http-service-python"), "{stdout}");
+    // v2 report: startup-required layer columns + precision/density/tokens
+    assert!(stdout.contains("arch"), "{stdout}");
+    assert!(stdout.contains("entry"), "{stdout}");
+    assert!(stdout.contains("prec"), "{stdout}");
+    assert!(stdout.contains("f/1k"), "{stdout}");
     assert!(stdout.contains("mean"), "{stdout}");
     assert!(stdout.contains("gate:"), "{stdout}");
     assert!(stdout.contains("PASS") || stdout.contains("FAIL"), "{stdout}");
@@ -124,9 +125,8 @@ fn bench_atlas_corpus_mode_with_explicit_dirs() {
     assert!(stdout.contains("mean"), "{stdout}");
     assert!(stdout.contains("gate:"), "{stdout}");
     assert!(stdout.contains("PASS") || stdout.contains("FAIL"), "{stdout}");
-    // the deliberately nonexistent ground-truth items are reported as missed
     assert!(
-        stdout.contains("ownership:zzz_missing_store"),
+        stdout.contains("state_authority:zzz_missing_store"),
         "missed items must be listed: {stdout}"
     );
 }

@@ -1,17 +1,12 @@
 # mockito
 > https://github.com/mockito/mockito | Java | java service (lib) | ~102k LOC
 
-## components
+## architecture
 - Mockito — facade class in mockito-core/src/main/java/org/mockito/Mockito.java (4096 lines) exposing the static mock/when/verify API
 - MockitoCore — internal engine in mockito-core/src/main/java/org/mockito/internal/MockitoCore.java implementing mock/when/verify/validateMockitoUsage behind the facade
-- ArgumentMatchers — static matcher factory in org/mockito/ArgumentMatchers.java (any, eq, anyString, anyInt, argThat)
-- MockSettings — settings interface built via withSettings() for name/defaultAnswer/extraInterfaces on a mock
-- Answers — enum of default answers incl. RETURNS_DEFAULTS, RETURNS_SMART_NULLS, CALLS_REAL_METHODS
 - MockMaker — SPI interface in org/mockito/plugins/MockMaker.java for pluggable mock-creation backends
 - ByteBuddyMockMaker — default subclass mock maker in internal/creation/bytebuddy/ generating mock classes via Byte Buddy
 - InlineByteBuddyMockMaker — inline mock maker in internal/creation/bytebuddy/ that can mock final classes/types via instrumentation
-- MockUtil — helpers in internal/util/MockUtil.java (isMock, getMockHandler) used across internal and API code
-- MockingProgress — thread-local stubbing/verification state in internal/progress/ driving when()/verify() sequencing
 - MockitoSession — org.mockito.MockitoSession API owning initMocks/strictness/finishMocking lifecycle
 - MockitoExtension — JUnit Jupiter extension in mockito-extensions/mockito-junit-jupiter/ (implements BeforeEachCallback, AfterEachCallback, ParameterResolver)
 
@@ -26,7 +21,7 @@
 - `spy(T object)` — wraps a real instance with CALLS_REAL_METHODS default answer
 - `doReturn(Object toBeReturned)` — Stubber entry for stubbing methods that bypass when() (e.g. void methods)
 
-## flows
+## behavior
 - `mock()` -> MockitoCore.mock -> MockMaker.createMock — creation chain from facade through internal engine to the plugin mock maker
 - `when()` -> MockitoCore.when -> stubbingStarted() -> OngoingStubbing.thenReturn — stubbing flow sequenced by MockingProgress
 - `verify()` -> MockitoCore.verify -> VerificationModeFactory.times(1) — default verification flow
@@ -36,7 +31,7 @@
 - `MockitoExtension.beforeEach` — per-test JUnit setup flow: MockitoSession.startMocking -> initMocks + Strictness.STRICT_STUBS
 - `doThrow(Throwable...)` -> MOCKITO_CORE.stubber() -> Stubber.doThrow — stubber flow for stubbing exceptions on any method
 
-## ownership
+## state_authority
 - MockingProgress — thread-local mocking state owned per thread, reported by mockingProgress() in MockitoCore
 - Plugins — internal/configuration/plugins/Plugins.java registry owning MockMaker/MockitoLogger plugin resolution
 - MockitoSession — owns per-test mocking lifecycle (startMocking/finishMocking) incl. strict stubbing enforcement
@@ -55,6 +50,13 @@
 - `Strictness.STRICT_STUBS` — strict-stubbing quality contract enforced by MockitoSession (unused stubs fail)
 - `MockSettings.extraInterfaces` — contract for making a mock implement additional interfaces
 - `@Captor` — annotation in org/mockito/Captor.java for ArgumentCaptor field initialization
+
+## landmarks
+- ArgumentMatchers — static matcher factory in org/mockito/ArgumentMatchers.java (any, eq, anyString, anyInt, argThat)
+- MockSettings — settings interface built via withSettings() for name/defaultAnswer/extraInterfaces on a mock
+- Answers — enum of default answers incl. RETURNS_DEFAULTS, RETURNS_SMART_NULLS, CALLS_REAL_METHODS
+- MockUtil — helpers in internal/util/MockUtil.java (isMock, getMockHandler) used across internal and API code
+- MockingProgress — thread-local stubbing/verification state in internal/progress/ driving when()/verify() sequencing
 
 ## tests
 - MockitoTest — mockito-core/src/test/java/org/mockito/MockitoTest.java covering core mock/when/verify API

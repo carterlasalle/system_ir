@@ -1,7 +1,7 @@
 # sqlalchemy
 > https://github.com/sqlalchemy/sqlalchemy | Python | db-heavy | ~632k LOC
 
-## components
+## architecture
 - Engine — DB-API wrapper/connection factory in lib/sqlalchemy/engine/base.py (line 2893)
 - Connection — per-call DBAPI connection wrapper with transactions (lib/sqlalchemy/engine/base.py line 90)
 - Session — ORM persistence unit-of-work class in lib/sqlalchemy/orm/session.py (line 1471)
@@ -12,7 +12,6 @@
 - Table — schema table construct (lib/sqlalchemy/sql/schema.py line 328)
 - Column — schema column construct (lib/sqlalchemy/sql/schema.py line 1770)
 - MetaData — collection of Table objects with DDL (lib/sqlalchemy/sql/schema.py line 5788)
-- ForeignKey — column-level referential constraint (lib/sqlalchemy/sql/schema.py line 3036)
 - Pool — abstract connection pool (lib/sqlalchemy/pool/base.py line 156); QueuePool default in pool/impl.py line 44
 - SQLiteDialect — sqlite dialect class with name = "sqlite" (lib/sqlalchemy/dialects/sqlite/base.py line 2102)
 - PGDialect — postgresql dialect class with name = "postgresql" (lib/sqlalchemy/dialects/postgresql/base.py line 3590)
@@ -29,7 +28,7 @@
 - MetaData.create_all — emits CREATE TABLE DDL for all tables (lib/sqlalchemy/sql/schema.py line 6295)
 - registry — declarative class registry (lib/sqlalchemy/orm/decl_api.py line 1165)
 
-## flows
+## behavior
 - create_engine -> Engine.connect -> Connection.execute — core execution path (engine/base.py)
 - Session.execute -> ORMExecuteState — hook state passed to do_orm_execute events (orm/session.py line 257)
 - declarative_base -> Mapper.configure — declarative class config into mapper (orm/decl_base.py _DeclarativeMapperConfig)
@@ -37,7 +36,7 @@
 - Transaction -> commit/rollback — SessionTransaction lifecycle (orm/session.py line 858)
 - QueuePool -> _ConnectionFairy — connection checkout/return proxy (pool/base.py line 1193)
 
-## ownership
+## state_authority
 - engine.pool — the Pool instance owning DBAPI connections (engine/base.py Engine.pool)
 - Session identity map — IdentityMap keyed by instance identity (lib/sqlalchemy/orm/identity.py line 37)
 - MetaData.tables — dict of Table objects owned by the MetaData (sql/schema.py)
@@ -53,6 +52,9 @@
 - select(t1).where(t1.c.c2 == t2.c.c1) — select/where usage in test/aaa_profiling/test_compiler.py (line 73)
 - test_session_commit_rollback — commit/rollback lifecycle test (test/aaa_profiling/test_memusage.py line 1691)
 - name = "sqlite" — dialect URL scheme identifier (lib/sqlalchemy/dialects/sqlite/base.py line 2103)
+
+## landmarks
+- ForeignKey — column-level referential constraint (lib/sqlalchemy/sql/schema.py line 3036)
 
 ## tests
 - test/orm/test_session.py — Session behavior tests

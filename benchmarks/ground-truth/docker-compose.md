@@ -1,17 +1,13 @@
 # docker-compose
 > https://github.com/docker/compose | Go | docker deploy | ~57k LOC
 
-## components
+## architecture
 - composeService — pkg/compose/compose.go central implementation of the compose API (holds dockerCli, clock, prompt)
-- NewComposeService — constructor in pkg/compose/compose.go wiring dockerCli, options, and events into a composeService
 - api.Compose — pkg/api/api.go interface of all compose operations (Build/Pull/Create/Up/Down/Ps/Exec/Logs)
 - types.Project — compose-go project model (github.com/compose-spec/compose-go/v2/types) passed to every operation
 - RootCommand — cmd/compose/compose.go builds the root cobra command tree for `docker compose`
 - pluginMain — cmd/main.go Docker CLI plugin entrypoint (plugin.Run wrapping RootCommand)
-- runUp — cmd/compose/up.go orchestration of create+start for the `up` command
-- Run — pkg/compose/progress.go helper executing an operation with Start/Done events on the event bus
 - EventProcessor — pkg/api/event.go interface notified of compose operations (Start/On/Err)
-- ProjectOptions — cmd/compose/compose.go options struct owning project loading state (shared by up/down/etc.)
 
 ## entrypoints
 - `upCommand` — cobra command `up [OPTIONS] [SERVICE...]` in cmd/compose/up.go
@@ -27,7 +23,7 @@
 - `Up(ctx context.Context, project *types.Project, options api.UpOptions) error` — composeService.Up in pkg/compose/up.go, the core bring-up operation
 - `Down(ctx context.Context, projectName string, options api.DownOptions) error` — composeService.Down in pkg/compose/down.go, the teardown operation
 
-## flows
+## behavior
 - `up` -> composeService.Up -> create -> start — main bring-up flow (up.go calls s.create then s.start)
 - `down` -> composeService.Down -> remove containers/networks — teardown flow in down.go
 - `create` -> createNetwork/createVolume/container creation — create.go provisioning flow
@@ -37,7 +33,7 @@
 - `logs` -> composeService.Logs -> LogConsumer callbacks — log streaming flow
 - `exec` -> composeService.Exec -> run command in container — exec flow
 
-## ownership
+## state_authority
 - composeService — owns dockerCli, clock, prompt, events, and container state for all compose operations
 - types.Project — owns the service/network/volume model (ServiceNames(), WithSelectedServices())
 - api.UpOptions — options struct in pkg/api owning up flags (Detach, noStart, cascadeStop, etc.)
@@ -58,6 +54,12 @@
 - `--detach` — up flag "Detached mode: Run containers in the background" (BoolVarP with -d)
 - `--force-recreate` — up/create flag to recreate containers even if unchanged
 - `--remove-orphans` — up flag to remove containers not defined in the Compose file
+
+## landmarks
+- NewComposeService — constructor in pkg/compose/compose.go wiring dockerCli, options, and events into a composeService
+- runUp — cmd/compose/up.go orchestration of create+start for the `up` command
+- Run — pkg/compose/progress.go helper executing an operation with Start/Done events on the event bus
+- ProjectOptions — cmd/compose/compose.go options struct owning project loading state (shared by up/down/etc.)
 
 ## tests
 - pkg/compose/create_test.go — container-creation unit tests

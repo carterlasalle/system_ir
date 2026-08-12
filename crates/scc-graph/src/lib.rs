@@ -188,11 +188,12 @@ impl<'a> CompilationPipeline<'a> {
         // error.
         let graph = RealityGraph::load(self.store)?;
         let intent = self.store.intent_claims()?;
-        let pairs = cochange::cochange_pairs(
-            &self.store.root,
-            cochange::COCHANGE_MIN_COMMITS,
-        )
-        .map_err(GraphError::Cochange)?;
+        // HEAD-keyed cache in store meta: a cache hit skips the git pass
+        // entirely (second `scc index` at the same HEAD is near-instant);
+        // a miss computes with per-commit caps and persists. Any failure
+        // is non-fatal — empty pairs, same as a non-git repo — so the
+        // atlas/index never waits on git history.
+        let pairs = cochange::cached_cochange_pairs(self.store).unwrap_or_default();
         let comps = components::compile_components(&graph, self.store, &intent, &pairs)?;
         self.store.replace_components(&comps)?;
         cochange::enrich_components(self.store, &pairs).map_err(GraphError::Cochange)?;

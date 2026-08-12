@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use scc_core::{
     Entity, Evidence, Flow, Invariant, Provenance, Relationship, Repository, Severity, Snapshot,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -1480,27 +1480,84 @@ impl Store {
         Ok(out)
     }
 
-    /// Delete evidence records no longer referenced by any entity or
-    /// relationship. Run after the derived layer (components/flows) rebuilds,
-    /// because derived edges may briefly hold references during recompilation.
+    /// Delete evidence records no longer referenced by any entity,
+    /// relationship, component, invariant, flow step, or flow-graph node/
+    /// edge. Run after the derived layer (components/flows) rebuilds,
+    /// because derived edges may briefly hold references during
+    /// recompilation.
     pub fn sweep_orphan_evidence(&self) -> Result<u64> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM evidence e WHERE NOT EXISTS (
-                 SELECT 1 FROM entities x WHERE x.evidence LIKE '%' || e.id || '%'
-             ) AND NOT EXISTS (
-                 SELECT 1 FROM relationships y WHERE y.evidence LIKE '%' || e.id || '%'
-             )",
-        )?;
+        // Set-based pass: collect every referenced evidence id ONCE (exact
+        // id membership in the JSON arrays, no per-row LIKE scans), then
+        // delete evidence rows whose id is not referenced anywhere.
+        let mut referenced: HashSet<String> = HashSet::new();
+
+        // Columns holding JSON arrays of evidence ids.
+        for (table, column) in [
+            ("entities", "evidence"),
+            ("relationships", "evidence"),
+            ("components", "evidence"),
+            ("invariants", "evidence"),
+        ] {
+            let sql = format!("SELECT {column} FROM {table}");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&r?) {
+                    referenced.extend(ids);
+                }
+            }
+            drop(stmt);
+        }
+
+        // flows.steps: array of FlowStep objects, each with an evidence list.
+        {
+            let mut stmt = self.conn.prepare("SELECT steps FROM flows")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                if let Ok(steps) = serde_json::from_str::<Vec<scc_core::FlowStep>>(&r?) {
+                    for step in steps {
+                        referenced.extend(step.evidence);
+                    }
+                }
+            }
+            drop(stmt);
+        }
+
+        // flow_graphs.graph: nodes[].evidence and edges[].evidence arrays.
+        {
+            let mut stmt = self.conn.prepare("SELECT graph FROM flow_graphs")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                if let Ok(g) = serde_json::from_str::<scc_core::FlowGraph>(&r?) {
+                    for node in &g.nodes {
+                        referenced.extend(node.evidence.iter().cloned());
+                    }
+                    for edge in &g.edges {
+                        referenced.extend(edge.evidence.iter().cloned());
+                    }
+                }
+            }
+            drop(stmt);
+        }
+
+        let mut stmt = self.conn.prepare("SELECT id FROM evidence")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut ids: Vec<String> = Vec::new();
+        let mut orphans: Vec<String> = Vec::new();
         for r in rows {
-            ids.push(r?);
+            let id = r?;
+            if !referenced.contains(&id) {
+                orphans.push(id);
+            }
         }
         drop(stmt);
-        let count = ids.len() as u64;
-        for id in ids {
+
+        let count = orphans.len() as u64;
+        // Chunked deletes avoid one giant IN list.
+        for chunk in orphans.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("DELETE FROM evidence WHERE id IN ({placeholders})");
             self.conn
-                .execute("DELETE FROM evidence WHERE id = ?1", params![id])?;
+                .execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
         }
         Ok(count)
     }
@@ -2144,6 +2201,84 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].predicate, "calls");
         assert_eq!(got[0].provenance, Provenance::Resolved);
+    }
+
+    #[test]
+    fn sweep_orphan_evidence_removes_only_unreferenced() {
+        let (s, _d) = tmp_store();
+        // three evidence rows: two referenced (entity, relationship), one not
+        s.insert_evidence(&Evidence::source("evidence:ent", "src/a.py")).unwrap();
+        s.insert_evidence(&Evidence::source("evidence:rel", "src/b.py")).unwrap();
+        s.insert_evidence(&Evidence::source("evidence:orphan", "src/c.py")).unwrap();
+
+        let mut e = Entity::new("repo://r/component/keep", "component", "keep");
+        e.evidence = vec!["evidence:ent".into()];
+        s.insert_entity(&e, &["src/a.py".into()]).unwrap();
+        let rel = Relationship::new(
+            "rel:1",
+            "repo://r/component/keep",
+            "calls",
+            "repo://r/component/other",
+            Provenance::Resolved,
+        )
+        .with_evidence(vec!["evidence:rel".into()]);
+        s.insert_relationship(&rel, "src/b.py").unwrap();
+
+        // sweep: the unreferenced row goes, the referenced rows stay
+        assert_eq!(s.sweep_orphan_evidence().unwrap(), 1);
+        assert!(s.get_evidence("evidence:ent").unwrap().is_some());
+        assert!(s.get_evidence("evidence:rel").unwrap().is_some());
+        assert!(s.get_evidence("evidence:orphan").unwrap().is_none());
+
+        // drop the entity's reference, sweep again: now it becomes an orphan
+        let e2 = Entity::new("repo://r/component/keep", "component", "keep");
+        s.insert_entity(&e2, &["src/a.py".into()]).unwrap();
+        assert_eq!(s.sweep_orphan_evidence().unwrap(), 1);
+        assert!(s.get_evidence("evidence:ent").unwrap().is_none());
+        assert!(s.get_evidence("evidence:rel").unwrap().is_some());
+    }
+
+    #[test]
+    fn sweep_orphan_evidence_keeps_flow_and_component_references() {
+        let (s, _d) = tmp_store();
+        // derived-layer references (flow step + component) must protect
+        // evidence even though entities/relationships no longer mention it
+        s.insert_evidence(&Evidence::source("evidence:flow", "src/a.py")).unwrap();
+        s.insert_evidence(&Evidence::source("evidence:comp", "src/b.py")).unwrap();
+        s.insert_evidence(&Evidence::source("evidence:gone", "src/c.py")).unwrap();
+
+        // component referencing evidence:comp
+        let mut comp = Entity::new("repo://r/component/keep", "component", "keep");
+        comp.evidence = vec!["evidence:comp".into()];
+        s.replace_components(&[comp]).unwrap();
+
+        // flow step referencing evidence:flow
+        let flow = scc_core::Flow {
+            id: "flow:1".into(),
+            kind: scc_core::FlowKind::Workflow,
+            name: "wf".into(),
+            trigger: None,
+            steps: vec![scc_core::FlowStep {
+                id: "step:1".into(),
+                order: 0,
+                actor: "repo://r/component/keep".into(),
+                operation: "run".into(),
+                condition: None,
+                r#async: None,
+                timeout_ms: None,
+                retry_policy: None,
+                failure_outcome: None,
+                provenance: None,
+                evidence: vec!["evidence:flow".into()],
+            }],
+            attributes: Default::default(),
+        };
+        s.replace_flows(&[flow]).unwrap();
+
+        assert_eq!(s.sweep_orphan_evidence().unwrap(), 1);
+        assert!(s.get_evidence("evidence:flow").unwrap().is_some());
+        assert!(s.get_evidence("evidence:comp").unwrap().is_some());
+        assert!(s.get_evidence("evidence:gone").unwrap().is_none());
     }
 
     #[test]

@@ -285,6 +285,12 @@ enum BenchSub {
         /// Emit the full report as JSON (per-repo recall + all missed keys)
         #[arg(long)]
         json: bool,
+        /// Classify every missed ground-truth item by gap kind
+        /// (PARSER/EXTRACTOR/RESOLUTION/COMPILER/PROJECTION/ALIAS) and print
+        /// a per-kind histogram plus per-repo gap lines (the regeneration
+        /// source for benchmarks/results/ground-truth-gaps.md)
+        #[arg(long)]
+        diagnose: bool,
     },
 }
 
@@ -609,9 +615,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 corpus,
                 ground_truth,
                 json,
+                diagnose,
             } => match scc_cli::benchatlas::run_atlas_bench(
                 corpus.as_deref(),
                 ground_truth.as_deref(),
+                diagnose,
             ) {
                 Ok(report) => {
                     if json {
@@ -621,7 +629,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
                         );
                     } else {
-                        scc_cli::benchatlas::print_report(&report);
+                        scc_cli::benchatlas::print_report(&report, diagnose);
                     }
                     Ok(())
                 }

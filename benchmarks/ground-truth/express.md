@@ -1,7 +1,7 @@
 # express
 > https://github.com/expressjs/express | TypeScript/JS | ts backend | ~21k LOC
 
-## components
+## architecture
 - `createApplication` — app factory in lib/express.js; returns the request-handling `app` function
 - `app` — application prototype in lib/application.js; holds settings, router, and view engines
 - `Router` — router constructor re-exported from the external `router` package in lib/express.js
@@ -12,8 +12,6 @@
 - `json` — body-parser JSON middleware re-exported from lib/express.js
 - `urlencoded` — body-parser urlencoded middleware re-exported from lib/express.js
 - `static` — serve-static middleware re-exported from lib/express.js
-- `methods` — lowercased HTTP verb list derived from node:http METHODS in lib/utils.js
-- `app.request` — per-app req/res prototypes created in createApplication
 
 ## entrypoints
 - `require('express')` — package entry index.js which just re-exports lib/express.js
@@ -24,7 +22,7 @@
 - `app.param` — registers route-parameter middleware on the router
 - `exports.application` — prototype export that apps subclass from
 
-## flows
+## behavior
 - `app.use` — middleware registration proxied to the router: `app.use` -> `this.router.use` (application.js)
 - `app.route` -> `router.route` — creates a chainable Route for a path
 - `methods.forEach` -> `app.get` — per-verb handlers delegated to `router.VERB` at module load
@@ -34,7 +32,7 @@
 - `res.redirect` — defaults to status 302 and sets the Location header (response.js)
 - `res.json` — serializes with the `json escape` / `json spaces` settings applied
 
-## ownership
+## state_authority
 - `this.router` — lazily constructed Router owned by the app (getrouter getter in application.js)
 - `this.settings` — app settings store (etag, query parser, trust proxy, view engine)
 - `this.engines` — map of registered template engines
@@ -53,6 +51,10 @@
 - `view engine` — default template engine extension setting
 - `query parser` — query parsing mode setting ('simple' default)
 - `res.status(code)` — integer status setter that throws on non-integer codes
+
+## landmarks
+- `methods` — lowercased HTTP verb list derived from node:http METHODS in lib/utils.js
+- `app.request` — per-app req/res prototypes created in createApplication
 
 ## tests
 - test/app.router.js — core routing behavior suite

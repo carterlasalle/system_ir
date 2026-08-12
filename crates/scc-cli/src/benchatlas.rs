@@ -1,12 +1,37 @@
-//! Atlas recall benchmark (Wave 8 §57): deterministic recall of
-//! independently documented ground truth against the startup System Atlas.
+//! Atlas recall benchmark v2 (Wave 8 §57): structured recall of
+//! independently documented ground truth against the startup System Atlas,
+//! with precision and token-density metrics and per-gap diagnosis.
 //!
-//! For each repo in the corpus: index in place, compile the atlas pack, then
-//! score every ground-truth key string (from `benchmarks/ground-truth/<name>.md`)
-//! as a case-insensitive substring of the atlas content. Per-section recall
-//! (components/entrypoints/flows/ownership/contracts, tests informational),
-//! overall = equal-weighted mean of the five scored sections, and a quality
-//! gate on the overall mean (floor 0.5 — real repos are messy; raise later).
+//! Ground truth is organized into seven layers (the v2 ontology):
+//! `architecture` (components/subsystems the agent must know at startup),
+//! `entrypoints` (invokable surfaces), `behavior` (flows/lifecycles),
+//! `state_authority` (state owners), `contracts` (HTTP/CLI/API contracts),
+//! `landmarks` (symbols one zoom level deeper — informational), and
+//! `tests` (informational). The quality gate is the equal-weighted mean of
+//! the FIVE startup-required layers only (architecture, entrypoints,
+//! behavior, state_authority, contracts) — landmarks/tests are excluded,
+//! which is the anti-bloat guarantee: dumping implementation symbols into
+//! the atlas can no longer inflate the score.
+//!
+//! Scoring is STRUCTURED, not text-substring: each layer is matched against
+//! the machine model (`scc_context::atlas::build_atlas`), not the rendered
+//! text. Item/haystack normalization applies the documented aliases
+//! (`::` -> `.`, `fn X` -> `X`, `./p` -> `p`) so e.g. `Controller::run`
+//! matches a flow step rendered as `Controller.run`.
+//!
+//! v2 metrics:
+//! - `precision`: fraction of canonical flow-graph edges whose (from-op,
+//!   to-op) pair appears — in order — inside some ground-truth `behavior`
+//!   item (a same-item chain step). A pragmatic false-causal proxy: an edge
+//!   the ground truth never describes may be a spurious causal link.
+//! - `density` (startup_facts_per_1k_tokens): matched startup-required
+//!   items per 1000 atlas tokens; `atlas_tokens` per repo is reported too.
+//!
+//! `--diagnose` classifies every missed item by WHERE it disappeared
+//! (PARSER/EXTRACTOR/WRITER/RESOLUTION/COMPILER/PROJECTION/ALIAS) via a
+//! deterministic store->flows->components->text ladder, and prints a
+//! per-kind histogram plus per-repo gap lines (the regeneration source for
+//! `benchmarks/results/ground-truth-gaps.md`).
 //!
 //! When `benchmarks/corpus/` is absent (or empty), the harness falls back to
 //! the golden `fixtures/`: ground truth is synthesized from
@@ -14,43 +39,56 @@
 //! golden fixtures are never written into), and the same recall pipeline runs.
 
 use crate::benchctx::{BenchmarkCorpus, BenchTask};
+use crate::Compiler;
+use scc_context::atlas;
+use scc_context::ContextCompiler;
+use scc_core::{Entity, FlowGraph};
+use scc_indexer::scan::Language;
+use scc_store::Store;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Quality gate: overall mean recall must be >= this floor (Wave 8 §57).
+/// The floor is over the five startup-required layers ONLY.
 pub const ATLAS_GATE: f64 = 0.5;
 
-/// The five sections that count toward the overall score (tests are
-/// informational only).
-const SCORED_SECTIONS: [&str; 5] = [
-    "components",
+/// The five startup-required layers that count toward the overall score
+/// (architecture, entrypoints, behavior, state_authority, contracts — see
+/// `ALL_SECTIONS`; landmarks + tests are informational).
+const ALL_SECTIONS: [&str; 7] = [
+    "architecture",
     "entrypoints",
-    "flows",
-    "ownership",
+    "behavior",
+    "state_authority",
     "contracts",
+    "landmarks",
+    "tests",
 ];
 
 /// Ground-truth sections parsed from `benchmarks/ground-truth/<name>.md`
-/// (one `- <key string>` bullet per item).
+/// (one `- <key string>` bullet per item). The v2 ontology; legacy section
+/// names (components/flows/ownership) are accepted and normalized.
 #[derive(Debug, Clone, Default)]
 pub struct GroundTruthDoc {
-    pub components: Vec<String>,
+    pub architecture: Vec<String>,
     pub entrypoints: Vec<String>,
-    pub flows: Vec<String>,
-    pub ownership: Vec<String>,
+    pub behavior: Vec<String>,
+    pub state_authority: Vec<String>,
     pub contracts: Vec<String>,
+    pub landmarks: Vec<String>,
     pub tests: Vec<String>,
 }
 
 impl GroundTruthDoc {
     pub fn section(&self, name: &str) -> &Vec<String> {
         match name {
-            "components" => &self.components,
+            "architecture" => &self.architecture,
             "entrypoints" => &self.entrypoints,
-            "flows" => &self.flows,
-            "ownership" => &self.ownership,
+            "behavior" => &self.behavior,
+            "state_authority" => &self.state_authority,
             "contracts" => &self.contracts,
+            "landmarks" => &self.landmarks,
             "tests" => &self.tests,
             _ => unreachable!("unknown section {name}"),
         }
@@ -58,33 +96,117 @@ impl GroundTruthDoc {
 
     fn section_mut(&mut self, name: &str) -> &mut Vec<String> {
         match name {
-            "components" => &mut self.components,
+            "architecture" => &mut self.architecture,
             "entrypoints" => &mut self.entrypoints,
-            "flows" => &mut self.flows,
-            "ownership" => &mut self.ownership,
+            "behavior" => &mut self.behavior,
+            "state_authority" => &mut self.state_authority,
             "contracts" => &mut self.contracts,
+            "landmarks" => &mut self.landmarks,
             "tests" => &mut self.tests,
             _ => unreachable!("unknown section {name}"),
+        }
+    }
+
+    /// Remove duplicates, preserving first-seen order.
+    fn dedupe(&mut self) {
+        for name in ALL_SECTIONS {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            self.section_mut(name).retain(|item| seen.insert(item.clone()));
+        }
+    }
+
+    fn to_markdown(&self) -> String {
+        let mut out = String::from("# fixtures fallback (synthesized from benchmarks/tasks.json)\n");
+        for name in ALL_SECTIONS {
+            out.push_str(&format!("## {name}\n"));
+            for item in self.section(name) {
+                out.push_str(&format!("- {item}\n"));
+            }
+        }
+        out
+    }
+}
+
+/// Gap-kind classification for a missed ground-truth item (`--diagnose`):
+/// where the fact disappeared between source and the rendered atlas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GapKind {
+    /// The symbol/string is not parseable by any enabled extractor
+    /// (language disabled, ignored path, or a format no extractor reads).
+    Parser,
+    /// Parsed, but no semantic fact was emitted for it (e.g. no route /
+    /// registration / export extraction for the construct).
+    Extractor,
+    /// The fact exists in the ExtractedFile but was not written to the
+    /// store. Not observable from the store side (the heuristic ladder
+    /// below maps parsed-but-absent facts to `Extractor`); the kind exists
+    /// so the taxonomy is complete.
+    Writer,
+    /// Exists in the store but was never wired into the graph (the matched
+    /// symbol has zero relationships — resolution/compilation never reached
+    /// it, so no flow or component can carry it).
+    Resolution,
+    /// Exists in the store but was not compiled into components/flows.
+    Compiler,
+    /// Compiled into a component but dropped by budget/policy/rendering.
+    Projection,
+    /// Likely present under a different spelling; the aliases did not match.
+    Alias,
+}
+
+impl GapKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GapKind::Parser => "PARSER",
+            GapKind::Extractor => "EXTRACTOR",
+            GapKind::Writer => "WRITER",
+            GapKind::Resolution => "RESOLUTION",
+            GapKind::Compiler => "COMPILER",
+            GapKind::Projection => "PROJECTION",
+            GapKind::Alias => "ALIAS",
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GapFinding {
+    pub section: String,
+    pub item: String,
+    pub kind: GapKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RepoRecall {
     pub repo: String,
-    pub components: f64,
+    pub architecture: f64,
     pub entrypoints: f64,
-    pub flows: f64,
-    pub ownership: f64,
+    pub behavior: f64,
+    pub state_authority: f64,
     pub contracts: f64,
+    pub landmarks: f64,
     pub tests: f64,
+    /// Equal-weighted mean of the five startup-required layers (the gate).
     pub overall: f64,
+    /// Fraction of canonical flow-graph edges whose (from-op, to-op) pair
+    /// appears in order inside some ground-truth behavior item.
+    pub precision: f64,
+    /// Matched startup-required items per 1000 atlas tokens.
+    pub density: f64,
+    /// Rendered atlas token count.
+    pub atlas_tokens: usize,
+    /// Number of ground-truth items in the (informational) landmarks layer.
+    pub landmark_items: usize,
     /// When set, the repo was not scored (missing dir / missing ground
     /// truth / index failure) and the recall fields are meaningless.
     pub skipped_reason: Option<String>,
-    /// Ground-truth key strings absent from the atlas content
+    /// Ground-truth key strings the structured matcher missed
     /// (`section:key`), for diagnosing misses.
     pub missed: Vec<String>,
+    /// Per-item gap classification (populated when `--diagnose`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<GapFinding>,
 }
 
 impl RepoRecall {
@@ -101,15 +223,21 @@ impl Default for RepoRecall {
     fn default() -> Self {
         RepoRecall {
             repo: String::new(),
-            components: 0.0,
+            architecture: 0.0,
             entrypoints: 0.0,
-            flows: 0.0,
-            ownership: 0.0,
+            behavior: 0.0,
+            state_authority: 0.0,
             contracts: 0.0,
+            landmarks: 0.0,
             tests: 0.0,
             overall: 0.0,
+            precision: 0.0,
+            density: 0.0,
+            atlas_tokens: 0,
+            landmark_items: 0,
             skipped_reason: None,
             missed: Vec::new(),
+            gaps: Vec::new(),
         }
     }
 }
@@ -121,24 +249,37 @@ pub struct AtlasRecallReport {
     pub repos: Vec<RepoRecall>,
     /// Where the run came from: "benchmarks/corpus" or "fixtures fallback".
     pub mode: String,
-    pub mean_components: f64,
+    pub mean_architecture: f64,
     pub mean_entrypoints: f64,
-    pub mean_flows: f64,
-    pub mean_ownership: f64,
+    pub mean_behavior: f64,
+    pub mean_state_authority: f64,
     pub mean_contracts: f64,
-    /// Equal-weighted mean of the five scored sections over scored repos.
+    pub mean_landmarks: f64,
+    pub mean_tests: f64,
+    /// Equal-weighted mean of the five startup-required layers over scored
+    /// repos (the gate).
     pub mean_overall: f64,
+    pub mean_precision: f64,
+    pub mean_density: f64,
+    pub mean_atlas_tokens: f64,
     pub scored: usize,
     pub skipped: usize,
     pub gate_passed: bool,
+    /// Gap-kind histogram over all diagnosed items (kind -> count).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gap_histogram: BTreeMap<String, usize>,
 }
 
 /// Parse a ground-truth markdown doc into per-section key strings.
 ///
-/// Accepts the Wave 8 corpus format (`## section` heading + `- item` bullets).
-/// A bullet is either the bare key string or `<key string> — explanation`;
-/// the explanation is not expected in atlas output, so only the key string
-/// (before ` — `) is scored. Inline-code backticks are stripped.
+/// Accepts the Wave 8 corpus format (`## section` heading + `- item` bullets)
+/// for both the v2 ontology (architecture/entrypoints/behavior/
+/// state_authority/contracts/landmarks/tests) and the legacy names
+/// (components -> architecture, flows -> behavior, ownership ->
+/// state_authority). A bullet is either the bare key string or
+/// `<key string> — explanation`; the explanation is not expected in atlas
+/// output, so only the key string (before ` — `) is kept. Inline-code
+/// backticks are stripped.
 pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
     let mut doc = GroundTruthDoc::default();
     let mut current: Option<&'static str> = None;
@@ -147,11 +288,12 @@ pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("## ") {
             current = match rest.trim().to_ascii_lowercase().as_str() {
-                "components" => Some("components"),
+                "architecture" | "components" => Some("architecture"),
                 "entrypoints" => Some("entrypoints"),
-                "flows" => Some("flows"),
-                "ownership" => Some("ownership"),
+                "behavior" | "flows" => Some("behavior"),
+                "state_authority" | "ownership" => Some("state_authority"),
                 "contracts" => Some("contracts"),
+                "landmarks" => Some("landmarks"),
                 "tests" => Some("tests"),
                 _ => None,
             };
@@ -186,48 +328,301 @@ pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
     doc
 }
 
-/// Recall for one section: fraction of ground-truth key strings found as
-/// case-insensitive substrings of the atlas content. An empty ground truth
-/// scores 1.0 (nothing to miss).
-fn section_recall(items: &[String], content_lc: &str) -> (f64, usize, usize) {
+/// Normalize a ground-truth item / atlas string for matching, applying the
+/// documented aliases: `::` -> `.` (so `Controller::run` matches
+/// `Controller.run`), `fn X` -> `X`, and `./p` -> `p` (path prefix).
+fn norm(s: &str) -> String {
+    let mut out = s.to_ascii_lowercase();
+    out = out.replace("::", ".");
+    if let Some(rest) = out.strip_prefix("fn ") {
+        out = rest.to_string();
+    }
+    if let Some(rest) = out.strip_prefix("./") {
+        out = rest.to_string();
+    }
+    out
+}
+
+/// Normalize and join parts into one haystack (newline-separated).
+fn norm_join(parts: impl IntoIterator<Item = String>) -> String {
+    let mut out: Vec<String> = parts.into_iter().map(|p| norm(&p)).collect();
+    out.sort();
+    out.dedup();
+    out.join("\n")
+}
+
+/// Structured atlas haystacks, one per ontology layer, built from the
+/// machine model (`SystemAtlas`) plus the rendered pack (for the
+/// informational `tests` layer and the ALIAS gap check).
+struct AtlasLayers {
+    architecture: String,
+    entrypoints: String,
+    behavior: String,
+    state_authority: String,
+    contracts: String,
+    landmarks: String,
+    /// Normalized rendered atlas content (tests layer + alias check).
+    text: String,
+    /// Normalized flow inventory: derived flows + canonical flow graphs
+    /// (names, triggers, step/node operations) — used by gap diagnosis.
+    flows: String,
+    /// Normalized component inventory (names, purposes, implementations,
+    /// owns targets) — used by gap diagnosis.
+    components: String,
+}
+
+fn build_layers(ctx: &ContextCompiler<'_>, pack: &scc_context::ContextPack) -> AtlasLayers {
+    let atlas = atlas::build_atlas(ctx);
+
+    let mut arch_parts: Vec<String> = Vec::new();
+    let mut sa_parts: Vec<String> = Vec::new();
+    let mut land_parts: Vec<String> = Vec::new();
+    let mut comp_parts: Vec<String> = Vec::new();
+    for c in &atlas.components {
+        comp_parts.push(c.name.clone());
+        comp_parts.push(c.purpose.clone());
+        comp_parts.extend(c.implementation.iter().cloned());
+        comp_parts.extend(c.owns.iter().map(|o| o.target.clone()));
+        arch_parts.push(c.name.clone());
+        if !c.purpose.is_empty() {
+            arch_parts.push(c.purpose.clone());
+        }
+        arch_parts.extend(c.implementation.iter().cloned());
+        for o in &c.owns {
+            sa_parts.push(o.target.clone());
+        }
+        land_parts.extend(c.implementation.iter().cloned());
+    }
+    sa_parts.extend(atlas.data_stores.iter().cloned());
+
+    let mut ep_parts: Vec<String> = Vec::new();
+    for e in &atlas.entrypoints {
+        ep_parts.push(e.name.clone());
+        ep_parts.push(e.trigger.clone());
+        // the symbol id's last segment is the symbol name (e.g.
+        // repo://x/symbol/fastapi/applications.py/FastAPI -> FastAPI)
+        if let Some(seg) = e.symbol.rsplit('/').next() {
+            if !seg.is_empty() {
+                ep_parts.push(seg.to_string());
+            }
+        }
+    }
+
+    let mut bh_parts: Vec<String> = Vec::new();
+    let mut flow_parts: Vec<String> = Vec::new();
+    for f in &atlas.flows {
+        bh_parts.push(f.name.clone());
+        flow_parts.push(f.name.clone());
+        if let Some(t) = &f.trigger {
+            bh_parts.push(t.clone());
+            flow_parts.push(t.clone());
+        }
+        for s in &f.steps {
+            bh_parts.push(s.clone());
+            flow_parts.push(s.clone());
+            land_parts.push(s.clone());
+        }
+    }
+    // canonical flow graphs (the flow edge source) — ops join the flow
+    // inventory for diagnosis even when the flow was not rendered
+    if let Ok(graphs) = ctx.store.flow_graphs() {
+        for g in &graphs {
+            flow_parts.push(g.name.clone());
+            if let Some(t) = &g.trigger {
+                flow_parts.push(t.clone());
+            }
+            for n in &g.nodes {
+                flow_parts.push(n.operation.clone());
+                flow_parts.push(n.actor.clone());
+            }
+        }
+    }
+    // derived (non-sequence) flows: view flows carry name/trigger/steps
+    for f in ctx.view.flows() {
+        flow_parts.push(f.name.clone());
+        if let Some(t) = &f.trigger {
+            flow_parts.push(t.clone());
+        }
+        for s in &f.steps {
+            flow_parts.push(s.actor.clone());
+            flow_parts.push(s.operation.clone());
+        }
+    }
+
+    let contracts = atlas.contracts.to_vec();
+
+    AtlasLayers {
+        architecture: norm_join(arch_parts),
+        entrypoints: norm_join(ep_parts),
+        behavior: norm_join(bh_parts),
+        state_authority: norm_join(sa_parts),
+        contracts: norm_join(contracts),
+        landmarks: norm_join(land_parts),
+        text: norm(&pack.content),
+        flows: norm_join(flow_parts),
+        components: norm_join(comp_parts),
+    }
+}
+
+/// The haystack a layer matches against.
+fn layer_haystack<'a>(section: &str, layers: &'a AtlasLayers, text_norm: &'a str) -> &'a str {
+    match section {
+        "architecture" => &layers.architecture,
+        "entrypoints" => &layers.entrypoints,
+        "behavior" => &layers.behavior,
+        "state_authority" => &layers.state_authority,
+        "contracts" => &layers.contracts,
+        "landmarks" => &layers.landmarks,
+        "tests" => text_norm,
+        _ => unreachable!("unknown section {section}"),
+    }
+}
+
+/// Recall for one layer: fraction of ground-truth key strings found
+/// (case-insensitive, aliases applied) in the layer's structured haystack.
+/// An empty ground truth scores 1.0 (nothing to miss).
+fn layer_recall(items: &[String], haystack: &str) -> (f64, usize, usize) {
     if items.is_empty() {
         return (1.0, 0, 0);
     }
     let mut hit = 0usize;
     for item in items {
-        if content_lc.contains(&item.to_ascii_lowercase()) {
+        if haystack.contains(&norm(item)) {
             hit += 1;
         }
     }
     (hit as f64 / items.len() as f64, hit, items.len())
 }
 
+/// Whether one ground-truth item matches its layer's structured haystack.
+fn item_matched(section: &str, item: &str, layers: &AtlasLayers, text_norm: &str) -> bool {
+    layer_haystack(section, layers, text_norm).contains(&norm(item))
+}
+
+/// Flow-edge precision: the fraction of canonical flow-graph edges whose
+/// (from-op, to-op) pair appears — in order — inside some ground-truth
+/// `## behavior` item. An edge the ground truth never describes may be a
+/// spurious causal link; a same-item chain step (e.g. `worker consumer ->
+/// task.run`) supports exactly its consecutive pairs. Empty ground truth
+/// (nothing to contradict any edge) or an empty graph scores 1.0.
+fn flow_edge_precision(graphs: &[FlowGraph], behavior: &[String]) -> f64 {
+    if behavior.is_empty() {
+        return 1.0;
+    }
+    let mut total = 0usize;
+    let mut supported = 0usize;
+    for g in graphs {
+        for e in &g.edges {
+            let from = g
+                .nodes
+                .get(e.from as usize)
+                .map(|n| norm(&n.operation))
+                .unwrap_or_default();
+            let to = g
+                .nodes
+                .get(e.to as usize)
+                .map(|n| norm(&n.operation))
+                .unwrap_or_default();
+            if from.is_empty() || to.is_empty() {
+                continue;
+            }
+            total += 1;
+            let ok = behavior.iter().any(|item| {
+                let it = norm(item);
+                match (it.find(&from), it.find(&to)) {
+                    (Some(a), Some(b)) => a < b,
+                    _ => false,
+                }
+            });
+            if ok {
+                supported += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return 1.0;
+    }
+    supported as f64 / total as f64
+}
+
+/// Startup facts per 1000 atlas tokens: matched startup-required items over
+/// the rendered pack's token count.
+fn token_density(matched_startup: usize, tokens: usize) -> f64 {
+    if tokens == 0 {
+        return 0.0;
+    }
+    matched_startup as f64 / (tokens as f64 / 1000.0)
+}
+
 /// Index one repo in place and score its ground truth against the atlas.
-pub fn score_repo(repo_dir: &Path, gt: &GroundTruthDoc) -> Result<RepoRecall, String> {
+///
+/// v2 scoring is structured: each layer is matched against the machine
+/// `SystemAtlas` (component name/purpose/implementation for architecture;
+/// entrypoint name/trigger/symbol; flow name/trigger/step ops; owns claims +
+/// data stores; contracts), except the informational `tests` layer which is
+/// matched against the rendered text. `diagnose` additionally classifies
+/// every missed item by gap kind.
+pub fn score_repo(
+    repo_dir: &Path,
+    gt: &GroundTruthDoc,
+    diagnose: bool,
+) -> Result<RepoRecall, String> {
     crate::commands::cmd_index(repo_dir, true).map_err(|e| format!("index failed: {e}"))?;
     let store = crate::open_store(repo_dir).map_err(|e| format!("store: {e}"))?;
     let config = crate::load_config(repo_dir).map_err(|e| format!("config: {e}"))?;
     let stale = crate::stale_paths(&store).map_err(|e| format!("stale: {e}"))?;
     let comp = crate::compiler(&store, &config, stale).map_err(|e| format!("compiler: {e}"))?;
     let pack = comp.ctx().system_atlas(None);
-    let content_lc = pack.content.to_ascii_lowercase();
+    let layers = build_layers(&comp.ctx(), &pack);
+    let text_norm = &layers.text;
 
-    let (components, _, _) = section_recall(&gt.components, &content_lc);
-    let (entrypoints, _, _) = section_recall(&gt.entrypoints, &content_lc);
-    let (flows, _, _) = section_recall(&gt.flows, &content_lc);
-    let (ownership, _, _) = section_recall(&gt.ownership, &content_lc);
-    let (contracts, _, _) = section_recall(&gt.contracts, &content_lc);
-    let (tests, _, _) = section_recall(&gt.tests, &content_lc);
-    let overall = (components + entrypoints + flows + ownership + contracts) / 5.0;
+    let (architecture, arch_hit, _) = layer_recall(&gt.architecture, &layers.architecture);
+    let (entrypoints, ep_hit, _) = layer_recall(&gt.entrypoints, &layers.entrypoints);
+    let (behavior, bh_hit, _) = layer_recall(&gt.behavior, &layers.behavior);
+    let (state_authority, sa_hit, _) = layer_recall(&gt.state_authority, &layers.state_authority);
+    let (contracts, ct_hit, _) = layer_recall(&gt.contracts, &layers.contracts);
+    let (landmarks, _, _) = layer_recall(&gt.landmarks, &layers.landmarks);
+    let (tests, _, _) = layer_recall(&gt.tests, text_norm);
+    let overall = (architecture + entrypoints + behavior + state_authority + contracts) / 5.0;
+
+    let matched_startup = arch_hit + ep_hit + bh_hit + sa_hit + ct_hit;
+    let graphs = store.flow_graphs().unwrap_or_default();
+    let precision = flow_edge_precision(&graphs, &gt.behavior);
+    let density = token_density(matched_startup, pack.tokens);
 
     let mut missed: Vec<String> = Vec::new();
-    for section in SCORED_SECTIONS.iter().chain(std::iter::once(&"tests")) {
+    for section in ALL_SECTIONS {
         for item in gt.section(section) {
-            if !content_lc.contains(&item.to_ascii_lowercase()) {
+            if !item_matched(section, item, &layers, text_norm) {
                 missed.push(format!("{section}:{item}"));
             }
         }
     }
+
+    let gaps = if diagnose {
+        let store_cands = store_candidates(&comp);
+        missed
+            .iter()
+            .map(|m| {
+                let (section, item) = m
+                    .split_once(':')
+                    .map(|(s, i)| (s.to_string(), i.to_string()))
+                    .unwrap_or_else(|| ("?".into(), m.clone()));
+                classify_gap(
+                    &section,
+                    &item,
+                    repo_dir,
+                    &store,
+                    &config,
+                    &comp,
+                    &layers,
+                    &store_cands,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let repo = repo_dir
         .file_name()
@@ -235,15 +630,21 @@ pub fn score_repo(repo_dir: &Path, gt: &GroundTruthDoc) -> Result<RepoRecall, St
         .unwrap_or_else(|| repo_dir.display().to_string());
     Ok(RepoRecall {
         repo,
-        components,
+        architecture,
         entrypoints,
-        flows,
-        ownership,
+        behavior,
+        state_authority,
         contracts,
+        landmarks,
         tests,
         overall,
+        precision,
+        density,
+        atlas_tokens: pack.tokens,
+        landmark_items: gt.landmarks.len(),
         skipped_reason: None,
         missed,
+        gaps,
     })
 }
 
@@ -255,6 +656,7 @@ pub fn run_atlas_recall(
     corpus_dir: &Path,
     ground_truth_dir: &Path,
     repo_names: &[String],
+    diagnose: bool,
 ) -> Result<AtlasRecallReport, String> {
     let mut names: Vec<&String> = repo_names.iter().collect();
     names.sort();
@@ -284,13 +686,26 @@ pub fn run_atlas_recall(
                 continue;
             }
         };
-        match score_repo(&repo_dir, &gt) {
+        match score_repo(&repo_dir, &gt, diagnose) {
             Ok(r) => {
-                report.mean_components += r.components;
+                report.mean_architecture += r.architecture;
                 report.mean_entrypoints += r.entrypoints;
-                report.mean_flows += r.flows;
-                report.mean_ownership += r.ownership;
+                report.mean_behavior += r.behavior;
+                report.mean_state_authority += r.state_authority;
                 report.mean_contracts += r.contracts;
+                report.mean_landmarks += r.landmarks;
+                report.mean_tests += r.tests;
+                report.mean_precision += r.precision;
+                report.mean_density += r.density;
+                report.mean_atlas_tokens += r.atlas_tokens as f64;
+                if diagnose {
+                    for g in &r.gaps {
+                        *report
+                            .gap_histogram
+                            .entry(g.kind.as_str().to_string())
+                            .or_insert(0) += 1;
+                    }
+                }
                 report.scored += 1;
                 report.repos.push(r);
             }
@@ -303,15 +718,20 @@ pub fn run_atlas_recall(
 
     if report.scored > 0 {
         let n = report.scored as f64;
-        report.mean_components /= n;
+        report.mean_architecture /= n;
         report.mean_entrypoints /= n;
-        report.mean_flows /= n;
-        report.mean_ownership /= n;
+        report.mean_behavior /= n;
+        report.mean_state_authority /= n;
         report.mean_contracts /= n;
-        report.mean_overall = (report.mean_components
+        report.mean_landmarks /= n;
+        report.mean_tests /= n;
+        report.mean_precision /= n;
+        report.mean_density /= n;
+        report.mean_atlas_tokens /= n;
+        report.mean_overall = (report.mean_architecture
             + report.mean_entrypoints
-            + report.mean_flows
-            + report.mean_ownership
+            + report.mean_behavior
+            + report.mean_state_authority
             + report.mean_contracts)
             / 5.0;
     }
@@ -324,6 +744,7 @@ pub fn run_atlas_recall(
 pub fn run_atlas_bench(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
+    diagnose: bool,
 ) -> Result<AtlasRecallReport, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = crate::find_root(&cwd);
@@ -332,7 +753,7 @@ pub fn run_atlas_bench(
     // Fixtures fallback: no corpus dir (or an empty one) -> run over the
     // golden fixtures with ground truth synthesized from tasks.json.
     if corpus.is_none() && repo_dirs(&default_corpus).is_empty() {
-        return fixtures_fallback(&root);
+        return fixtures_fallback(&root, diagnose);
     }
     if let Some(p) = corpus {
         if !p.is_dir() {
@@ -346,7 +767,7 @@ pub fn run_atlas_bench(
         None => root.join("benchmarks").join("ground-truth"),
     };
     let names = repo_dirs(&corpus_dir);
-    run_atlas_recall(&corpus_dir, &gt_dir, &names)
+    run_atlas_recall(&corpus_dir, &gt_dir, &names, diagnose)
 }
 
 /// Sorted non-hidden subdirectory names of `dir` (the corpus listing).
@@ -371,7 +792,7 @@ fn repo_dirs(dir: &Path) -> Vec<String> {
 /// Hermetic fixtures run: copy the golden fixtures into a temp corpus (the
 /// real fixtures are never indexed into) and synthesize ground-truth docs
 /// from `benchmarks/tasks.json`.
-fn fixtures_fallback(root: &Path) -> Result<AtlasRecallReport, String> {
+fn fixtures_fallback(root: &Path, diagnose: bool) -> Result<AtlasRecallReport, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let tasks_path = root.join("benchmarks").join("tasks.json");
     let text = std::fs::read_to_string(&tasks_path)
@@ -402,68 +823,38 @@ fn fixtures_fallback(root: &Path) -> Result<AtlasRecallReport, String> {
             .map_err(|e| e.to_string())?;
     }
 
-    let mut report = run_atlas_recall(&tmp_corpus, &tmp_gt, &names)?;
+    let mut report = run_atlas_recall(&tmp_corpus, &tmp_gt, &names, diagnose)?;
     report.mode = "fixtures fallback (ground truth from benchmarks/tasks.json)".to_string();
     Ok(report)
 }
 
 /// Fixtures-fallback ground truth per repo, synthesized from the task
-/// corpus. Mapping: components -> components; routes -> entrypoints AND
-/// contracts (HTTP routes are both); symbols proxy flow steps; stores + data
-/// -> ownership (who owns the store/DB); tests -> tests (informational).
+/// corpus. Mapping: components -> architecture; routes -> entrypoints AND
+/// contracts (HTTP routes are both); symbols proxy flow steps (behavior);
+/// stores + data -> state_authority (who owns the store/DB); tests -> tests
+/// (informational).
 fn ground_truth_from_tasks(tasks: &[BenchTask], repo: &str) -> GroundTruthDoc {
     let mut doc = GroundTruthDoc::default();
     for t in tasks {
         if t.repo != repo {
             continue;
         }
-        doc.components.extend(t.ground_truth.components.iter().cloned());
+        doc.architecture
+            .extend(t.ground_truth.components.iter().cloned());
         for r in &t.ground_truth.routes {
             doc.entrypoints.push(r.clone());
             doc.contracts.push(r.clone());
         }
-        doc.flows.extend(t.ground_truth.symbols.iter().cloned());
-        doc.ownership.extend(t.ground_truth.stores.iter().cloned());
-        doc.ownership.extend(t.ground_truth.data.iter().cloned());
+        doc.behavior
+            .extend(t.ground_truth.symbols.iter().cloned());
+        doc.state_authority
+            .extend(t.ground_truth.stores.iter().cloned());
+        doc.state_authority
+            .extend(t.ground_truth.data.iter().cloned());
         doc.tests.extend(t.ground_truth.tests.iter().cloned());
     }
     doc.dedupe();
     doc
-}
-
-impl GroundTruthDoc {
-    /// Remove duplicates, preserving first-seen order.
-    fn dedupe(&mut self) {
-        for name in [
-            "components",
-            "entrypoints",
-            "flows",
-            "ownership",
-            "contracts",
-            "tests",
-        ] {
-            let mut seen: BTreeSet<String> = BTreeSet::new();
-            self.section_mut(name).retain(|item| seen.insert(item.clone()));
-        }
-    }
-
-    fn to_markdown(&self) -> String {
-        let mut out = String::from("# fixtures fallback (synthesized from benchmarks/tasks.json)\n");
-        for name in [
-            "components",
-            "entrypoints",
-            "flows",
-            "ownership",
-            "contracts",
-            "tests",
-        ] {
-            out.push_str(&format!("## {name}\n"));
-            for item in self.section(name) {
-                out.push_str(&format!("- {item}\n"));
-            }
-        }
-        out
-    }
 }
 
 /// Locate the fixtures directory: walk up from cwd; fall back to the
@@ -507,38 +898,264 @@ fn copy_tree_skip_scc(src: &Path, dst: &Path) {
     }
 }
 
-pub fn print_report(r: &AtlasRecallReport) {
-    println!("scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57)");
+// ---------------------------------------------------------------------------
+// Gap diagnosis (--diagnose)
+// ---------------------------------------------------------------------------
+
+/// Normalized presence haystack of one entity: id + name + attribute JSON.
+fn entity_norm(e: &Entity) -> String {
+    let attrs = serde_json::to_string(&e.attributes).unwrap_or_default();
+    norm(&format!("{} {} {}", e.id, e.name, attrs))
+}
+
+/// Precompute the store-presence candidates for one repo (entity haystacks +
+/// derived route strings), so gap diagnosis does not re-serialize every
+/// entity per missed item.
+fn store_candidates(comp: &Compiler<'_>) -> Vec<String> {
+    let mut cands: Vec<String> = Vec::new();
+    for e in comp.graph.entities.values() {
+        cands.push(entity_norm(e));
+    }
+    for e in comp.graph.entities_of_kind(scc_core::kinds::ROUTE) {
+        let method = e
+            .attributes
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let path = e
+            .attributes
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !path.is_empty() {
+            cands.push(norm(&format!("{method} {path}")));
+        }
+    }
+    cands
+}
+
+/// Classify a missed ground-truth item by where it disappeared, via the
+/// deterministic ladder of the v2 spec: store presence -> flows ->
+/// components -> rendered atlas text.
+///
+/// - nothing in the store: file-level parseability decides PARSER (disabled
+///   language / no extractor for the format) vs EXTRACTOR (parsed but no
+///   semantic fact emitted). WRITER is not observable from the store side
+///   (it needs extractor output); parsed-but-absent facts map to EXTRACTOR.
+/// - in the store as an isolated symbol (zero graph relationships):
+///   RESOLUTION (resolution never connected it to a flow or component).
+/// - in the store but never compiled into a component or flow: COMPILER.
+/// - compiled into a flow but no component: COMPILER (flow-level only).
+/// - compiled into a component but absent from the rendered atlas:
+///   PROJECTION (dropped by budget/policy/rendering).
+/// - present in the rendered atlas text only under a spelling the
+///   structured layers do not carry (README prose, format variants):
+///   ALIAS (the aliases did not reconcile it).
+#[allow(clippy::too_many_arguments)]
+fn classify_gap(
+    section: &str,
+    item: &str,
+    repo_dir: &Path,
+    store: &Store,
+    config: &scc_indexer::Config,
+    comp: &Compiler<'_>,
+    layers: &AtlasLayers,
+    store_cands: &[String],
+) -> GapFinding {
+    let n = norm(item);
+    let section = section.to_string();
+    let item = item.to_string();
+
+    // 1. Store presence.
+    if !store_cands.iter().any(|c| c.contains(&n)) {
+        // 2. Not in the store at all: file-level parseability.
+        return match file_language(item.as_str(), repo_dir, store) {
+            Some(lang) if config.language_enabled(lang) => GapFinding {
+                section,
+                item,
+                kind: GapKind::Extractor,
+                detail: format!(
+                    "file exists and {} is enabled, but no semantic fact reached the store",
+                    lang.as_str()
+                ),
+            },
+            Some(lang) => GapFinding {
+                section,
+                item,
+                kind: GapKind::Parser,
+                detail: format!(
+                    "file is {} but the extractor is disabled/ignored",
+                    lang.as_str()
+                ),
+            },
+            None => GapFinding {
+                section,
+                item,
+                kind: GapKind::Extractor,
+                detail: "nothing in the store and no extractor emits this fact".into(),
+            },
+        };
+    }
+
+    // 3. In the store: a symbol with zero graph relationships was never
+    // wired by resolution/compilation.
+    let sym_matches: Vec<&Entity> = comp
+        .graph
+        .entities
+        .values()
+        .filter(|e| e.kind == scc_core::kinds::SYMBOL && entity_norm(e).contains(&n))
+        .collect();
+    let isolated = !sym_matches.is_empty()
+        && sym_matches.iter().all(|e| {
+            comp.graph
+                .out
+                .get(&e.id)
+                .map(|r| r.is_empty())
+                .unwrap_or(true)
+                && comp
+                    .graph
+                    .inn
+                    .get(&e.id)
+                    .map(|r| r.is_empty())
+                    .unwrap_or(true)
+        });
+    if isolated {
+        return GapFinding {
+            section,
+            item,
+            kind: GapKind::Resolution,
+            detail: "symbol exists in the store but has zero graph relationships; resolution never connected it to a flow or component".into(),
+        };
+    }
+
+    // 4. Compiled into a component? Then only rendering could drop it.
+    if layers.components.contains(&n) {
+        return if layers.text.contains(&n) {
+            GapFinding {
+                section,
+                item,
+                kind: GapKind::Alias,
+                detail: "compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match".into(),
+            }
+        } else {
+            GapFinding {
+                section,
+                item,
+                kind: GapKind::Projection,
+                detail: "compiled into a component but dropped from the rendered atlas by budget/policy/rendering".into(),
+            }
+        };
+    }
+
+    // 5. Reached a flow but never a component, or neither.
+    if layers.flows.contains(&n) {
+        return GapFinding {
+            section,
+            item,
+            kind: GapKind::Compiler,
+            detail: "reached a flow but was never compiled into a component".into(),
+        };
+    }
+    if layers.text.contains(&n) {
+        GapFinding {
+            section,
+            item,
+            kind: GapKind::Alias,
+            detail: "present in the rendered atlas text (e.g. README purpose or trust boundaries) under a spelling the structured layers do not carry".into(),
+        }
+    } else {
+        GapFinding {
+            section,
+            item,
+            kind: GapKind::Compiler,
+            detail: "present in the store but not compiled into components or flows".into(),
+        }
+    }
+}
+
+/// If `item` names a repo file, return the language it would be scanned
+/// with (language from the file registry when scanned; otherwise inferred
+/// from the extension when the file exists on disk).
+fn file_language(item: &str, repo_dir: &Path, store: &Store) -> Option<Language> {
+    if !item.contains('/') {
+        return None;
+    }
+    let rel = item.trim_start_matches("./");
+    if let Ok(files) = store.all_files() {
+        for (path, _hash, lang, _kind, _size) in files {
+            if path == rel {
+                return lang_from_str(&lang);
+            }
+        }
+    }
+    let full = repo_dir.join(rel);
+    if full.is_file() {
+        lang_from_ext(rel)
+    } else {
+        None
+    }
+}
+
+fn lang_from_str(s: &str) -> Option<Language> {
+    match s {
+        "python" => Some(Language::Python),
+        "typescript" | "javascript" => Some(Language::TypeScript),
+        "go" => Some(Language::Go),
+        "rust" => Some(Language::Rust),
+        "java" => Some(Language::Java),
+        _ => None,
+    }
+}
+
+fn lang_from_ext(path: &str) -> Option<Language> {
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "py" | "pyi" => Some(Language::Python),
+        "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
+        "js" | "jsx" | "mjs" | "cjs" => Some(Language::TypeScript),
+        "go" => Some(Language::Go),
+        "rs" => Some(Language::Rust),
+        "java" => Some(Language::Java),
+        _ => None,
+    }
+}
+
+pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
+    println!("scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)");
     println!("  mode: {}", r.mode);
-    println!("  gate: overall mean recall >= {ATLAS_GATE}");
     println!(
-        "  {:<24} {:>10} {:>11} {:>7} {:>10} {:>10} {:>7} {:>8}  note",
-        "repo",
-        "components",
-        "entrypoints",
-        "flows",
-        "ownership",
-        "contracts",
-        "tests",
-        "overall"
+        "  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= {ATLAS_GATE}"
+    );
+    println!(
+        "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>5}  note",
+        "repo", "arch", "entry", "behav", "state", "contr", "landm", "tests", "overall",
+        "prec", "f/1k", "toks"
     );
     for repo in &r.repos {
         match &repo.skipped_reason {
             Some(reason) => println!(
-                "  {:<24} {:>10} {:>11} {:>7} {:>10} {:>10} {:>7} {:>8}  skipped: {reason}",
-                repo.repo, "-", "-", "-", "-", "-", "-", "-"
+                "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>5}  skipped: {reason}",
+                repo.repo, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"
             ),
             None => {
                 println!(
-                    "  {:<24} {:>10.3} {:>11.3} {:>7.3} {:>10.3} {:>10.3} {:>7.3} {:>8.3}",
+                    "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}",
                     repo.repo,
-                    repo.components,
+                    repo.architecture,
                     repo.entrypoints,
-                    repo.flows,
-                    repo.ownership,
+                    repo.behavior,
+                    repo.state_authority,
                     repo.contracts,
+                    repo.landmarks,
                     repo.tests,
-                    repo.overall
+                    repo.overall,
+                    repo.precision,
+                    repo.density,
+                    repo.atlas_tokens
                 );
                 for m in &repo.missed {
                     println!("      missed: {m}");
@@ -547,15 +1164,19 @@ pub fn print_report(r: &AtlasRecallReport) {
         }
     }
     println!(
-        "  {:<24} {:>10.3} {:>11.3} {:>7.3} {:>10.3} {:>10.3} {:>7} {:>8.3}",
+        "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}",
         "mean",
-        r.mean_components,
+        r.mean_architecture,
         r.mean_entrypoints,
-        r.mean_flows,
-        r.mean_ownership,
+        r.mean_behavior,
+        r.mean_state_authority,
         r.mean_contracts,
-        "-",
-        r.mean_overall
+        r.mean_landmarks,
+        r.mean_tests,
+        r.mean_overall,
+        r.mean_precision,
+        r.mean_density,
+        r.mean_atlas_tokens.round() as usize
     );
     println!("  scored: {}   skipped: {}", r.scored, r.skipped);
     println!(
@@ -563,6 +1184,27 @@ pub fn print_report(r: &AtlasRecallReport) {
         if r.gate_passed { "PASS" } else { "FAIL" },
         r.mean_overall
     );
+
+    if !diagnose {
+        return;
+    }
+    println!("\ngap-kind histogram (all sections):");
+    if r.gap_histogram.is_empty() {
+        println!("  (none — no missed items)");
+    }
+    for (kind, count) in &r.gap_histogram {
+        println!("  {kind:<12} {count}");
+    }
+    println!("\nPer-repo gap lines (regenerated into benchmarks/results/ground-truth-gaps.md):");
+    for repo in &r.repos {
+        if repo.gaps.is_empty() {
+            continue;
+        }
+        println!("\n## {}", repo.repo);
+        for g in &repo.gaps {
+            println!("- `{}:{}` — {} GAP: {}", g.section, g.item, g.kind.as_str(), g.detail);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -572,21 +1214,24 @@ mod tests {
     const GT_MD: &str = r#"# synth repo
 > synthetic | python | service
 
-## components
+## architecture
 - root — the app root component
 - services — business logic
 
 ## entrypoints
 - GET /api/items — fetch items
 
-## flows
+## behavior
 - `handle_items` — entry handler
 
-## ownership
+## state_authority
 - db.items — owned by services
 
 ## contracts
 - POST /api/items
+
+## landmarks
+- `ItemStore` — one zoom level deeper
 
 ## tests
 - test_create_item — creation test
@@ -595,12 +1240,26 @@ mod tests {
     #[test]
     fn parses_ground_truth_sections() {
         let doc = parse_ground_truth(GT_MD);
-        assert_eq!(doc.components, ["root", "services"]);
+        assert_eq!(doc.architecture, ["root", "services"]);
         assert_eq!(doc.entrypoints, ["GET /api/items"]);
-        assert_eq!(doc.flows, ["handle_items"], "inline-code backticks stripped");
-        assert_eq!(doc.ownership, ["db.items"]);
+        assert_eq!(doc.behavior, ["handle_items"], "inline-code backticks stripped");
+        assert_eq!(doc.state_authority, ["db.items"]);
         assert_eq!(doc.contracts, ["POST /api/items"]);
+        assert_eq!(doc.landmarks, ["ItemStore"]);
         assert_eq!(doc.tests, ["test_create_item"]);
+    }
+
+    #[test]
+    fn parse_ground_truth_accepts_legacy_section_names() {
+        let md = "## components\n- root\n## flows\n- handle\n## ownership\n- db.x\n## entrypoints\n- e\n## contracts\n- c\n## tests\n- t\n";
+        let doc = parse_ground_truth(md);
+        assert_eq!(doc.architecture, ["root"], "components -> architecture");
+        assert_eq!(doc.behavior, ["handle"], "flows -> behavior");
+        assert_eq!(doc.state_authority, ["db.x"], "ownership -> state_authority");
+        assert_eq!(doc.entrypoints, ["e"]);
+        assert_eq!(doc.contracts, ["c"]);
+        assert_eq!(doc.tests, ["t"]);
+        assert!(doc.landmarks.is_empty());
     }
 
     #[test]
@@ -616,47 +1275,98 @@ mod tests {
     }
 
     #[test]
+    fn norm_applies_documented_aliases() {
+        assert_eq!(norm("Controller::run"), "controller.run");
+        assert_eq!(norm("fn main"), "main");
+        assert_eq!(norm("./src/index-client.js"), "src/index-client.js");
+        assert_eq!(norm("ArgMatches"), "argmatches");
+        assert_eq!(norm("GET /api/items"), "get /api/items");
+    }
+
+    #[test]
     fn recall_counts_all_hit_partial_and_zero() {
-        let content = "\
-SYSTEM PURPOSE
-get /api/items
-handle_items
-ARCHITECTURE
-ROOT
-SERVICES
-DATA OWNERSHIP
-services owns db.items
-CONTRACTS
-POST /api/items
-test_create_item
-";
-        let lc = content.to_ascii_lowercase();
+        // haystack already normalized: layer_recall applies norm() to items
+        let hay = "root\nservices\nget /api/items\nhandle_items\ndb.items\npost /api/items\nitemstore\ntest_create_item";
         let doc = parse_ground_truth(GT_MD);
-        let (c, _, _) = section_recall(&doc.components, &lc);
-        assert_eq!(c, 1.0);
-        let (e, _, _) = section_recall(&doc.entrypoints, &lc);
+        let (a, _, _) = layer_recall(&doc.architecture, hay);
+        assert_eq!(a, 1.0);
+        let (e, _, _) = layer_recall(&doc.entrypoints, hay);
         assert_eq!(e, 1.0);
-        let (f, _, _) = section_recall(&doc.flows, &lc);
-        assert_eq!(f, 1.0);
-        let (o, _, _) = section_recall(&doc.ownership, &lc);
-        assert_eq!(o, 1.0);
-        let (ct, _, _) = section_recall(&doc.contracts, &lc);
-        assert_eq!(ct, 1.0);
-        let (t, _, _) = section_recall(&doc.tests, &lc);
+        let (b, _, _) = layer_recall(&doc.behavior, hay);
+        assert_eq!(b, 1.0);
+        let (s, _, _) = layer_recall(&doc.state_authority, hay);
+        assert_eq!(s, 1.0);
+        let (c, _, _) = layer_recall(&doc.contracts, hay);
+        assert_eq!(c, 1.0);
+        let (l, _, _) = layer_recall(&doc.landmarks, hay);
+        assert_eq!(l, 1.0);
+        let (t, _, _) = layer_recall(&doc.tests, hay);
         assert_eq!(t, 1.0);
 
-        // zero: no ground-truth item is a substring of empty content
-        let (z, _, _) = section_recall(&doc.components, "");
+        // zero: no ground-truth item is a substring of empty haystack
+        let (z, _, _) = layer_recall(&doc.architecture, "");
         assert_eq!(z, 0.0);
 
         // partial: "root" hits, "services" does not
-        let (p, hit, total) = section_recall(&doc.components, "root only");
+        let (p, hit, total) = layer_recall(&doc.architecture, "root only");
         assert_eq!((p, hit, total), (0.5, 1, 2));
 
         // empty ground truth scores 1.0 (nothing to miss)
         let empty = GroundTruthDoc::default();
-        let (x, hit0, total0) = section_recall(&empty.components, "anything");
+        let (x, hit0, total0) = layer_recall(&empty.architecture, "anything");
         assert_eq!((x, hit0, total0), (1.0, 0, 0));
+    }
+
+    #[test]
+    fn flow_edge_precision_counts_ordered_pairs_in_behavior_items() {
+        // two graphs: g1 has a supported chain, g2 has an unsupported edge
+        let g1 = FlowGraph {
+            id: "g1".into(),
+            kind: scc_core::FlowKind::Sequence,
+            name: "g1".into(),
+            trigger: None,
+            nodes: vec![
+                scc_core::FlowNode { id: 0, actor: "a".into(), operation: "worker consumer".into(), evidence: vec![] },
+                scc_core::FlowNode { id: 1, actor: "b".into(), operation: "task.run".into(), evidence: vec![] },
+                scc_core::FlowNode { id: 2, actor: "c".into(), operation: "task.retry".into(), evidence: vec![] },
+            ],
+            edges: vec![
+                scc_core::FlowEdge { from: 0, to: 1, kind: scc_core::FlowEdgeKind::Next, condition: None, provenance: None, confidence: 1.0, evidence: vec![] },
+                scc_core::FlowEdge { from: 1, to: 2, kind: scc_core::FlowEdgeKind::Next, condition: None, provenance: None, confidence: 1.0, evidence: vec![] },
+            ],
+            entrypoints: vec![0],
+            exits: vec![2],
+            provenance_summary: Default::default(),
+        };
+        // "worker consumer -> task.run" supports (0,1) but not (1,2)
+        let behavior = vec!["worker consumer -> task.run".to_string()];
+        let prec = flow_edge_precision(&[g1], &behavior);
+        assert!((prec - 0.5).abs() < 1e-9, "1 of 2 edges supported: {prec}");
+
+        // no behavior ground truth -> 1.0 (nothing to contradict)
+        assert_eq!(flow_edge_precision(&[], &behavior), 1.0);
+        let g_empty = FlowGraph {
+            id: "g".into(),
+            kind: scc_core::FlowKind::Sequence,
+            name: "g".into(),
+            trigger: None,
+            nodes: vec![
+                scc_core::FlowNode { id: 0, actor: "a".into(), operation: "x".into(), evidence: vec![] },
+                scc_core::FlowNode { id: 1, actor: "b".into(), operation: "y".into(), evidence: vec![] },
+            ],
+            edges: vec![],
+            entrypoints: vec![0],
+            exits: vec![1],
+            provenance_summary: Default::default(),
+        };
+        assert_eq!(flow_edge_precision(std::slice::from_ref(&g_empty), &behavior), 1.0, "no edges -> 1.0");
+        assert_eq!(flow_edge_precision(&[g_empty], &[]), 1.0);
+    }
+
+    #[test]
+    fn token_density_guards_zero_tokens() {
+        assert_eq!(token_density(5, 0), 0.0);
+        assert!((token_density(5, 5000) - 1.0).abs() < 1e-9, "5 facts / 5k tokens = 1 per 1k");
     }
 
     #[test]
@@ -669,7 +1379,7 @@ test_create_item
         std::fs::create_dir_all(corpus.join("repo-a")).unwrap();
 
         let names = ["repo-b".to_string(), "repo-a".to_string()];
-        let report = run_atlas_recall(&corpus, &gt, &names).unwrap();
+        let report = run_atlas_recall(&corpus, &gt, &names, false).unwrap();
         assert_eq!(report.scored, 0);
         assert_eq!(report.skipped, 2);
         assert!(!report.gate_passed);
@@ -689,9 +1399,7 @@ test_create_item
             .contains("corpus dir missing"));
     }
 
-    #[test]
-    fn run_atlas_recall_scores_synthetic_repo() {
-        let tmp = tempfile::TempDir::new().unwrap();
+    fn synth_repo(tmp: &tempfile::TempDir, gt_md: &str) {
         let corpus = tmp.path().join("corpus");
         let gt = tmp.path().join("ground-truth");
         std::fs::create_dir_all(&corpus).unwrap();
@@ -708,33 +1416,62 @@ test_create_item
             "class ItemRepository:\n    def find_all(self):\n        return []\n",
         )
         .unwrap();
-        std::fs::write(
-            gt.join("synth.md"),
-            "## components\n- root\n- services\n## entrypoints\n- handle_items\n## flows\n- ItemRepository\n## ownership\n- zzz_nonexistent_store\n## contracts\n- GET /api/items\n- GET /api/zzz_nonexistent\n## tests\n- test_nonexistent\n",
-        )
-        .unwrap();
+        std::fs::write(gt.join("synth.md"), gt_md).unwrap();
+    }
+
+    #[test]
+    fn run_atlas_recall_scores_synthetic_repo_structurally() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        synth_repo(
+            &tmp,
+            "## architecture\n- root\n- services\n## entrypoints\n- handle_items\n## behavior\n- ItemRepository\n## state_authority\n- zzz_nonexistent_store\n## contracts\n- GET /api/items\n- GET /api/zzz_nonexistent\n## landmarks\n- ItemRepository\n## tests\n- test_nonexistent\n",
+        );
 
         let report =
-            run_atlas_recall(&corpus, &gt, &["synth".to_string()]).unwrap();
+            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], false)
+                .unwrap();
         assert_eq!(report.scored, 1);
         assert_eq!(report.skipped, 0);
         assert!(report.gate_passed == (report.mean_overall >= ATLAS_GATE));
         let r = &report.repos[0];
         assert!(r.skipped_reason.is_none());
-        // overall is the equal-weighted mean of the five scored sections
-        let expect =
-            (r.components + r.entrypoints + r.flows + r.ownership + r.contracts) / 5.0;
+        // overall is the equal-weighted mean of the five startup layers
+        let expect = (r.architecture + r.entrypoints + r.behavior + r.state_authority + r.contracts) / 5.0;
         assert!((r.overall - expect).abs() < 1e-9);
-        // components / entrypoints / flows surface in the atlas
-        assert_eq!(r.components, 1.0, "root + services components");
-        assert_eq!(r.entrypoints, 1.0, "handle_items in flow steps");
-        assert_eq!(r.flows, 1.0, "ItemRepository in flow steps");
         // the deliberately nonexistent items must be missed
-        assert_eq!(r.ownership, 0.0);
+        assert_eq!(r.state_authority, 0.0);
         assert_eq!(r.contracts, 0.5, "GET /api/items hits, zzz misses");
-        assert!(r.missed.contains(&"ownership:zzz_nonexistent_store".to_string()));
+        assert!(r.missed.contains(&"state_authority:zzz_nonexistent_store".to_string()));
         assert!(r.missed.contains(&"contracts:GET /api/zzz_nonexistent".to_string()));
         assert!(!r.missed.contains(&"entrypoints:handle_items".to_string()));
+        // v2 metrics are finite and in range
+        assert!((0.0..=1.0).contains(&r.precision));
+        assert!(r.density >= 0.0);
+        assert!(r.atlas_tokens > 0, "rendered atlas has tokens");
+        assert_eq!(r.landmark_items, 1);
+    }
+
+    #[test]
+    fn diagnose_classifies_missed_items_deterministically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        synth_repo(
+            &tmp,
+            "## architecture\n- root\n## state_authority\n- zzz_nonexistent_store\n## contracts\n- GET /api/zzz_nonexistent\n## tests\n- test_nonexistent\n",
+        );
+
+        let report =
+            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], true)
+                .unwrap();
+        let r = &report.repos[0];
+        assert!(!r.gaps.is_empty(), "diagnose produced gap findings");
+        // nothing in the store, not a repo file -> EXTRACTOR
+        for g in &r.gaps {
+            assert_eq!(g.kind, GapKind::Extractor, "{:?}", g);
+            assert!(!g.detail.is_empty());
+        }
+        // histogram covers exactly the diagnosed items
+        let total: usize = report.gap_histogram.values().sum();
+        assert_eq!(total, r.gaps.len());
     }
 
     #[test]
@@ -748,16 +1485,20 @@ test_create_item
         )
         .unwrap();
         let doc = ground_truth_from_tasks(&[task.clone(), task], "r");
-        assert_eq!(doc.components, ["root"]);
+        assert_eq!(doc.architecture, ["root"]);
         assert_eq!(doc.entrypoints, ["GET /api/x"]);
         assert_eq!(doc.contracts, ["GET /api/x"]);
-        assert_eq!(doc.flows, ["s1", "s2"]);
-        assert_eq!(doc.ownership, ["redis", "db.x"]);
+        assert_eq!(doc.behavior, ["s1", "s2"]);
+        assert_eq!(doc.state_authority, ["redis", "db.x"]);
         assert_eq!(doc.tests, ["test_a"]);
 
         // re-parse the synthesized markdown through the same parser
         let doc2 = parse_ground_truth(&doc.to_markdown());
-        assert_eq!(doc2.flows, doc.flows);
-        assert_eq!(doc2.ownership, doc.ownership);
+        assert_eq!(doc2.behavior, doc.behavior);
+        assert_eq!(doc2.state_authority, doc.state_authority);
+        assert_eq!(doc2.architecture, doc.architecture);
     }
 }
+
+
+

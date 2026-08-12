@@ -1,22 +1,10 @@
 # fastapi
 > https://github.com/fastapi/fastapi | Python | python service | ~113k LOC
 
-## components
+## architecture
 - FastAPI — the app class in fastapi/applications.py (line 42), core of the framework; note: no fastapi/main.py in this version
 - APIRouter — route-grouping component in fastapi/routing.py (line 2255), included into FastAPI apps via include_router
 - APIRoute — path-operation route class in fastapi/routing.py (line 1126), wraps endpoint + response model
-- APIWebSocketRoute — websocket route class in fastapi/routing.py (line 801), subclasses Starlette WebSocketRoute
-- Dependant — dependency-graph node dataclass in fastapi/dependencies/models.py (line 32)
-- ParamTypes — enum of parameter locations (query/header/path/cookie) in fastapi/params.py (line 19)
-- Path — path parameter class in fastapi/params.py (line 137), sets in_ = ParamTypes.path
-- Query — query parameter class in fastapi/params.py (line 221), sets in_ = ParamTypes.query
-- Body — request-body field class in fastapi/params.py (line 469), base of Form/File
-- Depends — frozen dataclass declaring a dependency callable in fastapi/params.py (line 746)
-- Security — Depends subclass with scopes in fastapi/params.py (line 753)
-- jsonable_encoder — JSON-compatible object encoder in fastapi/encoders.py (line 129)
-- get_openapi — OpenAPI schema generator in fastapi/openapi/utils.py (line 585)
-- BackgroundTasks — background task container in fastapi/background.py with add_task (line 40)
-- HTTPException — error type raised in endpoints, exported from fastapi/exceptions.py
 
 ## entrypoints
 - `GET /items/{item_id}` — route decorator on a FastAPI instance, e.g. docs_src/app_testing/tutorial003_py310.py
@@ -29,7 +17,7 @@
 - openapi — method generating the app's OpenAPI schema (fastapi/applications.py line 1070)
 - fastapi = "fastapi.cli:main" — CLI console script in pyproject.toml (line 120)
 
-## flows
+## behavior
 - get_dependant — builds the Dependant tree from an endpoint signature (fastapi/dependencies/utils.py line 271)
 - solve_dependencies — async resolution of the dependency tree into request args (fastapi/dependencies/utils.py line 586)
 - get_request_handler — wraps endpoint + dependant into the ASGI handler (fastapi/routing.py line 375)
@@ -38,7 +26,7 @@
 - generate_operation_id — derives operationId strings like read_items_items__get (fastapi/openapi/utils.py line 266)
 - jsonable_encoder — encodes response objects (datetimes, Decimals, models) to JSON-safe values (fastapi/encoders.py line 129)
 
-## ownership
+## state_authority
 - self.dependency_overrides — app-level dict of overridden dependencies (fastapi/applications.py line 967)
 - self.router — the internal APIRouter holding all registered routes (fastapi/applications.py init)
 - app.state — State object attached to the app instance (fastapi/applications.py line 966)
@@ -54,6 +42,20 @@
 - response_model=Item — response model contract in docs_src/additional_responses/tutorial001_py310.py
 - `GET /items/{item_id}` — APIRouter route contract in tests/test_router_include_context.py (line 43)
 - `Header` — header parameter contract (x_token: str = Header()) in docs_src/app_b_py310/main.py
+
+## landmarks
+- APIWebSocketRoute — websocket route class in fastapi/routing.py (line 801), subclasses Starlette WebSocketRoute
+- Dependant — dependency-graph node dataclass in fastapi/dependencies/models.py (line 32)
+- ParamTypes — enum of parameter locations (query/header/path/cookie) in fastapi/params.py (line 19)
+- Path — path parameter class in fastapi/params.py (line 137), sets in_ = ParamTypes.path
+- Query — query parameter class in fastapi/params.py (line 221), sets in_ = ParamTypes.query
+- Body — request-body field class in fastapi/params.py (line 469), base of Form/File
+- Depends — frozen dataclass declaring a dependency callable in fastapi/params.py (line 746)
+- Security — Depends subclass with scopes in fastapi/params.py (line 753)
+- jsonable_encoder — JSON-compatible object encoder in fastapi/encoders.py (line 129)
+- get_openapi — OpenAPI schema generator in fastapi/openapi/utils.py (line 585)
+- BackgroundTasks — background task container in fastapi/background.py with add_task (line 40)
+- HTTPException — error type raised in endpoints, exported from fastapi/exceptions.py
 
 ## tests
 - tests/test_application.py — openapi schema and route behavior assertions

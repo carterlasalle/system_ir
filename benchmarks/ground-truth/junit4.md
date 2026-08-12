@@ -1,21 +1,16 @@
 # junit4
 > https://github.com/junit-team/junit4 | Java | java service (lib) | ~45k LOC
 
-## components
-- Test — @Test annotation in src/main/java/org/junit/Test.java with expected() and timeout() attributes
-- Assert — static assertion class org.junit.Assert (assertEquals/assertTrue/assertThrows/fail)
+## architecture
 - JUnitCore — runner facade in org/junit/runner/JUnitCore.java with run/runClasses/main
-- Result — runner/Result.java collecting run counts, failures, and ignored counts
 - Runner — abstract base class in runner/Runner.java defining run(Notifier)/getDescription
-- Description — runner/Description.java test identity and display names (createTestDescription)
 - ParentRunner — runners/ParentRunner.java base class for hierarchical runners (Suite, BlockJUnit4ClassRunner)
 - BlockJUnit4ClassRunner — runners/BlockJUnit4ClassRunner.java executes @Test methods with @Before/@After lifecycle
 - Suite — runners/Suite.java runs a group of test classes together
 - Parameterized — runners/Parameterized.java data-driven parameterized test runner
-- Before — @Before lifecycle annotation in org/junit/Before.java (run before each @Test)
-- TestRule — org/junit/rules/TestRule.java interface for reusable rule wrappers
 - JUnit38ClassRunner — internal/runners/JUnit38ClassRunner.java adapter running legacy junit.framework.Test
 - RunNotifier — runner/notification/RunNotifier.java event dispatch (fireTestStarted/fireTestFailure)
+- TestRule — org/junit/rules/TestRule.java interface for reusable rule wrappers
 
 ## entrypoints
 - `JUnitCore.main` — CLI entry: System.exit(runMain(args)) in JUnitCore.java
@@ -26,7 +21,7 @@
 - `Request.classes` — runner/Request.java entry constructing a Runner for given classes
 - `@Test` — method-level marker recognized by BlockJUnit4ClassRunner
 
-## flows
+## behavior
 - `JUnitCore.run` -> Request.classes -> Computer -> Runner — runner assembly flow from facade to suite
 - `BlockJUnit4ClassRunner` -> MethodRoadie -> RunRules -> before/test/after — per-method execution flow in internal/runners
 - `ParentRunner.run` -> runChildren — recursive execution of child runners
@@ -35,7 +30,7 @@
 - `assertThrows` -> ThrowingRunnable.run() inside try/catch — assertion flow in Assert.java
 - `@RunWith(Parameterized.class)` -> Parameterized -> per-parameter-set child runners — parameterized execution flow
 
-## ownership
+## state_authority
 - Result — owns run/failure/ignore counters via AtomicInteger and the failure list
 - Description — owns test names, unique ids, and the children tree
 - Failure — runner/notification/Failure.java owns the failed Description plus thrown exception (getException)
@@ -54,6 +49,13 @@
 - `@Rule` — rule field contract processed by RuleContainer
 - `@Ignore` — org/junit/Ignore.java contract to skip a test or class
 - `@FixMethodOrder(MethodSorters.NAME_ASCENDING)` — execution-order contract with runners/MethodSorters.java
+
+## landmarks
+- Test — @Test annotation in src/main/java/org/junit/Test.java with expected() and timeout() attributes
+- Assert — static assertion class org.junit.Assert (assertEquals/assertTrue/assertThrows/fail)
+- Result — runner/Result.java collecting run counts, failures, and ignored counts
+- Description — runner/Description.java test identity and display names (createTestDescription)
+- Before — @Before lifecycle annotation in org/junit/Before.java (run before each @Test)
 
 ## tests
 - AssertionTest — src/test/java/org/junit/tests/assertion/AssertionTest.java covering assert APIs

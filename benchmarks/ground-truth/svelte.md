@@ -1,13 +1,9 @@
 # svelte
 > https://github.com/sveltejs/svelte | TypeScript | monorepo | ~157k LOC
 
-## components
+## architecture
 - `compile` — component compiler entry in packages/svelte/src/compiler/index.js
-- `compileModule` — runes-module compiler entry (compiler/index.js)
-- `parse` — AST-only parser export (compiler/index.js)
-- `parseCss` — stylesheet-only parse returning a StyleSheetFile
 - `preprocess` — preprocessor pipeline exported from compiler/index.js
-- `print` — AST -> code printer (compiler/print)
 - `migrate` — Svelte 4 to 5 migration (compiler/migrate)
 - `Component` — public component interface in src/index.d.ts
 - `mount` — client render entry in internal/client/render.js
@@ -28,7 +24,7 @@
 - `phases/2-analyze` — analysis phase (analyze_component)
 - `phases/3-transform` — client/server transform phase
 
-## flows
+## behavior
 - `compile` — full compile chain: `compile` -> `_parse` -> `analyze_component` -> `transform_component`
 - `parse` — CSS AST path: `parse` -> `Parser.forCss` -> `parse_stylesheet`
 - `mount` — client render with effects: `mount` -> `_mount(component, options)`
@@ -38,7 +34,7 @@
 - `state` — reactive value creation: `state` -> `source` signal + proxy (sources.js)
 - `flushSync` / `fork` — batch flushing from reactivity/batch.js
 
-## ownership
+## state_authority
 - `state` — compiler-global state (warnings, filename) in compiler/state.js
 - `Batch` — client update batching manager (reactivity/batch.js)
 - `mounted_components` — unmount registry in render.js
@@ -59,6 +55,12 @@
 - `runes` — compile option toggling runes mode (compiler/index.js)
 - `css` — compile option controlling css output ('external' default in legacy)
 - `mount` — client mount options contract
+
+## landmarks
+- `compileModule` — runes-module compiler entry (compiler/index.js)
+- `parse` — AST-only parser export (compiler/index.js)
+- `parseCss` — stylesheet-only parse returning a StyleSheetFile
+- `print` — AST -> code printer (compiler/print)
 
 ## tests
 - packages/svelte/tests/compiler-errors — compile error fixtures

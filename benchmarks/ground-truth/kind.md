@@ -1,12 +1,10 @@
 # kind
 > https://github.com/kubernetes-sigs/kind | Go | k8s deploy | ~27k LOC
 
-## components
+## architecture
 - Provider — pkg/cluster/provider.go public facade for cluster operations (Create/Delete/List)
-- NewProvider — constructor in pkg/cluster/provider.go taking ProviderOptions (docker/podman/nerdctl runtimes)
 - Cluster — cluster config type in pkg/apis/config/v1alpha4/types.go (kind: Cluster)
 - Node — per-node config type with Role field in pkg/apis/config/v1alpha4/types.go
-- NodeRole — enum type in v1alpha4 types.go: ControlPlaneRole "control-plane", WorkerRole "worker"
 - create.Cluster — pkg/cluster/internal/create/create.go internal cluster provisioning function
 - delete.Cluster — pkg/cluster/internal/delete/delete.go internal teardown function
 - nodeimage.Build — pkg/build/nodeimage/build.go node image build entry (Build(options ...Option))
@@ -26,7 +24,7 @@
 - `func (p *Provider) Delete(name, explicitKubeconfigPath string) error` — provider entry for teardown
 - `func (p *Provider) List() ([]string, error)` — provider entry listing existing clusters
 
-## flows
+## behavior
 - `kind create cluster` -> NewProvider -> Provider.Create -> create.Cluster — CLI-to-provider creation flow
 - `CreateWithConfigFile` -> internalencoding.Load -> Cluster config — config parsing flow (raw YAML -> typed config)
 - `CreateWithWaitForReady` -> wait for control-plane readiness — readiness flow after provisioning
@@ -36,7 +34,7 @@
 - `docker.NewProvider` — Docker runtime provisioning of node containers (cluster in Docker)
 - `CreateWithWaitForReady` — flag-to-option wiring: `wait` flag DurationVar -> flags.Wait -> CreateWithWaitForReady (createcluster.go:115)
 
-## ownership
+## state_authority
 - DefaultClusterName — pkg/cluster/constants/constants.go `DefaultClusterName = "kind"` default cluster/context name
 - providers.Provider — internal runtime interface owning node lifecycle ops (Provision, ListNodes)
 - docker.NewProvider — Docker provider implementation (pkg/cluster/internal/providers/docker)
@@ -55,6 +53,10 @@
 - `--kubeconfig` — explicit kubeconfig path flag (StringVar on flags.Kubeconfig)
 - `ControlPlaneRole NodeRole = "control-plane"` — control-plane role constant in v1alpha4 types.go
 - `WorkerRole NodeRole = "worker"` — worker role constant in v1alpha4 types.go
+
+## landmarks
+- NewProvider — constructor in pkg/cluster/provider.go taking ProviderOptions (docker/podman/nerdctl runtimes)
+- NodeRole — enum type in v1alpha4 types.go: ControlPlaneRole "control-plane", WorkerRole "worker"
 
 ## tests
 - pkg/internal/apis/config/encoding/load_test.go — config parsing tests

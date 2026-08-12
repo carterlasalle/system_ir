@@ -1,7 +1,7 @@
 # prettier
 > https://github.com/prettier/prettier | TypeScript/JS | ts backend (tool) | ~164k LOC
 
-## components
+## architecture
 - `format` — main async formatting API in src/index.js
 - `check` — verifies formatted output equals input (src/index.js)
 - `formatWithCursor` — format returning a cursor offset (src/main/core.js)
@@ -10,9 +10,6 @@
 - `printAstToDoc` — AST -> document conversion in src/main/ast-to-doc.js
 - `prepareToPrint` — preprocessing step before doc building (ast-to-doc.js)
 - `printDocToString` — document -> string printer (src/document/printer/printer.js)
-- `group` — doc builder for groupable layout (src/document/builders/group.js)
-- `hardline` — forced line-break doc builder (builders/line.js)
-- `softline` — optional line-break doc builder
 - `builders` — exported doc-builder namespace in src/document/public.js
 
 ## entrypoints
@@ -24,7 +21,7 @@
 - `formatFiles` — CLI bulk-format runner in src/cli/format.js
 - `src/cli/context.js` — CLI context construction from argv
 
-## flows
+## behavior
 - `format` -> `coreFormat` -> `parse` -> `printAstToDoc` -> `printDocToString` — main pipeline
 - `check` -> `format` text comparison — check-mode short-circuit
 - `parse` -> `resolveParser` -> `parser.preprocess` — parser resolution (main/parse.js)
@@ -34,7 +31,7 @@
 - `formatFile` -> `mockable.writeFormattedFile` — write mode with mtime-preserving skip
 - `normalizeInputAndOptions` -> `normalizeFormatOptions` — option normalization before core
 
-## ownership
+## state_authority
 - `printAstToDoc` — AST-to-doc memoization across files
 - `options` — normalized options object threaded through the whole pipeline
 - `resolveConfig` — config file loading (src/config/resolve-config.js)
@@ -56,6 +53,11 @@
 - `html` — HTML parser (src/language-html)
 - `yaml` — YAML parser (src/language-yaml/parser-yaml.js)
 - `CATEGORY_OUTPUT` — option category constant for output flags
+
+## landmarks
+- `group` — doc builder for groupable layout (src/document/builders/group.js)
+- `hardline` — forced line-break doc builder (builders/line.js)
+- `softline` — optional line-break doc builder
 
 ## tests
 - tests/format — golden formatting snapshots per language (js, css, html, json, ...)

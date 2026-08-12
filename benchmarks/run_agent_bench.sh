@@ -11,8 +11,11 @@
 #   E  Codex + full startup System Atlas (scc atlas)
 #   F  Codex + atlas with lazy semantic resolution (scc atlas --resolve)
 #
-# The harness measures: wall time, exit status, output size, and
-# localization = ground-truth files surfaced in the agent's output.
+# The harness measures: wall time, exit status, output size, localization
+# (ground-truth files surfaced in the agent's output), and — because the
+# codex variants run with `--json` — tool-level exploration metrics parsed
+# from the JSONL event stream: files opened, search/read tool calls,
+# wrong-first locations, and first-correct-location time.
 # Results print per variant; JSON summaries land in benchmarks/results/.
 
 set -euo pipefail
@@ -25,16 +28,16 @@ mkdir -p benchmarks/results
 TIME_BUDGET=300
 export PATH="$PWD/target/release:$PATH"
 
-baseline_cmd='printf "%s\n" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
+baseline_cmd='printf "%s\n" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
 
-atlas_cmd='ATLAS=$("'"$SCC_BIN"'" atlas 2>/dev/null || true); printf "SCC SYSTEM ATLAS (startup architecture):\n%s\n\nTASK: %s\n" "$ATLAS" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
+atlas_cmd='ATLAS=$("'"$SCC_BIN"'" atlas 2>/dev/null || true); printf "SCC SYSTEM ATLAS (startup architecture):\n%s\n\nTASK: %s\n" "$ATLAS" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
 
-atlas_resolve_cmd='ATLAS=$("'"$SCC_BIN"'" atlas --resolve 2>/dev/null || true); printf "SCC SYSTEM ATLAS (startup architecture):\n%s\n\nTASK: %s\n" "$ATLAS" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
+atlas_resolve_cmd='ATLAS=$("'"$SCC_BIN"'" atlas --resolve 2>/dev/null || true); printf "SCC SYSTEM ATLAS (startup architecture):\n%s\n\nTASK: %s\n" "$ATLAS" "$SCC_GOAL" | gtimeout '"$TIME_BUDGET"' codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . - 2>/dev/null'
 
 run_variant() {
   local v="$1" cmd="$2"
-  echo "=== variant $v: 21 tasks through codex ==="
-  "$SCC_BIN" bench agent --cmd "$cmd" 2>&1 | tee "benchmarks/results/agent-$v.txt"
+  echo "=== variant $v: 21 tasks through codex (--json event stream) ==="
+  "$SCC_BIN" bench agent --cmd "$cmd" 2>&1 | tee "benchmarks/results/agent-$v-v2.txt"
 }
 
 variants=("$@")
@@ -48,4 +51,4 @@ for v in "${variants[@]}"; do
     *) echo "unknown variant $v (A|E|F)"; exit 1 ;;
   esac
 done
-echo "done — results in benchmarks/results/agent-{A,E,F}.txt"
+echo "done — results in benchmarks/results/agent-{A,E,F}-v2.txt"

@@ -1,7 +1,7 @@
 # microservices-demo
 > https://github.com/GoogleCloudPlatform/microservices-demo | Multi | microservices | ~22k LOC
 
-## components
+## architecture
 - hipstershop — proto package in protos/demo.proto (go_package github.com/GoogleCloudPlatform/microservices-demo/hipstershop)
 - CartService — gRPC service in demo.proto with AddItem/GetCart/EmptyCart
 - ProductCatalogService — gRPC service in demo.proto with ListProducts/GetProduct/SearchProducts
@@ -27,7 +27,7 @@
 - src/cartservice/src/Program.cs — .NET gRPC server entry (Dockerfile ENV ASPNETCORE_HTTP_PORTS=7070)
 - src/paymentservice/server.js — Node gRPC server (HipsterShopServer.PORT from env, 50051 in manifests)
 
-## flows
+## behavior
 - `ListProducts` -> catalog_loader.go -> products.json — catalog loading flow (jsonpb unmarshal of products.json)
 - `getCart` -> CartService.GetCart — frontend/rpc.go cart fetch flow
 - `PlaceOrder` -> GetCart -> GetQuote -> Charge -> SendOrderConfirmation -> ShipOrder — checkout pipeline in checkoutservice/main.go
@@ -37,7 +37,7 @@
 - `ListRecommendations` -> RecommendationService — recommendation flow (frontend getRecommendations)
 - `homeHandler` -> getProducts -> ProductCatalogService.ListProducts — storefront home flow
 
-## ownership
+## state_authority
 - redis-cart — cartservice.yaml redis Deployment owning cart state (REDIS_ADDR redis-cart:6379)
 - RedisCartStore — cartservice/src/cartstore/RedisCartStore.cs cart storage implementation
 - ICartStore — cartservice/src/cartstore/ICartStore.cs interface owning cart persistence contract

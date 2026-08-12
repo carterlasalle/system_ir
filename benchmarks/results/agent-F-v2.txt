@@ -1,0 +1,24 @@
+scc bench agent — ground-truth corpus through an external agent command
+  tasks: 21   exit-ok: 21/21   mean duration: 59109 ms   mean localization: 0.952
+  exploration means: files opened 5.5   searches 0.4   reads 2.0   wrong-first 0.9   first-correct 33229 ms
+  http-service.rename-transcript-field       ok      61178 ms    48935 B  files 2/2  opened  4  srh  0  read  0  tot   7  wrng  0  1st-correct    47868 ms
+  http-service.transcript-normalization      ok      82685 ms    55965 B  files 2/2  opened  0  srh  0  read  3  tot  17  wrng  0  1st-correct    37411 ms
+  http-service.health-check                  ok      51883 ms    31826 B  files 1/1  opened  3  srh  0  read  0  tot   6  wrng  0  1st-correct    13597 ms
+  queue-worker.asr-retry                     ok      65884 ms    35184 B  files 2/2  opened 12  srh  0  read  1  tot   7  wrng  0  1st-correct    16650 ms
+  queue-worker.street-vocabulary             ok      67088 ms    49397 B  files 2/2  opened  7  srh  0  read  0  tot   6  wrng  3  1st-correct    51524 ms
+  queue-worker.redis-persist                 ok      60240 ms    34525 B  files 2/2  opened  8  srh  0  read  1  tot   6  wrng  0  1st-correct    42495 ms
+  monorepo.rename-transcript-field           ok      21883 ms     5205 B  files 3/3  opened  0  srh  0  read  0  tot   1  wrng  0  1st-correct    15258 ms
+  monorepo.worker-indexing                   ok     108810 ms    66019 B  files 2/2  opened 11  srh  2  read  2  tot  16  wrng  3  1st-correct    39205 ms
+  monorepo.new-field                         ok      75518 ms    65941 B  files 1/1  opened  4  srh  1  read 10  tot  18  wrng  4  1st-correct    50475 ms
+  py-queue.classification-fallback           ok      57991 ms    52322 B  files 2/2  opened  8  srh  0  read  3  tot   6  wrng  0  1st-correct    11750 ms
+  py-queue.store-changes                     ok      16189 ms     1119 B  files 0/2  opened  0  srh  0  read  0  tot   0  wrng  0  1st-correct        —
+  py-queue.empty-messages                    ok      99957 ms    62082 B  files 2/2  opened  4  srh  2  read  0  tot  14  wrng  0  1st-correct    40016 ms
+  ts-api-web.pagination                      ok      64230 ms    30079 B  files 2/2  opened  8  srh  0  read  0  tot   6  wrng  0  1st-correct    44487 ms
+  ts-api-web.contract-field                  ok      35640 ms    36744 B  files 3/3  opened  8  srh  0  read  0  tot   4  wrng  0  1st-correct    24954 ms
+  ts-api-web.creation-test                   ok      71535 ms    55092 B  files 2/2  opened  8  srh  2  read  7  tot  18  wrng  1  1st-correct    38207 ms
+  large-ts.new-order-endpoint                ok      26829 ms    34603 B  files 3/3  opened  3  srh  2  read  1  tot   3  wrng  0  1st-correct    18814 ms
+  large-ts.order-total-invariant             ok      77796 ms    93607 B  files 2/2  opened  4  srh  0  read  1  tot  11  wrng  0  1st-correct    42160 ms
+  nextjs.transcript-response                 ok      29899 ms    25014 B  files 3/3  opened  2  srh  0  read  0  tot   2  wrng  0  1st-correct    15885 ms
+  nextjs.store-pagination                    ok      39591 ms    38197 B  files 2/2  opened  6  srh  0  read  2  tot   4  wrng  0  1st-correct    28788 ms
+  polyglot.refund-endpoint                   ok      71444 ms    48386 B  files 3/3  opened  9  srh  0  read  9  tot  15  wrng  2  1st-correct    50058 ms
+  polyglot.web-payments                      ok      55011 ms    29913 B  files 3/3  opened  7  srh  0  read  1  tot   4  wrng  5  1st-correct    34974 ms

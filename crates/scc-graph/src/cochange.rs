@@ -22,8 +22,20 @@ use std::process::Command;
 /// Used by the compilation pipeline for both clustering and enrichment.
 pub const COCHANGE_MIN_COMMITS: u32 = 2;
 
+/// Cap on files per commit: commits touching more than this many files are
+/// skipped entirely — formatting, vendor, and mass-rename commits are
+/// pairing noise, and pairing them is O(k²) (a 4,600-file commit would
+/// generate ~10.6M inserts).
+pub const COCHANGE_MAX_FILES: usize = 500;
+
+/// Meta key prefix for the HEAD-keyed pair cache. The full key is
+/// `cochange:<git HEAD>` (or `cochange:nogit` when git is unavailable).
+/// Cache use is a pure cache of a deterministic computation — it never
+/// bumps a model epoch.
+pub const COCHANGE_CACHE_PREFIX: &str = "cochange:";
+
 /// One co-changed file pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CochangePair {
     /// Lexicographically smaller file (repo-relative).
     pub a: String,
@@ -93,6 +105,51 @@ pub fn cochange_pairs(root: &Path, min_commits: u32) -> Result<Vec<CochangePair>
     Ok(pairs)
 }
 
+/// The repo's current git HEAD, or `"nogit"` when git is unavailable, the
+/// dir is missing, or the repo has no HEAD (fresh `git init`). The HEAD is
+/// the natural cache key: pairs change exactly when history changes, and
+/// HEAD moves invalidate the cache automatically.
+pub fn cache_key(root: &Path) -> String {
+    if !root.is_dir() {
+        return "nogit".to_string();
+    }
+    match Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => "nogit".to_string(),
+    }
+}
+
+/// Pairs cached in the store under `key` (full meta key, e.g.
+/// `cochange:<HEAD>`). `None` on miss or corrupt JSON — a corrupt cache is
+/// recomputed, never fatal.
+pub fn cached_pairs(store: &Store, key: &str) -> Option<Vec<CochangePair>> {
+    let raw = store.meta_get(key).ok().flatten()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Co-change pairs for the store's repo, served from the HEAD-keyed store
+/// cache when present. On a cache miss, computes fresh (with the per-commit
+/// caps applied) and persists the result under `cochange:<HEAD>` — the
+/// second `scc index`/`scc atlas` run at the same HEAD skips the git pass
+/// entirely. Non-fatal like `cochange_pairs`: no git repo or git failure
+/// yields empty pairs.
+pub fn cached_cochange_pairs(store: &Store) -> Result<Vec<CochangePair>, String> {
+    let key = format!("{COCHANGE_CACHE_PREFIX}{}", cache_key(&store.root));
+    if let Some(pairs) = cached_pairs(store, &key) {
+        return Ok(pairs);
+    }
+    let pairs = cochange_pairs(&store.root, COCHANGE_MIN_COMMITS)?;
+    let raw = serde_json::to_string(&pairs).map_err(|e| e.to_string())?;
+    store.meta_set(&key, &raw).map_err(|e| e.to_string())?;
+    Ok(pairs)
+}
+
 /// Annotate each store component whose implementation paths contain BOTH
 /// sides of a co-change pair with a `cochange` attribute:
 /// `{pairs: ["a <-> b ×N", ...], top: N}` (top 5 pairs by commit count).
@@ -146,7 +203,15 @@ pub fn enrich_components(store: &Store, pairs: &[CochangePair]) -> Result<usize,
 /// Count every unordered pair of distinct files changed together in one
 /// commit. Pairs are canonicalized to lexicographic order so (a, b) and
 /// (b, a) collapse into a single counter.
+///
+/// Pathological commits are skipped: fewer than 2 files form no pair, and
+/// commits touching more than `COCHANGE_MAX_FILES` files (formatting,
+/// vendor, mass-rename noise) are dropped entirely — pairing them is O(k²)
+/// and the signal is garbage.
 fn record_commit(files: &HashSet<String>, counts: &mut BTreeMap<(String, String), u32>) {
+    if files.len() < 2 || files.len() > COCHANGE_MAX_FILES {
+        return;
+    }
     let mut list: Vec<&String> = files.iter().collect();
     list.sort();
     for (i, a) in list.iter().enumerate() {
@@ -391,5 +456,130 @@ mod tests {
         assert_eq!(n, 0);
         let comps = store.components().unwrap();
         assert!(!comps[0].attributes.contains_key("cochange"));
+    }
+
+    #[test]
+    fn cache_key_tracks_head() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // not a git repo → "nogit"
+        assert_eq!(cache_key(tmp.path()), "nogit");
+        // nonexistent dir → "nogit"
+        assert_eq!(cache_key(&tmp.path().join("nope")), "nogit");
+
+        git_init(tmp.path());
+        // no commits yet → no HEAD → "nogit"
+        assert_eq!(cache_key(tmp.path()), "nogit");
+
+        write(tmp.path(), "a.py", "a\n");
+        commit_all(tmp.path(), "c1");
+        let head1 = cache_key(tmp.path());
+        assert_eq!(head1.len(), 40, "SHA-1 HEAD");
+
+        write(tmp.path(), "b.py", "b\n");
+        commit_all(tmp.path(), "c2");
+        let head2 = cache_key(tmp.path());
+        assert_eq!(head2.len(), 40);
+        assert_ne!(head1, head2, "cache key changes when HEAD moves");
+    }
+
+    #[test]
+    fn cached_pairs_keyed_by_head() {
+        let (store, _tmp) = store_for();
+        let key1 = format!("{COCHANGE_CACHE_PREFIX}aaa");
+        let key2 = format!("{COCHANGE_CACHE_PREFIX}bbb");
+        let pairs1 = vec![
+            CochangePair { a: "x.py".into(), b: "y.py".into(), commits: 3 },
+            CochangePair { a: "x.py".into(), b: "z.py".into(), commits: 1 },
+        ];
+        let pairs2 = vec![CochangePair { a: "m.rs".into(), b: "n.rs".into(), commits: 7 }];
+        store.meta_set(&key1, &serde_json::to_string(&pairs1).unwrap()).unwrap();
+        store.meta_set(&key2, &serde_json::to_string(&pairs2).unwrap()).unwrap();
+
+        // two keys (two HEADs) round-trip independently, order preserved
+        assert_eq!(cached_pairs(&store, &key1).unwrap(), pairs1);
+        assert_eq!(cached_pairs(&store, &key2).unwrap(), pairs2);
+        // unknown key → None
+        assert!(cached_pairs(&store, "cochange:zzz").is_none());
+        // corrupt JSON → None (recomputed, never fatal)
+        store.meta_set(&key1, "not json").unwrap();
+        assert!(cached_pairs(&store, &key1).is_none());
+    }
+
+    #[test]
+    fn cached_cochange_pairs_persists_meta_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        git_init(tmp.path());
+        write(tmp.path(), "src/a.py", "a = 1\n");
+        write(tmp.path(), "src/b.py", "b = 2\n");
+        commit_all(tmp.path(), "c1");
+        write(tmp.path(), "src/a.py", "a = 2\n");
+        write(tmp.path(), "src/b.py", "b = 3\n");
+        commit_all(tmp.path(), "c2");
+
+        let store = Store::open(&tmp.path().join("scc.db"), tmp.path()).unwrap();
+        let key = format!("{COCHANGE_CACHE_PREFIX}{}", cache_key(tmp.path()));
+        assert!(store.meta_get(&key).unwrap().is_none(), "no cache before");
+
+        let pairs = cached_cochange_pairs(&store).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].commits, 2);
+
+        // meta key present after the run → second run at the same HEAD
+        // takes the cache path and never re-runs git
+        let raw = store.meta_get(&key).unwrap().expect("cochange cache key present");
+        let decoded: Vec<CochangePair> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded, pairs);
+        // second call is served from cache and is identical (deterministic)
+        assert_eq!(cached_cochange_pairs(&store).unwrap(), pairs);
+    }
+
+    #[test]
+    fn record_commit_skips_pathological_commits() {
+        let mut counts: BTreeMap<(String, String), u32> = BTreeMap::new();
+
+        // < 2 files → no pair
+        let one: HashSet<String> = ["a.py".into()].into_iter().collect();
+        record_commit(&one, &mut counts);
+        assert!(counts.is_empty());
+
+        // > COCHANGE_MAX_FILES → skipped entirely (the O(k²) noise case)
+        let huge: HashSet<String> = (0..COCHANGE_MAX_FILES + 1)
+            .map(|i| format!("f{i}.py"))
+            .collect();
+        record_commit(&huge, &mut counts);
+        assert!(counts.is_empty(), "oversized commit contributes nothing");
+
+        // exactly at the cap still pairs
+        let at_cap: HashSet<String> = (0..COCHANGE_MAX_FILES)
+            .map(|i| format!("g{i}.py"))
+            .collect();
+        record_commit(&at_cap, &mut counts);
+        assert_eq!(counts.len(), COCHANGE_MAX_FILES * (COCHANGE_MAX_FILES - 1) / 2);
+
+        // normal 2-file commit counts once
+        let two: HashSet<String> = ["m.py".into(), "n.py".into()].into_iter().collect();
+        record_commit(&two, &mut counts);
+        assert_eq!(counts[&("m.py".into(), "n.py".into())], 1);
+    }
+
+    #[test]
+    fn oversized_commit_excluded_from_pairs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        git_init(tmp.path());
+        write(tmp.path(), "src/a.py", "a\n");
+        write(tmp.path(), "src/b.py", "b\n");
+        commit_all(tmp.path(), "c1");
+        // mass-rename commit over the cap: 501 files, incl. the pair files
+        for i in 0..COCHANGE_MAX_FILES + 1 {
+            write(tmp.path(), &format!("vendor/f{i}.txt"), &format!("{i}\n"));
+        }
+        write(tmp.path(), "src/a.py", "a2\n");
+        write(tmp.path(), "src/b.py", "b2\n");
+        commit_all(tmp.path(), "mass rename");
+
+        // the two-file commit c1 still pairs; the 503-file commit is dropped
+        let pairs = cochange_pairs(tmp.path(), 1).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].commits, 1);
     }
 }

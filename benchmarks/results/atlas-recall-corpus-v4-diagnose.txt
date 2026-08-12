@@ -1,24 +1,972 @@
-# Ground-truth gaps — atlas recall v2 (Wave 8 §57)
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)
+  mode: corpus: /Users/rocket/system_ir/benchmarks/corpus
+  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec   f/1k  toks  note
+  bat                       0.200  0.400  0.000  0.000  1.000  0.000  0.000    0.320  0.000   6.59  2275
+      missed: architecture:Controller
+      missed: architecture:Config
+      missed: architecture:Input
+      missed: architecture:App
+      missed: entrypoints:Controller::run
+      missed: entrypoints:Controller::run_with_error_handler
+      missed: entrypoints:bat cache
+      missed: behavior:App.new
+      missed: behavior:App.inputs
+      missed: behavior:Controller.run
+      missed: behavior:Assets.from_cache
+      missed: behavior:SyntaxMapping.get_syntax_for
+      missed: state_authority:Assets
+      missed: state_authority:Config
+      missed: state_authority:InputDescription
+      missed: state_authority:PrettyPrinter
+      missed: state_authority:Controller
+      missed: landmarks:PrettyPrinter
+      missed: landmarks:Printer
+      missed: landmarks:SimplePrinter
+      missed: landmarks:InteractivePrinter
+      missed: landmarks:SyntaxMapping
+      missed: landmarks:PagingMode
+      missed: landmarks:OutputHandle
+      missed: tests:tests/integration_tests.rs
+      missed: tests:tests/snapshot_tests.rs` + `tests/snapshots/
+      missed: tests:tests/test_pretty_printer.rs
+      missed: tests:tests/syntax-tests
+      missed: tests:tests/benchmarks
+      missed: tests:src/syntax_mapping.rs` `mod tests` (line 190)
+      missed: tests:tests/github-actions.rs
+  celery                    0.077  0.000  0.667  0.000  0.000  0.500  0.667    0.149  0.000   0.31 16153
+      missed: architecture:Task
+      missed: architecture:Signature
+      missed: architecture:group
+      missed: architecture:chain
+      missed: architecture:chord
+      missed: architecture:AsyncResult
+      missed: architecture:GroupResult
+      missed: architecture:WorkController
+      missed: architecture:RedisBackend
+      missed: architecture:RPCBackend
+      missed: architecture:BaseKeyValueStoreBackend
+      missed: architecture:Scheduler
+      missed: entrypoints:@app.task
+      missed: entrypoints:@shared_task
+      missed: entrypoints:app.send_task
+      missed: entrypoints:task.delay
+      missed: entrypoints:task.apply_async
+      missed: entrypoints:app.worker_main
+      missed: entrypoints:app.start
+      missed: entrypoints:celery -A proj worker
+      missed: behavior:chord header -> add_unlock_chord_task
+      missed: behavior:worker consumer -> task.run
+      missed: state_authority:app.conf
+      missed: state_authority:broker_url
+      missed: state_authority:result_backend
+      missed: state_authority:task_keyprefix = 'celery-task-meta-'
+      missed: state_authority:celery/worker/state.py
+      missed: state_authority:PersistentScheduler
+      missed: contracts:--broker
+      missed: contracts:--result-backend
+      missed: contracts:-Q
+      missed: contracts:--concurrency
+      missed: contracts:--pool
+      missed: contracts:broker='amqp://guest@localhost//'
+      missed: contracts:redis://localhost:6379/0
+      missed: contracts:name='celery.accumulate'
+      missed: landmarks:crontab
+      missed: tests:t/integration/
+      missed: tests:t/unit/tasks/test_canvas.py
+  clap                      0.667  0.000  0.000  0.000  0.000  0.250  0.200    0.133  0.000   0.14 14523
+      missed: architecture:Command
+      missed: entrypoints:Command.new
+      missed: entrypoints:Command.get_matches
+      missed: entrypoints:Command.get_matches_from
+      missed: entrypoints:Command.arg
+      missed: entrypoints:Command.subcommand
+      missed: entrypoints:#[derive(Parser)]
+      missed: entrypoints:clap_complete.generate
+      missed: entrypoints:clap_mangen
+      missed: behavior:Command.new
+      missed: behavior:Command.get_matches
+      missed: behavior:Arg.new
+      missed: behavior:Parser
+      missed: behavior:Command.subcommand
+      missed: behavior:ArgMatches.get_one
+      missed: behavior:clap_complete.generate_to
+      missed: state_authority:ArgMatches
+      missed: state_authority:Command
+      missed: state_authority:Id
+      missed: state_authority:mkeymap
+      missed: state_authority:ArgPredicate
+      missed: state_authority:ValueParser
+      missed: state_authority:StyledStr
+      missed: contracts:long
+      missed: contracts:short('f')
+      missed: contracts:Arg.required
+      missed: contracts:Arg.num_args
+      missed: contracts:ErrorKind.InvalidValue
+      missed: contracts:ErrorKind.UnknownArgument
+      missed: contracts:ErrorKind.DisplayHelp
+      missed: contracts:Command.bin_name
+      missed: contracts:Command.arg_required_else_help
+      missed: landmarks:ArgMatches
+      missed: landmarks:Parser
+      missed: landmarks:ValueEnum
+      missed: landmarks:CommandFactory
+      missed: landmarks:FromArgMatches
+      missed: landmarks:ArgAction
+      missed: landmarks:ErrorKind
+      missed: landmarks:ValueHint
+      missed: landmarks:ColorChoice
+      missed: tests:clap_builder/src/builder/tests.rs
+      missed: tests:examples/
+      missed: tests:ErrorKind
+      missed: tests:ArgAction
+  docker-compose            0.000  0.000  0.000  0.000  0.000  0.000  0.000    0.000  0.000   0.00  3054
+      missed: architecture:composeService
+      missed: architecture:api.Compose
+      missed: architecture:types.Project
+      missed: architecture:RootCommand
+      missed: architecture:pluginMain
+      missed: architecture:EventProcessor
+      missed: entrypoints:upCommand
+      missed: entrypoints:downCommand
+      missed: entrypoints:psCmd
+      missed: entrypoints:startCommand
+      missed: entrypoints:stopCommand
+      missed: entrypoints:restartCmd
+      missed: entrypoints:pullCommand
+      missed: entrypoints:logsCmd
+      missed: entrypoints:exec
+      missed: entrypoints:build
+      missed: entrypoints:Up(ctx context.Context, project *types.Project, options api.UpOptions) error
+      missed: entrypoints:Down(ctx context.Context, projectName string, options api.DownOptions) error
+      missed: behavior:up` -> composeService.Up -> create -> start
+      missed: behavior:down` -> composeService.Down -> remove containers/networks
+      missed: behavior:create` -> createNetwork/createVolume/container creation
+      missed: behavior:runUp` -> backend.Up with Create/Build options
+      missed: behavior:ps` -> composeService.Ps -> []api.ContainerSummary
+      missed: behavior:pull` -> composeService.Pull -> image pulls
+      missed: behavior:logs` -> composeService.Logs -> LogConsumer callbacks
+      missed: behavior:exec` -> composeService.Exec -> run command in container
+      missed: state_authority:composeService
+      missed: state_authority:types.Project
+      missed: state_authority:api.UpOptions
+      missed: state_authority:api.DownOptions
+      missed: state_authority:ProjectOptions
+      missed: state_authority:EventProcessor
+      missed: state_authority:executor
+      missed: contracts:up [OPTIONS] [SERVICE...]
+      missed: contracts:down [OPTIONS] [SERVICES]
+      missed: contracts:ps [OPTIONS] [SERVICE...]
+      missed: contracts:exec [OPTIONS] SERVICE COMMAND [ARGS...]
+      missed: contracts:build [OPTIONS] [SERVICE...]
+      missed: contracts:pull [OPTIONS] [SERVICE...]
+      missed: contracts:restart [OPTIONS] [SERVICE...]
+      missed: contracts:logs [OPTIONS] [SERVICE...]
+      missed: contracts:--detach
+      missed: contracts:--force-recreate
+      missed: contracts:--remove-orphans
+      missed: landmarks:NewComposeService
+      missed: landmarks:runUp
+      missed: landmarks:Run
+      missed: landmarks:ProjectOptions
+      missed: tests:pkg/compose/create_test.go
+      missed: tests:pkg/compose/down_test.go
+      missed: tests:pkg/compose/loader_test.go
+      missed: tests:pkg/compose/executor_test.go
+      missed: tests:cmd/compose/up_test.go
+      missed: tests:cmd/compose/compose_test.go
+      missed: tests:pkg/e2e
+  express                   0.000  0.000  0.125  0.000  0.556  0.000  0.125    0.136  0.000   1.85  3240
+      missed: architecture:createApplication
+      missed: architecture:app
+      missed: architecture:Router
+      missed: architecture:Route
+      missed: architecture:req
+      missed: architecture:res
+      missed: architecture:View
+      missed: architecture:json
+      missed: architecture:urlencoded
+      missed: architecture:static
+      missed: entrypoints:require('express')
+      missed: entrypoints:app.listen
+      missed: entrypoints:app.handle
+      missed: entrypoints:app.init
+      missed: entrypoints:app.engine
+      missed: entrypoints:app.param
+      missed: entrypoints:exports.application
+      missed: behavior:app.route` -> `router.route
+      missed: behavior:methods.forEach` -> `app.get
+      missed: behavior:app.listen` -> `http.createServer(this)` -> `app.handle
+      missed: behavior:app.render` -> `tryRender` -> `View.prototype.render
+      missed: behavior:res.sendFile` -> `sendfile` helper
+      missed: behavior:res.redirect
+      missed: behavior:res.json
+      missed: state_authority:this.router
+      missed: state_authority:this.settings
+      missed: state_authority:this.engines
+      missed: state_authority:this.cache
+      missed: state_authority:res.locals
+      missed: state_authority:req.app
+      missed: state_authority:trustProxyDefaultSymbol
+      missed: contracts:case sensitive routing
+      missed: contracts:view engine
+      missed: contracts:query parser
+      missed: contracts:res.status(code)
+      missed: landmarks:methods
+      missed: landmarks:app.request
+      missed: tests:test/app.param.js
+      missed: tests:test/app.head.js
+      missed: tests:test/app.options.js
+      missed: tests:test/res.json.js
+      missed: tests:test/req.ip.js
+      missed: tests:test/req.route.js
+      missed: tests:test/utils.js
+  fastapi                   0.333  0.111  0.143  0.000  0.714  0.417  0.000    0.260  0.000   0.26 30822
+      missed: architecture:APIRouter
+      missed: architecture:APIRoute
+      missed: entrypoints:app.get
+      missed: entrypoints:app.post
+      missed: entrypoints:include_router
+      missed: entrypoints:add_api_route
+      missed: entrypoints:websocket
+      missed: entrypoints:exception_handler
+      missed: entrypoints:openapi
+      missed: entrypoints:fastapi = "fastapi.cli:main"
+      missed: behavior:get_dependant
+      missed: behavior:solve_dependencies
+      missed: behavior:get_request_handler
+      missed: behavior:request_response
+      missed: behavior:get_openapi_path
+      missed: behavior:generate_operation_id
+      missed: state_authority:self.dependency_overrides
+      missed: state_authority:self.router
+      missed: state_authority:app.state
+      missed: state_authority:model_name_map
+      missed: state_authority:app.openapi_url
+      missed: contracts:read_items_items__get
+      missed: contracts:response_model=Item
+      missed: landmarks:APIWebSocketRoute
+      missed: landmarks:Dependant
+      missed: landmarks:ParamTypes
+      missed: landmarks:Security
+      missed: landmarks:get_openapi
+      missed: landmarks:BackgroundTasks
+      missed: landmarks:HTTPException
+      missed: tests:tests/test_application.py
+      missed: tests:tests/test_dependencies_utils.py
+      missed: tests:tests/test_router_include_context.py
+      missed: tests:tests/test_openapi_separate_input_output_schemas.py
+      missed: tests:tests/test_fastapi_cli.py
+      missed: tests:docs_src/app_testing/tutorial003_py310.py
+      missed: tests:tests/test_dependency_overrides.py
+  flask                     0.000  0.000  0.143  0.000  0.714  0.000  0.000    0.171  0.000   1.02  5903
+      missed: architecture:Flask
+      missed: architecture:Blueprint
+      missed: architecture:Scaffold
+      missed: architecture:App
+      missed: architecture:View
+      missed: architecture:SessionInterface
+      missed: architecture:Config
+      missed: architecture:Environment
+      missed: architecture:FlaskGroup
+      missed: entrypoints:app.run
+      missed: entrypoints:@app.route
+      missed: entrypoints:@app.get
+      missed: entrypoints:@app.post
+      missed: entrypoints:register_blueprint
+      missed: entrypoints:add_url_rule
+      missed: entrypoints:flask = "flask.cli:main"
+      missed: entrypoints:flask run
+      missed: entrypoints:locate_app
+      missed: behavior:full_dispatch_request
+      missed: behavior:dispatch_request
+      missed: behavior:preprocess_request
+      missed: behavior:process_response
+      missed: behavior:url_for
+      missed: behavior:find_best_app
+      missed: state_authority:app.view_functions
+      missed: state_authority:self.url_map
+      missed: state_authority:session_interface
+      missed: state_authority:jinja_env
+      missed: state_authority:app.config
+      missed: state_authority:flask.session
+      missed: contracts:--host
+      missed: contracts:flask routes
+      missed: landmarks:MethodView
+      missed: landmarks:SecureCookieSessionInterface
+      missed: landmarks:DispatchingJinjaLoader
+      missed: tests:tests/test_basic.py
+      missed: tests:tests/test_blueprints.py
+      missed: tests:tests/test_cli.py
+      missed: tests:tests/test_templating.py
+      missed: tests:tests/test_user_error_handler.py
+      missed: tests:tests/test_session_interface.py
+      missed: tests:tests/test_views.py
+  gin                       0.286  0.000  0.000  0.000  0.000  0.167  0.000    0.057  1.000   0.14 14709
+      missed: architecture:Engine
+      missed: architecture:RouterGroup
+      missed: architecture:Context
+      missed: architecture:Logger
+      missed: architecture:Recovery
+      missed: entrypoints:gin.New()
+      missed: entrypoints:gin.Default()
+      missed: entrypoints:Engine.Run
+      missed: entrypoints:Engine.ServeHTTP
+      missed: entrypoints:RouterGroup.GET
+      missed: entrypoints:RouterGroup.POST
+      missed: entrypoints:RouterGroup.Group
+      missed: entrypoints:RouterGroup.Use
+      missed: behavior:gin.Default
+      missed: behavior:ServeHTTP
+      missed: behavior:Use
+      missed: behavior:Context.JSON
+      missed: behavior:RouterGroup.handle
+      missed: behavior:Context.Next
+      missed: state_authority:engine.trees
+      missed: state_authority:engine.RouterGroup
+      missed: state_authority:engine.noRoute
+      missed: state_authority:Context
+      missed: state_authority:RouterGroup.BasePath
+      missed: contracts:router.GET("/ping"
+      missed: contracts:GET /test
+      missed: contracts:GET /:count
+      missed: contracts:GET /v1/:path
+      missed: contracts:GET /test/:param
+      missed: contracts:POST /
+      missed: contracts:Engine.NoRoute
+      missed: contracts:Context.Param
+      missed: contracts:Context.ShouldBindJSON
+      missed: landmarks:HandlerFunc
+      missed: landmarks:HandlersChain
+      missed: landmarks:RouteInfo
+      missed: landmarks:methodTree
+      missed: landmarks:Error
+      missed: tests:gin_test.go
+      missed: tests:gin_integration_test.go
+      missed: tests:benchmarks_test.go
+      missed: tests:context_test.go
+      missed: tests:auth_test.go
+      missed: tests:errors_test.go
+      missed: tests:router.Group("/users")
+  gorilla-mux               0.000  0.000  0.000  0.000  0.000  0.000  0.000    0.000  1.000   0.00  1763
+      missed: architecture:Router
+      missed: architecture:Route
+      missed: entrypoints:NewRouter
+      missed: entrypoints:Router.HandleFunc
+      missed: entrypoints:Router.Handle
+      missed: entrypoints:Router.NewRoute
+      missed: entrypoints:Router.ServeHTTP
+      missed: entrypoints:Router.Match
+      missed: behavior:NewRouter
+      missed: behavior:ServeHTTP
+      missed: behavior:PathPrefix
+      missed: behavior:Vars
+      missed: behavior:Router.Use
+      missed: state_authority:Router.routes
+      missed: state_authority:Router.namedRoutes
+      missed: state_authority:varsKey
+      missed: state_authority:routeRegexp
+      missed: state_authority:Router.routeConf
+      missed: contracts:r.HandleFunc("/api", emptyHandler).Methods("POST")
+      missed: contracts:Queries("time", "{time:[0-9]+}")
+      missed: contracts:Queries("foo", "{foo:[0-9]+}")
+      missed: contracts:PathPrefix("/sub/").Subrouter()
+      missed: contracts:Subrouter
+      missed: contracts:Host("{subdomain}.domain.com")
+      missed: contracts:r.HandleFunc("/", func1).Name("func1")
+      missed: contracts:{name:pattern}
+      missed: landmarks:RouteMatch
+      missed: landmarks:routeRegexp
+      missed: landmarks:routeRegexpGroup
+      missed: landmarks:routeConf
+      missed: landmarks:MatcherFunc
+      missed: landmarks:MiddlewareFunc
+      missed: tests:mux_test.go
+      missed: tests:route_test.go
+      missed: tests:regexp_test.go
+      missed: tests:example_route_test.go
+      missed: tests:example_authentication_middleware_test.go
+      missed: tests:example_cors_method_middleware_test.go
+      missed: tests:mux_httpserver_test.go
+      missed: tests:bench_test.go
+  junit4                    0.000  0.000  0.000  0.000  0.000  0.000  0.000    0.000  1.000   0.00   284
+      missed: architecture:JUnitCore
+      missed: architecture:Runner
+      missed: architecture:ParentRunner
+      missed: architecture:BlockJUnit4ClassRunner
+      missed: architecture:Suite
+      missed: architecture:Parameterized
+      missed: architecture:JUnit38ClassRunner
+      missed: architecture:RunNotifier
+      missed: architecture:TestRule
+      missed: entrypoints:JUnitCore.main
+      missed: entrypoints:JUnitCore.run
+      missed: entrypoints:runClasses(Class<?>... classes)
+      missed: entrypoints:JUnitCommandLineParseResult
+      missed: entrypoints:@RunWith
+      missed: entrypoints:Request.classes
+      missed: entrypoints:@Test
+      missed: behavior:JUnitCore.run` -> Request.classes -> Computer -> Runner
+      missed: behavior:BlockJUnit4ClassRunner` -> MethodRoadie -> RunRules -> before/test/after
+      missed: behavior:ParentRunner.run` -> runChildren
+      missed: behavior:RunNotifier.fireTestStarted` -> listeners
+      missed: behavior:--filter` -> FilterFactories -> Filter
+      missed: behavior:assertThrows` -> ThrowingRunnable.run() inside try/catch
+      missed: behavior:@RunWith(Parameterized.class)` -> Parameterized -> per-parameter-set child runners
+      missed: state_authority:Result
+      missed: state_authority:Description
+      missed: state_authority:Failure
+      missed: state_authority:TestClass
+      missed: state_authority:TestMethod
+      missed: state_authority:RuleContainer
+      missed: state_authority:RunNotifier
+      missed: contracts:@Test
+      missed: contracts:timeout()
+      missed: contracts:assertEquals(Object expected, Object actual)
+      missed: contracts:assertThrows
+      missed: contracts:@Before
+      missed: contracts:@BeforeClass
+      missed: contracts:@Rule
+      missed: contracts:@Ignore
+      missed: contracts:@FixMethodOrder(MethodSorters.NAME_ASCENDING)
+      missed: landmarks:Test
+      missed: landmarks:Assert
+      missed: landmarks:Result
+      missed: landmarks:Description
+      missed: landmarks:Before
+      missed: tests:AssertionTest
+      missed: tests:JUnitCoreReturnsCorrectExitCodeTest
+      missed: tests:CommandLineTest
+      missed: tests:TimeoutTest
+      missed: tests:ExpectedTest
+      missed: tests:AllTests
+      missed: tests:AllCoreTests
+  kind                      0.000  0.000  0.000  0.000  0.000  0.000  0.000    0.000  0.000   0.00  1374
+      missed: architecture:Provider
+      missed: architecture:Cluster
+      missed: architecture:Node
+      missed: architecture:create.Cluster
+      missed: architecture:delete.Cluster
+      missed: architecture:nodeimage.Build
+      missed: architecture:kubeconfig
+      missed: architecture:app.Main
+      missed: architecture:providers.Provider
+      missed: architecture:internalencoding
+      missed: entrypoints:main.go
+      missed: entrypoints:pkg/cmd/kind/root.go
+      missed: entrypoints:pkg/cmd/kind/create/create.go
+      missed: entrypoints:pkg/cmd/kind/create/cluster/createcluster.go
+      missed: entrypoints:pkg/cmd/kind/delete/delete.go
+      missed: entrypoints:pkg/cmd/kind/get/get.go
+      missed: entrypoints:func (p *Provider) Create(name string, options ...CreateOption) error
+      missed: entrypoints:func (p *Provider) Delete(name, explicitKubeconfigPath string) error
+      missed: entrypoints:func (p *Provider) List() ([]string, error)
+      missed: behavior:kind create cluster` -> NewProvider -> Provider.Create -> create.Cluster
+      missed: behavior:CreateWithConfigFile` -> internalencoding.Load -> Cluster config
+      missed: behavior:CreateWithWaitForReady` -> wait for control-plane readiness
+      missed: behavior:Provider.Delete
+      missed: behavior:pkg/cmd/kind/get/kubeconfig
+      missed: behavior:nodeimage.Build` -> docker build of node image
+      missed: behavior:docker.NewProvider
+      missed: behavior:CreateWithWaitForReady
+      missed: state_authority:DefaultClusterName
+      missed: state_authority:providers.Provider
+      missed: state_authority:docker.NewProvider
+      missed: state_authority:podman.NewProvider
+      missed: state_authority:nerdctl.NewProvider
+      missed: state_authority:pkg/cluster/internal/kubeconfig
+      missed: state_authority:v1alpha4
+      missed: contracts:kind.x-k8s.io/v1alpha4
+      missed: contracts:--config
+      missed: contracts:--name
+      missed: contracts:--image
+      missed: contracts:--retain
+      missed: contracts:--wait
+      missed: contracts:--kubeconfig
+      missed: contracts:ControlPlaneRole NodeRole = "control-plane"
+      missed: contracts:WorkerRole NodeRole = "worker"
+      missed: landmarks:NewProvider
+      missed: landmarks:NodeRole
+      missed: tests:pkg/internal/apis/config/encoding/load_test.go
+      missed: tests:pkg/internal/apis/config/validate_test.go
+      missed: tests:pkg/internal/apis/config/cluster_util_test.go
+      missed: tests:pkg/cluster/internal/providers/docker/network_test.go
+      missed: tests:pkg/cluster/internal/providers/common/namer_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/write_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/remove_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/merge_test.go
+  microservices-demo        0.000  0.000  0.000  0.000  0.000  1.000  0.000    0.000  0.000   0.00  2387
+      missed: architecture:hipstershop
+      missed: architecture:CartService
+      missed: architecture:ProductCatalogService
+      missed: architecture:ShippingService
+      missed: architecture:CurrencyService
+      missed: architecture:PaymentService
+      missed: architecture:EmailService
+      missed: architecture:CheckoutService
+      missed: architecture:AdService
+      missed: architecture:RecommendationService
+      missed: architecture:frontend
+      missed: architecture:loadgenerator
+      missed: entrypoints:src/checkoutservice/main.go
+      missed: entrypoints:src/currencyservice/server.js
+      missed: entrypoints:src/productcatalogservice/server.go
+      missed: entrypoints:src/adservice/src/main/java/hipstershop/AdService.java
+      missed: entrypoints:src/emailservice/email_server.py
+      missed: entrypoints:src/recommendationservice/recommendation_server.py
+      missed: entrypoints:src/shippingservice/main.go
+      missed: entrypoints:src/frontend/main.go
+      missed: entrypoints:src/cartservice/src/Program.cs
+      missed: entrypoints:src/paymentservice/server.js
+      missed: behavior:ListProducts` -> catalog_loader.go -> products.json
+      missed: behavior:getCart` -> CartService.GetCart
+      missed: behavior:PlaceOrder` -> GetCart -> GetQuote -> Charge -> SendOrderConfirmation -> ShipOrder
+      missed: behavior:AddItem` -> CartService -> cartstore
+      missed: behavior:Convert` -> CurrencyService
+      missed: behavior:GetAds` -> AdService
+      missed: behavior:ListRecommendations` -> RecommendationService
+      missed: behavior:homeHandler` -> getProducts -> ProductCatalogService.ListProducts
+      missed: state_authority:redis-cart
+      missed: state_authority:RedisCartStore
+      missed: state_authority:ICartStore
+      missed: state_authority:SpannerCartStore
+      missed: state_authority:src/productcatalogservice/products.json
+      missed: state_authority:cookieSessionID
+      missed: state_authority:kubernetes-manifests
+      missed: state_authority:helm-chart
+      missed: state_authority:skaffold.yaml
+      missed: contracts:rpc GetCart(GetCartRequest) returns (Cart)
+      missed: contracts:rpc ListProducts(Empty) returns (ListProductsResponse)
+      missed: contracts:rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse)
+      missed: contracts:rpc GetSupportedCurrencies(Empty) returns (GetSupportedCurrenciesResponse)
+      missed: contracts:containerPort: 9555
+      missed: contracts:port: 7070
+      missed: contracts:port: 5050
+      missed: contracts:port: 50051
+      missed: contracts:port: 3550
+      missed: contracts:/_healthz
+      missed: contracts:GET /product/{id}
+      missed: tests:src/productcatalogservice/product_catalog_test.go
+      missed: tests:src/shippingservice/shippingservice_test.go
+      missed: tests:src/frontend/validator/validator_test.go
+      missed: tests:src/checkoutservice/money/money_test.go
+      missed: tests:src/frontend/money/money_test.go
+      missed: tests:src/loadgenerator/locustfile.py
+  mockito                   0.143  0.000  0.000  0.000  0.000  0.000  0.000    0.029  1.000   2.70   370
+      missed: architecture:MockitoCore
+      missed: architecture:MockMaker
+      missed: architecture:ByteBuddyMockMaker
+      missed: architecture:InlineByteBuddyMockMaker
+      missed: architecture:MockitoSession
+      missed: architecture:MockitoExtension
+      missed: entrypoints:mock(Class<T> classToMock)
+      missed: entrypoints:when(T methodCall)
+      missed: entrypoints:verify(T mock)
+      missed: entrypoints:MockitoAnnotations.openMocks
+      missed: entrypoints:mockitoSession()
+      missed: entrypoints:MockitoExtension.beforeEach
+      missed: entrypoints:MockitoJUnitRunner
+      missed: entrypoints:spy(T object)
+      missed: entrypoints:doReturn(Object toBeReturned)
+      missed: behavior:mock()` -> MockitoCore.mock -> MockMaker.createMock
+      missed: behavior:when()` -> MockitoCore.when -> stubbingStarted() -> OngoingStubbing.thenReturn
+      missed: behavior:verify()` -> MockitoCore.verify -> VerificationModeFactory.times(1)
+      missed: behavior:any()`/`eq()` -> reportMatcher() -> matcher stack
+      missed: behavior:timeout(long millis)
+      missed: behavior:inOrder(mocks)` -> InOrder.verify
+      missed: behavior:MockitoExtension.beforeEach
+      missed: behavior:doThrow(Throwable...)` -> MOCKITO_CORE.stubber() -> Stubber.doThrow
+      missed: state_authority:MockingProgress
+      missed: state_authority:Plugins
+      missed: state_authority:MockitoSession
+      missed: state_authority:MockMakers
+      missed: state_authority:mockito-core
+      missed: state_authority:MockUtil
+      missed: state_authority:GlobalConfiguration
+      missed: contracts:OngoingStubbing
+      missed: contracts:VerificationMode
+      missed: contracts:ArgumentMatcher<T>
+      missed: contracts:ArgumentCaptor
+      missed: contracts:@Mock
+      missed: contracts:@InjectMocks
+      missed: contracts:Strictness.STRICT_STUBS
+      missed: contracts:MockSettings.extraInterfaces
+      missed: contracts:@Captor
+      missed: landmarks:ArgumentMatchers
+      missed: landmarks:MockSettings
+      missed: landmarks:Answers
+      missed: landmarks:MockUtil
+      missed: landmarks:MockingProgress
+      missed: tests:MockitoTest
+      missed: tests:ArgumentCaptorTest
+      missed: tests:JunitJupiterTest
+      missed: tests:StrictnessTest
+      missed: tests:InjectMocksTest
+      missed: tests:verification
+      missed: tests:internal
+      missed: tests:StaticMockingExperimentTest
+  nest                      0.000  0.000  0.000  0.000  0.000  0.333  0.000    0.000  0.000   0.00  2600
+      missed: architecture:NestFactoryStatic
+      missed: architecture:NestFactory
+      missed: architecture:ExpressAdapter
+      missed: architecture:NestExpressApplication
+      missed: architecture:ClientProxy
+      missed: architecture:TestingModuleBuilder
+      missed: entrypoints:NestFactory.create(AppModule)
+      missed: entrypoints:NestFactory.createMicroservice
+      missed: entrypoints:NestFactory.createApplicationContext
+      missed: entrypoints:app.listen(port)
+      missed: entrypoints:Test.createTestingModule
+      missed: entrypoints:@Controller('cats')
+      missed: entrypoints:packages/core/index.ts
+      missed: behavior:NestFactory.create` -> `NestApplication
+      missed: behavior:DependenciesScanner.scan
+      missed: behavior:Controller` -> `RoutesResolver
+      missed: behavior:MessagePattern` -> server
+      missed: behavior:Test.createTestingModule` -> `TestingModuleBuilder.compile` -> `TestingModule
+      missed: behavior:NestContainer` -> `InstanceLoader` -> `Injector
+      missed: behavior:ExpressAdapter` -> `RouterMethodFactory
+      missed: behavior:NestFactory.create` -> `GraphInspector
+      missed: state_authority:NestContainer
+      missed: state_authority:ModulesContainer
+      missed: state_authority:ApplicationConfig
+      missed: state_authority:InstanceLoader
+      missed: state_authority:Injector
+      missed: state_authority:GraphInspector
+      missed: state_authority:DependenciesScanner
+      missed: contracts:@Controller('cats')
+      missed: contracts:@Get(':id')
+      missed: contracts:@Param('id', new ParseIntPipe())
+      missed: contracts:@UseGuards(RolesGuard)
+      missed: contracts:Test.createTestingModule
+      missed: contracts:NestExpressApplication
+      missed: contracts:@EventPattern
+      missed: contracts:Transport
+      missed: contracts:APP_GUARD
+      missed: landmarks:Controller
+      missed: landmarks:Injectable
+      missed: landmarks:Param` / `Body` / `Query
+      missed: landmarks:MessagePattern
+      missed: tests:packages/core/test
+      missed: tests:integration/
+      missed: tests:sample/01-cats-app/src/cats/cats.controller.spec.ts
+      missed: tests:sample/19-auth-jwt/e2e/app/app.e2e-spec.ts
+      missed: tests:sample/02-gateways/e2e/events-gateway/gateway.e2e-spec.ts
+      missed: tests:sample/26-queues/e2e/audio/audio.e2e-spec.ts
+      missed: tests:packages/common/test
+  prettier                  0.000  0.286  0.000  0.000  0.000  0.000  0.000    0.057  1.000   0.91  2201
+      missed: architecture:format
+      missed: architecture:check
+      missed: architecture:formatWithCursor
+      missed: architecture:coreFormat
+      missed: architecture:parse
+      missed: architecture:printAstToDoc
+      missed: architecture:prepareToPrint
+      missed: architecture:printDocToString
+      missed: architecture:builders
+      missed: entrypoints:src/index.js
+      missed: entrypoints:src/cli/index.js
+      missed: entrypoints:src/standalone.js
+      missed: entrypoints:formatFiles
+      missed: entrypoints:src/cli/context.js
+      missed: behavior:format` -> `coreFormat` -> `parse` -> `printAstToDoc` -> `printDocToString
+      missed: behavior:check` -> `format` text comparison
+      missed: behavior:parse` -> `resolveParser` -> `parser.preprocess
+      missed: behavior:printAstToDoc` -> `prepareToPrint` -> doc cache Map
+      missed: behavior:formatFiles` -> `formatFile` -> `writeOutput
+      missed: behavior:listDifferent` -> `prettier.check
+      missed: behavior:formatFile` -> `mockable.writeFormattedFile
+      missed: behavior:normalizeInputAndOptions` -> `normalizeFormatOptions
+      missed: state_authority:printAstToDoc
+      missed: state_authority:options
+      missed: state_authority:resolveConfig
+      missed: state_authority:editorconfig
+      missed: state_authority:context.argv
+      missed: state_authority:mockable
+      missed: state_authority:directory-ignorer
+      missed: state_authority:ast
+      missed: contracts:--write
+      missed: contracts:--check
+      missed: contracts:--list-different
+      missed: contracts:--debug-check
+      missed: contracts:--log-level
+      missed: contracts:babel
+      missed: contracts:typescript
+      missed: contracts:postcss
+      missed: contracts:html
+      missed: contracts:yaml
+      missed: contracts:CATEGORY_OUTPUT
+      missed: landmarks:group
+      missed: landmarks:hardline
+      missed: landmarks:softline
+      missed: tests:tests/format
+      missed: tests:tests/unit
+      missed: tests:tests/integration
+      missed: tests:tests/config
+      missed: tests:tests/dts
+      missed: tests:tests/format/js
+      missed: tests:tests/format/css
+      missed: tests:tests/unit/doc-builders.js
+      missed: tests:tests/unit/editorconfig-to-prettier.js
+  pydantic                  0.000  0.000  0.167  0.000  0.000  0.111  0.000    0.033  0.000   0.17  5904
+      missed: architecture:BaseModel
+      missed: architecture:FieldInfo
+      missed: architecture:TypeAdapter
+      missed: architecture:dataclass
+      missed: architecture:GenerateJsonSchema
+      missed: architecture:create_model
+      missed: entrypoints:model_validate
+      missed: entrypoints:model_validate_json
+      missed: entrypoints:model_validate_strings
+      missed: entrypoints:model_dump
+      missed: entrypoints:model_dump_json
+      missed: entrypoints:model_construct
+      missed: entrypoints:model_json_schema
+      missed: entrypoints:TypeAdapter.validate_python
+      missed: entrypoints:TypeAdapter.dump_json
+      missed: behavior:__get_pydantic_core_schema__
+      missed: behavior:model_rebuild
+      missed: behavior:TypeAdapter.json_schema
+      missed: behavior:model_post_init
+      missed: behavior:__pydantic_init_subclass__
+      missed: state_authority:model_config
+      missed: state_authority:__pydantic_fields__
+      missed: state_authority:__pydantic_fields_set__
+      missed: state_authority:model_extra
+      missed: state_authority:__pydantic_private__
+      missed: state_authority:ConfigDict.validate_assignment
+      missed: contracts:model_config = ConfigDict(validate_assignment=True)
+      missed: contracts:strict=True
+      missed: contracts:mode='json'
+      missed: contracts:ConfigDict(defer_build=True)
+      missed: contracts:indent
+      missed: contracts:mode='validation'
+      missed: landmarks:ConfigDict
+      missed: landmarks:ValidationError
+      missed: landmarks:PydanticUserError
+      missed: landmarks:AfterValidator
+      missed: landmarks:BeforeValidator
+      missed: landmarks:field_validator
+      missed: landmarks:model_validator
+      missed: landmarks:computed_field
+      missed: tests:tests/test_main.py
+      missed: tests:tests/test_type_adapter.py
+      missed: tests:tests/test_json_schema.py
+      missed: tests:tests/test_validators.py
+      missed: tests:tests/test_model_validator.py
+      missed: tests:tests/test_dataclasses.py
+      missed: tests:tests/test_create_model.py
+      missed: tests:tests/test_errors.py
+  serde                     0.750  0.000  0.000  0.000  0.000  0.000  0.000    0.150  1.000   1.55  1936
+      missed: architecture:de::value
+      missed: entrypoints:#[derive(Serialize)]
+      missed: entrypoints:#[derive(Deserialize)]
+      missed: entrypoints:Serialize::serialize
+      missed: entrypoints:Deserialize::deserialize
+      missed: entrypoints:serde_json::to_string
+      missed: entrypoints:serde_json::from_str
+      missed: behavior:Serialize.serialize
+      missed: behavior:Deserializer.deserialize_struct
+      missed: behavior:Serialize
+      missed: behavior:serde_json::to_string
+      missed: behavior:Deserializer.deserialize_enum
+      missed: state_authority:serde/src/private
+      missed: state_authority:serde_derive_internals
+      missed: state_authority:serde_core/src
+      missed: state_authority:Content
+      missed: state_authority:serde_core/src/format.rs
+      missed: contracts:serialize_struct
+      missed: contracts:deserialize_struct
+      missed: contracts:#[serde(tag = "t", content = "c")]
+      missed: contracts:Error::custom
+      missed: contracts:serde_test::Token
+      missed: contracts:serde_json::to_string
+      missed: landmarks:Serialize
+      missed: landmarks:Deserialize
+      missed: landmarks:Serializer
+      missed: landmarks:Deserializer
+      missed: landmarks:Visitor
+      missed: landmarks:SerializeSeq
+      missed: landmarks:SeqAccess
+      missed: landmarks:IgnoredAny
+      missed: tests:test_suite/tests/test_ser.rs
+      missed: tests:test_suite/tests/test_de.rs
+      missed: tests:test_suite/tests/test_roundtrip.rs
+      missed: tests:test_suite/tests/test_annotations.rs
+      missed: tests:test_suite/tests/test_enum_adjacently_tagged.rs
+      missed: tests:test_suite/tests/regression/issue2565.rs
+      missed: tests:test_suite/tests/ui
+  shadcn-ui                 0.000  0.000  0.000  0.000  0.000  0.000  0.000    0.000  1.000   0.00  2937
+      missed: architecture:init
+      missed: architecture:add
+      missed: architecture:apply
+      missed: architecture:build
+      missed: architecture:@shadcn/react
+      missed: architecture:@shadcn/helpers
+      missed: architecture:v4
+      missed: entrypoints:npx shadcn init
+      missed: entrypoints:shadcn add
+      missed: entrypoints:npx shadcn create
+      missed: entrypoints:next dev --turbopack --port 4000
+      missed: entrypoints:scripts/build-registry.mts
+      missed: entrypoints:apps/v4/app/(app)/docs/[[...slug]]/page.tsx
+      missed: entrypoints:apps/v4/app/(app)/blocks/[...categories]/page.tsx
+      missed: entrypoints:apps/v4/app/api/search/route.ts
+      missed: behavior:build-registry.mts
+      missed: behavior:add` command -> fetch item address -> apply component to project
+      missed: behavior:components.json
+      missed: behavior:packages/shadcn/src/commands/apply.ts
+      missed: behavior:apps/v4/lib/source.ts
+      missed: behavior:createFromSource
+      missed: behavior:capture-registry.mts
+      missed: behavior:capture-explore.mts
+      missed: state_authority:apps/v4/registry.json
+      missed: state_authority:apps/v4/components.json
+      missed: state_authority:apps/v4/lib/registry.ts
+      missed: state_authority:apps/v4/lib/config.ts
+      missed: state_authority:registry/new-york-v4
+      missed: state_authority:registry/bases
+      missed: state_authority:apps/v4/lib/themes.ts
+      missed: contracts:"button"
+      missed: contracts:apps/v4/registry/new-york-v4/ui/card.tsx
+      missed: contracts:apps/v4/registry/new-york-v4/ui/dialog.tsx
+      missed: contracts:npx shadcn init
+      missed: contracts:shadcn add
+      missed: contracts:--yes
+      missed: contracts:data-slot="dialog"
+      missed: contracts:data-slot="card"
+      missed: contracts:[[...slug]]
+      missed: landmarks:Button
+      missed: landmarks:buttonVariants
+      missed: landmarks:Card
+      missed: landmarks:Dialog
+      missed: landmarks:apps/v4/source.config.ts
+      missed: tests:packages/shadcn/src/commands/add.test.ts
+      missed: tests:packages/shadcn/src/commands/init.test.ts
+      missed: tests:packages/shadcn/src/commands/build.test.ts
+      missed: tests:packages/shadcn/src/commands/apply.test.ts
+      missed: tests:packages/shadcn/test
+      missed: tests:apps/v4/registry/calendar.test.ts
+      missed: tests:apps/v4/registry/config.test.ts
+      missed: tests:packages/tests
+  sqlalchemy                0.000  0.000  0.167  0.000  0.000  0.000  0.000    0.033  0.000   0.25  3979
+      missed: architecture:Engine
+      missed: architecture:Connection
+      missed: architecture:Session
+      missed: architecture:sessionmaker
+      missed: architecture:scoped_session
+      missed: architecture:Mapper
+      missed: architecture:Select
+      missed: architecture:Table
+      missed: architecture:Column
+      missed: architecture:MetaData
+      missed: architecture:Pool
+      missed: architecture:SQLiteDialect
+      missed: architecture:PGDialect
+      missed: architecture:MySQLDialect
+      missed: entrypoints:create_engine
+      missed: entrypoints:declarative_base
+      missed: entrypoints:select
+      missed: entrypoints:Engine.connect
+      missed: entrypoints:Connection.execute
+      missed: entrypoints:Session.execute
+      missed: entrypoints:Session.connection
+      missed: entrypoints:MetaData.create_all
+      missed: entrypoints:registry
+      missed: behavior:create_engine -> Engine.connect -> Connection.execute
+      missed: behavior:Session.execute -> ORMExecuteState
+      missed: behavior:declarative_base -> Mapper.configure
+      missed: behavior:Transaction -> commit/rollback
+      missed: behavior:QueuePool -> _ConnectionFairy
+      missed: state_authority:engine.pool
+      missed: state_authority:Session identity map
+      missed: state_authority:MetaData.tables
+      missed: state_authority:sessionmaker(bind=engine)
+      missed: state_authority:_sa_instance_state
+      missed: state_authority:Session.connection
+      missed: contracts:create_engine("sqlite://")
+      missed: contracts:"sqlite:///:memory:"
+      missed: contracts:Table
+      missed: contracts:LABEL_STYLE_TABLENAME_PLUS_COL
+      missed: contracts:select(t1).where(t1.c.c2 == t2.c.c1)
+      missed: contracts:test_session_commit_rollback
+      missed: contracts:name = "sqlite"
+      missed: landmarks:ForeignKey
+      missed: tests:test/orm/test_session.py
+      missed: tests:test/orm/test_query.py
+      missed: tests:test/engine/test_transaction.py
+      missed: tests:test/engine/test_pool.py
+      missed: tests:test/dialect/sqlite/
+      missed: tests:test/aaa_profiling/test_orm.py
+      missed: tests:test/aaa_profiling/test_pool.py
+  svelte                    0.000  0.125  0.125  0.000  0.000  0.000  0.000    0.050  1.000   1.77  1133
+      missed: architecture:compile
+      missed: architecture:preprocess
+      missed: architecture:migrate
+      missed: architecture:Component
+      missed: architecture:mount
+      missed: architecture:unmount
+      missed: architecture:hydrate
+      missed: architecture:tick
+      missed: architecture:onMount
+      missed: architecture:writable
+      missed: architecture:state
+      missed: entrypoints:src/index-server.js
+      missed: entrypoints:svelte/compiler
+      missed: entrypoints:svelte/internal
+      missed: entrypoints:svelte/store` / `svelte/motion
+      missed: entrypoints:phases/1-parse
+      missed: entrypoints:phases/2-analyze
+      missed: entrypoints:phases/3-transform
+      missed: behavior:compile
+      missed: behavior:parse
+      missed: behavior:mount
+      missed: behavior:_mount
+      missed: behavior:migrate
+      missed: behavior:preprocess
+      missed: behavior:flushSync` / `fork
+      missed: state_authority:state
+      missed: state_authority:Batch
+      missed: state_authority:mounted_components
+      missed: state_authority:get_or_init_context_map
+      missed: state_authority:active_reaction
+      missed: state_authority:STATE_SYMBOL
+      missed: state_authority:ScopeRoot
+      missed: state_authority:css
+      missed: contracts:$state
+      missed: contracts:$derived
+      missed: contracts:$effect
+      missed: contracts:$props
+      missed: contracts:bind:value
+      missed: contracts:bind:this
+      missed: contracts:bind:group
+      missed: contracts:runes
+      missed: contracts:css
+      missed: contracts:mount
+      missed: landmarks:compileModule
+      missed: landmarks:parse
+      missed: landmarks:parseCss
+      missed: landmarks:print
+      missed: tests:packages/svelte/tests/compiler-errors
+      missed: tests:packages/svelte/tests/runtime-runes
+      missed: tests:packages/svelte/tests/runtime-legacy
+      missed: tests:packages/svelte/tests/runtime-browser
+      missed: tests:packages/svelte/tests/parser-modern
+      missed: tests:packages/svelte/tests/parser-legacy
+      missed: tests:packages/svelte/tests/snapshot
+      missed: tests:packages/svelte/tests/server-side-rendering
+      missed: tests:packages/svelte/tests/store
+  mean                      0.123  0.046  0.077  0.000  0.149  0.139  0.050    0.079  0.400   0.88  5877
+  scored: 20   skipped: 0
+  gate: FAIL (overall mean recall 0.079 >= 0.5)
 
-Per-repo classification of every ground-truth key the structured
-startup-atlas matcher missed, generated from `scc bench atlas --diagnose`
-(the v4 corpus run, 2026-08-12). Each line is
-`section:key` — GAP KIND: where the fact disappeared between source and the
-rendered atlas (PARSER = not parseable by an enabled extractor; EXTRACTOR =
-parsed but no semantic fact; WRITER = fact not written to the store;
-RESOLUTION = in the store but never wired into the graph; COMPILER = in the
-store but not compiled into components/flows; PROJECTION = compiled but
-dropped by budget/policy/rendering; ALIAS = present under a spelling the
-structured layers/aliases did not reconcile). Landmarks/tests are
-informational and excluded from the recall gate. Counts are consistent with
-the v2 run (20 repos, java enabled).
-
-Gap-kind histogram (all sections):
+gap-kind histogram (all sections):
   ALIAS        76
   COMPILER     553
   EXTRACTOR    260
   RESOLUTION   45
 
+Per-repo gap lines (regenerated into benchmarks/results/ground-truth-gaps.md):
 
 ## bat
 - `architecture:Controller` — COMPILER GAP: present in the store but not compiled into components or flows

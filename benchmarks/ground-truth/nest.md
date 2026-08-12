@@ -1,18 +1,12 @@
 # nest
 > https://github.com/nestjs/nest | TypeScript | ts backend | ~117k LOC
 
-## components
+## architecture
 - `NestFactoryStatic` — application factory class in packages/core/nest-factory.ts
 - `NestFactory` — singleton exported from packages/core/index.ts (with APP_FILTER/APP_GUARD/APP_INTERCEPTOR/APP_PIPE tokens)
-- `Module` — class decorator in packages/common/decorators/modules/module.decorator.ts
-- `Controller` — class decorator in packages/common/decorators/core/controller.decorator.ts
-- `Injectable` — provider marker decorator in packages/common/decorators/core/injectable.decorator.ts
-- `Get` — route-mapping decorator via createMappingDecorator in http/request-mapping.decorator.ts
-- `Param` / `Body` / `Query` — request-extraction parameter decorators in http/route-params.decorator.ts
 - `ExpressAdapter` — HTTP adapter in packages/platform-express/adapters/express-adapter.ts
 - `NestExpressApplication` — platform interface in packages/platform-express/interfaces
 - `ClientProxy` — abstract microservice client in packages/microservices/client/client-proxy.ts
-- `MessagePattern` — microservice handler decorator in packages/microservices/decorators
 - `TestingModuleBuilder` — testing harness builder in packages/testing/testing-module.builder.ts
 
 ## entrypoints
@@ -24,7 +18,7 @@
 - `@Controller('cats')` — sample app entry in sample/01-cats-app/src/cats/cats.controller.ts
 - `packages/core/index.ts` — barrel re-exporting all public core symbols
 
-## flows
+## behavior
 - `NestFactory.create` -> `NestApplication` — app construction in nest-factory.ts
 - `DependenciesScanner.scan` — metadata discovery into the container: `Module` decorator -> `DependenciesScanner.scan` (scanner.ts)
 - `Controller` -> `RoutesResolver` — route registration onto the HTTP adapter (router/routes-resolver.ts)
@@ -34,7 +28,7 @@
 - `ExpressAdapter` -> `RouterMethodFactory` — HTTP verb dispatch on the express router
 - `NestFactory.create` -> `GraphInspector` — dependency-graph serialization for tooling
 
-## ownership
+## state_authority
 - `NestContainer` — DI container owning the modules map (injector/container.ts)
 - `ModulesContainer` — module registry inside NestContainer
 - `ApplicationConfig` — global application-level configuration
@@ -53,6 +47,14 @@
 - `@EventPattern` — event-based handler decorator (microservices)
 - `Transport` — enum of microservice transports (TCP, REDIS, NATS, MQTT, GRPC, RMQ)
 - `APP_GUARD` — global enhancer injection token from core constants
+
+## landmarks
+- `Module` — class decorator in packages/common/decorators/modules/module.decorator.ts
+- `Controller` — class decorator in packages/common/decorators/core/controller.decorator.ts
+- `Injectable` — provider marker decorator in packages/common/decorators/core/injectable.decorator.ts
+- `Get` — route-mapping decorator via createMappingDecorator in http/request-mapping.decorator.ts
+- `Param` / `Body` / `Query` — request-extraction parameter decorators in http/route-params.decorator.ts
+- `MessagePattern` — microservice handler decorator in packages/microservices/decorators
 
 ## tests
 - `packages/core/test` — mocha unit specs run via npm test
