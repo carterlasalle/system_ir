@@ -29,11 +29,11 @@
 - celery -A proj worker — CLI invocation documented in examples/app/myapp.py line 16
 
 ## flows
-- apply_async -> send_task -> broker publish — task dispatch path (celery/app/task.py -> base.py)
+- apply_async — task dispatch path first step (`apply_async -> send_task -> broker publish`, celery/app/task.py -> base.py)
 - task.retry — re-queues the task with countdown/eta (celery/app/task.py line 767)
 - chord header -> add_unlock_chord_task — fallback chord join via 'celery.chord_unlock' builtin (celery/app/builtins.py line 37)
-- group -> GroupResult — group execution returns a GroupResult (celery/result.py line 930)
-- Scheduler -> ScheduleEntry -> apply_async — beat scheduling path (celery/beat.py line 82)
+- group — group execution first step (`group -> GroupResult`, celery/result.py line 930)
+- Scheduler — beat scheduling path first step (`Scheduler -> ScheduleEntry -> apply_async`, celery/beat.py line 82)
 - worker consumer -> task.run — worker executes the Task body (celery/app/task.py line 527)
 
 ## ownership

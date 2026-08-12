@@ -16,7 +16,7 @@
 - `OutputHandle` — src/output.rs; write target (terminal, pager pipe, or file)
 
 ## entrypoints
-- `fn main` — src/bin/bat/main.rs:459; process entry, delegates to App then Controller
+- `main` — src/bin/bat/main.rs:459; process entry (`fn main`), delegates to App then Controller
 - `Controller::run` — src/controller.rs:39; main printing pipeline over a list of Inputs
 - `Controller::run_with_error_handler` — controller.rs:47; run variant with custom error callback
 - `build_app` — src/bin/bat/clap_app.rs:21; builds the clap `Command` (all flags) and the `bat cache` subcommand

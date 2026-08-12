@@ -51,7 +51,7 @@
 - --host — flask run options with defaults 127.0.0.1:5000 (src/flask/cli.py lines 883-884)
 - -A — CLI option selecting the app import path (src/flask/cli.py line 454)
 - flask routes — CLI command listing registered rules with --sort/--all-methods (src/flask/cli.py line 1048)
-- `@app.route("/", methods=["GET", "POST"])` — methods-array contract in tests/test_basic.py (line 34)
+- `GET /` — methods-array route contract (`@app.route("/", methods=["GET", "POST"])` in tests/test_basic.py line 34)
 
 ## tests
 - tests/test_basic.py — request dispatching, session and routing behavior

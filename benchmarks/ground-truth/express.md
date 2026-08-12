@@ -44,9 +44,9 @@
 - `trustProxyDefaultSymbol` — sentinel used for trust-proxy inheritance bookkeeping
 
 ## contracts
-- `app.get('/tobi'` — verb route registration pattern (test/app.head.js)
-- `app.get('/post/:id'` — path-param route with req.params.id (test/app.param.js)
-- `app.get('/user/:id{/:op}'` — optional-group path syntax (test/req.route.js)
+- `GET /tobi` — verb route registration pattern (`app.get('/tobi')`, test/app.head.js)
+- `GET /post/:id` — path-param route with req.params.id (`app.get('/post/:id')`, test/app.param.js)
+- `GET /user/:id{/:op}` — optional-group path syntax (`app.get('/user/:id{/:op}')`, test/req.route.js)
 - `GET /` — route string asserted in test/app.router.js
 - `case sensitive routing` — routing setting toggling Router case sensitivity
 - `trust proxy` — proxy-trust setting compiled via compileTrust

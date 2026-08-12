@@ -33,7 +33,7 @@
 - create_engine -> Engine.connect -> Connection.execute — core execution path (engine/base.py)
 - Session.execute -> ORMExecuteState — hook state passed to do_orm_execute events (orm/session.py line 257)
 - declarative_base -> Mapper.configure — declarative class config into mapper (orm/decl_base.py _DeclarativeMapperConfig)
-- Table -> MetaData.create_all — DDL generation from schema constructs (sql/schema.py line 6295)
+- Table — DDL generation first step (`Table -> MetaData.create_all`, sql/schema.py line 6295)
 - Transaction -> commit/rollback — SessionTransaction lifecycle (orm/session.py line 858)
 - QueuePool -> _ConnectionFairy — connection checkout/return proxy (pool/base.py line 1193)
 
@@ -48,7 +48,7 @@
 ## contracts
 - create_engine("sqlite://") — in-memory sqlite URL contract in test/aaa_profiling/test_resultset.py (line 193)
 - "sqlite:///:memory:" — memory DB URL flagged in test/aaa_profiling/test_memusage.py (line 507)
-- Table("sometable", m, Column("somecolumn", String)) — table/column construction in test/dialect/mssql/test_compiler.py (line 113)
+- Table — table/column construction contract (`Table("sometable", m, Column("somecolumn", String))` in test/dialect/mssql/test_compiler.py line 113)
 - LABEL_STYLE_TABLENAME_PLUS_COL — label-style contract in test/dialect/mssql/test_deprecations.py (line 107)
 - select(t1).where(t1.c.c2 == t2.c.c1) — select/where usage in test/aaa_profiling/test_compiler.py (line 73)
 - test_session_commit_rollback — commit/rollback lifecycle test (test/aaa_profiling/test_memusage.py line 1691)
