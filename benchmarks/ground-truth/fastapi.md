@@ -19,7 +19,7 @@
 - HTTPException — error type raised in endpoints, exported from fastapi/exceptions.py
 
 ## entrypoints
-- `@app.get("/items/{item_id}")` — route decorator on a FastAPI instance, e.g. docs_src/app_testing/tutorial003_py310.py
+- `GET /items/{item_id}` — route decorator on a FastAPI instance, e.g. docs_src/app_testing/tutorial003_py310.py
 - app.get — HTTP GET decorator method on FastAPI (fastapi/applications.py line 1646)
 - app.post — HTTP POST decorator method on FastAPI (fastapi/applications.py line 2397)
 - include_router — attaches an APIRouter's routes to the app (fastapi/applications.py line 1441)
@@ -52,8 +52,8 @@
 - `/path/{item_id}` — openapi path assertion in tests/test_application.py (line 104)
 - `read_items_items__get` — operationId asserted in tests/test_openapi_separate_input_output_schemas.py (line 171)
 - response_model=Item — response model contract in docs_src/additional_responses/tutorial001_py310.py
-- `@router.get("/items/{item_id}")` — APIRouter route contract in tests/test_router_include_context.py (line 43)
-- `Header()` — header parameter contract (x_token: str = Header()) in docs_src/app_b_py310/main.py
+- `GET /items/{item_id}` — APIRouter route contract in tests/test_router_include_context.py (line 43)
+- `Header` — header parameter contract (x_token: str = Header()) in docs_src/app_b_py310/main.py
 
 ## tests
 - tests/test_application.py — openapi schema and route behavior assertions

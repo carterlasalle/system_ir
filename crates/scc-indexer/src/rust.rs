@@ -16,6 +16,7 @@ use crate::model::{
     StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
 use tree_sitter::{Node, Parser};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Rust extractor. Uses the tree-sitter-rust grammar.
 pub struct RustExtractor {
@@ -391,6 +392,9 @@ struct Ctx {
     store_refs: Vec<StoreRef>,
     retries: Vec<Retry>,
     entrypoints: Vec<Entrypoint>,
+    /// CLI flags per owning symbol (clap `#[arg(...)]`), `-`/`--`
+    /// prefixed, sorted + deduped.
+    cli_flags: BTreeMap<String, BTreeSet<String>>,
     scopes: Vec<Scope>,
 }
 
@@ -405,6 +409,11 @@ impl Ctx {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
     fn into_extracted(self) -> ExtractedFile {
+        let cli_flags = self
+            .cli_flags
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -414,6 +423,7 @@ impl Ctx {
             store_refs: self.store_refs,
             retries: self.retries,
             entrypoints: self.entrypoints,
+            cli_flags,
         }
     }
 }
@@ -571,7 +581,7 @@ impl RustExtractor {
         let exported = self.is_exported(node);
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
-        let (doc, _attrs) = self.leading_annotations(node, src);
+        let (doc, attrs) = self.leading_annotations(node, src);
         ctx.symbols.push(Symbol {
             name: name.clone(),
             kind,
@@ -582,6 +592,57 @@ impl RustExtractor {
             docstring: doc,
             parent: None,
         });
+        // clap derive surface: `#[derive(Parser)]` structs own their field
+        // `#[arg(...)]` flags; `#[derive(Subcommand)]` enums expose each
+        // variant as a CLI subcommand and own the variants' arg flags.
+        let derives = derive_names(&attrs, src);
+        let is_parser = derives.iter().any(|d| d == "Parser");
+        let is_subcommand = derives.iter().any(|d| d == "Subcommand");
+        if is_parser || is_subcommand {
+            let mut lists: Vec<Node> = Vec::new();
+            let mut variants: Vec<Node> = Vec::new();
+            let mut cursor = node.walk();
+            for c in node.named_children(&mut cursor) {
+                match c.kind() {
+                    "field_declaration_list" => lists.push(c),
+                    "enum_variant_list" => {
+                        let mut c2 = c.walk();
+                        for inner in c.named_children(&mut c2) {
+                            if inner.kind() == "enum_variant" {
+                                variants.push(inner);
+                                let mut c3 = inner.walk();
+                                for f in inner.named_children(&mut c3) {
+                                    if f.kind() == "field_declaration_list" {
+                                        lists.push(f);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut flags = clap_arg_flags(&lists, src);
+            if !flags.is_empty() {
+                // sorted + deduped
+                flags.sort();
+                flags.dedup();
+                ctx.cli_flags.entry(name.clone()).or_default().extend(flags);
+            }
+            if is_subcommand {
+                for v in variants {
+                    let vname = clean(node_text(v.child_by_field_name("name"), src));
+                    if vname.is_empty() {
+                        continue;
+                    }
+                    ctx.entrypoints.push(Entrypoint {
+                        symbol: vname,
+                        kind: "cli-subcommand".to_string(),
+                        line: v.start_position().row as u32 + 1,
+                    });
+                }
+            }
+        }
         // Trait bodies contain function declarations (contracts, default
         // impls); struct/enum bodies have none. Walk everything uniformly.
         self.walk_children(node, ctx, src);
@@ -991,6 +1052,98 @@ fn attr_name(a: Node, src: &[u8]) -> String {
     p[..end].to_string()
 }
 
+/// Derive names of a `#[derive(...)]` attribute run, last path segment
+/// only (`#[derive(clap::Parser)]` -> `Parser`).
+fn derive_names(attrs: &[Node], src: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in attrs {
+        if attr_name(*a, src) != "derive" {
+            continue;
+        }
+        let p = attr_policy(*a, src);
+        let Some(inner) = p.strip_prefix("derive(").and_then(|s| s.strip_suffix(')')) else {
+            continue;
+        };
+        for part in inner.split(',') {
+            let t = clean(part);
+            let t = t.rsplit("::").next().unwrap_or(&t).trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// True when an `#[arg(...)]` policy mentions `long` (explicit or
+/// bare, e.g. `long = "port"` / `short, long`).
+fn attr_has_long(policy: &str) -> bool {
+    let body = policy
+        .trim_start_matches("arg")
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    body.split(',').any(|t| t.trim().starts_with("long"))
+}
+
+/// Explicit `long = "port"` value, when present.
+fn attr_long_value(policy: &str) -> Option<String> {
+    let body = policy
+        .trim_start_matches("arg")
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    for t in body.split(',') {
+        let t = t.trim();
+        if let Some(rest) = t.strip_prefix("long") {
+            let rest = rest.trim();
+            if let Some(v) = rest.strip_prefix('=') {
+                let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `--flag` names from `#[arg(...)]` attributes on clap fields. In the
+/// tree-sitter-rust grammar the attributes precede their field inside the
+/// enclosing `field_declaration_list`; each attribute applies to the next
+/// field_declaration.
+fn clap_arg_flags(lists: &[Node], src: &[u8]) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    for list in lists {
+        let mut pending: Vec<Node> = Vec::new();
+        let mut cursor = list.walk();
+        for c in list.named_children(&mut cursor) {
+            match c.kind() {
+                "attribute_item" => pending.push(c),
+                "field_declaration" => {
+                    let fname = clean(node_text(c.child_by_field_name("name"), src));
+                    for a in pending.drain(..) {
+                        let an = attr_name(a, src);
+                        if an != "arg" && !an.ends_with("::arg") {
+                            continue;
+                        }
+                        let p = attr_policy(a, src);
+                        if !attr_has_long(&p) || fname.is_empty() {
+                            continue;
+                        }
+                        match attr_long_value(&p) {
+                            Some(v) => flags.push(format!("--{v}")),
+                            None => flags.push(format!("--{fname}")),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,6 +1454,78 @@ fn plain() {}
         // a method named main is not an entrypoint
         let ef2 = extract("struct S;\nimpl S {\n    fn main(&self) {}\n}\n");
         assert!(ef2.entrypoints.is_empty());
+    }
+
+    #[test]
+    fn clap_subcommands_and_flags() {
+        let ef = extract(
+            r#"use clap::{Parser, Subcommand};
+
+/// demo CLI
+#[derive(Parser)]
+struct Cli {
+    /// paged output
+    #[arg(long)]
+    paging: bool,
+
+    /// output format
+    #[arg(short, long)]
+    format: String,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// serve requests
+    Serve {
+        #[arg(long = "port", default_value_t = 8080)]
+        port: u16,
+    },
+    /// deploy the build
+    Deploy {
+        #[arg(short, long)]
+        env: String,
+    },
+}
+
+fn main() {
+    let _cli = Cli::parse();
+}
+"#,
+        );
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 3, "eps: {eps:?}");
+        // fn main + the two subcommand variants
+        assert_eq!(eps[0].symbol, "Serve");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+        assert_eq!(eps[1].symbol, "Deploy");
+        assert_eq!(eps[1].kind, "cli-subcommand");
+        assert_eq!(eps[2].symbol, "main");
+        assert_eq!(eps[2].kind, "bin");
+        // flags: struct fields (explicit long + bare long) on Cli;
+        // variant fields on Command; sorted + deduped
+        let cli = ef.cli_flags.get("Cli").expect("flags on Cli");
+        assert_eq!(cli, &["--format", "--paging"]);
+        let cmd = ef.cli_flags.get("Command").expect("flags on Command");
+        assert_eq!(cmd, &["--env", "--port"]);
+        assert_eq!(ef.cli_flags.len(), 2);
+    }
+
+    #[test]
+    fn clap_derives_only() {
+        // derive without Parser/Subcommand emits nothing
+        let ef = extract(
+            r#"#[derive(Debug)]
+struct Plain {
+    #[arg(long)]
+    paging: bool,
+}
+"#,
+        );
+        assert!(ef.entrypoints.is_empty());
+        assert!(ef.cli_flags.is_empty());
     }
 
     #[test]

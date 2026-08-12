@@ -1331,13 +1331,19 @@ fn store_ref_impl(
     let caller = ctx.caller.clone();
     let line = line_of(call);
     match r {
-            "prisma" | "sequelize" | "typeorm" | "mongoose" | "knex" => {
-                if segments.len() < 2 {
+            "prisma" | "sequelize" | "typeorm" | "mongoose" | "knex" | "Model" => {
+                if segments.is_empty() {
                     return None;
                 }
                 let op = orm_op(method)?;
-                let target = segments.last().cloned(); // model, nearest the root
-                let technology = if r == "mongoose" { "mongodb" } else { "sql" };
+                // model nearest the root (`prisma.user.create` -> user), or
+                // the receiver itself for bare `Model.create(...)`.
+                let target = if segments.len() >= 2 {
+                    segments.last().cloned()
+                } else {
+                    Some(r.to_string())
+                };
+                let technology = if r == "mongoose" || r == "Model" { "mongodb" } else { "sql" };
                 Some(StoreRef {
                     caller,
                     store: r.to_string(),
@@ -1348,6 +1354,9 @@ fn store_ref_impl(
                 })
             }
             "db" | "database" | "pool" | "client" | "sql" => {
+                // drizzle chains (`db.insert(t).values(...)`) are handled
+                // by the inner `db.insert(t)` call, which is recorded on its
+                // own; chain verbs like `values`/`set` map to no op here.
                 let (op, target) = sql_op(method, call, src)?;
                 Some(StoreRef {
                     caller,
@@ -1441,16 +1450,32 @@ fn s3_op(method: &str) -> Option<StoreOp> {
 }
 
 /// (op, target) for raw SQL clients: `db.query("SELECT ...")` sniffs the SQL;
-/// `db.insert(...)` etc. are direct writes.
+/// `db.insert(users)` etc. are direct writes with an identifier target
+/// (drizzle-style table/model argument).
 fn sql_op(method: &str, call: &Node, src: &[u8]) -> Option<(StoreOp, Option<String>)> {
     match method {
         "query" | "execute" => {
             let sql = sql_text_arg(call, src)?;
             Some((sniff_sql_op(&sql), sniff_sql_target(&sql)))
         }
-        "insert" | "update" | "delete" => Some((StoreOp::Write, None)),
+        "insert" | "update" | "delete" => {
+            Some((StoreOp::Write, first_ident_arg(call, src)))
+        }
+        "select" => Some((StoreOp::Query, first_ident_arg(call, src))),
         _ => None,
     }
+}
+
+/// First identifier argument of a call (drizzle `db.insert(users)` table).
+fn first_ident_arg(call: &Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cur = args.walk();
+    for a in args.named_children(&mut cur) {
+        if a.kind() == "identifier" {
+            return Some(node_text(&a, src).to_string());
+        }
+    }
+    None
 }
 
 /// First string literal argument of a call.
@@ -2007,6 +2032,46 @@ async function neg() {
         assert!(!ef.store_refs.iter().any(|s| s.caller.as_deref() == Some("neg")));
         let knex_import = ef.imports.iter().find(|i| i.module == "knex").unwrap();
         assert_eq!(knex_import.names, vec![("knex".into(), "default".into())]);
+    }
+
+    #[test]
+    fn store_refs_drizzle_and_model() {
+        let ef = extract(
+            "src/data.ts",
+            r#"import { db } from "./drizzle";
+import { users, logs } from "./schema";
+import mongoose from "mongoose";
+
+async function w() {
+  await db.insert(users).values({ name: "x" });
+  await db.update(logs).set({ level: "info" });
+  await db.select();
+  await Model.create({ name: "y" });
+  await Model.findById("1");
+}
+"#,
+        );
+        let sr = |store: &str, op: StoreOp, target: &str, caller: &str| {
+            ef.store_refs.iter().any(|s| {
+                s.store == store
+                    && s.op == op
+                    && s.target.as_deref() == Some(target)
+                    && s.caller.as_deref() == Some(caller)
+            })
+        };
+        let sr_none = |store: &str, op: StoreOp, caller: &str| {
+            ef.store_refs
+                .iter()
+                .any(|s| s.store == store && s.op == op && s.target.is_none() && s.caller.as_deref() == Some(caller))
+        };
+        // drizzle: chain verbs inherit the inner op + table argument
+        assert!(sr("db", StoreOp::Write, "users", "w"));
+        assert!(sr("db", StoreOp::Write, "logs", "w"));
+        assert!(sr_none("db", StoreOp::Query, "w")); // db.select()
+        // mongoose-style Model receiver
+        assert!(sr("Model", StoreOp::Write, "Model", "w"));
+        assert!(sr("Model", StoreOp::Query, "Model", "w"));
+        assert_eq!(ef.store_refs.len(), 5);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! golden fixtures are never written into), and the same recall pipeline runs.
 
 use crate::benchctx::{BenchmarkCorpus, BenchTask};
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +69,7 @@ impl GroundTruthDoc {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RepoRecall {
     pub repo: String,
     pub components: f64,
@@ -113,7 +114,7 @@ impl Default for RepoRecall {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AtlasRecallReport {
     /// One row per requested repo, in sorted order; skipped repos carry
     /// `skipped_reason`.
@@ -141,6 +142,7 @@ pub struct AtlasRecallReport {
 pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
     let mut doc = GroundTruthDoc::default();
     let mut current: Option<&'static str> = None;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for raw in md.lines() {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("## ") {
@@ -171,6 +173,12 @@ pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
             None => item,
         };
         if key.is_empty() {
+            continue;
+        }
+        // duplicates (same key bulleted twice in one section, e.g. a route
+        // listed both as decorator and as canonical form) would skew the
+        // denominator — keep the first occurrence only.
+        if !seen.insert(format!("{section}:{key}")) {
             continue;
         }
         doc.section_mut(section).push(key.to_string());
@@ -593,6 +601,18 @@ mod tests {
         assert_eq!(doc.ownership, ["db.items"]);
         assert_eq!(doc.contracts, ["POST /api/items"]);
         assert_eq!(doc.tests, ["test_create_item"]);
+    }
+
+    #[test]
+    fn parse_ground_truth_dedupes_keys_per_section() {
+        let md = "## contracts\n- GET /api/items\n- GET /api/items — duplicate bullet\n- POST /api/items\n";
+        let doc = parse_ground_truth(md);
+        assert_eq!(doc.contracts, ["GET /api/items", "POST /api/items"]);
+        // same key in two sections is not a duplicate
+        let md2 = "## entrypoints\n- GET /api/items\n## contracts\n- GET /api/items\n";
+        let doc2 = parse_ground_truth(md2);
+        assert_eq!(doc2.entrypoints, ["GET /api/items"]);
+        assert_eq!(doc2.contracts, ["GET /api/items"]);
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl Default for LanguagesConfig {
             python: true,
             go: true,
             rust: true,
-            java: false,
+            java: true,
         }
     }
 }

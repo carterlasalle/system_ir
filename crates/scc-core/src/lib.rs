@@ -489,6 +489,10 @@ pub struct SystemAtlas {
     pub async_boundaries: Vec<String>,
     #[serde(default)]
     pub implementation_map: BTreeMap<String, Vec<String>>,
+    /// Data stores / data entities written by components (WRITES-derived),
+    /// rendered as a DATA STORES list under DATA OWNERSHIP.
+    #[serde(default)]
+    pub data_stores: Vec<String>,
     #[serde(default)]
     pub evidence_summary: BTreeMap<String, usize>,
     #[serde(default)]

@@ -8,6 +8,7 @@ use crate::model::{
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
 use tree_sitter::{Node, Parser};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Python extractor. Uses the tree-sitter-python grammar.
 pub struct PythonExtractor {
@@ -131,17 +132,25 @@ fn string_literal_value(node: Node, src: &[u8]) -> Option<String> {
 
 /// First positional string argument of a call.
 fn first_string_arg(call: Node, src: &[u8]) -> Option<String> {
-    let args = call.child_by_field_name("arguments")?;
+    string_args(call, src).into_iter().next()
+}
+
+/// All positional string-literal arguments of a call, in order.
+fn string_args(call: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return out;
+    };
     let mut cursor = args.walk();
     for child in args.named_children(&mut cursor) {
         if child.kind() == "keyword_argument" {
             continue;
         }
         if let Some(s) = string_literal_value(child, src) {
-            return Some(s);
+            out.push(s);
         }
     }
-    None
+    out
 }
 
 /// Case-insensitive byte search; returns index into the original string.
@@ -358,11 +367,13 @@ fn call_is_conditional(node: tree_sitter::Node) -> bool {
 fn classify_op(name: &str) -> Option<StoreOp> {
     match name {
         "execute" | "executemany" | "executescript" => Some(StoreOp::Query), // refined by SQL sniff
-        "commit" | "save" | "add" | "delete" | "update" | "insert" | "remove" | "set" | "upsert" => {
+        "commit" | "save" | "add" | "delete" | "update" | "insert" | "remove" | "set" | "upsert"
+        | "create" | "create_many" | "createMany" => {
             Some(StoreOp::Write)
         }
         "get" | "fetch" | "read" | "count" => Some(StoreOp::Read),
-        "query" | "select" | "find" => Some(StoreOp::Query),
+        "query" | "select" | "find" | "find_many" | "findMany" | "find_one" | "findOne"
+        | "find_first" | "findFirst" => Some(StoreOp::Query),
         "publish" | "send" | "produce" => Some(StoreOp::Publish),
         "subscribe" | "consume" | "on_message" | "on_event" => Some(StoreOp::Subscribe),
         "incr" | "decr" | "push" | "pop" => Some(StoreOp::Write),
@@ -407,6 +418,9 @@ struct Ctx {
     store_refs: Vec<StoreRef>,
     retries: Vec<Retry>,
     entrypoints: Vec<Entrypoint>,
+    /// CLI flags per owning symbol (argparse `add_argument` / click
+    /// `@click.option`), `-`/`--` prefixed, sorted + deduped.
+    cli_flags: BTreeMap<String, BTreeSet<String>>,
     scopes: Vec<Scope>,
 }
 
@@ -421,6 +435,11 @@ impl Ctx {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
     fn into_extracted(self) -> ExtractedFile {
+        let cli_flags = self
+            .cli_flags
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -430,6 +449,7 @@ impl Ctx {
             store_refs: self.store_refs,
             retries: self.retries,
             entrypoints: self.entrypoints,
+            cli_flags,
         }
     }
 }
@@ -600,6 +620,33 @@ impl PythonExtractor {
                 });
             }
         }
+        // click CLI commands/groups and their options
+        if expr.kind() == "call" {
+            let verb = dotted.rsplit('.').next().unwrap_or("");
+            match verb {
+                "command" | "group" => {
+                    if let Some(sym) = def_symbol {
+                        ctx.entrypoints.push(Entrypoint {
+                            symbol: sym.to_string(),
+                            kind: "cli-subcommand".to_string(),
+                            line,
+                        });
+                    }
+                }
+                "option" => {
+                    if let Some(sym) = def_symbol {
+                        let flags: Vec<String> = string_args(expr, src)
+                            .into_iter()
+                            .filter(|s| s.starts_with('-') && s.len() > 1)
+                            .collect();
+                        if !flags.is_empty() {
+                            ctx.cli_flags.entry(sym.to_string()).or_default().extend(flags);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // route decoration
         if expr.kind() != "call" {
             return;
@@ -643,6 +690,7 @@ impl PythonExtractor {
             if !callee.is_empty() {
                 let root = callee_root(fn_node);
                 let known_receiver = root.kind() == "identifier";
+                self.record_cli_surface(node, &callee, ctx, src);
                 ctx.calls.push(Call {
                     caller: ctx.caller(),
                     callee,
@@ -713,6 +761,37 @@ impl PythonExtractor {
             target,
             line: node.start_position().row as u32 + 1,
         });
+    }
+
+    /// argparse CLI surface: `sub.add_parser("serve")` registers a
+    /// subcommand entrypoint; `p.add_argument("--port", ...)` contributes
+    /// `--`/`-` flags to the enclosing function (the parser owner).
+    fn record_cli_surface(&self, node: Node, callee: &str, ctx: &mut Ctx, src: &[u8]) {
+        let method = callee.rsplit('.').next().unwrap_or("");
+        match method {
+            "add_parser" => {
+                if let Some(name) = first_string_arg(node, src) {
+                    ctx.entrypoints.push(Entrypoint {
+                        symbol: name,
+                        kind: "cli-subcommand".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                    });
+                }
+            }
+            "add_argument" => {
+                let Some(caller) = ctx.caller() else {
+                    return;
+                };
+                let flags: Vec<String> = string_args(node, src)
+                    .into_iter()
+                    .filter(|s| s.starts_with('-') && s.len() > 1)
+                    .collect();
+                if !flags.is_empty() {
+                    ctx.cli_flags.entry(caller).or_default().extend(flags);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn record_import(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
@@ -1386,6 +1465,66 @@ mod tests {
         assert_eq!(eps[0].symbol, "main");
         assert_eq!(eps[0].kind, "main-guard");
         assert_eq!(eps[0].line, 4);
+    }
+
+    #[test]
+    fn cli_subcommands_argparse() {
+        let ef = extract(
+            "import argparse\n\n\ndef build_parser():\n    parser = argparse.ArgumentParser(prog=\"app\")\n    sub = parser.add_subparsers(dest=\"command\")\n    serve = sub.add_parser(\"serve\")\n    serve.add_argument(\"--port\", type=int)\n    serve.add_argument(\"--paging\", action=\"store_true\")\n    deploy = sub.add_parser(\"deploy\")\n    deploy.add_argument(\"--env\", choices=[\"dev\", \"prod\"])\n    parser.add_argument(\"--verbose\")\n    return parser\n",
+        );
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 2, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "serve");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+        assert_eq!(eps[0].line, 7);
+        assert_eq!(eps[1].symbol, "deploy");
+        assert_eq!(eps[1].kind, "cli-subcommand");
+        // flags attach to the parser-owning function, sorted + deduped
+        let flags = ef.cli_flags.get("build_parser").expect("flags on build_parser");
+        assert_eq!(flags, &["--env", "--paging", "--port", "--verbose"]);
+    }
+
+    #[test]
+    fn cli_subcommands_click() {
+        let ef = extract(
+            "import click\n\n\n@click.group()\ndef cli():\n    pass\n\n\n@cli.command()\n@click.option(\"--paging\", is_flag=True)\n@click.option(\"-p\", \"--port\", default=8080)\ndef serve(paging, port):\n    pass\n\n\n@cli.command()\ndef deploy():\n    pass\n",
+        );
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 3, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "cli");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+        assert_eq!(eps[1].symbol, "serve");
+        assert_eq!(eps[2].symbol, "deploy");
+        // options land on the decorated function, deduped; byte order puts
+        // `--...` before `-p`
+        let flags = ef.cli_flags.get("serve").expect("flags on serve");
+        assert_eq!(flags, &["--paging", "--port", "-p"]);
+        assert!(!ef.cli_flags.contains_key("deploy"));
+    }
+
+    #[test]
+    fn store_refs_prisma_sqlalchemy_ops() {
+        let ef = extract(
+            "def q(session, client):\n    session.add(user)\n    session.commit()\n    session.query(User).all()\n    client.user.create({\"name\": \"x\"})\n    client.post.findMany({})\n    client.post.createMany([{\"a\": 1}])\n",
+        );
+        let refs = &ef.store_refs;
+        assert_eq!(refs.len(), 6, "refs: {refs:?}");
+        assert_eq!(refs[0].store, "session");
+        assert_eq!(refs[0].op, StoreOp::Write);
+        assert_eq!(refs[1].store, "session");
+        assert_eq!(refs[1].op, StoreOp::Write);
+        assert_eq!(refs[2].store, "session");
+        assert_eq!(refs[2].op, StoreOp::Query);
+        assert_eq!(refs[2].target, None);
+        assert_eq!(refs[3].store, "client");
+        assert_eq!(refs[3].op, StoreOp::Write);
+        assert_eq!(refs[3].target.as_deref(), Some("user"));
+        assert_eq!(refs[4].store, "client");
+        assert_eq!(refs[4].op, StoreOp::Query);
+        assert_eq!(refs[4].target.as_deref(), Some("post"));
+        assert_eq!(refs[5].store, "client");
+        assert_eq!(refs[5].op, StoreOp::Write);
+        assert_eq!(refs[5].target.as_deref(), Some("post"));
     }
 
     #[test]

@@ -19,8 +19,8 @@
 - `state` — rune runtime primitive (internal/client/reactivity/sources.js)
 
 ## entrypoints
-- `./src/index-client.js` — package "main"/"module" entry (package.json exports ".")
-- `./src/index-server.js` — server-side rendering entry
+- `src/index-client.js` — package "main"/"module" entry (package.json exports ".")
+- `src/index-server.js` — server-side rendering entry
 - `svelte/compiler` — subpath export to compiler/index.js
 - `svelte/internal` — subpath export to internal/index.js
 - `svelte/store` / `svelte/motion` — subpath exports for store and motion modules

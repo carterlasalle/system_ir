@@ -123,25 +123,31 @@ fn extract_package_json(path: &str, content: &str, repo_id: &str, out: &mut Conf
         );
         out.relationships.push((rel, path.to_string()));
     }
-    // bin/main -> entrypoints
+    // bin/main -> entrypoints (kind "entrypoint"; name = bin key or path)
     for key in ["bin", "main"] {
         if let Some(bin) = v.get(key) {
-            let target = match bin {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Object(o) => o
-                    .values()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .next()
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            if !target.is_empty() {
-                let entry = Entrypoint {
-                    symbol: format!("{key}:{target}"),
-                    kind: key.to_string(),
-                    line: 1,
-                };
-                out.entrypoints.push(entry);
+            match bin {
+                serde_json::Value::String(s) => {
+                    if !s.is_empty() {
+                        out.entrypoints.push(Entrypoint {
+                            symbol: s.clone(),
+                            kind: "entrypoint".to_string(),
+                            line: 1,
+                        });
+                    }
+                }
+                serde_json::Value::Object(o) => {
+                    for (name, val) in o {
+                        if val.as_str().is_some() {
+                            out.entrypoints.push(Entrypoint {
+                                symbol: name.clone(),
+                                kind: "entrypoint".to_string(),
+                                line: 1,
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -322,12 +328,19 @@ mod tests {
         let content = r#"{
             "name": "mono",
             "workspaces": ["packages/*"],
-            "main": "dist/index.js"
+            "main": "dist/index.js",
+            "bin": {
+                "mono-cli": "bin/mono.js"
+            }
         }"#;
         let out = extract_config_file("package.json", content, "mono");
         assert_eq!(out.entities.len(), 1);
         assert_eq!(out.entities[0].kind, kinds::PACKAGE);
-        assert_eq!(out.entrypoints.len(), 1);
+        assert_eq!(out.entrypoints.len(), 2);
+        let names: Vec<&str> = out.entrypoints.iter().map(|e| e.symbol.as_str()).collect();
+        assert!(names.contains(&"dist/index.js"));
+        assert!(names.contains(&"mono-cli"));
+        assert!(out.entrypoints.iter().all(|e| e.kind == "entrypoint"));
     }
 
     #[test]

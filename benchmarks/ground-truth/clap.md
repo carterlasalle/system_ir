@@ -19,13 +19,13 @@
 - `clap_derive` — proc-macro crate; `#[proc_macro_derive(Parser, attributes(clap, ...))]` etc. in clap_derive/src/lib.rs
 
 ## entrypoints
-- `Command::new` — clap_builder/src/builder/command.rs:133; creates the root command from a name, entry of every builder API
-- `Command::get_matches` — command.rs:663; parses `std::env::args_os` into `ArgMatches`
-- `Command::get_matches_from` — command.rs:758; parses an arbitrary iterator of OsString
-- `Command::arg` — command.rs:171; registers an `Arg` on the command
-- `Command::subcommand` — command.rs:527; registers a nested `Command`
+- `Command.new` — clap_builder/src/builder/command.rs:133; creates the root command from a name, entry of every builder API
+- `Command.get_matches` — command.rs:663; parses `std::env::args_os` into `ArgMatches`
+- `Command.get_matches_from` — command.rs:758; parses an arbitrary iterator of OsString
+- `Command.arg` — command.rs:171; registers an `Arg` on the command
+- `Command.subcommand` — command.rs:527; registers a nested `Command`
 - `#[derive(Parser)]` — clap_derive/src/lib.rs:54; entry for the derive-based API
-- `clap_complete::generate` — clap_complete/src/aot/generator/mod.rs:284; emits shell completion script into a writer
+- `clap_complete.generate` — clap_complete/src/aot/generator/mod.rs:284; emits shell completion script into a writer
 - `clap_mangen` — workspace crate generating man pages from a `Command` (workspace member)
 
 ## flows
@@ -49,13 +49,13 @@
 ## contracts
 - `long` — long-flag name contract (`Arg::long("--flag")` form); stored as `Str` in builder/arg.rs:228
 - `short('f')` — short-flag char contract (arg.rs:182)
-- `Arg::required` — requiredness contract (arg.rs:755); violation yields `MissingRequiredArgument`
-- `Arg::num_args` — value-count contract for options/positionals (arg.rs:1209)
-- `ErrorKind::InvalidValue` — contract for values failing the arg's value parser (error/kind.rs:20)
-- `ErrorKind::UnknownArgument` — contract for unrecognized flags/args (error/kind.rs:35)
-- `ErrorKind::DisplayHelp` — help-request outcome treated as an Error kind (error/kind.rs:276)
-- `Command::bin_name` — the binary name shown in help/version output (command.rs:1901)
-- `Command::arg_required_else_help` — help-when-no-args contract (command.rs:2411)
+- `Arg.required` — requiredness contract (arg.rs:755); violation yields `MissingRequiredArgument`
+- `Arg.num_args` — value-count contract for options/positionals (arg.rs:1209)
+- `ErrorKind.InvalidValue` — contract for values failing the arg's value parser (error/kind.rs:20)
+- `ErrorKind.UnknownArgument` — contract for unrecognized flags/args (error/kind.rs:35)
+- `ErrorKind.DisplayHelp` — help-request outcome treated as an Error kind (error/kind.rs:276)
+- `Command.bin_name` — the binary name shown in help/version output (command.rs:1901)
+- `Command.arg_required_else_help` — help-when-no-args contract (command.rs:2411)
 
 ## tests
 - `clap_builder/src/builder/tests.rs` — unit tests for Command/Arg builder behavior

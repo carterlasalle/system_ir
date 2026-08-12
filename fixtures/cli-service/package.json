@@ -1,0 +1,11 @@
+{
+  "name": "cli-service",
+  "version": "1.0.0",
+  "bin": {
+    "cli-service": "bin/cli.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js"
+  }
+}

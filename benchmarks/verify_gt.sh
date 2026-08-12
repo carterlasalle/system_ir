@@ -38,6 +38,13 @@ key_ok() { # $1=key $2=repodir
     local t="${dot%%.*}" m="${dot##*.}"
     git -C "$repo" grep -qF -- "$t" 2>/dev/null && git -C "$repo" grep -qF -- "$m" 2>/dev/null && return 0
   fi
+  # V5 CLI flag "--flag" / "-f": the flag name (dashes stripped) appears in
+  # source (covers clap-derive style `long = "paging"` definitions where the
+  # literal "--paging" never appears)
+  if printf '%s' "$key" | grep -qE '^--?[a-zA-Z][a-zA-Z0-9-]*$'; then
+    local flag="${key#-}"; flag="${flag#-}"
+    git -C "$repo" grep -qF -- "$flag" 2>/dev/null && return 0
+  fi
   return 1
 }
 

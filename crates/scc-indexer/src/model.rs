@@ -6,6 +6,7 @@
 //! in `resolve.rs`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A source file handed to an extractor.
 #[derive(Debug, Clone)]
@@ -223,6 +224,10 @@ pub struct ExtractedFile {
     pub store_refs: Vec<StoreRef>,
     pub retries: Vec<Retry>,
     pub entrypoints: Vec<Entrypoint>,
+    /// CLI flags owned by a symbol (argparse/click/clap/cobra), keyed by
+    /// symbol name. Values are `-`/`--`-prefixed, sorted, deduped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cli_flags: BTreeMap<String, Vec<String>>,
 }
 
 /// A language extractor. Must be deterministic and side-effect free.

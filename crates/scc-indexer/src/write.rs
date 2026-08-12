@@ -172,6 +172,13 @@ impl<'a> Writer<'a> {
                 cond.dedup();
                 se.attr("conditional_calls", serde_json::json!(cond));
             }
+            // cli_flags: `--flag` list owned by the symbol (sorted, deduped
+            // by the extractor).
+            if let Some(flags) = ef.cli_flags.get(&sym.name) {
+                if !flags.is_empty() {
+                    se.attr("cli_flags", serde_json::json!(flags));
+                }
+            }
             self.store.insert_entity(&se, &[path.to_string()])?;
             self.store.insert_symbol(
                 path,

@@ -282,6 +282,9 @@ enum BenchSub {
         /// Ground-truth docs directory (default: <repo-root>/benchmarks/ground-truth)
         #[arg(long)]
         ground_truth: Option<PathBuf>,
+        /// Emit the full report as JSON (per-repo recall + all missed keys)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -602,18 +605,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => Err(scc_cli::CliError::Other(e)),
                 }
             }
-            BenchSub::Atlas { corpus, ground_truth } => {
-                match scc_cli::benchatlas::run_atlas_bench(
-                    corpus.as_deref(),
-                    ground_truth.as_deref(),
-                ) {
-                    Ok(report) => {
+            BenchSub::Atlas {
+                corpus,
+                ground_truth,
+                json,
+            } => match scc_cli::benchatlas::run_atlas_bench(
+                corpus.as_deref(),
+                ground_truth.as_deref(),
+            ) {
+                Ok(report) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
+                        );
+                    } else {
                         scc_cli::benchatlas::print_report(&report);
-                        Ok(())
                     }
-                    Err(e) => Err(scc_cli::CliError::Other(e)),
+                    Ok(())
                 }
-            }
+                Err(e) => Err(scc_cli::CliError::Other(e)),
+            },
         },
         Commands::StatePath => {
             println!("{}", scc_cli::state_dir(&root).display());

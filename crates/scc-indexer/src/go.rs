@@ -10,6 +10,7 @@ use crate::model::{
     StoreRef, Symbol, SymbolKind,
 };
 use tree_sitter::{Node, Parser};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Go extractor. Uses the tree-sitter-go grammar.
 pub struct GoExtractor {
@@ -39,6 +40,9 @@ impl LanguageExtractor for GoExtractor {
             return ExtractedFile::default();
         };
         let mut ctx = Ctx::default();
+        // prepass: `var cmd = ...cobra.Command{Use: "x"}` bindings, used to
+        // name `rootCmd.AddCommand(cmd)` subcommands.
+        scan_cobra_commands(tree.root_node(), src, &mut ctx.command_uses);
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
     }
@@ -352,6 +356,13 @@ struct Ctx {
     store_refs: Vec<StoreRef>,
     entrypoints: Vec<Entrypoint>,
     scopes: Vec<String>,
+    /// `var name = ...cobra.Command{Use: "x"}` map (prepass).
+    command_uses: BTreeMap<String, String>,
+    /// CLI flags per owning symbol (cobra `Flags().StringP(...)`),
+    /// `--` prefixed, sorted + deduped.
+    cli_flags: BTreeMap<String, BTreeSet<String>>,
+    /// Subcommand names already emitted as entrypoints.
+    seen_subcommands: BTreeSet<String>,
 }
 
 impl Ctx {
@@ -359,12 +370,18 @@ impl Ctx {
         self.scopes.last().cloned()
     }
     fn into_extracted(self) -> ExtractedFile {
+        let cli_flags = self
+            .cli_flags
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
             calls: self.calls,
             store_refs: self.store_refs,
             entrypoints: self.entrypoints,
+            cli_flags,
             ..ExtractedFile::default()
         }
     }
@@ -608,6 +625,7 @@ impl GoExtractor {
                 let root = callee_root(fn_node);
                 let known_receiver =
                     matches!(root.kind(), "identifier" | "type_identifier" | "field_identifier");
+                self.record_cli_surface(node, &callee, ctx, src);
                 ctx.calls.push(Call {
                     caller: ctx.caller(),
                     callee,
@@ -619,6 +637,64 @@ impl GoExtractor {
             }
         }
         self.walk_children(node, ctx, src);
+    }
+
+    /// cobra CLI surface: `rootCmd.AddCommand(serveCmd)` registers
+    /// subcommand entrypoints (named via the prepass `Use` map or an inline
+    /// `cobra.Command{Use: ...}` literal); `cmd.Flags().StringP("paging",
+    /// ...)` contributes `--` flags to the enclosing function (the parser
+    /// owner).
+    fn record_cli_surface(&self, node: Node, callee: &str, ctx: &mut Ctx, src: &[u8]) {
+        let line = node.start_position().row as u32 + 1;
+        if callee.ends_with(".AddCommand") {
+            let Some(args) = node.child_by_field_name("arguments") else {
+                return;
+            };
+            let mut cursor = args.walk();
+            for arg in args.named_children(&mut cursor) {
+                let name = match arg.kind() {
+                    "identifier" => ctx
+                        .command_uses
+                        .get(&clean(node_text(Some(arg), src)))
+                        .cloned(),
+                    // inline `&cobra.Command{Use: "serve"}` literal
+                    _ => cobra_command_use(arg, src),
+                };
+                let Some(name) = name else { continue };
+                if !ctx.seen_subcommands.insert(name.clone()) {
+                    continue;
+                }
+                ctx.entrypoints.push(Entrypoint {
+                    symbol: name,
+                    kind: "cli-subcommand".to_string(),
+                    line,
+                });
+            }
+            return;
+        }
+        if !(callee.contains(".Flags().") || callee.contains(".PersistentFlags().")) {
+            return;
+        }
+        let method = if callee.contains(".Flags().") {
+            callee.rsplit(".Flags().").next().unwrap_or("")
+        } else if callee.contains(".PersistentFlags().") {
+            callee.rsplit(".PersistentFlags().").next().unwrap_or("")
+        } else {
+            return;
+        };
+        if !PFLAG_METHODS.contains(&method) {
+            return;
+        }
+        let Some(caller) = ctx.caller() else {
+            return;
+        };
+        let Some(name) = first_string_arg(node, src) else {
+            return;
+        };
+        ctx.cli_flags
+            .entry(caller)
+            .or_default()
+            .insert(format!("--{name}"));
     }
 
     fn record_store_ref(
@@ -685,6 +761,143 @@ impl GoExtractor {
             target,
             line: node.start_position().row as u32 + 1,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cobra CLI surface helpers
+// ---------------------------------------------------------------------------
+
+/// pflag `FlagSet` registration methods whose first string argument is the
+/// flag name (`StringP("paging", "p", ...)`, `BoolVar(&x, "theme", ...)`).
+const PFLAG_METHODS: &[&str] = &[
+    "Bool", "BoolP", "BoolVar", "BoolVarP", "Count", "CountP", "Duration", "DurationP",
+    "DurationVar", "DurationVarP", "Float64", "Float64P", "Float64Var", "Float64VarP", "IP",
+    "IPP", "IPVar", "IPVarP", "IPSlice", "IPSliceP", "Int", "IntP", "IntVar", "IntVarP", "Int64",
+    "Int64P", "Int64Var", "Int64VarP", "IntSlice", "IntSliceP", "String", "StringP", "StringVar",
+    "StringVarP", "StringArray", "StringArrayP", "StringSlice", "StringSliceP", "StringToInt",
+    "StringToIntP", "StringToInt64", "StringToInt64P", "StringToString", "StringToStringP",
+    "StringToUint", "StringToUintP", "Uint", "UintP", "UintVar", "UintVarP", "Uint64", "Uint64P",
+    "Uint64Var", "Uint64VarP", "UintSlice", "UintSliceP", "Var", "VarP",
+];
+
+/// The `Use` value of a `cobra.Command{Use: "serve", ...}` literal value
+/// (unwrapping `&`/parens), or `None` for anything else.
+fn cobra_command_use(expr: Node, src: &[u8]) -> Option<String> {
+    let mut n = expr;
+    while matches!(n.kind(), "unary_expression" | "parenthesized_expression") {
+        let inner = n.named_child(0)?;
+        n = inner;
+    }
+    if n.kind() != "composite_literal" {
+        return None;
+    }
+    // the type is a plain child (`cobra.Command` qualified_type); some
+    // grammar versions expose it as a `type` field instead.
+    let ty = match n.child_by_field_name("type") {
+        Some(t) => t,
+        None => {
+            let mut cursor = n.walk();
+            let mut found: Option<Node> = None;
+            for c in n.named_children(&mut cursor) {
+                if matches!(c.kind(), "qualified_type" | "type_identifier") {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found?
+        }
+    };
+    let ty = clean(node_text(Some(ty), src));
+    if ty != "cobra.Command" && !ty.ends_with(".cobra.Command") {
+        return None;
+    }
+    let mut cursor = n.walk();
+    for c in n.named_children(&mut cursor) {
+        if c.kind() != "literal_value" {
+            continue;
+        }
+        let mut c2 = c.walk();
+        for el in c.named_children(&mut c2) {
+            if el.kind() != "keyed_element" {
+                continue;
+            }
+            // key/value are wrapped in `literal_element` nodes.
+            let key = el
+                .child_by_field_name("key")
+                .map(|k| literal_inner(k))
+                .map(|k| clean(node_text(Some(k), src)))
+                .unwrap_or_default();
+            if key != "Use" {
+                continue;
+            }
+            let v = el.child_by_field_name("value")?;
+            return string_literal_value(literal_inner(v), src);
+        }
+    }
+    None
+}
+
+/// Descend through `literal_element` wrappers to the underlying value node.
+fn literal_inner(mut n: Node) -> Node {
+    while n.kind() == "literal_element" {
+        match n.named_child(0) {
+            Some(inner) => n = inner,
+            None => break,
+        }
+    }
+    n
+}
+
+/// Prepass: map `var serveCmd = &cobra.Command{Use: "serve"}` (and
+/// `serveCmd := ...`) bindings to their `Use` names.
+fn scan_cobra_commands(node: Node, src: &[u8], out: &mut BTreeMap<String, String>) {
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        match c.kind() {
+            "var_declaration" => {
+                let mut c2 = c.walk();
+                for spec in c.named_children(&mut c2) {
+                    if spec.kind() != "var_spec" {
+                        continue;
+                    }
+                    let name = clean(node_text(spec.child_by_field_name("name"), src));
+                    let Some(value) = spec.child_by_field_name("value") else {
+                        continue;
+                    };
+                    let mut c3 = value.walk();
+                    for expr in value.named_children(&mut c3) {
+                        if let Some(u) = cobra_command_use(expr, src) {
+                            out.insert(name.clone(), u);
+                        }
+                    }
+                }
+            }
+            "short_var_declaration" => {
+                let mut lefts: Vec<String> = Vec::new();
+                let mut lc = c.walk();
+                for n in c.children_by_field_name("left", &mut lc) {
+                    let t = clean(node_text(Some(n), src));
+                    if !t.is_empty() {
+                        lefts.push(t);
+                    }
+                }
+                let mut rights: Vec<Node> = Vec::new();
+                let mut rc = c.walk();
+                for n in c.children_by_field_name("right", &mut rc) {
+                    rights.push(n);
+                }
+                for (name, expr_list) in lefts.iter().zip(rights.iter()) {
+                    let mut ec = expr_list.walk();
+                    for expr in expr_list.named_children(&mut ec) {
+                        if let Some(u) = cobra_command_use(expr, src) {
+                            out.insert(name.clone(), u);
+                        }
+                    }
+                }
+            }
+            _ => scan_cobra_commands(c, src, out),
+        }
     }
 }
 
@@ -1014,6 +1227,43 @@ mod tests {
         assert_eq!(eps[0].symbol, "main");
         assert_eq!(eps[0].kind, "bin");
         assert_eq!(eps[0].line, 5);
+    }
+
+    #[test]
+    fn cobra_subcommands_and_flags() {
+        let ef = extract(
+            "package main\n\nimport \"github.com/spf13/cobra\"\n\nvar rootCmd = &cobra.Command{Use: \"cli-service\"}\n\nvar serveCmd = &cobra.Command{\n    Use:   \"serve\",\n    Short: \"serve requests\",\n    Run:   func(cmd *cobra.Command, args []string) {},\n}\n\nvar deployCmd = &cobra.Command{Use: \"deploy\"}\n\nfunc init() {\n    rootCmd.AddCommand(serveCmd, deployCmd)\n    rootCmd.AddCommand(&cobra.Command{Use: \"inline\"})\n    serveCmd.Flags().IntP(\"port\", \"p\", 8080, \"port to listen on\")\n    serveCmd.Flags().Bool(\"paging\", false, \"paged output\")\n    deployCmd.PersistentFlags().StringVar(&env, \"env\", \"dev\", \"target env\")\n}\n\nfunc main() {\n    rootCmd.Execute()\n}\n",
+        );
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 4, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "serve");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+        assert_eq!(eps[0].line, 16);
+        assert_eq!(eps[1].symbol, "deploy");
+        assert_eq!(eps[1].kind, "cli-subcommand");
+        // inline `&cobra.Command{Use: "inline"}` literal arg
+        assert_eq!(eps[2].symbol, "inline");
+        assert_eq!(eps[2].kind, "cli-subcommand");
+        assert_eq!(eps[3].symbol, "main");
+        assert_eq!(eps[3].kind, "bin");
+        // flags attach to the function that owns the parser (init),
+        // `--` prefixed, sorted + deduped
+        let flags = ef.cli_flags.get("init").expect("flags on init");
+        assert_eq!(flags, &["--env", "--paging", "--port"]);
+        assert_eq!(ef.cli_flags.len(), 1);
+    }
+
+    #[test]
+    fn cobra_use_map_short_decl() {
+        let ef = extract(
+            "package main\n\nfunc main() {\n    serveCmd := &cobra.Command{Use: \"serve\"}\n    root.AddCommand(serveCmd)\n}\n",
+        );
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 2, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "main");
+        assert_eq!(eps[0].kind, "bin");
+        assert_eq!(eps[1].symbol, "serve");
+        assert_eq!(eps[1].kind, "cli-subcommand");
     }
 
     #[test]

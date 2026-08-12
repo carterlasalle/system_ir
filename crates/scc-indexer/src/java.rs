@@ -360,6 +360,7 @@ impl Ctx {
             store_refs: self.store_refs,
             retries: self.retries,
             entrypoints: self.entrypoints,
+            cli_flags: std::collections::BTreeMap::new(),
         }
     }
 }

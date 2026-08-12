@@ -29,6 +29,8 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
 
     // ---- components ----
     let mut components: Vec<AtlasComponent> = Vec::new();
+    // data stores / data entities written by component symbols (WRITES-derived)
+    let mut data_stores: BTreeSet<String> = BTreeSet::new();
     for c in view.components() {
         let purpose_text = c
             .attributes
@@ -90,20 +92,49 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             }
         }
 
+        // Ownership claims come from the component compiler's `owns` attr
+        // (write-edge derived + declared intent, provenance preserved).
+        // Claims targeting data-store / data-entity entities additionally
+        // surface in the atlas DATA STORES list, using the full store
+        // reference (`db.users`) so data entities stay attributed to their
+        // store.
         let mut owns: Vec<AtlasOwnershipClaim> = Vec::new();
         if let Some(oa) = c.attributes.get("owns").and_then(|v| v.as_array()) {
             for o in oa {
-                if let (Some(t), Some(p)) = (
-                    o.get("target").and_then(|v| v.as_str()),
-                    o.get("provenance").and_then(|v| v.as_str()),
-                ) {
-                    owns.push(AtlasOwnershipClaim {
-                        target: entity_name(view, t),
-                        provenance: p.to_string(),
-                    });
+                let Some(t) = o.get("target").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let p = o.get("provenance").and_then(|v| v.as_str()).unwrap_or("");
+                let is_store_target = view
+                    .entity(t)
+                    .map(|e| {
+                        e.kind == scc_core::kinds::DATA_STORE
+                            || e.kind == scc_core::kinds::DATA_ENTITY
+                    })
+                    .unwrap_or(false);
+                let target_name = match view.entity(t) {
+                    Some(e) if e.kind == scc_core::kinds::DATA_STORE => e.name.clone(),
+                    Some(e) if e.kind == scc_core::kinds::DATA_ENTITY => e
+                        .attributes
+                        .get("store")
+                        .and_then(|v| v.as_str())
+                        .map(|s| format!("{s}.{}", e.name))
+                        .unwrap_or_else(|| e.name.clone()),
+                    _ => entity_name(view, t),
+                };
+                if is_store_target {
+                    data_stores.insert(target_name.clone());
                 }
+                owns.push(AtlasOwnershipClaim {
+                    target: target_name,
+                    provenance: p.to_string(),
+                });
             }
         }
+        // defensive dedupe: the same (target, provenance) pair may repeat
+        // across claims
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        owns.retain(|o| seen.insert((o.target.clone(), o.provenance.clone())));
 
         components.push(AtlasComponent {
             name: c.name.clone(),
@@ -146,14 +177,29 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         });
     }
     for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
-        if e.attributes.contains_key("entrypoints") {
-            entrypoints.push(AtlasEntrypoint {
-                name: e.name.clone(),
-                kind: "entrypoint".into(),
-                trigger: format!("entrypoint:{}", e.name),
-                symbol: e.id.clone(),
-            });
+        let Some(kinds) = e.attributes.get("entrypoints").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if kinds.is_empty() {
+            continue;
         }
+        // extractor contract: entrypoint kinds are strings ("main-guard",
+        // "cli-subcommand", ...); cli-subcommand entrypoints render as
+        // `name [cli-subcommand]` instead of the generic kind
+        let kind = if kinds
+            .iter()
+            .any(|k| k.as_str() == Some("cli-subcommand"))
+        {
+            "cli-subcommand"
+        } else {
+            "entrypoint"
+        };
+        entrypoints.push(AtlasEntrypoint {
+            name: e.name.clone(),
+            kind: kind.into(),
+            trigger: format!("entrypoint:{}", e.name),
+            symbol: e.id.clone(),
+        });
     }
     entrypoints.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -173,6 +219,49 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         if !path.is_empty() {
             contracts.insert(format!("{method} {path}").trim().to_string());
         }
+    }
+
+    // CLI contracts: symbols carrying `cli_flags: ["--flag", ...]` attrs
+    // (extractor contract). Deterministic order: grouped by the component
+    // that contains the symbol, flags sorted within each group; symbols not
+    // inside any component fall into a `cli` group.
+    let mut symbol_comp: BTreeMap<String, String> = BTreeMap::new();
+    for c in view.components() {
+        for r in view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+            for sr in view.out_pred(&r.object, scc_core::predicates::CONTAINS) {
+                symbol_comp.insert(sr.object.clone(), c.name.clone());
+            }
+        }
+    }
+    let mut cli_by_comp: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut cli_unattributed: BTreeSet<String> = BTreeSet::new();
+    for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
+        let Some(flags) = e.attributes.get("cli_flags").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let flags: BTreeSet<String> = flags
+            .iter()
+            .filter_map(|f| f.as_str().map(String::from))
+            .collect();
+        if flags.is_empty() {
+            continue;
+        }
+        match symbol_comp.get(&e.id) {
+            Some(comp) => cli_by_comp
+                .entry(comp.clone())
+                .or_default()
+                .extend(flags),
+            None => cli_unattributed.extend(flags),
+        }
+    }
+    for (comp, flags) in &cli_by_comp {
+        contracts.insert(format!("{}: {}", comp, flags.iter().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    if !cli_unattributed.is_empty() {
+        contracts.insert(format!(
+            "cli: {}",
+            cli_unattributed.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
 
     // ---- flows: SEQUENCES project from the canonical FlowGraph (P1 §18);
@@ -337,6 +426,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         trust_boundaries,
         async_boundaries: async_boundaries.into_iter().collect(),
         implementation_map,
+        data_stores: data_stores.into_iter().collect(),
         evidence_summary,
         warnings,
     }
@@ -432,6 +522,12 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
                 "{} owns {} ({})\n",
                 c.name, o.target, o.provenance
             ));
+        }
+    }
+    if !atlas.data_stores.is_empty() {
+        ownership.push_str("\nDATA STORES\n");
+        for s in &atlas.data_stores {
+            ownership.push_str(&format!("  {s}\n"));
         }
     }
     sections.push(Section::new("DATA OWNERSHIP", ownership, 10));
