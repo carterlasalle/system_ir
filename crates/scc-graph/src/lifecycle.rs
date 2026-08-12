@@ -38,6 +38,12 @@ pub fn component_candidates(graph: &RealityGraph) -> Vec<ComponentCandidate> {
         candidates.push(ComponentCandidate {
             name: c.name.clone(),
             dirs,
+            boundary_kind: c
+                .attributes
+                .get("boundary_kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| crate::components::BOUNDARY_CODE_REGION.to_string()),
         });
     }
     candidates

@@ -503,6 +503,42 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         8,
     ));
 
+    // RUNTIME (Wave 6): observed trace-path signatures + three-way drift
+    // (declared vs static vs observed). Priority 8 — droppable before any
+    // critical section, so a tight budget never hides invariants.
+    let mut runtime = String::new();
+    let sigs = ctx.store.trace_signatures().unwrap_or_default();
+    if !sigs.is_empty() {
+        runtime.push_str("OBSERVED PATH\n");
+        // store order: (count DESC, signature) — deterministic top-10
+        for (signature, count, latency_ms, errors, _last) in sigs.into_iter().take(10) {
+            runtime.push_str(&format!(
+                "{signature} ({count} reqs, avg {latency_ms:.1} ms, {errors} err)\n"
+            ));
+        }
+    }
+    const THREE_WAY_KINDS: [&str; 3] = [
+        "undeclared_observed",
+        "declared_unobserved",
+        "static_unobserved",
+    ];
+    for (_, kind, _sev, msg, _) in ctx.store.drift_findings(true).unwrap_or_default() {
+        if !THREE_WAY_KINDS.contains(&kind.as_str()) {
+            continue;
+        }
+        let label = match kind.as_str() {
+            "undeclared_observed" => "undeclared observed",
+            "declared_unobserved" => "declared unobserved",
+            "static_unobserved" => "static unobserved",
+            _ => kind.as_str(),
+        };
+        runtime.push_str(&format!("DRIFT {label}: {msg}\n"));
+    }
+    if runtime.is_empty() {
+        runtime.push_str("(none)\n");
+    }
+    sections.push(Section::new("RUNTIME", runtime, 8));
+
     let warnings = atlas.warnings.clone();
     finish(&mut pack, sections, budget, warnings);
     pack.entity_ids = comp_ids(ctx);

@@ -14,6 +14,7 @@ pub enum Language {
     JavaScript,
     Go,
     Rust,
+    Java,
     Json,
     Yaml,
     Toml,
@@ -35,6 +36,7 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Go => "go",
             Language::Rust => "rust",
+            Language::Java => "java",
             Language::Json => "json",
             Language::Yaml => "yaml",
             Language::Toml => "toml",
@@ -126,6 +128,13 @@ fn is_test_path(path: &Path, language: Language) -> bool {
                 || name.ends_with(".spec.js")
                 || dirs.contains(&"__tests__")
         }
+        Language::Java => {
+            name.ends_with("Test.java")
+                || name.ends_with("Tests.java")
+                || dirs.contains(&"test")
+                || dirs.contains(&"src/test")
+                || dirs.iter().any(|d| d.starts_with("test"))
+        }
         _ => false,
     }
 }
@@ -145,6 +154,7 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
             "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "go" => Language::Go,
             "rs" => Language::Rust,
+            "java" => Language::Java,
             "json" | "jsonc" => Language::Json,
             "yaml" | "yml" => Language::Yaml,
             "toml" => Language::Toml,

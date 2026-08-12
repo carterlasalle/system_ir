@@ -34,6 +34,7 @@ pub struct LanguagesConfig {
     pub python: bool,
     pub go: bool,
     pub rust: bool,
+    pub java: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,8 +166,9 @@ impl Default for LanguagesConfig {
         LanguagesConfig {
             typescript: true,
             python: true,
-            go: false,
-            rust: false,
+            go: true,
+            rust: true,
+            java: false,
         }
     }
 }
@@ -245,6 +247,7 @@ impl Config {
             }
             crate::scan::Language::Go => self.languages.go,
             crate::scan::Language::Rust => self.languages.rust,
+            crate::scan::Language::Java => self.languages.java,
             _ => true, // config/infra/docs always processed
         }
     }

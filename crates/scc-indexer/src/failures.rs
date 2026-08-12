@@ -45,14 +45,17 @@ pub struct FailureHit {
 }
 
 /// Scan `content` for failure patterns in the given `language` (`python`,
-/// `typescript`, or `javascript`; anything else yields nothing). Pure and
-/// deterministic: identical input produces identical output.
+/// `typescript`, `javascript`, `go`, or `rust`; anything else yields
+/// nothing). Pure and deterministic: identical input produces identical
+/// output.
 pub fn scan_failures(content: &str, language: &str) -> Vec<FailureHit> {
-    let mut hits: Vec<FailureHit> = Vec::new();
     match language {
-        "python" | "typescript" | "javascript" => {}
-        _ => return hits,
+        "go" => return scan_go(content),
+        "rust" => return scan_rust(content),
+        "python" | "typescript" | "javascript" | "java" => {}
+        _ => return Vec::new(),
     }
+    let mut hits: Vec<FailureHit> = Vec::new();
     let keyword = if language == "python" { "except" } else { "catch" };
     let mut boundary: Option<String> = None;
     for (idx, raw) in content.lines().enumerate() {
@@ -102,15 +105,97 @@ pub fn scan_failures(content: &str, language: &str) -> Vec<FailureHit> {
     hits
 }
 
-/// Apply `hits` for one file into the store. For each hit the enclosing
-/// symbol entity's `failures` attribute is appended (deduped by
-/// kind+detail+line); a missing symbol entity is created synthetically
-/// (kind `function`). Every hit backs a `source` evidence row with extractor
-/// `scc-failures`. DLQ hits additionally create/update a `topic` entity with
-/// `{dlq: true}` plus an EXTRACTED `subscribes` relationship from the
-/// enclosing symbol (or file, when no symbol is known) to the topic.
-/// Idempotent: the same hit always maps to the same evidence id and the
-/// failures entries dedupe on re-apply. Returns the number of hits applied.
+/// Go failure scanning: `panic(...)` calls (Go has no exception/catch
+/// fallback; `defer`/`recover` handling is out of scope). Line-based like
+/// the other languages; the enclosing function comes from `boundary_name`
+/// (`func main`, `func (s *Store) Save`). `panic` is word-bounded so
+/// `panicking` / `panicked` never match, and the `(` guard keeps bare
+/// mentions in comments from firing.
+fn scan_go(content: &str) -> Vec<FailureHit> {
+    let mut hits: Vec<FailureHit> = Vec::new();
+    let mut boundary: Option<String> = None;
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = (idx + 1) as u32;
+        if has_keyword(raw, "panic") && raw.contains('(') {
+            hits.push(FailureHit {
+                file: String::new(),
+                symbol: boundary.clone(),
+                kind: "panic".to_string(),
+                detail: "panic call".to_string(),
+                line: line_no,
+            });
+        }
+        // A boundary on this line applies to *later* lines.
+        if let Some(name) = boundary_name(raw, "go") {
+            boundary = Some(name);
+        }
+    }
+    hits.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    hits.dedup();
+    hits
+}
+/// Rust failure scanning: `panic!`/`panic(` calls and unconditional
+/// `unwrap()`/`expect(...)` calls (Rust has no `except`/`catch` fallback;
+/// `?` propagation is the idiomatic error path and deliberately not
+/// flagged). Line-based like the other languages; the enclosing function
+/// comes from `boundary_name` (`fn name(`). `panic`/`unwrap`/`expect` are
+/// word-bounded so `panicking`, `unwrap_or`, and `expected(` never match;
+/// the `(`/`!` guards keep bare mentions in comments from firing.
+fn scan_rust(content: &str) -> Vec<FailureHit> {
+    const PANIC_PATTERNS: &[&str] = &["panic!()", "panic!(", "panic(", "unwrap()", "expect("];
+    let mut hits: Vec<FailureHit> = Vec::new();
+    let mut boundary: Option<String> = None;
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = (idx + 1) as u32;
+        if let Some(detail) = PANIC_PATTERNS.iter().find(|p| has_keyword(raw, p)) {
+            hits.push(FailureHit {
+                file: String::new(),
+                symbol: boundary.clone(),
+                kind: "panic".to_string(),
+                detail: (*detail).to_string(),
+                line: line_no,
+            });
+        }
+        // circuit breaker identifier mention
+        if let Some(ident) = circuit_identifier(raw) {
+            hits.push(FailureHit {
+                file: String::new(),
+                symbol: boundary.clone(),
+                kind: "circuit-breaker".to_string(),
+                detail: ident,
+                line: line_no,
+            });
+        }
+        // DLQ string literals
+        for lit in dlq_literals(raw) {
+            hits.push(FailureHit {
+                file: String::new(),
+                symbol: boundary.clone(),
+                kind: "dlq".to_string(),
+                detail: lit,
+                line: line_no,
+            });
+        }
+        // A boundary on this line applies to *later* lines.
+        if let Some(name) = boundary_name(raw, "rust") {
+            boundary = Some(name);
+        }
+    }
+    hits.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    hits.dedup();
+    hits
+}
+
 pub fn apply_failures(
     store: &Store,
     file: &str,
@@ -313,8 +398,19 @@ fn redact(s: &str) -> String {
 
 /// Name of the function declared on `line`, if any. Python matches
 /// `def`/`async def`; TS/JS matches `function` (with optional `export`/
-/// `async` prefixes) and `const name =`.
+/// `async` prefixes) and `const name =`; Go matches `func name(` and
+/// `func (r Receiver) name(` (method symbol `Receiver.name`, matching the
+/// extractor's naming so failures land on the real symbol entity).
 fn boundary_name(line: &str, language: &str) -> Option<String> {
+    if language == "go" {
+        return go_boundary_name(line);
+    }
+    if language == "java" {
+        return java_boundary_name(line);
+    }
+    if language == "rust" {
+        return rust_boundary_name(line);
+    }
     let t = line.trim_start();
     let rest: &str = if language == "python" {
         if let Some(r) = t.strip_prefix("async def ") {
@@ -348,6 +444,159 @@ fn boundary_name(line: &str, language: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Go function boundary: `func main(` → `main`; `func (s *Store) Save(` →
+/// `Store.Save` (receiver type's last dotted segment, matching the Go
+/// extractor's method naming).
+fn go_boundary_name(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("func ")?;
+    let rest = rest.trim_start();
+    if let Some(inner) = rest.strip_prefix('(') {
+        let close = inner.find(')')?;
+        let after = inner[close + 1..].trim_start();
+        let name = take_ident(after);
+        if name.is_empty() {
+            return None;
+        }
+        match receiver_type(&inner[..close]) {
+            Some(rt) if !rt.is_empty() => Some(format!("{rt}.{name}")),
+            _ => Some(name.to_string()),
+        }
+    } else {
+        let name = take_ident(rest);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+}
+
+/// Rust function boundary: `fn name(` → `name`. Strips visibility
+/// (`pub`, `pub(crate)`), `async`, `const`, `unsafe`, and `extern`
+/// modifiers.
+fn rust_boundary_name(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let mut r = t;
+    loop {
+        if let Some(x) = r.strip_prefix("pub ") {
+            r = x;
+            continue;
+        }
+        if r.starts_with("pub(") {
+            let Some(paren) = r.find(')') else { break };
+            r = r[paren + 1..].trim_start();
+            continue;
+        }
+        if let Some(x) = r.strip_prefix("async ") {
+            r = x;
+            continue;
+        }
+        if let Some(x) = r.strip_prefix("const ") {
+            r = x;
+            continue;
+        }
+        if let Some(x) = r.strip_prefix("unsafe ") {
+            r = x;
+            continue;
+        }
+        if let Some(x) = r.strip_prefix("extern ") {
+            r = x;
+            continue;
+        }
+        // `extern "C" fn` — skip the ABI string literal
+        if r.starts_with('"') {
+            if let Some(end) = r[1..].find('"') {
+                r = r[end + 2..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    let rest = r.strip_prefix("fn ")?;
+    let name = take_ident(rest);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Receiver type from inside `(s *Service)`: strips the name, `*`/`&`, and
+/// any package qualifier, keeping the last dotted segment.
+fn receiver_type(recv: &str) -> Option<String> {
+    let t = recv.trim();
+    let last = t.split_whitespace().last()?;
+    let last = last.trim_start_matches(['*', '&']);
+    let seg = last.rsplit('.').next().unwrap_or(last);
+    let seg = seg.split('[').next().unwrap_or(seg).trim();
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
+/// Java method declarations: `public void storeOrder(String id) {`,
+/// `Order findById(String id) {`, `public Service() {`. The method name is
+/// the identifier immediately before the first `(` on a line whose
+/// (modifier-stripped) remainder opens a block.
+fn java_boundary_name(line: &str) -> Option<String> {
+    let mut r = line.trim_start();
+    loop {
+        let stripped = strip_java_modifier(r);
+        if stripped == r {
+            break;
+        }
+        r = stripped;
+    }
+    let r = r.trim_start();
+    if !r.ends_with('{') {
+        return None;
+    }
+    let paren = r.find('(')?;
+    if paren == 0 {
+        return None;
+    }
+    let before = &r[..paren];
+    let name = take_last_ident(before);
+    if name.is_empty() {
+        return None;
+    }
+    // control-flow openers with parenthesized conditions are not methods
+    if matches!(
+        name,
+        "if" | "for" | "while" | "switch" | "catch" | "return" | "new" | "else" | "synchronized"
+    ) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Strip one leading Java modifier keyword (if followed by whitespace).
+fn strip_java_modifier(s: &str) -> &str {
+    const MODIFIERS: &[&str] = &[
+        "public", "private", "protected", "static", "final", "abstract", "synchronized",
+        "native", "strictfp", "default", "transient", "volatile",
+    ];
+    let t = s.trim_start();
+    for m in MODIFIERS {
+        if let Some(r) = t.strip_prefix(m) {
+            if r.starts_with(char::is_whitespace) {
+                return r.trim_start();
+            }
+        }
+    }
+    t
+}
+
+/// Last identifier in `s` (e.g. `public void storeOrder` -> `storeOrder`).
+fn take_last_ident(s: &str) -> &str {
+    s.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .find(|w| !w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or("")
 }
 
 /// Leading identifier characters ([A-Za-z0-9_$], never starting with a digit).
@@ -480,6 +729,149 @@ const producer = () => {
     }
 
     #[test]
+    fn go_panic_with_enclosing_symbol() {
+        let content = r#"
+package main
+
+func main() {
+    if err := run(); err != nil {
+        panic("run failed")
+    }
+}
+
+func (s *Store) Save(order string) error {
+    if order == "" {
+        panic("empty order")
+    }
+    return nil
+}
+"#;
+        let hits = scan_failures(content, "go");
+        assert_eq!(hits.len(), 2, "hits: {hits:?}");
+        assert_eq!(hits[0].kind, "panic");
+        assert_eq!(hits[0].detail, "panic call");
+        assert_eq!(hits[0].symbol.as_deref(), Some("main"));
+        assert_eq!(hits[0].line, 6);
+
+        assert_eq!(hits[1].symbol.as_deref(), Some("Store.Save"));
+        assert_eq!(hits[1].line, 12);
+
+        // `panicking` is not `panic`; a bare comment mention with `(` still
+        // yields a hit (permissive by design), so test the word boundary
+        // separately.
+        assert!(scan_failures("func f() {\n    panicking()\n}\n", "go").is_empty());
+        // non-go languages never scan for panic (rust scans its own panic!(
+        // pattern; use a language without any panic scan here)
+        assert!(scan_failures("func main() { panic(\"x\") }\n", "python").is_empty());
+    }
+
+    #[test]
+    fn rust_panic_unwrap_expect_with_enclosing_symbol() {
+        let content = r#"
+pub fn main() {
+    let conn = "jobs.db";
+    conn.execute("INSERT INTO jobs (id) VALUES (?)", &["1"]).expect("store write failed");
+}
+
+fn fallback() {
+    panic!("queue dead");
+}
+
+async fn poll() {
+    let v = Option::<i32>::None.unwrap();
+}
+"#;
+        let hits = scan_failures(content, "rust");
+        assert_eq!(hits.len(), 3, "hits: {hits:?}");
+        assert_eq!(hits[0].kind, "panic");
+        assert_eq!(hits[0].detail, "expect(");
+        assert_eq!(hits[0].symbol.as_deref(), Some("main"));
+        assert_eq!(hits[0].line, 4);
+
+        assert_eq!(hits[1].kind, "panic");
+        assert_eq!(hits[1].detail, "panic!(");
+        assert_eq!(hits[1].symbol.as_deref(), Some("fallback"));
+        assert_eq!(hits[1].line, 8);
+
+        assert_eq!(hits[2].kind, "panic");
+        assert_eq!(hits[2].detail, "unwrap()");
+        assert_eq!(hits[2].symbol.as_deref(), Some("poll"));
+        assert_eq!(hits[2].line, 12);
+
+        // plain `?` propagation is idiomatic and never flagged
+        assert!(
+            scan_failures("fn load() -> Result<(), String> {\n    read()?;\n    Ok(())\n}\n", "rust")
+                .is_empty()
+        );
+        // `unwrap_or`, `expected(`, and `panicking` are not failure calls
+        let neg = "fn f() {\n    let a = v.unwrap_or(0);\n    expected(1);\n    panicking();\n}\n";
+        assert!(scan_failures(neg, "rust").is_empty());
+    }
+
+    #[test]
+    fn rust_boundary_visibility_forms() {
+        let content = "pub(crate) async fn send() {\n    panic!(\"x\")\n}\n\npub fn recv() {\n    panic!(\"y\")\n}\n\nunsafe extern \"C\" fn raw() {\n    panic!(\"z\")\n}\n";
+        let hits = scan_failures(content, "rust");
+        assert_eq!(hits.len(), 3, "hits: {hits:?}");
+        assert_eq!(hits[0].symbol.as_deref(), Some("send"));
+        assert_eq!(hits[1].symbol.as_deref(), Some("recv"));
+        assert_eq!(hits[2].symbol.as_deref(), Some("raw"));
+    }
+
+    #[test]
+    fn java_catch_with_enclosing_method() {
+        let content = r#"
+public class Service {
+    public void process(String orderId) {
+        try {
+            this.storeOrder(orderId);
+        } catch (Exception e) {
+            this.fallback(orderId);
+        }
+    }
+    public void storeOrder(String orderId) {}
+    public void fallback(String orderId) {}
+}
+"#;
+        let hits = scan_failures(content, "java");
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].kind, "except-fallback");
+        assert_eq!(hits[0].detail, "catch block");
+        assert_eq!(hits[0].symbol.as_deref(), Some("process"));
+        assert_eq!(hits[0].line, 6);
+        // constructor boundary resolves to the class name, not a method
+        let ctor = r#"
+public class Service {
+    public Service() {
+        try {
+            setup();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+"#;
+        let hits = scan_failures(ctor, "java");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol.as_deref(), Some("Service"));
+        // control-flow openers are never method boundaries
+        let flow = r#"
+public void loop() {
+    for (int i = 0; i < 3; i++) {
+        try {
+            work();
+        } catch (Exception e) {
+            retry();
+        }
+    }
+}
+"#;
+        let hits = scan_failures(flow, "java");
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].symbol.as_deref(), Some("loop"));
+    }
+
+    #[test]
     fn negative_cases() {
         // `Exception` (capitalized) and `exceptional` are not the `except` keyword
         assert!(scan_failures("raise Exception('boom')\n", "python").is_empty());
@@ -492,8 +884,8 @@ const producer = () => {
         // `catches` is not the `catch` keyword
         assert!(scan_failures("function f() { catches(e); }\n", "typescript").is_empty());
         // unsupported languages are skipped entirely
-        assert!(scan_failures("try:\n    pass\nexcept:\n    pass\n", "rust").is_empty());
-        assert!(scan_failures("try {} catch (e) {}", "go").is_empty());
+        assert!(scan_failures("try:\n    pass\nexcept:\n    pass\n", "ruby").is_empty());
+        assert!(scan_failures("try {} catch (e) {}", "csharp").is_empty());
     }
 
     #[test]
@@ -522,7 +914,7 @@ const producer = () => {
 
     #[test]
     fn malformed_input_no_panic() {
-        for lang in ["python", "typescript", "javascript", "rust", ""] {
+        for lang in ["python", "typescript", "javascript", "java", "rust", ""] {
             assert!(scan_failures("", lang).is_empty());
             // binary junk
             let junk = String::from_utf8_lossy(&[0x00u8, 0x01, 0xff, 0xfe, b'a', 0x80]).to_string();

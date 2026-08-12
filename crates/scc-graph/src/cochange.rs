@@ -17,6 +17,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
+/// Default minimum shared commits for a pair to count as co-change signal
+/// (one shared commit is weak; two or more indicate repeated coupling).
+/// Used by the compilation pipeline for both clustering and enrichment.
+pub const COCHANGE_MIN_COMMITS: u32 = 2;
+
 /// One co-changed file pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CochangePair {
@@ -174,8 +179,9 @@ fn is_skip_path(path: &str) -> bool {
 
 /// True when `file` lives under one of the component's path prefixes. The
 /// synthetic `root` component matches top-level files (no `/`), mirroring
-/// `components::component_for_path`.
-fn file_in_paths(file: &str, paths: &[&str]) -> bool {
+/// `components::component_for_path`. Shared with the component compiler
+/// (Wave 5 clustering) so pair-containment uses one rule everywhere.
+pub(crate) fn file_in_paths(file: &str, paths: &[&str]) -> bool {
     for p in paths {
         let p = p.trim_end_matches('/');
         if p.is_empty() {

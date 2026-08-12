@@ -11,13 +11,20 @@
 //! - [`ingest_simple_edges`] accepts the legacy `[{"source","target","count"}]`
 //!   shape and only aggregates counts.
 //!
-//! [`reconcile`] compares observed edges against static RESOLVED `calls`
-//! relationships (mapped symbol-to-component) and reports matched, observed-
-//! only, and static-only edges.
+//! [`reconcile`] compares three sources at component granularity: observed
+//! edges, static evidence-grade `calls` relationships (mapped symbol-to-
+//! component), and declared intent (flow claims with a `steps` list).
+//! Differences become drift findings (`undeclared_observed` HIGH,
+//! `declared_unobserved` MEDIUM, `static_unobserved` LOW) written to the
+//! store, deduplicated across runs.
+//!
+//! [`ingest_otlp_json`] additionally records per-trace path signatures
+//! (root-to-leaf service paths, deduped per trace) into the
+//! `trace_signatures` table.
 
 use scc_core::{kinds, now_rfc3339, predicates, Entity, Provenance};
 use scc_store::rusqlite::params;
-use scc_store::Store;
+use scc_store::{ModelEpochKind, Store};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -40,7 +47,8 @@ pub struct TraceStats {
     pub errors: usize,
 }
 
-/// Static vs observed call-edge comparison.
+/// Static vs observed call-edge comparison, two-way (static vs observed)
+/// plus three-way (declared intent vs static vs observed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct Reconciliation {
     /// `"src -> tgt"` edges seen at runtime.
@@ -53,6 +61,22 @@ pub struct Reconciliation {
     pub observed_not_static: Vec<String>,
     /// Declared statically but never observed at runtime.
     pub static_not_observed: Vec<String>,
+    // ---- three-way diff (Wave 6): declared vs static vs observed ----
+    /// Declared edges from intent claims (source "flow" carrying a "steps"
+    /// list), joined component-wise. Empty when no declared flows exist.
+    pub declared: Vec<String>,
+    /// Observed but absent from the declared architecture: `observed \ declared`
+    /// (drift kind `undeclared_observed`, HIGH). Includes the synthetic
+    /// "root" head for traces.
+    pub observed_only: Vec<String>,
+    /// Declared but never observed: `declared \ observed` (drift kind
+    /// `declared_unobserved`, MEDIUM). Only populated when runtime data
+    /// exists.
+    pub declared_only: Vec<String>,
+    /// Statically reachable but neither declared nor observed:
+    /// `static \ (declared ∪ observed)` (drift kind `static_unobserved`,
+    /// LOW). Only populated when runtime data exists.
+    pub static_only: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +168,57 @@ fn attr_string(attrs: &[Attr], key: &str) -> Option<String> {
 fn json_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Cap on root-to-leaf paths collected per trace before the trace is
+/// skipped as non-canonical. Prevents a hostile wide/fan-out tree from
+/// exploding into an exponential number of signatures.
+const MAX_TRACE_PATHS: usize = 256;
+
+/// Depth-first walk from a root span, merging every root-to-leaf path into
+/// `out` keyed by its service labels (including the synthetic "root" head):
+/// `(latency sum, error sum, path count)` per distinct path. Iterative (no
+/// recursion depth hazard) and deterministic (children visited in span-id
+/// order; identical paths are merged, not duplicated). When the path budget
+/// is exhausted `exploded` is set and the walk stops — the caller should
+/// skip that trace entirely.
+fn walk_trace_paths<'a>(
+    root: &'a SpanInfo,
+    trace_spans: &'a HashMap<String, SpanInfo>,
+    out: &mut BTreeMap<Vec<String>, (f64, u64, u64)>,
+    exploded: &mut bool,
+) {
+    // stack entries: (span, path-so-far, latency-so-far, errors-so-far)
+    let mut stack: Vec<(&SpanInfo, Vec<String>, f64, u64)> =
+        vec![(root, vec!["root".to_string()], 0.0, 0)];
+    while let Some((span, prefix, latency, errors)) = stack.pop() {
+        if *exploded {
+            return;
+        }
+        let mut path = prefix;
+        path.push(span.service.clone());
+        let latency = latency + span.latency_ms;
+        let errors = errors + u64::from(span.error);
+        let mut children: Vec<&SpanInfo> = trace_spans
+            .values()
+            .filter(|s| s.parent_span_id.as_deref() == Some(span.span_id.as_str()))
+            .collect();
+        children.sort_by_key(|s| s.span_id.clone());
+        if children.is_empty() {
+            if out.len() >= MAX_TRACE_PATHS {
+                *exploded = true;
+                return;
+            }
+            let entry = out.entry(path).or_insert((0.0, 0, 0));
+            entry.0 += latency;
+            entry.1 += errors;
+            entry.2 += 1;
+        } else {
+            for c in children {
+                stack.push((c, path.clone(), latency, errors));
+            }
+        }
+    }
 }
 
 /// Ingest an OTLP/JSON trace payload into `runtime_edges`.
@@ -253,6 +328,59 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
         edges += 1;
     }
 
+    // Trace path signatures (Wave 6): walk each trace from its root span
+    // and emit one signature per root-to-leaf path. Labels are the same
+    // service labels edges are resolved with, prefixed by the synthetic
+    // "root" head so a signature reads "root -> api -> db". Identical
+    // paths are merged per trace (dedupe per trace); only traces with
+    // >= 2 spans produce signatures. Each distinct signature upserts once
+    // per trace occurrence with the average path latency and the summed
+    // path errors, so `count` stays honest.
+    let mut sig_count = 0usize;
+    for trace_spans in by_trace.values() {
+        if trace_spans.len() < 2 {
+            continue; // a single-span trace has no meaningful path
+        }
+        let roots: Vec<&SpanInfo> = trace_spans
+            .values()
+            .filter(|s| {
+                s.parent_span_id
+                    .as_ref()
+                    .map(|p| !trace_spans.contains_key(p))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if roots.is_empty() {
+            continue;
+        }
+        let mut paths: BTreeMap<Vec<String>, (f64, u64, u64)> = BTreeMap::new();
+        let mut exploded = false;
+        for root in &roots {
+            walk_trace_paths(root, trace_spans, &mut paths, &mut exploded);
+            if exploded {
+                break;
+            }
+        }
+        if exploded {
+            // pathological fan-out: no canonical signature for this trace
+            continue;
+        }
+        for (labels, (latency, errors, path_count)) in paths {
+            let avg_latency = if path_count > 0 { latency / path_count as f64 } else { 0.0 };
+            store
+                .upsert_trace_signature(&labels.join(" -> "), avg_latency, errors)
+                .map_err(|e| format!("upsert trace signature: {e}"))?;
+            sig_count += 1;
+        }
+    }
+
+    // runtime truth changed — invalidate epoch-keyed context packs
+    if edges > 0 || sig_count > 0 {
+        store
+            .bump_epoch(ModelEpochKind::Runtime)
+            .map_err(|e| format!("bump runtime epoch: {e}"))?;
+    }
+
     let total_spans = agg.values().map(|(count, _, _)| *count).sum::<u64>() as usize;
     let error_spans = agg.values().map(|(_, _, errors)| *errors).sum::<u64>() as usize;
     Ok(TraceStats {
@@ -269,7 +397,9 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
 /// Ingest `[{"source","target","count"}]` edges (count defaults to 1).
 ///
 /// Only counts and `last_observed` are updated; latency/error aggregates from
-/// trace ingestion are left untouched.
+/// trace ingestion are left untouched. No trace-path signatures are recorded
+/// here: this shape carries no trace structure (no span tree to walk), so
+/// only aggregated edges are produced.
 pub fn ingest_simple_edges(store: &Store, body: &str) -> Result<TraceStats, String> {
     if body.trim().is_empty() {
         return Ok(TraceStats {
@@ -313,6 +443,12 @@ pub fn ingest_simple_edges(store: &Store, body: &str) -> Result<TraceStats, Stri
             )
             .map_err(|e| format!("upsert runtime edge: {e}"))?;
         edges += 1;
+    }
+    // runtime truth changed — invalidate epoch-keyed context packs
+    if edges > 0 {
+        store
+            .bump_epoch(ModelEpochKind::Runtime)
+            .map_err(|e| format!("bump runtime epoch: {e}"))?;
     }
     Ok(TraceStats {
         spans: 0,
@@ -408,8 +544,87 @@ fn component_name(store: &Store, id: &str, components: &[Entity]) -> String {
     sym.name
 }
 
-/// Compare observed runtime edges against static RESOLVED `calls`
-/// relationships between symbol entities, at component granularity.
+/// Declared edges from intent claims: source `"flow"` claims carrying a
+/// `steps` list are joined component-wise — each consecutive pair becomes a
+/// `"A -> B"` edge. Step entries are component names (strings) or objects
+/// with a `component` field. Honest by construction: a claim without a
+/// `steps` list declares no edges, and if no declared flows exist the
+/// declared set is empty (findings then reduce to observed-only vs
+/// static-only comparisons).
+fn declared_edges(store: &Store) -> Result<BTreeSet<String>, String> {
+    let claims = store
+        .intent_claims()
+        .map_err(|e| format!("load intent claims: {e}"))?;
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for (source, claim) in claims {
+        if source != "flow" {
+            continue;
+        }
+        let Some(steps) = claim["steps"].as_array() else {
+            continue;
+        };
+        let labels: Vec<String> = steps
+            .iter()
+            .filter_map(|s| {
+                s.as_str()
+                    .map(String::from)
+                    .or_else(|| {
+                        s.get("component")
+                            .and_then(|c| c.as_str())
+                            .map(String::from)
+                    })
+            })
+            .collect();
+        for pair in labels.windows(2) {
+            out.insert(format!("{} -> {}", pair[0], pair[1]));
+        }
+    }
+    Ok(out)
+}
+
+/// Write drift findings for the three-way diff, skipping any (kind,
+/// message) already present among unresolved findings so repeated
+/// reconciles stay idempotent. Returns whether anything new was written.
+fn persist_reconcile_findings(
+    store: &Store,
+    findings: &[(String, String, String)],
+) -> Result<bool, String> {
+    if findings.is_empty() {
+        return Ok(false);
+    }
+    let existing: BTreeSet<(String, String)> = store
+        .drift_findings(true)
+        .map_err(|e| format!("load drift findings: {e}"))?
+        .into_iter()
+        .map(|(_, kind, _, msg, _)| (kind, msg))
+        .collect();
+    let mut changed = false;
+    for (kind, severity, msg) in findings {
+        if existing.contains(&(kind.clone(), msg.clone())) {
+            continue;
+        }
+        store
+            .add_drift_finding(kind, severity, msg)
+            .map_err(|e| format!("record drift finding: {e}"))?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Compare declared intent vs static evidence-grade `calls` vs observed
+/// runtime edges, all at component granularity.
+///
+/// Three-way drift findings (drift_findings kinds):
+/// - `undeclared_observed` (HIGH): observed \ declared — executed at runtime
+///   but absent from the declared architecture
+/// - `declared_unobserved` (MEDIUM): declared \ observed — declared but never
+///   observed (only when runtime data exists)
+/// - `static_unobserved` (LOW): static \ (declared ∪ observed) — statically
+///   reachable but neither declared nor observed (only when runtime data
+///   exists)
+///
+/// Findings are persisted (deduplicated across runs) and the Derived epoch
+/// is bumped when new findings land, so epoch-keyed packs pick them up.
 pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
     let observed: BTreeSet<String> = runtime_edges(store)?
         .into_iter()
@@ -440,12 +655,64 @@ pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
         static_set.insert(format!("{source} -> {target}"));
     }
 
+    let declared = declared_edges(store)?;
+    let has_runtime = !observed.is_empty();
+
+    // three-way diff -> drift findings (edge strings as messages)
+    let mut findings: Vec<(String, String, String)> = Vec::new();
+    for e in observed.difference(&declared) {
+        findings.push((
+            "undeclared_observed".into(),
+            "high".into(),
+            e.clone(),
+        ));
+    }
+    if has_runtime {
+        for e in declared.difference(&observed) {
+            findings.push((
+                "declared_unobserved".into(),
+                "medium".into(),
+                e.clone(),
+            ));
+        }
+        let known: BTreeSet<String> = declared.union(&observed).cloned().collect();
+        for e in static_set.difference(&known) {
+            findings.push((
+                "static_unobserved".into(),
+                "low".into(),
+                e.clone(),
+            ));
+        }
+    }
+    if persist_reconcile_findings(store, &findings)? {
+        store
+            .bump_epoch(ModelEpochKind::Derived)
+            .map_err(|e| format!("bump derived epoch: {e}"))?;
+    }
+
+    let observed_only: Vec<String> = observed.difference(&declared).cloned().collect();
+    let declared_only: Vec<String> = if has_runtime {
+        declared.difference(&observed).cloned().collect()
+    } else {
+        Vec::new()
+    };
+    let known: BTreeSet<String> = declared.union(&observed).cloned().collect();
+    let static_only: Vec<String> = if has_runtime {
+        static_set.difference(&known).cloned().collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(Reconciliation {
         observed_edges: observed.iter().cloned().collect(),
         static_edges: static_set.iter().cloned().collect(),
         matched: observed.intersection(&static_set).cloned().collect(),
         observed_not_static: observed.difference(&static_set).cloned().collect(),
         static_not_observed: static_set.difference(&observed).cloned().collect(),
+        declared: declared.into_iter().collect(),
+        observed_only,
+        declared_only,
+        static_only,
     })
 }
 
@@ -718,5 +985,227 @@ mod tests {
         assert!(r.matched.is_empty());
         assert!(r.observed_not_static.is_empty());
         assert!(r.static_not_observed.is_empty());
+        assert!(r.declared.is_empty());
+        assert!(r.observed_only.is_empty());
+        assert!(r.declared_only.is_empty());
+        assert!(r.static_only.is_empty());
+    }
+
+    /// Trace: one `api` root span with two `db` children — the two
+    /// root-to-leaf paths dedupe to a single "root -> api -> db" signature
+    /// from a 3-span tree. Span `c` is an error.
+    fn otlp_signature_trace() -> String {
+        serde_json::json!({
+            "resourceSpans": [
+                {
+                    "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "api" } }] },
+                    "scopeSpans": [{ "spans": [
+                        {
+                            "traceId": "t2", "spanId": "a", "name": "GET /x",
+                            "startTimeUnixNano": "0", "endTimeUnixNano": "10000000",
+                            "status": { "code": 0 }
+                        }
+                    ]}]
+                },
+                {
+                    "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "db" } }] },
+                    "scopeSpans": [{ "spans": [
+                        {
+                            "traceId": "t2", "spanId": "b", "parentSpanId": "a", "name": "SELECT 1",
+                            "startTimeUnixNano": "1000000", "endTimeUnixNano": "6000000",
+                            "status": { "code": 0 }
+                        },
+                        {
+                            "traceId": "t2", "spanId": "c", "parentSpanId": "a", "name": "SELECT 2",
+                            "startTimeUnixNano": "2000000", "endTimeUnixNano": "7000000",
+                            "status": { "code": 2 }
+                        }
+                    ]}]
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn otlp_ingest_records_trace_signatures() {
+        let (store, _dir) = tmp_store();
+        assert!(store.trace_signatures().unwrap().is_empty());
+
+        let stats = ingest_otlp_json(&store, &otlp_signature_trace()).unwrap();
+        assert_eq!(
+            stats,
+            TraceStats {
+                spans: 3,
+                // (root, api) + (api, db) — the two db spans merge into one edge
+                edges: 2,
+                errors: 1,
+            }
+        );
+
+        let sigs = store.trace_signatures().unwrap();
+        assert_eq!(sigs.len(), 1, "identical root-to-leaf paths dedupe per trace");
+        let (sig, count, latency, errors, last) = &sigs[0];
+        assert_eq!(sig, "root -> api -> db");
+        assert_eq!(*count, 1);
+        // avg over the deduped paths: (10ms + 5ms) twice -> 15.0
+        assert!((latency - 15.0).abs() < 1e-9, "latency {latency}");
+        assert_eq!(*errors, 1);
+        assert!(!last.is_empty());
+
+        // a second ingest increments the occurrence count and errors
+        ingest_otlp_json(&store, &otlp_signature_trace()).unwrap();
+        let sigs = store.trace_signatures().unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].1, 2);
+        assert_eq!(sigs[0].3, 2);
+        assert!((sigs[0].2 - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn otlp_ingest_signatures_for_branched_and_single_span_traces() {
+        let (store, _dir) = tmp_store();
+        // the shared fixture branches root(api) -> api and root(api) -> db
+        ingest_otlp_json(&store, &otlp_trace()).unwrap();
+        let sigs = store.trace_signatures().unwrap();
+        assert_eq!(sigs.len(), 2);
+        let labels: Vec<&str> = sigs.iter().map(|s| s.0.as_str()).collect();
+        assert!(labels.contains(&"root -> api -> api"));
+        assert!(labels.contains(&"root -> api -> db"));
+
+        // single-span traces produce no signature
+        let single = serde_json::json!({
+            "resourceSpans": [{
+                "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "api" } }] },
+                "scopeSpans": [{ "spans": [
+                    { "traceId": "t9", "spanId": "a", "name": "solo" }
+                ]}]
+            }]
+        })
+        .to_string();
+        ingest_otlp_json(&store, &single).unwrap();
+        let sigs = store.trace_signatures().unwrap();
+        assert_eq!(sigs.len(), 2, "single-span trace adds no signature");
+    }
+
+    #[test]
+    fn reconcile_three_way_findings() {
+        let (store, _dir) = tmp_store();
+
+        // Components: api owns src/api, db owns src/db; helper unmappable.
+        store
+            .insert_entity(&component("repo://repo/component/api", "api", &["src/api"]), &[])
+            .unwrap();
+        store
+            .insert_entity(&component("repo://repo/component/db", "db", &["src/db"]), &[])
+            .unwrap();
+        let fetch_user = symbol_id("repo", "src/api/handler.rs", "fetch_user");
+        let query = symbol_id("repo", "src/db/pool.rs", "query");
+        let helper = symbol_id("repo", "src/tools/util.rs", "helper");
+        for e in [
+            symbol_entity("src/api/handler.rs", "fetch_user"),
+            symbol_entity("src/db/pool.rs", "query"),
+            symbol_entity("src/tools/util.rs", "helper"),
+        ] {
+            store.insert_entity(&e, &[]).unwrap();
+        }
+        // Static RESOLVED calls: api -> db (observed too), api -> helper (never).
+        for (rid, subject, object) in [
+            ("rel:1", &fetch_user, &query),
+            ("rel:2", &fetch_user, &helper),
+        ] {
+            let rel =
+                Relationship::new(rid, subject, predicates::CALLS, object, Provenance::Resolved);
+            store.insert_relationship(&rel, "src/api/handler.rs").unwrap();
+        }
+        // Declared flow steps: api -> db -> cache (db -> cache never observed).
+        store
+            .replace_intent_claims(&[(
+                "flow".into(),
+                serde_json::json!({
+                    "name": "fetch",
+                    "entrypoint": "fetch_user",
+                    "steps": ["api", "db", "cache"],
+                }),
+            )])
+            .unwrap();
+        // Observed: api -> db (declared + static), web -> api (undeclared).
+        ingest_simple_edges(
+            &store,
+            r#"[{"source": "api", "target": "db"}, {"source": "web", "target": "api"}]"#,
+        )
+        .unwrap();
+
+        let r = reconcile(&store).unwrap();
+        // three-way sets
+        assert_eq!(r.declared, vec!["api -> db", "db -> cache"]);
+        assert_eq!(r.observed_only, vec!["web -> api"]);
+        assert_eq!(r.declared_only, vec!["db -> cache"]);
+        assert_eq!(r.static_only, vec!["api -> helper"]);
+        // two-way sets unchanged
+        assert_eq!(r.matched, vec!["api -> db"]);
+        assert_eq!(r.observed_not_static, vec!["web -> api"]);
+        assert_eq!(r.static_not_observed, vec!["api -> helper"]);
+
+        // drift findings written with the right kinds, severities, messages
+        let findings = store.drift_findings(true).unwrap();
+        let mut by_kind: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_kind_sev: BTreeMap<String, String> = BTreeMap::new();
+        for (_, kind, sev, msg, _) in &findings {
+            by_kind.entry(kind.clone()).or_default().push(msg.clone());
+            by_kind_sev.entry(kind.clone()).or_insert_with(|| sev.clone());
+        }
+        assert_eq!(by_kind.get("undeclared_observed").unwrap(), &vec!["web -> api".to_string()]);
+        assert_eq!(by_kind.get("declared_unobserved").unwrap(), &vec!["db -> cache".to_string()]);
+        assert_eq!(by_kind.get("static_unobserved").unwrap(), &vec!["api -> helper".to_string()]);
+        assert_eq!(by_kind_sev.get("undeclared_observed").unwrap(), "high");
+        assert_eq!(by_kind_sev.get("declared_unobserved").unwrap(), "medium");
+        assert_eq!(by_kind_sev.get("static_unobserved").unwrap(), "low");
+
+        // idempotent: reconciling again adds no duplicate findings
+        reconcile(&store).unwrap();
+        assert_eq!(store.drift_findings(true).unwrap().len(), findings.len());
+    }
+
+    #[test]
+    fn reconcile_three_way_without_runtime_data() {
+        let (store, _dir) = tmp_store();
+        store
+            .insert_entity(&component("repo://repo/component/api", "api", &["src/api"]), &[])
+            .unwrap();
+        store
+            .insert_entity(&component("repo://repo/component/db", "db", &["src/db"]), &[])
+            .unwrap();
+        let fetch_user = symbol_id("repo", "src/api/handler.rs", "fetch_user");
+        let query = symbol_id("repo", "src/db/pool.rs", "query");
+        for e in [
+            symbol_entity("src/api/handler.rs", "fetch_user"),
+            symbol_entity("src/db/pool.rs", "query"),
+        ] {
+            store.insert_entity(&e, &[]).unwrap();
+        }
+        let rel = Relationship::new(
+            "rel:1",
+            &fetch_user,
+            predicates::CALLS,
+            &query,
+            Provenance::Resolved,
+        );
+        store.insert_relationship(&rel, "src/api/handler.rs").unwrap();
+        store
+            .replace_intent_claims(&[(
+                "flow".into(),
+                serde_json::json!({ "name": "f", "steps": ["api", "db"] }),
+            )])
+            .unwrap();
+
+        // No runtime data: declared_unobserved and static_unobserved are
+        // suppressed (they only make sense once observations exist), and no
+        // finding fires because observed is empty.
+        let r = reconcile(&store).unwrap();
+        assert!(r.declared_only.is_empty(), "declared_unobserved requires runtime data");
+        assert!(r.static_only.is_empty(), "static_unobserved requires runtime data");
+        assert!(r.observed_only.is_empty());
+        assert!(store.drift_findings(true).unwrap().is_empty());
     }
 }

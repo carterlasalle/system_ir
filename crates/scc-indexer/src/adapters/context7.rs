@@ -7,6 +7,7 @@
 
 use crate::lsp::encode_frame;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -67,11 +68,17 @@ pub struct Context7Client {
     next_id: u64,
 }
 
-/// Spawn the Context7 MCP server. `command` is the full shell command.
-pub fn start(command: &str) -> Result<Context7Client, String> {
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+/// Spawn the Context7 MCP server. `command` is the full shell command;
+/// `cwd` is the repository root the server runs in. The child runs under
+/// the sandboxed environment (SCC-225): only PATH/HOME/TMPDIR/LANG/LC_ALL
+/// and SCC_* are inherited — never arbitrary parent env (no API keys).
+pub fn start(command: &str, cwd: &Path) -> Result<Context7Client, String> {
+    let mut cmd = super::sandboxed_command(command, cwd);
+    // stderr stays /dev/null on purpose: the MCP protocol is stdout-only and
+    // the child is a sandboxed subprocess — its diagnostics must not
+    // interleave the JSONL stream (a real server crash surfaces as a
+    // response timeout instead of corrupted frames).
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -298,7 +305,7 @@ for line in sys.stdin:
         let fake_path = dir.path().join("fake_c7.py");
         std::fs::write(&fake_path, FAKE_SERVER).unwrap();
         let cmd = format!("python3 {}", fake_path.display());
-        let mut client = start(&cmd).unwrap();
+        let mut client = start(&cmd, dir.path()).unwrap();
         let out = client.docs_for("fastapi/fastapi").unwrap();
         assert!(out.contains("CONTEXT7 EXTERNAL DOCUMENTATION"), "{out}");
         assert!(out.contains("/fastapi/fastapi"), "{out}");
@@ -313,14 +320,72 @@ for line in sys.stdin:
         let fake_path = dir.path().join("fake_c7_jsonl.py");
         std::fs::write(&fake_path, FAKE_SERVER).unwrap();
         let cmd = format!("python3 {}", fake_path.display());
-        let mut client = start(&cmd).unwrap();
+        let mut client = start(&cmd, dir.path()).unwrap();
         let out = client.docs_for("fastapi/fastapi").unwrap();
         assert!(out.contains("FastAPI route docs"), "{out}");
     }
 
     #[test]
     fn missing_server_errors() {
-        assert!(start("python3 /nonexistent.py").is_err());
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(start("python3 /nonexistent.py", dir.path()).is_err());
+    }
+
+    // SCC-225 sandbox enforcement: the child subprocess must inherit ONLY
+    // the allowlisted variables (PATH/HOME/TMPDIR/LANG/LC_ALL/SCC_*) — a
+    // secret in the parent environment must never reach it.
+    #[test]
+    fn sandboxed_command_strips_inherited_secrets() {
+        // A secret sitting in the parent environment...
+        std::env::set_var("SECRET_TOKEN", "scc-test-hunter2");
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake = dir.path().join("dump_env.py");
+        std::fs::write(
+            &fake,
+            "import json, os, sys\nsys.stdout.write(json.dumps(sorted(os.environ.keys())) + \"\\n\")\n",
+        )
+        .unwrap();
+        let cmd = format!("python3 {}", fake.display());
+        let output = super::super::sandboxed_command(&cmd, dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fake env dump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let keys: Vec<String> =
+            serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap().trim()).unwrap();
+        assert!(
+            keys.iter().all(|k| !k.contains("SECRET")),
+            "secret leaked into the child environment: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k == "PATH"),
+            "PATH must be preserved for npx/python3: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k == "HOME"),
+            "HOME must be preserved for the npx cache: {keys:?}"
+        );
+        // allowlist only — nothing else from the parent may leak through.
+        // The shell itself injects PWD/SHLVL/_ (and __CF_USER_TEXT_ENCODING
+        // on macOS) after exec; those are not parent inheritance.
+        let shell_init = ["PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"];
+        let leaked: Vec<&String> = keys
+            .iter()
+            .filter(|k| {
+                !matches!(k.as_str(), "PATH" | "HOME" | "TMPDIR" | "LANG" | "LC_ALL")
+                    && !k.starts_with("SCC_")
+                    && !shell_init.contains(&k.as_str())
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "non-allowlisted variable reached the child: {leaked:?}"
+        );
     }
 
     #[test]

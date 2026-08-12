@@ -259,6 +259,44 @@ fn atlas_excludes_stale_facts_and_warns() {
 }
 
 #[test]
+fn atlas_runtime_section_shows_observed_paths_and_drift() {
+    // Wave 6: the atlas RUNTIME section surfaces observed trace signatures
+    // and three-way drift findings (declared vs static vs observed).
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+
+    // No runtime data yet: the section renders but says (none).
+    let atlas = run_ok(&dir, &["atlas"]);
+    assert!(atlas.contains("# RUNTIME\n(none)"), "{atlas}");
+
+    // Ingest a 3-span OTLP trace: an `api` root span with two `db` children
+    // dedupes to one "root -> api -> db" signature.
+    let trace = r#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},"scopeSpans":[{"spans":[{"traceId":"t1","spanId":"a","name":"GET /x","startTimeUnixNano":"0","endTimeUnixNano":"10000000","status":{"code":0}}]}]},{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"db"}}]},"scopeSpans":[{"spans":[{"traceId":"t1","spanId":"b","parentSpanId":"a","name":"SELECT 1","startTimeUnixNano":"1000000","endTimeUnixNano":"6000000","status":{"code":0}},{"traceId":"t1","spanId":"c","parentSpanId":"a","name":"SELECT 2","startTimeUnixNano":"2000000","endTimeUnixNano":"7000000","status":{"code":0}}]}]}]}"#;
+    run_ok(&dir, &["ingest", trace]);
+    let atlas = run_ok(&dir, &["atlas"]);
+    assert!(atlas.contains("# RUNTIME"), "{atlas}");
+    assert!(atlas.contains("OBSERVED PATH"), "{atlas}");
+    assert!(atlas.contains("root -> api -> db (1 reqs"), "{atlas}");
+
+    // Reconcile writes the three-way drift: the observed edges are
+    // undeclared (the fixture declares no flows) and the fixture's static
+    // edges that were never observed are flagged. The epoch bump makes the
+    // cached atlas re-render with the drift lines.
+    run_ok(&dir, &["runtime", "reconcile"]);
+    let atlas = run_ok(&dir, &["atlas"]);
+    assert!(
+        atlas.contains("DRIFT undeclared observed: root -> api")
+            && atlas.contains("DRIFT undeclared observed: api -> db"),
+        "atlas must surface undeclared_observed drift: {atlas}"
+    );
+    assert!(
+        atlas.contains("DRIFT static unobserved:"),
+        "atlas must surface static_unobserved drift: {atlas}"
+    );
+}
+
+#[test]
 fn atlas_budget_accounting_is_honest() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());

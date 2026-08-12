@@ -17,7 +17,9 @@ pub mod embed;
 pub mod conflicts;
 pub mod failures;
 pub mod git;
+pub mod go;
 pub mod infra;
+pub mod java;
 pub mod lsp;
 pub mod lsp_ts;
 pub mod model;
@@ -25,6 +27,7 @@ pub mod python;
 pub mod redact;
 pub mod resolve;
 pub mod resolver;
+pub mod rust;
 pub mod runtime;
 pub mod scan;
 pub mod typescript;
@@ -68,8 +71,11 @@ pub struct IndexReport {
 pub struct Indexer {
     pub store: Store,
     pub config: Config,
+    pub go: Box<dyn LanguageExtractor>,
     pub python: Box<dyn LanguageExtractor>,
     pub typescript: Box<dyn LanguageExtractor>,
+    pub java: Box<dyn LanguageExtractor>,
+    pub rust: Box<dyn LanguageExtractor>,
 }
 
 impl Indexer {
@@ -77,8 +83,11 @@ impl Indexer {
         Indexer {
             store,
             config,
+            go: Box::new(crate::go::GoExtractor::default()),
             python: Box::new(crate::python::PythonExtractor::default()),
             typescript: Box::new(crate::typescript::TypeScriptExtractor::default()),
+            java: Box::new(crate::java::JavaExtractor::default()),
+            rust: Box::new(crate::rust::RustExtractor::default()),
         }
     }
 
@@ -163,7 +172,7 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python" || lang == "typescript" || lang == "javascript" {
+            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }
@@ -207,7 +216,15 @@ impl Indexer {
             let lang = f.language;
             let mut resolved_imports: Vec<ResolvedImport> = Vec::new();
             let mut resolved_calls = Vec::new();
-            if matches!(lang, Language::Python | Language::TypeScript | Language::JavaScript) {
+            if matches!(
+                lang,
+                Language::Python
+                    | Language::TypeScript
+                    | Language::JavaScript
+                    | Language::Go
+                    | Language::Java
+                    | Language::Rust
+            ) {
                 resolved_imports = ef
                     .imports
                     .iter()
@@ -320,10 +337,19 @@ impl Indexer {
             Language::Python if self.config.language_enabled(Language::Python) => {
                 self.python.extract(&file)
             }
+            Language::Go if self.config.language_enabled(Language::Go) => {
+                self.go.extract(&file)
+            }
             Language::TypeScript | Language::JavaScript
                 if self.config.language_enabled(Language::TypeScript) =>
             {
                 self.typescript.extract(&file)
+            }
+            Language::Java if self.config.language_enabled(Language::Java) => {
+                self.java.extract(&file)
+            }
+            Language::Rust if self.config.language_enabled(Language::Rust) => {
+                self.rust.extract(&file)
             }
             _ => ExtractedFile::default(),
         }
@@ -433,7 +459,7 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python" || lang == "typescript" || lang == "javascript" {
+            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }
@@ -466,7 +492,15 @@ impl Indexer {
         for (path, (f, ef, cfg_hits, fail_hits)) in &extracted {
             let mut resolved_imports: Vec<ResolvedImport> = Vec::new();
             let mut resolved_calls = Vec::new();
-            if matches!(f.language, Language::Python | Language::TypeScript | Language::JavaScript) {
+            if matches!(
+                f.language,
+                Language::Python
+                    | Language::TypeScript
+                    | Language::JavaScript
+                    | Language::Go
+                    | Language::Java
+                    | Language::Rust
+            ) {
                 resolved_imports = ef
                     .imports
                     .iter()
@@ -569,7 +603,7 @@ impl Indexer {
         let changed: HashSet<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
         let mut index = SymbolIndex::new(&self.store.repo_id);
         for (path, _h, lang, _kind, _size) in self.store.all_files()? {
-            if lang == "python" || lang == "typescript" || lang == "javascript" {
+            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }

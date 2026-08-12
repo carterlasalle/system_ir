@@ -226,8 +226,9 @@ pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
     let section = format!(
         "<!-- SCC-SECTION -->\n{capsule}\n## SCC usage rules\n\
          - The repository is indexed by SCC. For a task, run: `scc context task \"<goal>\"` and work within it.\n\
+         - For the system architecture at session start, run `scc atlas` — it is the authoritative startup source.\n\
          - `scc verify` reports freshness and drift — do not trust stale facts; re-index with `scc index` first.\n\
-         - Authority ordering: repository/runtime > System IR > task state > memory > model assumption.\n\
+         - Authority ordering: source/runtime > SCC System IR > checkpoint > Hindsight > model assumption.\n\
          - Drift and invariants: `scc drift`, `scc ci check`, and `scc impact <files>` before cross-layer edits.\n\
          <!-- /SCC-SECTION -->\n"
     );
@@ -330,5 +331,12 @@ mod tests {
         assert!(text.contains("SCC-SECTION"), "{text}");
         assert_eq!(text.matches("SCC-SECTION").count(), 2, "one SCC section only");
         assert!(text.contains("scc context task"), "{text}");
+        // the generated AGENTS.md must point at `scc atlas` as the startup
+        // architecture source and carry the authority ordering line
+        assert!(text.contains("scc atlas"), "atlas reference: {text}");
+        assert!(
+            text.contains("source/runtime > SCC System IR > checkpoint > Hindsight > model assumption"),
+            "authority ordering: {text}"
+        );
     }
 }

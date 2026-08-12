@@ -175,7 +175,11 @@ pub fn compile_flows(
                 }
             }
             dirs.push(name.clone());
-            candidates.push(ComponentCandidate { name, dirs });
+            candidates.push(ComponentCandidate {
+                name,
+                dirs,
+                boundary_kind: crate::components::BOUNDARY_DECLARED.to_string(),
+            });
         }
     }
     let mut top_dirs: HashSet<String> = HashSet::new();
@@ -194,6 +198,11 @@ pub fn compile_flows(
             candidates.push(ComponentCandidate {
                 name: d.clone(),
                 dirs: vec![d.clone()],
+                boundary_kind: if d == "root" {
+                    crate::components::BOUNDARY_ROOT.to_string()
+                } else {
+                    crate::components::BOUNDARY_CODE_REGION.to_string()
+                },
             });
         }
     }

@@ -162,11 +162,22 @@ enum Commands {
     /// Compute and store entity embeddings (optional semantic ranker)
     Embed,
 
-    /// List adapter capability manifests (security audit)
+    /// List enabled adapters with their declared capability scope (security audit)
     Adapters {
+        /// Dump the full capability manifests instead of the scope listing
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage the Hindsight lesson bank (.scc/lessons.jsonl)
+    Lessons {
+        /// Bare `scc lessons` lists stored lessons (limit: --limit)
+        #[command(subcommand)]
+        sub: Option<LessonsSub>,
+    },
+
+    /// List active bead tasks from .beads/issues.jsonl
+    Beads,
 
     /// Import external evidence (SCIP index, Narsil CCG)
     Import {
@@ -344,6 +355,19 @@ enum CheckpointSub {
 }
 
 #[derive(Subcommand)]
+enum LessonsSub {
+    /// Append a lesson to .scc/lessons.jsonl (ingest with `scc import hindsight .scc/lessons.jsonl`)
+    Add {
+        text: String,
+    },
+    /// List stored lessons from the store (after `scc import hindsight`)
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum SetupSub {
     /// Install Claude Code hooks
     Claude,
@@ -466,7 +490,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mcp => commands::cmd_mcp(&root),
         Commands::Ingest { body } => commands::cmd_ingest_runtime(&root, &body),
         Commands::Embed => scc_cli::embed_cli::cmd_embed(&root),
-        Commands::Adapters { json } => commands::cmd_adapters(json),
+        Commands::Adapters { json } => commands::cmd_adapters(&root, json),
+        Commands::Lessons { sub } => match sub.unwrap_or(LessonsSub::List { limit: 20 }) {
+            LessonsSub::Add { text } => commands::cmd_lessons_add(&root, &text),
+            LessonsSub::List { limit } => commands::cmd_lessons_list(&root, limit),
+        },
+        Commands::Beads => commands::cmd_beads(&root),
         Commands::Resolve { lsp: true } => {
             // SCC-125: capture native EXTRACTED edges before the LSP pass so
             // target changes can be recorded as resolution_conflict drift

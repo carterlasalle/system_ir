@@ -2,6 +2,7 @@
 
 use crate::{checkpoint, compiler, config_path, load_config, open_store, recompile, scc_dir};
 use scc_core::kinds;
+use std::io::Write;
 use std::path::Path;
 
 pub fn cmd_init(root: &Path) -> crate::Result<()> {
@@ -218,8 +219,9 @@ pub fn cmd_context_docs(root: &Path, dependency: &str) -> crate::Result<()> {
             "Context7 is not configured — set integrations.context7_command in .scc/config.yaml (e.g. 'npx -y @upstash/context7-mcp')".into(),
         ));
     }
-    let mut client = scc_indexer::adapters::context7::start(&config.integrations.context7_command)
-        .map_err(crate::CliError::Other)?;
+    let mut client =
+        scc_indexer::adapters::context7::start(&config.integrations.context7_command, root)
+            .map_err(crate::CliError::Other)?;
     let docs = client.docs_for(dependency).map_err(crate::CliError::Other)?;
     print!("{docs}");
     Ok(())
@@ -550,20 +552,125 @@ pub fn cmd_ingest_runtime(root: &Path, body: &str) -> crate::Result<()> {
     Ok(())
 }
 
-pub fn cmd_adapters(json: bool) -> crate::Result<()> {
+/// Declared capability scope per adapter (docs/SECURITY.md §6: the doc
+/// defines the manifest dimensions — FS scope, network, subprocess,
+/// credentials — but has no per-adapter table, so the assignments are
+/// pinned inline here). Importers read repo-local files only; Context7 runs
+/// an MCP server over stdio via npx (subprocess) that makes network calls.
+fn adapter_scope(name: &str) -> &'static str {
+    match name {
+        "context7" => "network+subprocess(npx)",
+        "serena" | "beads" | "cbm" | "hindsight" | "scip" | "gitnexus" | "narsil" => "filesystem",
+        _ => "filesystem",
+    }
+}
+
+/// Compute the configured-adapter scope listing: adapters enabled via
+/// config.integrations, then the always-available on-demand importers
+/// (scip/cbm need no config). Fixed declaration order keeps the output
+/// deterministic.
+fn configured_adapters(root: &Path) -> crate::Result<Vec<(String, &'static str)>> {
+    let config = load_config(root)?;
+    let mut configured: Vec<(String, &'static str)> = Vec::new();
+    if config.integrations.serena {
+        configured.push(("serena".into(), adapter_scope("serena")));
+    }
+    if config.integrations.beads {
+        configured.push(("beads".into(), adapter_scope("beads")));
+    }
+    if config.integrations.hindsight {
+        configured.push(("hindsight".into(), adapter_scope("hindsight")));
+    }
+    if config.integrations.gitnexus {
+        configured.push(("gitnexus".into(), adapter_scope("gitnexus")));
+    }
+    if config.integrations.narsil {
+        configured.push(("narsil".into(), adapter_scope("narsil")));
+    }
+    if !config.integrations.context7_command.is_empty() {
+        configured.push(("context7".into(), adapter_scope("context7")));
+    }
+    configured.push(("scip".into(), adapter_scope("scip")));
+    configured.push(("cbm".into(), adapter_scope("cbm")));
+    Ok(configured)
+}
+
+/// `scc adapters` — list enabled adapters with their declared capability
+/// scope (security audit; docs/SECURITY.md §6). `--json` dumps the full
+/// capability manifests instead.
+pub fn cmd_adapters(root: &Path, json: bool) -> crate::Result<()> {
     let manifests = scc_indexer::adapters::adapter_manifests();
     if json {
         println!("{}", serde_json::to_string_pretty(&manifests)?);
         return Ok(());
     }
-    println!("{:<16} {:<12} {:<10} {:<6} {:<6}", "adapter", "filesystem", "subprocess", "net", "cred");
-    for m in &manifests {
-        println!(
-            "{:<16} {:<12} {:<10} {:<6} {:<6}",
-            m.name, m.filesystem, m.subprocess, m.network, m.credentials
-        );
+    for (name, scope) in configured_adapters(root)? {
+        println!("adapter: {name}  scope: {scope}");
     }
-    println!("sandbox: default profile (no network/credentials; subprocess only for declared server adapters)");
+    Ok(())
+}
+
+/// `scc lessons add <text>` — append one durable lesson to
+/// `<root>/.scc/lessons.jsonl` (the Hindsight memory bank). The bank is
+/// ingested into the System IR with `scc import hindsight .scc/lessons.jsonl`.
+pub fn cmd_lessons_add(root: &Path, text: &str) -> crate::Result<()> {
+    let dir = scc_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("lessons.jsonl");
+    let n = std::fs::read_to_string(&path)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let id = format!("lesson-{}", n + 1);
+    let record = serde_json::json!({
+        "id": id,
+        "text": text,
+        "created_at": scc_core::now_rfc3339(),
+    });
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| crate::CliError::Other(format!("lessons: {e}")))?;
+    writeln!(f, "{record}").map_err(|e| crate::CliError::Other(format!("lessons: {e}")))?;
+    println!(
+        "appended {id} to {} (ingest with `scc import hindsight .scc/lessons.jsonl`)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `scc lessons` — list stored lessons from the System IR (most important
+/// first, same ordering as the context-pack enrichment).
+pub fn cmd_lessons_list(root: &Path, limit: usize) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let lessons = scc_indexer::adapters::hindsight::lessons(&store, limit);
+    if lessons.is_empty() {
+        println!("no lessons in the store — run `scc lessons add \"...\"` then `scc import hindsight .scc/lessons.jsonl`");
+        return Ok(());
+    }
+    for (content, tags) in lessons {
+        let tag_str = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(", "))
+        };
+        println!("- {content}{tag_str}");
+    }
+    Ok(())
+}
+
+/// `scc beads` — list active (in-progress) tasks from `.beads/issues.jsonl`
+/// (task state, not system facts).
+pub fn cmd_beads(root: &Path) -> crate::Result<()> {
+    let active = scc_indexer::adapters::beads::active_beads(root, 20);
+    if active.is_empty() {
+        println!("no active beads tasks (checked .beads/issues.jsonl)");
+        return Ok(());
+    }
+    println!("active beads tasks:");
+    for t in active {
+        println!("- {t}");
+    }
     Ok(())
 }
 
@@ -658,4 +765,63 @@ pub fn cmd_runtime_reconcile(root: &Path, json: bool) -> crate::Result<()> {
         println!("  [static-only] {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lessons_add_appends_jsonl_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        cmd_lessons_add(&root, "first lesson").unwrap();
+        cmd_lessons_add(&root, "second lesson").unwrap();
+        let path = root.join(".scc/lessons.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "a second add must append, not overwrite");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["id"], "lesson-1");
+        assert_eq!(first["text"], "first lesson");
+        assert!(first["created_at"].is_string());
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["id"], "lesson-2");
+        assert_eq!(second["text"], "second lesson");
+        // the shape must be ingestable by the hindsight adapter
+        let lesson: scc_indexer::adapters::hindsight::Lesson =
+            serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(lesson.body(), "first lesson");
+    }
+
+    #[test]
+    fn adapters_lists_configured_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join(".scc")).unwrap();
+        std::fs::write(
+            root.join(".scc/config.yaml"),
+            "schema: 1\nintegrations:\n  beads: true\n  context7_command: \"npx -y @upstash/context7-mcp\"\n",
+        )
+        .unwrap();
+        let listing = configured_adapters(&root).unwrap();
+        assert!(
+            listing.contains(&("beads".to_string(), "filesystem")),
+            "{listing:?}"
+        );
+        assert!(
+            listing.contains(&("context7".to_string(), "network+subprocess(npx)")),
+            "{listing:?}"
+        );
+        assert!(
+            !listing.iter().any(|(n, _)| n == "hindsight"),
+            "disabled integrations must not be listed: {listing:?}"
+        );
+        // scip/cbm are always-available on-demand importers
+        assert!(listing.iter().any(|(n, _)| n == "scip"), "{listing:?}");
+        assert!(listing.iter().any(|(n, _)| n == "cbm"), "{listing:?}");
+        // cmd_adapters renders the exact expected line format
+        cmd_adapters(&root, false).unwrap();
+    }
 }

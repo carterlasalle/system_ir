@@ -1,0 +1,1356 @@
+//! Rust language extractor (tree-sitter based).
+//!
+//! Pure, deterministic extraction: `(path, content) -> ExtractedFile`.
+//! Syntax-level only; cross-file resolution happens in `resolve.rs`.
+//!
+//! Kind mapping (SymbolKind has no struct/trait/impl variants, so the
+//! nearest model kinds are used): `struct` -> Class, `enum` -> Enum,
+//! `trait` -> Interface. `impl` blocks are not emitted as symbols
+//! themselves (their name would collide with the type they implement);
+//! their methods are emitted as Method symbols named `Type.method` so the
+//! native resolver's `self`/`this` rule can resolve `self.method()` calls
+//! (resolve.rs splits on '.' — `Type::method` names would never resolve).
+
+use crate::model::{
+    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SourceFile,
+    StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+};
+use tree_sitter::{Node, Parser};
+
+/// Rust extractor. Uses the tree-sitter-rust grammar.
+pub struct RustExtractor {
+    language: tree_sitter::Language,
+}
+
+impl Default for RustExtractor {
+    fn default() -> Self {
+        RustExtractor {
+            language: tree_sitter_rust::LANGUAGE.into(),
+        }
+    }
+}
+
+impl LanguageExtractor for RustExtractor {
+    fn language(&self) -> &'static str {
+        "rust"
+    }
+
+    fn extract(&self, file: &SourceFile) -> ExtractedFile {
+        let src = file.content.as_bytes();
+        let mut parser = Parser::new();
+        if parser.set_language(&self.language).is_err() {
+            return ExtractedFile::default();
+        }
+        let Some(tree) = parser.parse(&file.content, None) else {
+            return ExtractedFile::default();
+        };
+        let mut ctx = Ctx::default();
+        self.walk(tree.root_node(), &mut ctx, src);
+        ctx.into_extracted()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node helpers
+// ---------------------------------------------------------------------------
+
+fn node_text<'a>(node: Option<Node<'a>>, src: &'a [u8]) -> &'a str {
+    match node {
+        Some(n) => n.utf8_text(src).unwrap_or(""),
+        None => "",
+    }
+}
+
+/// Collapse internal whitespace runs to single spaces; trim ends.
+fn collapse(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            pending_ws = !out.is_empty();
+        } else {
+            if pending_ws {
+                out.push(' ');
+            }
+            pending_ws = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn clean(s: &str) -> String {
+    collapse(s.trim())
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Case-insensitive byte search; returns index into the original string.
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    'outer: for i in 0..=(h.len() - n.len()) {
+        for j in 0..n.len() {
+            if !h[i + j].eq_ignore_ascii_case(&n[j]) {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// First dotted identifier (`foo` or `schema.foo`) at/after byte `from`.
+fn first_dotted_after(s: &str, from: usize) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = from.min(bytes.len());
+    while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let start = i;
+    let mut end = i;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    while end > start && bytes[end - 1] == b'.' {
+        end -= 1;
+    }
+    if end == start {
+        None
+    } else {
+        Some(s[start..end].to_string())
+    }
+}
+
+fn words_after(s: &str, from: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = from.min(bytes.len());
+    while i < bytes.len() {
+        while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        while end > start && bytes[end - 1] == b'.' {
+            end -= 1;
+        }
+        if end > start {
+            out.push(s[start..end].to_string());
+        }
+        i = end;
+    }
+    out
+}
+
+/// Classify a SQL statement and extract its target table.
+fn sql_op_table(sql: &str) -> (StoreOp, Option<String>) {
+    const WRITE_KW: &[&str] = &["insert", "update", "delete", "replace", "merge"];
+    const MIGRATE_KW: &[&str] = &["create", "alter", "drop"];
+    const QUERY_KW: &[&str] = &["select", "show", "describe"];
+    let mut best: Option<(usize, &str, StoreOp)> = None;
+    for kw in WRITE_KW {
+        if let Some(p) = find_ci(sql, kw) {
+            if best.map(|(bp, _, _)| p < bp).unwrap_or(true) {
+                best = Some((p, kw, StoreOp::Write));
+            }
+        }
+    }
+    for kw in MIGRATE_KW {
+        if let Some(p) = find_ci(sql, kw) {
+            if best.map(|(bp, _, _)| p < bp).unwrap_or(true) {
+                best = Some((p, kw, StoreOp::Migrate));
+            }
+        }
+    }
+    for kw in QUERY_KW {
+        if let Some(p) = find_ci(sql, kw) {
+            if best.map(|(bp, _, _)| p < bp).unwrap_or(true) {
+                best = Some((p, kw, StoreOp::Query));
+            }
+        }
+    }
+    let Some((pos, verb, op)) = best else {
+        return (StoreOp::Query, None);
+    };
+    let table = extract_table(sql, verb, pos);
+    (op, table)
+}
+
+fn extract_table(sql: &str, verb: &str, verb_pos: usize) -> Option<String> {
+    match verb {
+        "insert" | "replace" | "merge" => {
+            let pos = find_ci(sql, "into")?;
+            first_dotted_after(sql, pos + 4)
+        }
+        "update" => first_dotted_after(sql, verb_pos + 6),
+        "delete" => {
+            let pos = find_ci(sql, "from")?;
+            first_dotted_after(sql, pos + 4)
+        }
+        "select" => {
+            let pos = find_ci(sql, "from")?;
+            first_dotted_after(sql, pos + 4)
+        }
+        "show" | "describe" => first_dotted_after(sql, verb_pos + verb.len()),
+        "create" | "alter" | "drop" => {
+            let words = words_after(sql, verb_pos + verb.len());
+            if words.is_empty() {
+                return None;
+            }
+            // CREATE INDEX [name] ON table
+            if words.iter().take(3).any(|w| w.eq_ignore_ascii_case("index")) {
+                for (i, w) in words.iter().enumerate() {
+                    if w.eq_ignore_ascii_case("on") && i + 1 < words.len() {
+                        return Some(words[i + 1].clone());
+                    }
+                }
+                return None;
+            }
+            let mut i = 0;
+            while i < words.len() {
+                let lower = words[i].to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "table"
+                        | "view"
+                        | "sequence"
+                        | "unique"
+                        | "temporary"
+                        | "temp"
+                        | "materialized"
+                        | "global"
+                        | "local"
+                        | "or"
+                        | "replace"
+                        | "if"
+                        | "not"
+                        | "exists"
+                ) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            words.get(i).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Value of a Rust string literal (or raw string), quotes stripped. The
+/// grammar has no `content` field for string literals, so take the text
+/// between the first and last `"` (works for `"..."`, `r"..."`, `r#"..."#`).
+fn rust_string_value(node: Node, src: &[u8]) -> Option<String> {
+    let t = node_text(Some(node), src).trim();
+    let b = t.as_bytes();
+    let first = b.iter().position(|&c| c == b'"')?;
+    let last = b.iter().rposition(|&c| c == b'"')?;
+    if last <= first {
+        return None;
+    }
+    Some(t[first + 1..last].to_string())
+}
+
+/// First string-literal argument of a call.
+fn first_string_arg(call: Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if matches!(child.kind(), "string_literal" | "raw_string_literal") {
+            return rust_string_value(child, src);
+        }
+    }
+    None
+}
+
+/// First paragraph of a docstring (blank-line terminated), like python.rs.
+fn first_paragraph(s: &str) -> String {
+    let t = s.trim();
+    let mut lines: Vec<&str> = Vec::new();
+    for line in t.lines() {
+        if line.trim().is_empty() {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        lines.push(line.trim_end());
+    }
+    let joined = lines.join("\n");
+    truncate_chars(joined.trim(), 200)
+}
+
+/// Strip a `///` or `/** */` doc marker; `None` for plain comments.
+fn strip_doc_marker(raw: &str) -> Option<String> {
+    let t = raw.trim_start();
+    if let Some(rest) = t.strip_prefix("///") {
+        let body = rest.strip_prefix(' ').unwrap_or(rest).trim_end();
+        return Some(body.to_string());
+    }
+    if let Some(rest) = t.strip_prefix("/**") {
+        let inner = rest.strip_suffix("*/").unwrap_or(rest);
+        let lines: Vec<String> = inner
+            .lines()
+            .map(|l| l.trim_start().trim_start_matches('*').trim().to_string())
+            .collect();
+        return Some(lines.join("\n"));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Tables (same receiver vocabulary as python.rs)
+// ---------------------------------------------------------------------------
+
+const STORE_RECEIVERS: &[&str] = &[
+    "db", "database", "session", "conn", "cursor", "pool", "engine", "client", "redis", "r",
+    "mongo", "collection", "kafka", "producer", "consumer", "queue", "publisher", "broker", "es",
+    "elasticsearch", "s3", "bucket", "storage", "supabase", "firestore", "dynamodb", "table",
+    "cache",
+];
+
+/// Roots for which a string literal argument names the target (key/topic).
+const STRING_TARGET_ROOTS: &[&str] = &[
+    "redis", "r", "kafka", "producer", "consumer", "broker", "publisher", "queue",
+];
+
+fn classify_op(name: &str) -> Option<StoreOp> {
+    match name {
+        "execute" | "executemany" | "executescript" => Some(StoreOp::Query), // refined by SQL sniff
+        "commit" | "save" | "add" | "delete" | "update" | "insert" | "remove" | "set" | "upsert" => {
+            Some(StoreOp::Write)
+        }
+        "get" | "fetch" | "read" | "count" => Some(StoreOp::Read),
+        "query" | "select" | "find" => Some(StoreOp::Query),
+        "publish" | "send" | "produce" => Some(StoreOp::Publish),
+        "subscribe" | "consume" | "on_message" | "on_event" => Some(StoreOp::Subscribe),
+        "incr" | "decr" | "push" | "pop" => Some(StoreOp::Write),
+        _ => None,
+    }
+}
+
+fn technology_for(root: &str) -> Option<String> {
+    match root {
+        "redis" | "r" => Some("redis".to_string()),
+        "kafka" | "producer" | "consumer" | "broker" => Some("kafka".to_string()),
+        "mongo" | "collection" => Some("mongodb".to_string()),
+        "s3" | "bucket" => Some("s3".to_string()),
+        "session" | "engine" | "conn" | "cursor" | "pool" | "db" | "database" => {
+            Some("sql".to_string())
+        }
+        "supabase" => Some("postgres".to_string()),
+        "es" | "elasticsearch" => Some("elasticsearch".to_string()),
+        "firestore" => Some("firestore".to_string()),
+        "dynamodb" => Some("dynamodb".to_string()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extraction context
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct Scope {
+    name: String,
+    /// True inside an `impl` block: functions become methods of `name`.
+    is_impl: bool,
+}
+
+#[derive(Default)]
+struct Ctx {
+    symbols: Vec<Symbol>,
+    imports: Vec<Import>,
+    calls: Vec<Call>,
+    tests: Vec<Test>,
+    store_refs: Vec<StoreRef>,
+    retries: Vec<Retry>,
+    entrypoints: Vec<Entrypoint>,
+    scopes: Vec<Scope>,
+}
+
+impl Ctx {
+    fn caller(&self) -> Option<String> {
+        self.scopes.last().map(|s| s.name.clone())
+    }
+    fn top_is_impl(&self) -> bool {
+        self.scopes.last().map(|s| s.is_impl).unwrap_or(false)
+    }
+    fn top_name(&self) -> String {
+        self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
+    }
+    fn into_extracted(self) -> ExtractedFile {
+        ExtractedFile {
+            symbols: self.symbols,
+            imports: self.imports,
+            calls: self.calls,
+            routes: Vec::new(),
+            tests: self.tests,
+            store_refs: self.store_refs,
+            retries: self.retries,
+            entrypoints: self.entrypoints,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Walker
+// ---------------------------------------------------------------------------
+
+impl RustExtractor {
+    fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        match node.kind() {
+            // trait method declarations have no body (function_signature_item)
+            "function_item" | "function_signature_item" => self.walk_function(node, ctx, src),
+            "struct_item" => self.walk_type_item(node, SymbolKind::Class, ctx, src),
+            "enum_item" => self.walk_type_item(node, SymbolKind::Enum, ctx, src),
+            "trait_item" => self.walk_type_item(node, SymbolKind::Interface, ctx, src),
+            "impl_item" => self.walk_impl(node, ctx, src),
+            "mod_item" => self.walk_mod(node, ctx, src),
+            "const_item" | "static_item" => self.walk_const(node, ctx, src),
+            "use_declaration" => self.record_use(node, ctx, src),
+            "call_expression" => self.record_call(node, ctx, src),
+            _ => self.walk_children(node, ctx, src),
+        }
+    }
+
+    fn walk_children(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.walk(child, ctx, src);
+        }
+    }
+
+    /// True when the item has a `pub` visibility modifier child.
+    fn is_exported(&self, node: Node) -> bool {
+        let mut cursor = node.walk();
+        let mut exported = false;
+        for c in node.children(&mut cursor) {
+            if c.kind() == "visibility_modifier" {
+                exported = true;
+                break;
+            }
+        }
+        exported
+    }
+
+    /// Docstring + attribute items directly above `node` (siblings, walking
+    /// backward; doc comments may precede attributes). Returns `(docstring,
+    /// attribute_items)` — docstring is the contiguous run of `///`/`/**`
+    /// comments, first paragraph.
+    fn leading_annotations<'a>(
+        &self,
+        node: Node<'a>,
+        src: &'a [u8],
+    ) -> (Option<String>, Vec<Node<'a>>) {
+        let Some(parent) = node.parent() else {
+            return (None, Vec::new());
+        };
+        let mut cursor = parent.walk();
+        let children: Vec<Node> = parent.named_children(&mut cursor).collect();
+        let Some(idx) = children.iter().position(|c| c.id() == node.id()) else {
+            return (None, Vec::new());
+        };
+        let mut doc_lines: Vec<String> = Vec::new();
+        let mut attrs: Vec<Node> = Vec::new();
+        for c in children[..idx].iter().rev() {
+            match c.kind() {
+                "line_comment" | "block_comment" => {
+                    match strip_doc_marker(node_text(Some(*c), src)) {
+                        Some(s) => doc_lines.push(s),
+                        // a plain comment breaks the doc run
+                        None => break,
+                    }
+                }
+                "attribute_item" => attrs.push(*c),
+                _ => break,
+            }
+        }
+        doc_lines.reverse();
+        let doc = if doc_lines.is_empty() {
+            None
+        } else {
+            Some(first_paragraph(&doc_lines.join("\n")))
+        };
+        (doc, attrs)
+    }
+
+    fn walk_function(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if name.is_empty() {
+            self.walk_children(node, ctx, src);
+            return;
+        }
+        let in_impl = ctx.top_is_impl();
+        let (sym_name, kind, parent) = if in_impl {
+            let ty = ctx.top_name();
+            (format!("{ty}.{name}"), SymbolKind::Method, Some(ty))
+        } else {
+            (name.clone(), SymbolKind::Function, None)
+        };
+        let exported = self.is_exported(node);
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+        let (doc, attrs) = self.leading_annotations(node, src);
+        let sig = signature(&name, node, src);
+        ctx.symbols.push(Symbol {
+            name: sym_name.clone(),
+            kind,
+            signature: Some(sig),
+            start_line,
+            end_line,
+            exported,
+            docstring: doc,
+            parent,
+        });
+        for a in &attrs {
+            let aname = attr_name(*a, src).to_ascii_lowercase();
+            if aname.contains("retry") || aname.contains("backoff") {
+                ctx.retries.push(Retry {
+                    symbol: sym_name.clone(),
+                    policy: attr_policy(*a, src),
+                    line: a.start_position().row as u32 + 1,
+                });
+            }
+            if aname == "test" || aname.ends_with("::test") {
+                ctx.tests.push(Test {
+                    name: name.clone(),
+                    symbol: Some(sym_name.clone()),
+                    kind: TestKind::Unit,
+                    line: a.start_position().row as u32 + 1,
+                });
+            }
+        }
+        // `fn main` at crate top level is the program entrypoint.
+        if !in_impl && ctx.scopes.is_empty() && name == "main" {
+            ctx.entrypoints.push(Entrypoint {
+                symbol: "main".to_string(),
+                kind: "bin".to_string(),
+                line: start_line,
+            });
+        }
+        ctx.scopes.push(Scope {
+            name: sym_name,
+            is_impl: false,
+        });
+        self.walk_children(node, ctx, src);
+        ctx.scopes.pop();
+    }
+
+    fn walk_type_item(&self, node: Node, kind: SymbolKind, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if name.is_empty() {
+            self.walk_children(node, ctx, src);
+            return;
+        }
+        let exported = self.is_exported(node);
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+        let (doc, _attrs) = self.leading_annotations(node, src);
+        ctx.symbols.push(Symbol {
+            name: name.clone(),
+            kind,
+            signature: None,
+            start_line,
+            end_line,
+            exported,
+            docstring: doc,
+            parent: None,
+        });
+        // Trait bodies contain function declarations (contracts, default
+        // impls); struct/enum bodies have none. Walk everything uniformly.
+        self.walk_children(node, ctx, src);
+    }
+
+    fn walk_impl(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        // Receiver type of the impl (`impl Trait for Type` -> Type). Generic
+        // parameters are dropped from the name.
+        let type_name = node
+            .child_by_field_name("type")
+            .map(|t| clean(node_text(Some(t), src)))
+            .unwrap_or_default();
+        let type_name = type_name.split('<').next().unwrap_or("").trim().to_string();
+        if type_name.is_empty() {
+            self.walk_children(node, ctx, src);
+            return;
+        }
+        ctx.scopes.push(Scope {
+            name: type_name,
+            is_impl: true,
+        });
+        self.walk_children(node, ctx, src);
+        ctx.scopes.pop();
+    }
+
+    fn walk_mod(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if name.is_empty() {
+            self.walk_children(node, ctx, src);
+            return;
+        }
+        let exported = self.is_exported(node);
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+        let (doc, _attrs) = self.leading_annotations(node, src);
+        ctx.symbols.push(Symbol {
+            name: name.clone(),
+            kind: SymbolKind::Module,
+            signature: None,
+            start_line,
+            end_line,
+            exported,
+            docstring: doc,
+            parent: None,
+        });
+        // Module bodies are walked WITHOUT a scope push: nested items keep
+        // plain names (symbols are per-file, so cross-module collisions in
+        // one file are the only risk — rare, and deterministic).
+        self.walk_children(node, ctx, src);
+    }
+
+    fn walk_const(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if name.is_empty() {
+            self.walk_children(node, ctx, src);
+            return;
+        }
+        let exported = self.is_exported(node);
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+        let (doc, _attrs) = self.leading_annotations(node, src);
+        ctx.symbols.push(Symbol {
+            name: name.clone(),
+            kind: SymbolKind::Const,
+            signature: None,
+            start_line,
+            end_line,
+            exported,
+            docstring: doc,
+            parent: None,
+        });
+        self.walk_children(node, ctx, src);
+    }
+
+    // ---- imports (`use` declarations) ----
+
+    fn record_use(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let line = node.start_position().row as u32 + 1;
+        let Some(arg) = node.child_by_field_name("argument") else {
+            return;
+        };
+        self.emit_use(arg, "", ctx, src, line);
+    }
+
+    /// Emit one `use` binding as an Import. `prefix` accumulates enclosing
+    /// `use a::b::{...}` paths. The module string is the full path as
+    /// written (`a::b::c`); the bound name is the last path segment.
+    fn emit_use(&self, node: Node, prefix: &str, ctx: &mut Ctx, src: &[u8], line: u32) {
+        let join = |p: &str, s: &str| {
+            if p.is_empty() {
+                s.to_string()
+            } else {
+                format!("{p}::{s}")
+            }
+        };
+        match node.kind() {
+            "use_as_clause" => {
+                let path = clean(node_text(
+                    node.child_by_field_name("path"),
+                    src,
+                ));
+                let alias = clean(node_text(node.child_by_field_name("alias"), src));
+                if path.is_empty() || alias.is_empty() {
+                    return;
+                }
+                let module = join(prefix, &path);
+                let last = path.rsplit("::").next().unwrap_or(&path).to_string();
+                ctx.imports.push(Import {
+                    module,
+                    names: vec![(alias, last)],
+                    line,
+                    r#type: ImportType::Member,
+                });
+            }
+            "use_wildcard" => {
+                let t = clean(node_text(Some(node), src)); // `a::b::*` or `*`
+                let module = t.strip_suffix("::*").unwrap_or(&t).to_string();
+                let module = if prefix.is_empty() {
+                    module
+                } else {
+                    join(prefix, &module)
+                };
+                if !module.is_empty() {
+                    ctx.imports.push(Import {
+                        module,
+                        names: Vec::new(),
+                        line,
+                        r#type: ImportType::Member,
+                    });
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                for c in node.named_children(&mut cursor) {
+                    self.emit_use(c, prefix, ctx, src, line);
+                }
+            }
+            "scoped_use_list" => {
+                let path = clean(node_text(node.child_by_field_name("path"), src));
+                let Some(list) = node.child_by_field_name("list") else {
+                    return;
+                };
+                let new_prefix = if prefix.is_empty() {
+                    path
+                } else {
+                    join(prefix, &path)
+                };
+                let mut cursor = list.walk();
+                for c in list.named_children(&mut cursor) {
+                    self.emit_use(c, &new_prefix, ctx, src, line);
+                }
+            }
+            "self" | "super" | "crate" => {
+                // `use a::{self}` binds the enclosing module `a`, not a
+                // path segment `a::self`; `use crate;` binds `crate`.
+                let t = clean(node_text(Some(node), src));
+                let module = if prefix.is_empty() { t } else { prefix.to_string() };
+                let last = module.rsplit("::").next().unwrap_or(&module).to_string();
+                ctx.imports.push(Import {
+                    module,
+                    names: vec![(last.clone(), last)],
+                    line,
+                    r#type: ImportType::Member,
+                });
+            }
+            _ => {
+                // identifier / scoped_identifier: the full path binds the
+                // last segment (`use a::b::c` binds `c`).
+                let t = clean(node_text(Some(node), src));
+                if t.is_empty() {
+                    return;
+                }
+                let module = join(prefix, &t);
+                let last = t.rsplit("::").next().unwrap_or(&t).to_string();
+                ctx.imports.push(Import {
+                    module,
+                    names: vec![(last.clone(), last)],
+                    line,
+                    r#type: ImportType::Member,
+                });
+            }
+        }
+    }
+
+    // ---- calls + store refs ----
+
+    fn record_call(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(fn_node) = node.child_by_field_name("function") {
+            // Skip chained-call receivers (`a()()`, `a.b()()`): the inner
+            // call is recorded on its own; the chain text is noise.
+            let chained = fn_node.kind() == "call_expression"
+                || (fn_node.kind() == "field_expression"
+                    && fn_node
+                        .child_by_field_name("value")
+                        .map(|v| v.kind() == "call_expression")
+                        .unwrap_or(false));
+            if !chained {
+                let mut callee = collapse(node_text(Some(fn_node), src));
+                // `self::method()` is normalized to `self.method` so the
+                // native resolver's self/this rule finds the sibling method.
+                if fn_node.kind() == "scoped_identifier" {
+                    if let Some(p) = fn_node.child_by_field_name("path") {
+                        if clean(node_text(Some(p), src)) == "self" {
+                            let m = clean(node_text(
+                                fn_node.child_by_field_name("name"),
+                                src,
+                            ));
+                            if !m.is_empty() {
+                                callee = format!("self.{m}");
+                            }
+                        }
+                    }
+                }
+                if !callee.is_empty() {
+                    ctx.calls.push(Call {
+                        caller: ctx.caller(),
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver: known_receiver(fn_node, src),
+                    });
+                    self.record_store_ref(node, fn_node, ctx, src);
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    fn record_store_ref(&self, call: Node, fn_node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if fn_node.kind() != "field_expression" {
+            return;
+        }
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(fn_node, &mut segs, src);
+        if segs.len() < 2 {
+            return;
+        }
+        // `self.conn.execute(...)`: unwrap the instance prefix.
+        if segs[0] == "self" && segs.len() >= 3 {
+            segs.remove(0);
+        }
+        let store = segs[0].clone();
+        if !STORE_RECEIVERS.contains(&store.as_str()) {
+            return;
+        }
+        let op_name = segs.last().unwrap().clone();
+        let Some(op) = classify_op(&op_name) else {
+            return;
+        };
+        // mid-chain segment is the entity (table/model/collection) when present
+        let mut target = if segs.len() >= 3 {
+            Some(segs[segs.len() - 2].clone())
+        } else {
+            None
+        };
+        // string-literal keys/topics for redis/kafka-ish roots
+        if STRING_TARGET_ROOTS.contains(&store.as_str()) {
+            if let Some(s) = first_string_arg(call, src) {
+                target = Some(s);
+            }
+        }
+        // SQL sniffing for execute-family ops overrides op + target
+        if matches!(op_name.as_str(), "execute" | "executemany" | "executescript") {
+            if let Some(sql) = first_string_arg(call, src) {
+                let (sniff_op, sniff_target) = sql_op_table(&sql);
+                ctx.store_refs.push(StoreRef {
+                    caller: ctx.caller(),
+                    technology: technology_for(&store),
+                    store,
+                    op: sniff_op,
+                    target: sniff_target,
+                    line: call.start_position().row as u32 + 1,
+                });
+                return;
+            }
+        }
+        ctx.store_refs.push(StoreRef {
+            caller: ctx.caller(),
+            technology: technology_for(&store),
+            store,
+            op,
+            target,
+            line: call.start_position().row as u32 + 1,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Walker helpers
+// ---------------------------------------------------------------------------
+
+/// Innermost object of a field-expression chain (`self.conn.execute` ->
+/// `self`).
+fn callee_root(mut node: Node) -> Node {
+    loop {
+        match node.kind() {
+            "field_expression" => match node.child_by_field_name("value") {
+                Some(v) => node = v,
+                None => return node,
+            },
+            "parenthesized_expression" => match node.named_child(0) {
+                Some(inner) => node = inner,
+                None => return node,
+            },
+            _ => return node,
+        }
+    }
+}
+
+/// Field-expression chain segments from outermost (root) to method.
+fn attribute_segments(mut node: Node, out: &mut Vec<String>, src: &[u8]) {
+    let mut stack: Vec<String> = Vec::new();
+    loop {
+        match node.kind() {
+            "field_expression" => {
+                let f = node_text(node.child_by_field_name("field"), src);
+                if !f.is_empty() {
+                    stack.push(f.to_string());
+                }
+                match node.child_by_field_name("value") {
+                    Some(v) => node = v,
+                    None => break,
+                }
+            }
+            "identifier" | "self" | "super" | "crate" => {
+                let t = node_text(Some(node), src);
+                if !t.is_empty() {
+                    stack.push(t.to_string());
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    out.extend(stack.into_iter().rev());
+}
+
+/// The callee root is a local/imported binding or a known receiver when it
+/// is a plain identifier, `self`, or a `self::`/`crate::`/`super::` path.
+fn known_receiver(fn_node: Node, src: &[u8]) -> bool {
+    match fn_node.kind() {
+        "identifier" | "self" => true,
+        "scoped_identifier" => {
+            let p = clean(node_text(fn_node.child_by_field_name("path"), src));
+            matches!(p.as_str(), "self" | "crate" | "super")
+        }
+        "generic_function" => fn_node
+            .child_by_field_name("function")
+            .map(|f| known_receiver(f, src))
+            .unwrap_or(false),
+        "field_expression" => {
+            let root = callee_root(fn_node);
+            matches!(root.kind(), "identifier" | "self")
+        }
+        "parenthesized_expression" => fn_node
+            .named_child(0)
+            .map(|f| known_receiver(f, src))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn signature(name: &str, fn_node: Node, src: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(params) = fn_node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for c in params.named_children(&mut cursor) {
+            if c.kind() == "self_parameter" {
+                continue; // receivers are dropped, like python's self/cls
+            }
+            let t = collapse(node_text(Some(c), src));
+            if !t.is_empty() {
+                parts.push(t);
+            }
+        }
+    }
+    let mut sig = format!("fn {name}({})", parts.join(", "));
+    if let Some(rt) = fn_node.child_by_field_name("return_type") {
+        let t = clean(node_text(Some(rt), src))
+            .trim_start_matches("->")
+            .trim()
+            .to_string();
+        if !t.is_empty() {
+            sig.push_str(" -> ");
+            sig.push_str(&t);
+        }
+    }
+    truncate_chars(&sig, 120)
+}
+
+/// Policy text of an attribute item, e.g. `#[retry(attempts = 3)]` ->
+/// `retry(attempts = 3)`.
+fn attr_policy(a: Node, src: &[u8]) -> String {
+    let t = node_text(Some(a), src).trim();
+    let t = t.strip_prefix("#[").unwrap_or(t);
+    let t = t.strip_suffix(']').unwrap_or(t);
+    clean(t)
+}
+
+/// Name of an attribute (`#[cfg(test)]` -> `cfg`, `#[tokio::test]` ->
+/// `tokio::test`).
+fn attr_name(a: Node, src: &[u8]) -> String {
+    let p = attr_policy(a, src);
+    let end = p
+        .find(|c: char| c == '(' || c.is_whitespace() || c == ']')
+        .unwrap_or(p.len());
+    p[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ImportType, StoreOp, SymbolKind, TestKind};
+
+    fn extract(src: &str) -> ExtractedFile {
+        let f = SourceFile::new("test.rs", src);
+        RustExtractor::default().extract(&f)
+    }
+
+    fn find_symbol<'a>(ef: &'a ExtractedFile, name: &str) -> &'a Symbol {
+        ef.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol {name} not found"))
+    }
+
+    #[test]
+    fn symbols_methods_signatures() {
+        let ef = extract(
+            r#"use std::collections::HashMap;
+
+const MAX: usize = 10;
+static FLAG: bool = true;
+
+/// A job service.
+pub struct Service {
+    name: String,
+}
+
+/// Handles jobs.
+pub enum JobState {
+    Pending,
+    Done,
+}
+
+/// Persistence contract.
+pub trait Store {
+    fn save(&self, job: &str);
+}
+
+mod internal {
+    fn helper() {}
+}
+
+impl Service {
+    /// Create a service.
+    pub fn new(name: &str) -> Service {
+        Service { name: name.to_string() }
+    }
+
+    fn run(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+"#,
+        );
+        assert_eq!(ef.symbols.len(), 10);
+
+        let max = find_symbol(&ef, "MAX");
+        assert_eq!(max.kind, SymbolKind::Const);
+        assert!(!max.exported);
+        assert_eq!(max.start_line, 3);
+        assert_eq!(max.end_line, 3);
+
+        let flag = find_symbol(&ef, "FLAG");
+        assert_eq!(flag.kind, SymbolKind::Const);
+
+        let svc = find_symbol(&ef, "Service");
+        assert_eq!(svc.kind, SymbolKind::Class);
+        assert!(svc.exported);
+        assert_eq!(svc.signature, None);
+        assert_eq!(svc.docstring.as_deref(), Some("A job service."));
+
+        let st = find_symbol(&ef, "JobState");
+        assert_eq!(st.kind, SymbolKind::Enum);
+        assert_eq!(st.docstring.as_deref(), Some("Handles jobs."));
+
+        let tr = find_symbol(&ef, "Store");
+        assert_eq!(tr.kind, SymbolKind::Interface);
+        assert!(tr.exported);
+
+        // trait method declarations (no body) are recorded too; the
+        // receiver is dropped from the signature like method symbols
+        let save = find_symbol(&ef, "save");
+        assert_eq!(save.kind, SymbolKind::Function);
+        assert!(!save.exported);
+        assert_eq!(save.signature.as_deref(), Some("fn save(job: &str)"));
+
+        let m = find_symbol(&ef, "internal");
+        assert_eq!(m.kind, SymbolKind::Module);
+        assert!(!m.exported);
+
+        let helper = find_symbol(&ef, "helper");
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert!(!helper.exported);
+
+        let new = find_symbol(&ef, "Service.new");
+        assert_eq!(new.kind, SymbolKind::Method);
+        assert!(new.exported);
+        assert_eq!(new.parent.as_deref(), Some("Service"));
+        assert_eq!(new.docstring.as_deref(), Some("Create a service."));
+        assert_eq!(new.signature.as_deref(), Some("fn new(name: &str) -> Service"));
+
+        let run = find_symbol(&ef, "Service.run");
+        assert_eq!(run.kind, SymbolKind::Method);
+        assert!(!run.exported);
+        assert_eq!(run.parent.as_deref(), Some("Service"));
+        // receiver dropped from signature
+        assert_eq!(run.signature.as_deref(), Some("fn run() -> Result<(), String>"));
+    }
+
+    #[test]
+    fn imports_all_forms() {
+        let ef = extract(
+            "use a::b::c;\nuse x::y as z;\nuse std::{collections::HashMap, io::Write as IoWrite};\nuse serde::*;\nuse super::config;\nuse crate::domain::{self, Service};\n",
+        );
+        let imps = &ef.imports;
+        assert_eq!(imps.len(), 8);
+
+        assert_eq!(imps[0].module, "a::b::c");
+        assert_eq!(imps[0].names, vec![("c".into(), "c".into())]);
+        assert_eq!(imps[0].r#type, ImportType::Member);
+        assert_eq!(imps[0].line, 1);
+
+        assert_eq!(imps[1].module, "x::y");
+        assert_eq!(imps[1].names, vec![("z".into(), "y".into())]);
+
+        assert_eq!(imps[2].module, "std::collections::HashMap");
+        assert_eq!(imps[2].names, vec![("HashMap".into(), "HashMap".into())]);
+
+        assert_eq!(imps[3].module, "std::io::Write");
+        assert_eq!(imps[3].names, vec![("IoWrite".into(), "Write".into())]);
+
+        // wildcard: no bound names
+        assert_eq!(imps[4].module, "serde");
+        assert!(imps[4].names.is_empty());
+
+        assert_eq!(imps[5].module, "super::config");
+        assert_eq!(imps[5].names, vec![("config".into(), "config".into())]);
+
+        // `use crate::domain::{self, Service}` -> two imports
+        assert_eq!(imps[6].module, "crate::domain");
+        assert_eq!(imps[6].names, vec![("domain".into(), "domain".into())]);
+        assert_eq!(imps[7].module, "crate::domain::Service");
+        assert_eq!(imps[7].names, vec![("Service".into(), "Service".into())]);
+    }
+
+    #[test]
+    fn calls_and_receivers() {
+        let ef = extract(
+            r#"fn helper() -> i32 { 1 }
+
+struct Svc;
+
+impl Svc {
+    fn run(&self) {
+        helper();
+        self.do_it(1);
+        self::other();
+    }
+    fn do_it(&self, x: i32) {}
+    fn other() {}
+}
+"#,
+        );
+        let calls = &ef.calls;
+        assert_eq!(calls.len(), 3);
+        // document order
+        assert_eq!(calls[0].caller.as_deref(), Some("Svc.run"));
+        assert_eq!(calls[0].callee, "helper");
+        assert!(calls[0].known_receiver);
+        assert_eq!(calls[0].line, 7);
+
+        assert_eq!(calls[1].caller.as_deref(), Some("Svc.run"));
+        assert_eq!(calls[1].callee, "self.do_it");
+        assert!(calls[1].known_receiver);
+
+        // `self::other()` is normalized to `self.other`
+        assert_eq!(calls[2].caller.as_deref(), Some("Svc.run"));
+        assert_eq!(calls[2].callee, "self.other");
+        assert!(calls[2].known_receiver);
+    }
+
+    #[test]
+    fn calls_chains_and_unknown_receivers() {
+        let ef = extract(
+            r#"fn f() {
+    obj.method();
+    get_client().send();
+    let x = v.unwrap();
+    Service::new();
+    (factory)(1);
+}
+"#,
+        );
+        let calls = &ef.calls;
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].callee, "obj.method");
+        assert!(calls[0].known_receiver);
+        assert_eq!(calls[1].callee, "get_client");
+        assert!(calls[1].known_receiver);
+        // `.send()` on a call receiver is skipped (chained)
+        assert_eq!(calls[2].callee, "v.unwrap");
+        assert!(calls[2].known_receiver);
+        assert_eq!(calls[3].callee, "Service::new");
+        assert!(!calls[3].known_receiver);
+        assert_eq!(calls[4].callee, "(factory)");
+        assert!(calls[4].known_receiver);
+    }
+
+    #[test]
+    fn store_refs_sql_and_clients() {
+        let ef = extract(
+            r#"fn worker(conn: &str, redis: &str, client: &str, svc: &str) {
+    conn.execute("INSERT INTO jobs (id) VALUES (?)", &["1"]);
+    conn.execute("SELECT * FROM users");
+    redis.set("k", "v");
+    client.fetch_data();
+    svc.ingest("x");
+}
+"#,
+        );
+        let refs = &ef.store_refs;
+        assert_eq!(refs.len(), 3);
+        let caller = Some("worker".to_string());
+
+        assert_eq!(refs[0].store, "conn");
+        assert_eq!(refs[0].technology.as_deref(), Some("sql"));
+        assert_eq!(refs[0].op, StoreOp::Write);
+        assert_eq!(refs[0].target.as_deref(), Some("jobs"));
+        assert_eq!(refs[0].caller, caller);
+
+        assert_eq!(refs[1].store, "conn");
+        assert_eq!(refs[1].op, StoreOp::Query);
+        assert_eq!(refs[1].target.as_deref(), Some("users"));
+
+        assert_eq!(refs[2].store, "redis");
+        assert_eq!(refs[2].technology.as_deref(), Some("redis"));
+        assert_eq!(refs[2].op, StoreOp::Write);
+        assert_eq!(refs[2].target.as_deref(), Some("k"));
+
+        // unknown receivers are not flagged
+        assert!(!refs.iter().any(|r| r.store == "client"));
+        assert!(!refs.iter().any(|r| r.store == "svc"));
+    }
+
+    #[test]
+    fn retry_attributes() {
+        let ef = extract(
+            r#"#[retry(attempts = 3)]
+fn a() {}
+
+#[backoff(on = "transient")]
+fn b() {}
+
+#[derive(Debug)]
+struct C;
+
+impl C {
+    /// Retrying method.
+    #[retry(max = 5)]
+    fn go(&self) {}
+}
+"#,
+        );
+        let retries = &ef.retries;
+        assert_eq!(retries.len(), 3);
+        assert_eq!(retries[0].symbol, "a");
+        assert_eq!(retries[0].policy, "retry(attempts = 3)");
+        assert_eq!(retries[0].line, 1);
+        assert_eq!(retries[1].symbol, "b");
+        assert_eq!(retries[1].policy, "backoff(on = \"transient\")");
+        assert_eq!(retries[2].symbol, "C.go");
+        assert_eq!(retries[2].policy, "retry(max = 5)");
+    }
+
+    #[test]
+    fn tests_detection() {
+        let ef = extract(
+            r#"#[test]
+fn it_works() {}
+
+#[tokio::test]
+async fn it_works_async() {}
+
+fn plain() {}
+"#,
+        );
+        let tests = &ef.tests;
+        assert_eq!(tests.len(), 2);
+        assert_eq!(tests[0].name, "it_works");
+        assert_eq!(tests[0].symbol.as_deref(), Some("it_works"));
+        assert_eq!(tests[0].kind, TestKind::Unit);
+        assert_eq!(tests[0].line, 1);
+        assert_eq!(tests[1].name, "it_works_async");
+    }
+
+    #[test]
+    fn entrypoint_main() {
+        let ef = extract("fn main() {\n    run();\n}\nfn run() {}\n");
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].symbol, "main");
+        assert_eq!(eps[0].kind, "bin");
+        assert_eq!(eps[0].line, 1);
+
+        // a method named main is not an entrypoint
+        let ef2 = extract("struct S;\nimpl S {\n    fn main(&self) {}\n}\n");
+        assert!(ef2.entrypoints.is_empty());
+    }
+
+    #[test]
+    fn docstrings_first_paragraph() {
+        let ef = extract(
+            r#"/// Sum two.
+///
+/// More here.
+fn f() {}
+
+/** Class doc. */
+struct A {}
+
+// not a doc
+fn g() {}
+"#,
+        );
+        let f = find_symbol(&ef, "f");
+        assert_eq!(f.docstring.as_deref(), Some("Sum two."));
+        let a = find_symbol(&ef, "A");
+        assert_eq!(a.docstring.as_deref(), Some("Class doc."));
+        let g = find_symbol(&ef, "g");
+        assert_eq!(g.docstring, None);
+    }
+
+    #[test]
+    fn malformed_input_does_not_panic() {
+        let cases = [
+            "fn broken(:",
+            "pub fn (\n",
+            "impl {}\n",
+            "use ;\n",
+            "#[retry(]\nfn x() {}\n",
+            "\u{0}\u{1}\u{2}\u{ff}",
+            "struct S { fn\n",
+            "fn main( {\n",
+            "use a::{b, c as\n",
+            "/// doc\n",
+        ];
+        for c in cases {
+            let _ = extract(c);
+        }
+    }
+
+    #[test]
+    fn deterministic_output() {
+        let src = "use std::collections::HashMap;\n\n#[retry(attempts = 3)]\nfn retry_me() {}\n\nfn main() {\n    retry_me();\n}\n";
+        let a = extract(src);
+        let b = extract(src);
+        let ja = serde_json::to_string(&a).unwrap();
+        let jb = serde_json::to_string(&b).unwrap();
+        assert_eq!(ja, jb);
+    }
+}

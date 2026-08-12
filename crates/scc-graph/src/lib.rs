@@ -38,6 +38,8 @@ use std::collections::HashMap;
 pub enum GraphError {
     #[error("store: {0}")]
     Store(#[from] scc_store::StoreError),
+    #[error("cochange: {0}")]
+    Cochange(String),
 }
 
 pub type Result<T> = std::result::Result<T, GraphError>;
@@ -179,10 +181,21 @@ impl<'a> CompilationPipeline<'a> {
             .bump_epoch(scc_store::ModelEpochKind::Derived)?;
 
         // STAGE 0/1: load the base reality graph, compile components.
+        // Co-change pairs are computed first (Wave 5): they feed the
+        // clustering score during compilation and enrich the freshly
+        // written components right after, before any later stage reloads
+        // the graph. Not a git repo yields empty pairs — no signal, no
+        // error.
         let graph = RealityGraph::load(self.store)?;
         let intent = self.store.intent_claims()?;
-        let comps = components::compile_components(&graph, self.store, &intent)?;
+        let pairs = cochange::cochange_pairs(
+            &self.store.root,
+            cochange::COCHANGE_MIN_COMMITS,
+        )
+        .map_err(GraphError::Cochange)?;
+        let comps = components::compile_components(&graph, self.store, &intent, &pairs)?;
         self.store.replace_components(&comps)?;
+        cochange::enrich_components(self.store, &pairs).map_err(GraphError::Cochange)?;
 
         // STAGE 2: reload (components now visible), compile flows.
         let graph = RealityGraph::load(self.store)?;
@@ -360,6 +373,113 @@ mod tests {
         assert!(
             flows.iter().any(|f| f.name.contains("get-/api/x")),
             "compiled flow must be present: {flows:?}"
+        );
+    }
+
+    fn git_init(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "SCC Test"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
+    fn git_commit_all(dir: &std::path::Path, msg: &str) {
+        let out = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", msg])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git commit failed");
+    }
+
+    fn git_write(dir: &std::path::Path, name: &str, content: &str) {
+        let p = dir.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn pipeline_wires_cochange_into_clustering() {
+        // Wave 5: the pipeline computes git co-change pairs before stage 1,
+        // feeds them into the clustering score (+2 per pair fully inside a
+        // candidate), and annotates the freshly written components via
+        // cochange::enrich_components — all in one run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        git_init(&root);
+        git_write(&root, "src/a.py", "a = 1\n");
+        git_write(&root, "src/b.py", "b = 2\n");
+        git_commit_all(&root, "c1");
+        git_write(&root, "src/a.py", "a = 2\n");
+        git_write(&root, "src/b.py", "b = 3\n");
+        git_commit_all(&root, "c2");
+
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        for f in ["src/a.py", "src/b.py"] {
+            let id = scc_core::entity_id(&store.repo_id, scc_core::kinds::FILE, f);
+            store
+                .insert_entity(
+                    &scc_core::Entity::new(id, scc_core::kinds::FILE, f),
+                    &[f.into()],
+                )
+                .unwrap();
+        }
+        store
+            .replace_intent_claims(&[(
+                "component".to_string(),
+                serde_json::json!({"name": "core", "paths": ["src"]}),
+            )])
+            .unwrap();
+
+        let rep = CompilationPipeline::new(&store).run().unwrap();
+        assert!(rep.components >= 2, "root + core: {}", rep.components);
+
+        let comps = store.components().unwrap();
+        let core = comps.iter().find(|c| c.name == "core").unwrap();
+        assert_eq!(
+            core.attributes["boundary_kind"],
+            serde_json::json!("declared")
+        );
+        // one pair (src/a.py <-> src/b.py) fully inside "src": +2.0
+        assert_eq!(
+            core.attributes["clustering_score"],
+            serde_json::json!(2.0),
+            "{:?}",
+            core.attributes
+        );
+        // enrich_components ran on the freshly written components
+        let cc = core.attributes["cochange"].clone();
+        assert_eq!(cc["top"], 2);
+        assert!(
+            cc["pairs"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("src/a.py <-> src/b.py"),
+            "{cc}"
+        );
+        // a second identical run is deterministic
+        let rep2 = CompilationPipeline::new(&store).run().unwrap();
+        assert_eq!(rep2.components, rep.components);
+        let comps2 = store.components().unwrap();
+        let core2 = comps2.iter().find(|c| c.name == "core").unwrap();
+        assert_eq!(
+            core.attributes["clustering_score"],
+            core2.attributes["clustering_score"]
         );
     }
 }

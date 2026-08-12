@@ -37,8 +37,11 @@ fn real_context7_server_protocol_compatibility() {
         String::from_utf8_lossy(&probe.stderr)
     );
 
-    let mut client = scc_indexer::adapters::context7::start(SERVER_CMD)
-        .expect("MCP handshake with the real server");
+    let mut client = scc_indexer::adapters::context7::start(
+        SERVER_CMD,
+        &std::env::current_dir().expect("cwd"),
+    )
+    .expect("MCP handshake with the real server");
 
     // docs_for exercises: initialize, notifications/initialized, tools/call
     // (library-search + query-docs) over real Content-Length framing
@@ -61,8 +64,11 @@ fn real_context7_server_rejects_unknown_library_gracefully() {
     if !live_enabled() {
         return;
     }
-    let mut client = scc_indexer::adapters::context7::start(SERVER_CMD)
-        .expect("MCP handshake with the real server");
+    let mut client = scc_indexer::adapters::context7::start(
+        SERVER_CMD,
+        &std::env::current_dir().expect("cwd"),
+    )
+    .expect("MCP handshake with the real server");
     // an impossible library name must not crash the client or hang it
     let result = client.docs_for("this-library-does-not-exist-xyz-12345");
     // either a clean error or empty docs — never a hang (client has a

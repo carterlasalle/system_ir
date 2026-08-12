@@ -19,9 +19,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 pub const FTS_ESCAPE: &str = "\"";
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_1,
+    MIGRATION_2,
+    MIGRATION_3,
+    MIGRATION_4,
+    MIGRATION_5,
+    MIGRATION_6,
+];
 
 /// v4: model epoch. `context_cache.revision` becomes `epoch` — the cache is
 /// keyed on the composite model state (source/semantic/evidence/intent/
@@ -40,6 +47,20 @@ CREATE TABLE IF NOT EXISTS flow_graphs (
   name TEXT NOT NULL,
   trigger TEXT,
   graph TEXT NOT NULL
+);
+"#;
+
+/// v6: observed trace-path signatures (Wave 6) — canonical root-to-leaf
+/// service paths per trace, aggregated across ingests. `count` is additive
+/// per trace occurrence, `latency_ms` a count-weighted running average,
+/// `errors` additive.
+const MIGRATION_6: &str = r#"
+CREATE TABLE IF NOT EXISTS trace_signatures (
+  signature TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 1,
+  latency_ms REAL NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  last_observed TEXT NOT NULL
 );
 "#;
 
@@ -1587,6 +1608,52 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // trace signatures (Wave 6)
+    // ------------------------------------------------------------------
+
+    /// Record one occurrence of an observed trace-path signature. `count`
+    /// increments by one (one trace occurrence), `latency_ms` is merged as a
+    /// count-weighted running average, `errors` is additive. Does NOT bump
+    /// any model-epoch generation: ingestion callers bump the Runtime
+    /// generation once per payload.
+    pub fn upsert_trace_signature(&self, signature: &str, latency_ms: f64, errors: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trace_signatures (signature, count, latency_ms, errors, last_observed)
+             VALUES (?1, 1, ?2, ?3, ?4)
+             ON CONFLICT(signature) DO UPDATE SET
+               count = trace_signatures.count + 1,
+               latency_ms = (trace_signatures.latency_ms * trace_signatures.count + excluded.latency_ms)
+                            / (trace_signatures.count + 1),
+               errors = trace_signatures.errors + excluded.errors,
+               last_observed = excluded.last_observed",
+            params![signature, latency_ms, errors as i64, scc_core::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// All observed trace signatures, ordered by (count DESC, signature).
+    pub fn trace_signatures(&self) -> Result<Vec<(String, u64, f64, u64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT signature, count, latency_ms, errors, last_observed
+             FROM trace_signatures ORDER BY count DESC, signature",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, f64>(2)?,
+                r.get::<_, i64>(3)? as u64,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
     // embeddings
     // ------------------------------------------------------------------
 
@@ -2007,6 +2074,45 @@ mod tests {
             .unwrap();
         let after = s.model_epoch().unwrap();
         assert_eq!(after.intent, before + 1);
+    }
+
+    #[test]
+    fn trace_signature_upsert_roundtrip_and_epoch_neutral() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.path().join("scc.db");
+        {
+            let s = Store::open(&db, &root).unwrap();
+            assert!(s.trace_signatures().unwrap().is_empty());
+
+            // upserts must not bump any model-epoch generation (the
+            // ingestion layer bumps the Runtime generation once per payload)
+            let epoch_before = s.model_epoch().unwrap();
+            s.upsert_trace_signature("root -> api -> db", 4.5, 1).unwrap();
+            s.upsert_trace_signature("root -> api -> db", 5.5, 0).unwrap();
+            s.upsert_trace_signature("root -> web -> api", 2.0, 0).unwrap();
+            assert_eq!(s.model_epoch().unwrap(), epoch_before);
+
+            let sigs = s.trace_signatures().unwrap();
+            assert_eq!(sigs.len(), 2);
+            // count increments, latency is a count-weighted running average
+            // ((4.5 + 5.5) / 2), errors are additive
+            assert_eq!(sigs[0].0, "root -> api -> db");
+            assert_eq!(sigs[0].1, 2);
+            assert!((sigs[0].2 - 5.0).abs() < 1e-9);
+            assert_eq!(sigs[0].3, 1);
+            assert!(!sigs[0].4.is_empty());
+            // ordering: (count DESC, signature)
+            assert_eq!(sigs[1].0, "root -> web -> api");
+            assert_eq!(sigs[1].1, 1);
+        }
+        // schema v6 + rows survive reopen
+        let s = Store::open(&db, &root).unwrap();
+        let sigs = s.trace_signatures().unwrap();
+        assert_eq!(sigs.len(), 2);
+        assert_eq!(sigs[0].0, "root -> api -> db");
+        assert_eq!(sigs[0].1, 2);
     }
 
     #[test]

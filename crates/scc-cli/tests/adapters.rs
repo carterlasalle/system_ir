@@ -142,6 +142,79 @@ fn context7_docs_via_mcp() {
 }
 
 #[test]
+fn adapters_command_lists_configured_scope() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let root = workdir(repo.path());
+    std::fs::create_dir_all(root.join(".scc")).unwrap();
+    std::fs::write(root.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join(".scc/config.yaml"),
+        "schema: 1\nintegrations:\n  beads: true\n  context7_command: \"npx -y @upstash/context7-mcp\"\n",
+    )
+    .unwrap();
+    let out = run_ok(&root, &["adapters"]);
+    assert!(
+        out.contains("adapter: context7  scope: network+subprocess(npx)"),
+        "{out}"
+    );
+    assert!(out.contains("adapter: beads  scope: filesystem"), "{out}");
+    // disabled integrations are not listed
+    assert!(!out.contains("hindsight"), "{out}");
+    // on-demand importers are always available
+    assert!(out.contains("adapter: scip  scope: filesystem"), "{out}");
+}
+
+#[test]
+fn lessons_add_then_import_then_list() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let root = workdir(repo.path());
+    std::fs::create_dir_all(root.join(".scc")).unwrap();
+    std::fs::write(root.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    std::fs::write(root.join(".scc/config.yaml"), "schema: 1\nintegrations:\n  hindsight: true\n").unwrap();
+
+    let out = run_ok(&root, &["lessons", "add", "retry with backoff works"]);
+    assert!(out.contains("appended lesson-1"), "{out}");
+    // second add appends
+    run_ok(&root, &["lessons", "add", "always reindex before verify"]);
+    let bank = std::fs::read_to_string(root.join(".scc/lessons.jsonl")).unwrap();
+    let lines: Vec<&str> = bank.lines().collect();
+    assert_eq!(lines.len(), 2, "{bank}");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["id"], "lesson-1");
+    assert_eq!(first["text"], "retry with backoff works");
+    assert!(first["created_at"].is_string());
+
+    let out = run_ok(&root, &["import", "hindsight", ".scc/lessons.jsonl"]);
+    assert!(out.contains("imported 2"), "{out}");
+    let out = run_ok(&root, &["lessons"]);
+    assert!(out.contains("retry with backoff works"), "{out}");
+    assert!(out.contains("always reindex before verify"), "{out}");
+}
+
+#[test]
+fn beads_command_lists_active() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let root = workdir(repo.path());
+    std::fs::create_dir_all(root.join(".beads")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join(".beads/issues.jsonl"),
+        "{\"id\":\"b1\",\"title\":\"Fix retry\",\"status\":\"in_progress\"}\n{\"id\":\"b2\",\"title\":\"Add fallback\",\"status\":\"open\"}\n",
+    )
+    .unwrap();
+    let out = run_ok(&root, &["beads"]);
+    assert!(out.contains("Fix retry"), "{out}");
+    assert!(!out.contains("Add fallback"), "open beads are not active: {out}");
+
+    // no .beads file -> clean empty listing
+    let empty = tempfile::TempDir::new().unwrap();
+    let empty_root = workdir(empty.path());
+    std::fs::create_dir_all(&empty_root).unwrap();
+    let out = run_ok(&empty_root, &["beads"]);
+    assert!(out.contains("no active beads tasks"), "{out}");
+}
+
+#[test]
 fn context7_unconfigured_errors_clearly() {
     let repo = tempfile::TempDir::new().unwrap();
     let root = workdir(repo.path());

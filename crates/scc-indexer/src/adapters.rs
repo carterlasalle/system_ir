@@ -137,6 +137,38 @@ pub fn sandbox_violations(m: &AdapterManifest) -> Vec<String> {
     out
 }
 
+/// Sandboxed subprocess spawn (SCC-225 enforcement): start `sh -c command`
+/// with a minimal environment — the parent's PATH, HOME, TMPDIR, LANG,
+/// LC_ALL, and `SCC_*` variables only, in deterministic order. Nothing else
+/// is inherited: API keys and other secrets sitting in the parent
+/// environment never reach the child. `cwd` (the repo root) becomes the
+/// child's working directory.
+///
+/// HOME is kept because npx (the Context7 MCP launcher) caches packages
+/// under ~/.npm; without it every spawn would re-fetch from the network.
+pub fn sandboxed_command(command: &str, cwd: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(command).current_dir(cwd).env_clear();
+    for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    // SCC_*: scc-controlled knobs (SCC_CONTEXT7_*, SCC_STATE_DIR, ...) are
+    // safe to propagate; sorted so the child environment is deterministic.
+    let mut scc_keys: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("SCC_"))
+        .map(|(k, _)| k)
+        .collect();
+    scc_keys.sort();
+    for key in scc_keys {
+        if let Ok(v) = std::env::var(&key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd
+}
+
 /// Aggregate result of one import run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {

@@ -19,6 +19,28 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const RELPREFIX: &str = "rel:comp:";
 
+/// Evidence class that created a component candidate (Wave 5, plan §27-30).
+/// The `boundary_kind` attribute records it on every compiled component;
+/// `code-region` is the bare top-level directory fallback and is never
+/// authoritative architecture.
+pub const BOUNDARY_DECLARED: &str = "declared";
+pub const BOUNDARY_PACKAGE: &str = "package";
+pub const BOUNDARY_DEPLOYMENT: &str = "deployment";
+pub const BOUNDARY_CODE_REGION: &str = "code-region";
+pub const BOUNDARY_ROOT: &str = "root";
+
+/// Authority order for `boundary_kind` when one candidate is created by
+/// several sources: declared intent > deployment units > workspace
+/// packages > directory fallback. Deterministic (fixed precedence).
+fn boundary_rank(kind: &str) -> u8 {
+    match kind {
+        BOUNDARY_DECLARED => 3,
+        BOUNDARY_DEPLOYMENT => 2,
+        BOUNDARY_PACKAGE => 1,
+        _ => 0,
+    }
+}
+
 pub fn rel(parts: &[&str]) -> String {
     let mut h = blake3::Hasher::new();
     for p in parts {
@@ -54,6 +76,9 @@ pub fn prov_rank(p: Provenance) -> u8 {
 pub struct ComponentCandidate {
     pub name: String,
     pub dirs: Vec<String>,
+    /// Evidence class that created this candidate (one of the
+    /// `BOUNDARY_*` constants).
+    pub boundary_kind: String,
 }
 
 /// Determine the component for a path: longest matching dir prefix wins.
@@ -96,6 +121,7 @@ pub fn compile_components(
     graph: &RealityGraph,
     store: &Store,
     intent: &[(String, serde_json::Value)],
+    pairs: &[crate::cochange::CochangePair],
 ) -> Result<Vec<scc_core::Entity>> {
     let repo_id = &store.repo_id;
 
@@ -118,7 +144,11 @@ pub fn compile_components(
                 }
             }
             dirs.push(name.clone()); // implicit: declared name == directory
-            candidates.push(ComponentCandidate { name, dirs });
+            candidates.push(ComponentCandidate {
+                name,
+                dirs,
+                boundary_kind: BOUNDARY_DECLARED.to_string(),
+            });
         }
     }
     // workspace packages
@@ -129,10 +159,14 @@ pub fn compile_components(
                 if !c.dirs.contains(&path.to_string()) {
                     c.dirs.push(path.to_string());
                 }
+                if boundary_rank(BOUNDARY_PACKAGE) > boundary_rank(&c.boundary_kind) {
+                    c.boundary_kind = BOUNDARY_PACKAGE.to_string();
+                }
             } else {
                 candidates.push(ComponentCandidate {
                     name,
                     dirs: vec![path.to_string()],
+                    boundary_kind: BOUNDARY_PACKAGE.to_string(),
                 });
             }
         }
@@ -149,10 +183,14 @@ pub fn compile_components(
                 if !c.dirs.contains(&ctx.to_string()) {
                     c.dirs.push(ctx.to_string());
                 }
+                if boundary_rank(BOUNDARY_DEPLOYMENT) > boundary_rank(&c.boundary_kind) {
+                    c.boundary_kind = BOUNDARY_DEPLOYMENT.to_string();
+                }
             } else {
                 candidates.push(ComponentCandidate {
                     name,
                     dirs: vec![ctx.to_string()],
+                    boundary_kind: BOUNDARY_DEPLOYMENT.to_string(),
                 });
             }
         }
@@ -175,6 +213,11 @@ pub fn compile_components(
             candidates.push(ComponentCandidate {
                 name: d.clone(),
                 dirs: vec![d.clone()],
+                boundary_kind: if d == "root" {
+                    BOUNDARY_ROOT.to_string()
+                } else {
+                    BOUNDARY_CODE_REGION.to_string()
+                },
             });
         }
     }
@@ -292,6 +335,109 @@ pub fn compile_components(
         v.dedup();
     }
 
+    // ---- clustering evidence (Wave 5, plan §28): weighted per-candidate
+    // signals feeding `clustering_score`. Deterministic by construction:
+    // every loop below iterates a sorted collection (entities_of_kind,
+    // files_in_component, or the sorted (symbol, component) list), never a
+    // raw HashMap.
+    let mut symbol_list: Vec<(String, String)> = symbol_component
+        .iter()
+        .map(|(s, c)| (s.clone(), c.clone()))
+        .collect();
+    symbol_list.sort();
+    // (component, store) -> distinct symbols in the component writing it
+    let mut shared_writes: BTreeMap<(String, String), HashSet<String>> = BTreeMap::new();
+    // component -> HANDLES edges from its symbols (entrypoint ownership)
+    let mut entrypoints: BTreeMap<String, usize> = BTreeMap::new();
+    // component -> PUBLISHES/CONSUMES edges from its symbols (event ownership)
+    let mut events: BTreeMap<String, usize> = BTreeMap::new();
+    // component -> (internal calls, total calls) from its symbols
+    let mut calls: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (sym_id, comp) in &symbol_list {
+        for r in graph.out_pred(sym_id, scc_core::predicates::WRITES) {
+            // data entities (repo://r/data/store.entity) resolve to their
+            // owning store so two symbols writing db.users and db.orders
+            // count as shared ownership of the same store
+            let target = if r.object.contains("/data/") {
+                graph
+                    .entities
+                    .get(&r.object)
+                    .and_then(|e| e.attributes.get("store"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| entity_id(repo_id, kinds::DATA_STORE, s))
+                    .unwrap_or_else(|| r.object.clone())
+            } else {
+                r.object.clone()
+            };
+            shared_writes
+                .entry((comp.clone(), target))
+                .or_default()
+                .insert(sym_id.clone());
+        }
+        for _r in graph.out_pred(sym_id, scc_core::predicates::HANDLES) {
+            *entrypoints.entry(comp.clone()).or_insert(0) += 1;
+        }
+        for _r in graph
+            .out_pred(sym_id, scc_core::predicates::PUBLISHES)
+            .into_iter()
+            .chain(graph.out_pred(sym_id, scc_core::predicates::CONSUMES))
+        {
+            *events.entry(comp.clone()).or_insert(0) += 1;
+        }
+        for r in graph.out_pred(sym_id, scc_core::predicates::CALLS) {
+            let e = calls.entry(comp.clone()).or_insert((0, 0));
+            e.1 += 1;
+            if symbol_component.get(&r.object) == Some(comp) {
+                e.0 += 1;
+            }
+        }
+    }
+    // component -> route entities contained in its files (route ownership)
+    let mut route_entities: BTreeMap<String, usize> = BTreeMap::new();
+    for (comp, files) in &files_in_component {
+        for fid in files {
+            for r in graph.out_pred(fid, scc_core::predicates::CONTAINS) {
+                if graph
+                    .entities
+                    .get(&r.object)
+                    .map(|e| e.kind == kinds::ROUTE)
+                    .unwrap_or(false)
+                {
+                    *route_entities.entry(comp.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    // deployment units with build contexts, most specific (longest context)
+    // first so `parent` picks the tightest unit; name tiebreak for
+    // determinism
+    let mut du_ctxs: Vec<(String, String)> = graph
+        .entities_of_kind(kinds::DEPLOYMENT_UNIT)
+        .into_iter()
+        .filter_map(|du| {
+            let ctx = du.attributes.get("build_context").and_then(|v| v.as_str())?;
+            if ctx == "." || ctx == "./" {
+                return None;
+            }
+            Some((du.name.clone(), ctx.trim_start_matches("./").to_string()))
+        })
+        .collect();
+    du_ctxs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    // component -> deployment unit name whose build context covers its dirs
+    let mut parent_per_comp: BTreeMap<String, String> = BTreeMap::new();
+    for c in &candidates {
+        for (du_name, ctx) in &du_ctxs {
+            let inside = c.dirs.iter().any(|d| {
+                let d = d.trim_end_matches('/');
+                d == ctx.as_str() || d.starts_with(&format!("{ctx}/"))
+            });
+            if inside {
+                parent_per_comp.insert(c.name.clone(), du_name.clone());
+                break;
+            }
+        }
+    }
+
     // intent responsibilities / ownership (DECLARED)
     let mut intent_resp: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut intent_owns: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -367,11 +513,11 @@ pub fn compile_components(
         }
         e.attr("responsibility", json!(resp));
 
-        let dirs = candidates
+        let cand = candidates
             .iter()
             .find(|c| c.name == name)
-            .map(|c| c.dirs.clone())
-            .unwrap_or_default();
+            .expect("every compiled component has a candidate");
+        let dirs = cand.dirs.clone();
         e.attr(
             "implementation",
             json!({
@@ -379,6 +525,51 @@ pub fn compile_components(
                 "symbols": symbols_per_comp.get(&name).cloned().unwrap_or_default(),
             }),
         );
+
+        // ---- Wave 5: boundary kind + weighted clustering score ----
+        let mut score: f64 = match cand.boundary_kind.as_str() {
+            BOUNDARY_DEPLOYMENT => 5.0,
+            BOUNDARY_PACKAGE => 4.0,
+            BOUNDARY_CODE_REGION | BOUNDARY_ROOT => 1.0,
+            // declared intent carries its authority in `boundary_kind`;
+            // the clustering score only counts graph evidence (plan §28)
+            _ => 0.0,
+        };
+        if shared_writes
+            .iter()
+            .any(|((c, _), syms)| c == &name && syms.len() >= 2)
+        {
+            score += 4.0; // shared data ownership
+        }
+        if entrypoints.get(&name).copied().unwrap_or(0) > 0 {
+            score += 4.0; // entrypoint ownership (route handlers)
+        }
+        if route_entities.get(&name).copied().unwrap_or(0) > 0 {
+            score += 3.0; // route ownership
+        }
+        if events.get(&name).copied().unwrap_or(0) > 0 {
+            score += 3.0; // event ownership
+        }
+        if let Some((internal, total)) = calls.get(&name) {
+            if *total > 0 {
+                score += 3.0 * (*internal as f64 / *total as f64); // cohesion
+            }
+        }
+        let dir_refs: Vec<&str> = dirs.iter().map(|d| d.as_str()).collect();
+        let co_pairs = pairs
+            .iter()
+            .filter(|p| {
+                crate::cochange::file_in_paths(&p.a, &dir_refs)
+                    && crate::cochange::file_in_paths(&p.b, &dir_refs)
+            })
+            .count();
+        score += 2.0 * co_pairs as f64; // co-change (+2 per pair inside)
+        score = (score * 1000.0).round() / 1000.0;
+        e.attr("boundary_kind", json!(cand.boundary_kind.clone()));
+        e.attr("clustering_score", json!(score));
+        if let Some(parent) = parent_per_comp.get(&name) {
+            e.attr("parent", json!(parent));
+        }
 
         // typed ownership claims: (target, provenance, confidence, evidence)
         // — intent stays DECLARED, write edges keep their own provenance
@@ -665,7 +856,7 @@ mod tests {
             serde_json::json!({"name": "root", "owns": ["db"]}),
         )];
         let graph = RealityGraph::load(&store).unwrap();
-        let comps = compile_components(&graph, &store, &intent).unwrap();
+        let comps = compile_components(&graph, &store, &intent, &[]).unwrap();
         let root_comp = comps.iter().find(|c| c.name == "root").unwrap();
 
         // the owns attribute carries typed claims with provenance
@@ -702,12 +893,251 @@ mod tests {
     #[test]
     fn path_assignment() {
         let cands = vec![
-            ComponentCandidate { name: "web".into(), dirs: vec!["src/web".into()] },
-            ComponentCandidate { name: "api".into(), dirs: vec!["src/api".into()] },
+            ComponentCandidate { name: "web".into(), dirs: vec!["src/web".into()], boundary_kind: BOUNDARY_PACKAGE.into() },
+            ComponentCandidate { name: "api".into(), dirs: vec!["src/api".into()], boundary_kind: BOUNDARY_DECLARED.into() },
         ];
         assert_eq!(component_for_path("src/api/routes.py", &cands), "api");
         assert_eq!(component_for_path("src/web/app.ts", &cands), "web");
         assert_eq!(component_for_path("src/shared/util.py", &cands), "src");
         assert_eq!(component_for_path("README.md", &cands), "root");
+    }
+
+    /// Insert a FILE entity plus CONTAINS edges to its symbols; returns the
+    /// file id and the symbol ids.
+    fn insert_file_with_symbols(
+        store: &Store,
+        path: &str,
+        symbols: &[&str],
+    ) -> (String, Vec<String>) {
+        let repo = store.repo_id.clone();
+        let file_id = scc_core::entity_id(&repo, kinds::FILE, path);
+        store
+            .insert_entity(
+                &scc_core::Entity::new(file_id.clone(), kinds::FILE, path),
+                &[path.into()],
+            )
+            .unwrap();
+        let mut sym_ids = Vec::new();
+        for s in symbols {
+            let sid = scc_core::symbol_id(&repo, path, s);
+            store
+                .insert_entity(
+                    &scc_core::Entity::new(sid.clone(), kinds::SYMBOL, *s),
+                    &[path.into()],
+                )
+                .unwrap();
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:contains:{}:{s}", path.replace('/', "_")),
+                        file_id.clone(),
+                        scc_core::predicates::CONTAINS,
+                        sid.clone(),
+                        Provenance::Extracted,
+                    ),
+                    path,
+                )
+                .unwrap();
+            sym_ids.push(sid);
+        }
+        (file_id, sym_ids)
+    }
+
+    #[test]
+    fn boundary_kind_classification() {
+        // Wave 5: every compiled component records the evidence class that
+        // created it — declared intent, workspace package, deployment-unit
+        // build context, bare top-level directory, or root-level files —
+        // while the entity kind stays kinds::COMPONENT.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+
+        for f in [
+            "web/app.py",
+            "packages/a/util.py",
+            "services/api/main.py",
+            "misc/util.py",
+            "README.md",
+        ] {
+            store
+                .insert_entity(
+                    &scc_core::Entity::new(
+                        scc_core::entity_id(&repo, kinds::FILE, f),
+                        kinds::FILE,
+                        f,
+                    ),
+                    &[f.into()],
+                )
+                .unwrap();
+        }
+        // workspace package member
+        let mut pkg = scc_core::Entity::new(
+            scc_core::entity_id(&repo, kinds::PACKAGE, "pkg_a"),
+            kinds::PACKAGE,
+            "pkg_a",
+        );
+        pkg.attr("path", serde_json::json!("packages/a"));
+        store
+            .insert_entity(&pkg, &["packages/a/util.py".into()])
+            .unwrap();
+        // deployment unit with a build context
+        let mut du = scc_core::Entity::new(
+            scc_core::entity_id(&repo, kinds::DEPLOYMENT_UNIT, "api"),
+            kinds::DEPLOYMENT_UNIT,
+            "api",
+        );
+        du.attr("build_context", serde_json::json!("services/api"));
+        store
+            .insert_entity(&du, &["services/api/main.py".into()])
+            .unwrap();
+
+        let intent = vec![(
+            "component".to_string(),
+            serde_json::json!({"name": "web", "paths": ["web"]}),
+        )];
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &intent, &[]).unwrap();
+        let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
+            comps.iter().map(|c| (c.name.as_str(), c)).collect();
+        let kind_of = |n: &str| by_name[n].attributes["boundary_kind"].as_str().unwrap();
+        assert_eq!(kind_of("web"), BOUNDARY_DECLARED);
+        assert_eq!(kind_of("pkg_a"), BOUNDARY_PACKAGE);
+        assert_eq!(kind_of("api"), BOUNDARY_DEPLOYMENT);
+        assert_eq!(kind_of("misc"), BOUNDARY_CODE_REGION);
+        assert_eq!(kind_of("services"), BOUNDARY_CODE_REGION, "dir fallback");
+        assert_eq!(kind_of("root"), BOUNDARY_ROOT);
+        // entity kind is never renamed; candidates keep their names
+        assert_eq!(by_name["api"].kind, kinds::COMPONENT);
+        assert!(by_name.contains_key("api"), "candidate name unchanged");
+        // components inside a deployment unit carry the additive parent attr
+        assert_eq!(by_name["api"].attributes["parent"], serde_json::json!("api"));
+        assert!(
+            !by_name["web"].attributes.contains_key("parent"),
+            "no parent outside a deployment unit"
+        );
+        // every compiled component carries both new attributes
+        for c in &comps {
+            assert!(c.attributes.contains_key("boundary_kind"), "{}", c.name);
+            assert!(c.attributes.contains_key("clustering_score"), "{}", c.name);
+        }
+    }
+
+    #[test]
+    fn clustering_score_deterministic_and_ranked() {
+        // Wave 5 §28 weights: shared data ownership +4, entrypoint
+        // ownership +4, route ownership +3, internal call cohesion +3 —
+        // and a bare directory fallback scores only +1.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+
+        let (_f1, api_syms) =
+            insert_file_with_symbols(&store, "api/routes.py", &["handle_a", "handle_b"]);
+        let (_f2, api_helpers) = insert_file_with_symbols(&store, "api/helpers.py", &["helper"]);
+        let (_f3, _web_syms) = insert_file_with_symbols(&store, "web/app.py", &["web_index"]);
+
+        let store_ent = scc_core::entity_id(&repo, kinds::DATA_STORE, "db");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(store_ent.clone(), kinds::DATA_STORE, "db"),
+                &["api/routes.py".into()],
+            )
+            .unwrap();
+        let routes_file = scc_core::entity_id(&repo, kinds::FILE, "api/routes.py");
+        for (i, sym) in ["handle_a", "handle_b"].iter().enumerate() {
+            let route = scc_core::entity_id(&repo, kinds::ROUTE, &format!("GET /api/{i}"));
+            store
+                .insert_entity(
+                    scc_core::Entity::new(route.clone(), kinds::ROUTE, format!("GET /api/{i}"))
+                        .attr("method", serde_json::json!("GET"))
+                        .attr("path", serde_json::json!(format!("/api/{i}"))),
+                    &["api/routes.py".into()],
+                )
+                .unwrap();
+            // the route entity lives in the candidate's file (route ownership)
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:route_contains_{i}"),
+                        routes_file.clone(),
+                        scc_core::predicates::CONTAINS,
+                        route.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "api/routes.py",
+                )
+                .unwrap();
+            let sym_id = scc_core::symbol_id(&repo, "api/routes.py", sym);
+            // the handler symbol owns the route (entrypoint ownership)
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:handles_{i}"),
+                        sym_id.clone(),
+                        scc_core::predicates::HANDLES,
+                        route.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "api/routes.py",
+                )
+                .unwrap();
+            // two distinct symbols write the same store (shared data ownership)
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:writes_{i}"),
+                        sym_id,
+                        scc_core::predicates::WRITES,
+                        store_ent.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "api/routes.py",
+                )
+                .unwrap();
+        }
+        // internal call cohesion: handle_a -> helper, both inside api
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:call_internal",
+                    api_syms[0].clone(),
+                    scc_core::predicates::CALLS,
+                    api_helpers[0].clone(),
+                    Provenance::Extracted,
+                ),
+                "api/routes.py",
+            )
+            .unwrap();
+
+        let intent = vec![(
+            "component".to_string(),
+            serde_json::json!({"name": "api", "paths": ["api"]}),
+        )];
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &intent, &[]).unwrap();
+        let graph2 = RealityGraph::load(&store).unwrap();
+        let comps2 = compile_components(&graph2, &store, &intent, &[]).unwrap();
+        let score = |c: &scc_core::Entity| c.attributes["clustering_score"].as_f64().unwrap();
+        for (a, b) in comps.iter().zip(comps2.iter()) {
+            assert_eq!(
+                a.attributes["clustering_score"],
+                b.attributes["clustering_score"],
+                "scores must be deterministic for {}",
+                a.name
+            );
+        }
+        let api = comps.iter().find(|c| c.name == "api").unwrap();
+        let web = comps.iter().find(|c| c.name == "web").unwrap();
+        assert_eq!(score(api), 14.0, "{:?}", api.attributes);
+        assert_eq!(score(web), 1.0, "bare directory: +1 only");
+        assert!(score(api) > score(web), "evidence-rich candidate outranks a bare dir");
+        assert_eq!(api.attributes["boundary_kind"], serde_json::json!("declared"));
+        assert_eq!(web.attributes["boundary_kind"], serde_json::json!("code-region"));
     }
 }
