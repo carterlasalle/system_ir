@@ -1082,15 +1082,16 @@ fn chain_outer(mut node: Node) -> Node {
     }
 }
 
+/// One clap chain segment: the method name and its argument node.
+type ChainSegment<'a> = (String, Option<Node<'a>>);
+/// `(root_text, root_args, segments)` — root is the innermost function
+/// text (`Command::new`, `Arg::new`, or a plain receiver identifier).
+type ClapChain<'a> = (String, Option<Node<'a>>, Vec<ChainSegment<'a>>);
+
 /// Method segments of a call chain, outermost call first:
-/// `(method, arguments)` per segment. Returns `(root_text, root_args,
-/// segments)` where the root is the innermost function text
-/// (`Command::new`, `Arg::new`, or a plain receiver identifier).
-fn clap_chain<'a>(
-    node: Node<'a>,
-    src: &'a [u8],
-) -> Option<(String, Option<Node<'a>>, Vec<(String, Option<Node<'a>>)>)> {
-    let mut segs: Vec<(String, Option<Node>)> = Vec::new();
+/// `(method, arguments)` per segment.
+fn clap_chain<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ClapChain<'a>> {
+    let mut segs: Vec<ChainSegment> = Vec::new();
     let mut cur = node;
     loop {
         if cur.kind() != "call_expression" {
@@ -1105,10 +1106,7 @@ fn clap_chain<'a>(
                 let m = collapse(node_text(f.child_by_field_name("field"), src));
                 let args = cur.child_by_field_name("arguments");
                 segs.push((m, args));
-                match f.child_by_field_name("value") {
-                    Some(v) => cur = v,
-                    None => return None,
-                }
+                cur = f.child_by_field_name("value")?;
             }
             // `foo().method()` — climb through the call receiver
             "call_expression" => cur = f,
