@@ -1,0 +1,24 @@
+scc bench agent — ground-truth corpus through an external agent command
+  tasks: 21   exit-ok: 21/21   mean duration: 70424 ms   mean localization: 0.111
+  http-service.rename-transcript-field       ok      30888 ms      209 B  files 0/2
+  http-service.transcript-normalization      ok      76354 ms      352 B  files 0/2
+  http-service.health-check                  ok      83054 ms      290 B  files 1/1
+  queue-worker.asr-retry                     ok      54687 ms      227 B  files 0/2
+  queue-worker.street-vocabulary             ok      48418 ms      220 B  files 1/2
+  queue-worker.redis-persist                 ok      76155 ms      255 B  files 0/2
+  monorepo.rename-transcript-field           ok      49960 ms      136 B  files 0/3
+  monorepo.worker-indexing                   ok     101594 ms      871 B  files 0/2
+  monorepo.new-field                         ok      57586 ms      204 B  files 0/1
+  py-queue.classification-fallback           ok      72975 ms      314 B  files 1/2
+  py-queue.store-changes                     ok      37651 ms      242 B  files 0/2
+  py-queue.empty-messages                    ok      78914 ms      441 B  files 0/2
+  ts-api-web.pagination                      ok      72191 ms      229 B  files 0/2
+  ts-api-web.contract-field                  ok      76932 ms      211 B  files 0/3
+  ts-api-web.creation-test                   ok     110225 ms      695 B  files 0/2
+  large-ts.new-order-endpoint                ok      50718 ms      189 B  files 0/3
+  large-ts.order-total-invariant             ok     128818 ms      487 B  files 0/2
+  nextjs.transcript-response                 ok      42251 ms      125 B  files 0/3
+  nextjs.store-pagination                    ok      92894 ms       98 B  files 0/2
+  polyglot.refund-endpoint                   ok      45601 ms      167 B  files 0/3
+  polyglot.web-payments                      ok      91028 ms      204 B  files 1/3
+  (tool-level metrics — files opened, search commands — require harness tracing; this is the portable layer)
