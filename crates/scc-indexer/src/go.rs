@@ -613,6 +613,7 @@ impl GoExtractor {
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
+                    conditional: false,
                 });
                 self.record_store_ref(node, &fn_node, &root, ctx, src);
             }

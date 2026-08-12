@@ -556,6 +556,7 @@ impl JavaExtractor {
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
+                    conditional: false,
                 });
                 self.record_store_ref(node, ctx, src);
             }
@@ -573,6 +574,7 @@ impl JavaExtractor {
                     callee: type_name,
                     line: node.start_position().row as u32 + 1,
                     known_receiver: false,
+                    conditional: false,
                 });
             }
         }

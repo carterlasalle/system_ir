@@ -175,24 +175,41 @@ fn canonical_flow_graph_preserves_topology() {
         kinds.contains(&"retry"),
         "retry edges from decorator evidence: {kinds:?}"
     );
-    // fanout (consume -> process_incident AND IncidentStore) is Branch edges
-    assert!(
-        kinds.contains(&"branch"),
-        "fanout from multiple call targets must be a branch: {kinds:?}"
+    // P1 §19: plain call fanout (consume -> process_incident AND
+    // IncidentStore) is NOT a branch — those are Next edges; only the call
+    // inside the try/except (classify) is a Branch edge.
+    let branch_edges: Vec<&serde_json::Value> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "branch")
+        .collect();
+    assert_eq!(
+        branch_edges.len(),
+        1,
+        "exactly one conditional call becomes a branch: {kinds:?}"
     );
-    // convergence of the fanout is a Join edge — no false sequential merge
     assert!(
-        kinds.contains(&"join"),
-        "convergence must be explicit: {kinds:?}"
+        branch_edges[0]["condition"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("conditional:"),
+        "branch condition names the conditional evidence: {branch_edges:?}"
     );
-    // branch edges carry structural conditions ("calls <op>"), never
+    assert!(
+        kinds.iter().filter(|k| *k == &"next").count() >= 2,
+        "plain fanout stays Next edges (unordered calls, not alternatives): {kinds:?}"
+    );
+    // no false convergence either: this fixture has no join point, so no
+    // Join edge is invented (the old branch-artifact join is gone)
+    // branch edges carry evidence conditions ("conditional: <op>"), never
     // comma-split operation lists from generated text
     for e in graph["edges"].as_array().unwrap() {
         if e["kind"] == "branch" {
             if let Some(c) = e["condition"].as_str() {
                 assert!(
-                    c.starts_with("calls "),
-                    "branch conditions are structural: {c}"
+                    c.starts_with("conditional:"),
+                    "branch conditions name the conditional evidence: {c}"
                 );
             }
         }

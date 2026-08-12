@@ -116,6 +116,11 @@ pub struct Call {
     /// Whether the callee root is a local/imported binding or something
     /// unknown (e.g. an arbitrary member on a parameter).
     pub known_receiver: bool,
+    /// Whether the call sits inside a conditional/loop/try body (if/else/
+    /// for/while/try/with/match) within its enclosing function — the ONLY
+    /// evidence that turns call fanout into control-flow branching.
+    #[serde(default)]
+    pub conditional: bool,
 }
 
 /// An HTTP route declaration.

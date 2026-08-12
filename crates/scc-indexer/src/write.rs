@@ -157,6 +157,21 @@ impl<'a> Writer<'a> {
             let ev = self.ev(path, "symbol", &sym.name, sym.start_line);
             self.store.insert_evidence(&ev)?;
             se.evidence.push(ev.id.clone());
+            // control-flow evidence (P1 §19): calls made inside conditional/
+            // loop/try bodies are the only evidence that call fanout is a
+            // branch. The FlowGraph compiler reads this attribute.
+            let conditional: Vec<String> = ef
+                .calls
+                .iter()
+                .filter(|c| c.conditional && c.caller.as_deref() == Some(sym.name.as_str()))
+                .map(|c| c.callee.clone())
+                .collect();
+            if !conditional.is_empty() {
+                let mut cond: Vec<String> = conditional;
+                cond.sort();
+                cond.dedup();
+                se.attr("conditional_calls", serde_json::json!(cond));
+            }
             self.store.insert_entity(&se, &[path.to_string()])?;
             self.store.insert_symbol(
                 path,

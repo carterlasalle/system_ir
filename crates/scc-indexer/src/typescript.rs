@@ -354,6 +354,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                     callee: normalize_callee(node_text(&function, src)),
                     line,
                     known_receiver: known_receiver(&function),
+                    conditional: ts_call_is_conditional(node),
                 });
             }
             _ => {}
@@ -1052,6 +1053,27 @@ fn push_retry(dec: &Node, src: &[u8], out: &mut Vec<(String, u32)>) {
 // ---------------------------------------------------------------------------
 
 /// Whether the callee root is an identifier (or member chain rooted in one).
+/// True when the call sits inside a conditional/loop/try/catch/switch body
+/// within its enclosing function — the ONLY evidence that turns call fanout
+/// into control-flow branching. Stops at the nearest function boundary so
+/// calls inside conditionally-defined closures are not marked.
+fn ts_call_is_conditional(node: Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "function_expression" | "arrow_function"
+            | "method_definition" | "class_declaration" | "program" | "module" => {
+                return false
+            }
+            "if_statement" | "for_statement" | "for_in_statement" | "for_of_statement"
+            | "while_statement" | "do_statement" | "try_statement" | "catch_clause"
+            | "switch_statement" | "ternary_expression" => return true,
+            _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
 fn known_receiver(function: &Node) -> bool {
     let mut n = *function;
     loop {

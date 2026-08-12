@@ -10,6 +10,7 @@
 //! excluded unless `include_low_confidence_inference` is set.
 
 use crate::packs::{entity_name, finish, Section};
+use scc_graph::TrustedGraphView;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
     AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasInvariant, AtlasOwnershipClaim, FlowKind,
@@ -174,10 +175,31 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         }
     }
 
-    // ---- flows (condensed, markers preserved) ----
+    // ---- flows: SEQUENCES project from the canonical FlowGraph (P1 §18);
+    // the old linear flows table is never the atlas's sequence source ----
     let mut flows: Vec<AtlasFlow> = Vec::new();
     let mut async_boundaries: BTreeSet<String> = BTreeSet::new();
+    for g in store.flow_graphs().unwrap_or_default() {
+        if g.kind != scc_core::FlowKind::Sequence {
+            continue;
+        }
+        let steps = project_flow_graph(view, &g, &mut async_boundaries);
+        if steps.is_empty() {
+            continue;
+        }
+        flows.push(AtlasFlow {
+            name: g.name.clone(),
+            kind: g.kind,
+            trigger: g.trigger.clone(),
+            steps,
+        });
+    }
+    // derived views (workflow/dataflow/lifecycle) still come from the
+    // derived compilers — but lifecycle is SIGNALS, never authoritative
     for f in view.flows() {
+        if f.kind == scc_core::FlowKind::Sequence {
+            continue; // sequences come from the canonical graphs
+        }
         let mut steps: Vec<String> = Vec::new();
         let mut prev_actor: Option<String> = None;
         for s in &f.steps {
@@ -189,13 +211,6 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             };
             if s.r#async == Some(true) {
                 line.push_str(" [async]");
-                if let Some(next) = f.steps.iter().find(|x| x.order > s.order) {
-                    async_boundaries.insert(format!(
-                        "{} --async--> {}",
-                        actor,
-                        entity_name(view, &next.actor)
-                    ));
-                }
             }
             if let Some(c) = &s.condition {
                 line.push_str(&format!(" (if {c})"));
@@ -209,13 +224,23 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             steps.push(line);
             prev_actor = Some(actor);
         }
-        flows.push(AtlasFlow {
-            name: f.name.clone(),
-            kind: f.kind,
-            trigger: f.trigger.clone(),
-            steps,
-        });
+        if f.attributes.get("signals_only").and_then(|v| v.as_bool()) == Some(true) {
+            flows.push(AtlasFlow {
+                name: format!("{} (LIFECYCLE SIGNALS — NOT VERIFIED TRANSITIONS)", f.name),
+                kind: f.kind,
+                trigger: f.trigger.clone(),
+                steps,
+            });
+        } else {
+            flows.push(AtlasFlow {
+                name: f.name.clone(),
+                kind: f.kind,
+                trigger: f.trigger.clone(),
+                steps,
+            });
+        }
     }
+    flows.sort_by(|a, b| a.name.cmp(&b.name));
 
     // ---- invariants ----
     let invariants: Vec<AtlasInvariant> = view
@@ -543,6 +568,93 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     finish(&mut pack, sections, budget, warnings);
     pack.entity_ids = comp_ids(ctx);
     pack
+}
+
+/// Project one canonical FlowGraph into ordered step lines for the atlas.
+/// Walks from the entrypoints along POLICY-ALLOWED edges (the trust view's
+/// provenance policy applies to derived edges too), marking edge kinds:
+/// branch / retry / error / async / publish / consume / join. Never
+/// flattens alternate paths into false sequential causality.
+fn project_flow_graph(
+    view: &TrustedGraphView,
+    g: &scc_core::FlowGraph,
+    async_boundaries: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let policy = view.policy();
+    let edge_ok = |e: &scc_core::FlowEdge| -> bool {
+        match e.provenance {
+            None => true,
+            Some(p) => policy.allows(p, e.confidence),
+        }
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut visited: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut queue: std::collections::VecDeque<u32> =
+        g.entrypoints.iter().copied().collect();
+    while let Some(n) = queue.pop_front() {
+        if !visited.insert(n) {
+            continue;
+        }
+        let Some(node) = g.nodes.get(n as usize) else { continue };
+        lines.push(format!("{}: {}", entity_name(view, &node.actor), node.operation));
+        let mut outs: Vec<&scc_core::FlowEdge> = g
+            .edges
+            .iter()
+            .filter(|e| e.from == n && edge_ok(e))
+            .collect();
+        outs.sort_by(|a, b| edge_rank(a.kind).cmp(&edge_rank(b.kind)).then(a.to.cmp(&b.to)));
+        for e in outs {
+            let Some(target) = g.nodes.get(e.to as usize) else { continue };
+            let mut line = format!(
+                "  -> {}: {}",
+                entity_name(view, &target.actor),
+                target.operation
+            );
+            match e.kind {
+                scc_core::FlowEdgeKind::Branch => line.push_str(" (branch)"),
+                scc_core::FlowEdgeKind::Retry => line.push_str(" [retry]"),
+                scc_core::FlowEdgeKind::Error => line.push_str(" [error]"),
+                scc_core::FlowEdgeKind::Async => line.push_str(" [async]"),
+                scc_core::FlowEdgeKind::Publish => line.push_str(" [publish]"),
+                scc_core::FlowEdgeKind::Consume => line.push_str(" [consume]"),
+                scc_core::FlowEdgeKind::Join => line.push_str(" (join)"),
+                scc_core::FlowEdgeKind::Fallback => line.push_str(" [fallback]"),
+                scc_core::FlowEdgeKind::Timeout => line.push_str(" [timeout]"),
+                scc_core::FlowEdgeKind::Compensation => line.push_str(" [compensate]"),
+                _ => {}
+            }
+            if let Some(c) = &e.condition {
+                line.push_str(&format!(" ({c})"));
+            }
+            lines.push(line);
+            if e.kind == scc_core::FlowEdgeKind::Async {
+                async_boundaries.insert(format!(
+                    "{} --async--> {}",
+                    entity_name(view, &node.actor),
+                    entity_name(view, &target.actor)
+                ));
+            }
+            queue.push_back(e.to);
+        }
+    }
+    lines
+}
+
+fn edge_rank(k: scc_core::FlowEdgeKind) -> u8 {
+    match k {
+        scc_core::FlowEdgeKind::Next => 0,
+        scc_core::FlowEdgeKind::Async => 1,
+        scc_core::FlowEdgeKind::Branch => 2,
+        scc_core::FlowEdgeKind::Join => 3,
+        scc_core::FlowEdgeKind::Retry => 4,
+        scc_core::FlowEdgeKind::Fallback => 5,
+        scc_core::FlowEdgeKind::Error => 6,
+        scc_core::FlowEdgeKind::Publish => 7,
+        scc_core::FlowEdgeKind::Consume => 8,
+        scc_core::FlowEdgeKind::Return => 9,
+        scc_core::FlowEdgeKind::Timeout => 10,
+        scc_core::FlowEdgeKind::Compensation => 11,
+    }
 }
 
 fn comp_ids(ctx: &ContextCompiler) -> Vec<String> {

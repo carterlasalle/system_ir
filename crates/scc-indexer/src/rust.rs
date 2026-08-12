@@ -801,6 +801,7 @@ impl RustExtractor {
                         callee,
                         line: node.start_position().row as u32 + 1,
                         known_receiver: known_receiver(fn_node, src),
+                        conditional: false,
                     });
                     self.record_store_ref(node, fn_node, ctx, src);
                 }

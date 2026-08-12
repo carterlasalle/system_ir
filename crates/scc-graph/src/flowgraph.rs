@@ -193,7 +193,21 @@ pub fn compile_flow_graphs(
                         .extend(e.evidence.clone());
                 }
             }
-            let is_branch = targets.len() > 1;
+            // P1 §19: call fanout is NOT control-flow branching. A call
+            // graph says "A may call B and C", not "A chooses B or C".
+            // Branch edges exist ONLY where the extractor recorded the call
+            // inside a conditional/loop/try body (conditional_calls attr).
+            let conditional_calls: std::collections::HashSet<String> = graph
+                .entities
+                .get(sym)
+                .and_then(|e| e.attributes.get("conditional_calls"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             for t in targets {
                 let actor = symbol_comp
                     .get(t)
@@ -205,6 +219,10 @@ pub fn compile_flow_graphs(
                     .get(&(sym.clone(), t.clone()))
                     .cloned()
                     .unwrap_or((Provenance::Resolved, Vec::new()));
+                let t_op = op_of(graph, t);
+                let is_branch = conditional_calls
+                    .iter()
+                    .any(|c| c == &t_op || c.ends_with(&format!(".{t_op}")));
                 edges.push(
                     from,
                     to,
@@ -213,7 +231,7 @@ pub fn compile_flow_graphs(
                     } else {
                         FlowEdgeKind::Next
                     },
-                    if is_branch { Some(format!("calls {}", op_of(graph, t))) } else { None },
+                    if is_branch { Some(format!("conditional: {t_op}")) } else { None },
                     prov,
                     evidence,
                 );

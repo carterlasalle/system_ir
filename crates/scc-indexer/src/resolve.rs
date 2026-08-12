@@ -493,6 +493,7 @@ mod tests {
             callee: "normalize".into(),
             line: 3,
             known_receiver: true,
+            conditional: false,
         }];
         let resolved = resolve_calls("a.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved.len(), 1);
@@ -523,6 +524,7 @@ mod tests {
             callee: "r".into(),
             line: 3,
             known_receiver: true,
+            conditional: false,
         }];
         let resolved = resolve_calls("a.py", &calls, &[mk_symbol("main", SymbolKind::Function)], &resolved_imports, &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "b.py", "resolve")));
@@ -547,6 +549,7 @@ mod tests {
             callee: "asr.transcribe".into(),
             line: 3,
             known_receiver: true,
+            conditional: false,
         }];
         let resolved = resolve_calls("main.py", &calls, &[mk_symbol("run", SymbolKind::Function)], &[ri], &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "svc/asr.py", "transcribe")));
@@ -570,6 +573,7 @@ mod tests {
             callee: "self.helper".into(),
             line: 3,
             known_receiver: true,
+            conditional: false,
         }];
         let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "w.py", "Worker.helper")));
@@ -591,6 +595,7 @@ mod tests {
             callee: "express".into(),
             line: 3,
             known_receiver: false,
+            conditional: false,
         }];
         let resolved = resolve_calls("a.ts", &calls, &[mk_symbol("main", SymbolKind::Function)], &[ri], &idx, "repo");
         assert_eq!(

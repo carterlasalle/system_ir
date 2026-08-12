@@ -337,6 +337,24 @@ const STRING_TARGET_ROOTS: &[&str] = &[
 
 const ROUTE_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "options", "head", "route"];
 
+/// True when the call sits inside a conditional/loop/try body within its
+/// enclosing function — walking ancestors from the call node up to (but
+/// excluding) the nearest function/class/module boundary. A call inside a
+/// nested function definition is NOT conditional (it is conditionally
+/// *defined*, not conditionally *called*).
+fn call_is_conditional(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_definition" | "class_definition" | "module" => return false,
+            "if_statement" | "for_statement" | "while_statement" | "try_statement"
+            | "with_statement" | "match_statement" => return true,
+            _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
 fn classify_op(name: &str) -> Option<StoreOp> {
     match name {
         "execute" | "executemany" | "executescript" => Some(StoreOp::Query), // refined by SQL sniff
@@ -630,6 +648,7 @@ impl PythonExtractor {
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
+                    conditional: call_is_conditional(node),
                 });
                 self.record_store_ref(node, fn_node, &root, ctx, src);
             }
