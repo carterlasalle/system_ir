@@ -60,11 +60,12 @@ class HermesPluginTest(unittest.TestCase):
         except (FileNotFoundError, subprocess.CalledProcessError):
             cls.repo = None
 
-    def test_registers_six_tools_and_skill(self):
+    def test_registers_seven_tools_and_skill(self):
         self.assertEqual(
             set(self.ctx.tools),
             {
                 "system_overview",
+                "system_atlas",
                 "task_context",
                 "component_context",
                 "flow_context",
@@ -85,9 +86,11 @@ class HermesPluginTest(unittest.TestCase):
         old = os.getcwd()
         os.chdir(self.repo)
         try:
-            for name in ("system_overview", "verify_context"):
+            for name in ("system_overview", "system_atlas", "verify_context"):
                 out = json.loads(self.ctx.tools[name]["handler"]({}))
                 self.assertNotIn("error", out, out)
+            atlas = json.loads(self.ctx.tools["system_atlas"]["handler"]({}))
+            self.assertIn("ARCHITECTURE", str(atlas), atlas)
             out = json.loads(self.ctx.tools["task_context"]["handler"]({"goal": "helper"}))
             self.assertIn("TASK", str(out), out)
             out = json.loads(self.ctx.tools["impact_context"]["handler"]({"files": ["a.py"]}))

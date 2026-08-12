@@ -1,7 +1,7 @@
 """SCC plugin — registration: wire schemas to handlers, bundle the skill.
 
 Hermes loads this via `register(ctx)` at startup. The plugin provides the
-six semantic context tools backed by the local `scc` CLI.
+seven semantic context tools backed by the local `scc` CLI.
 """
 
 import logging
