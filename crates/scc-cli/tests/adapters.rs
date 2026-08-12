@@ -4,32 +4,29 @@
 mod golden;
 use golden::*;
 
+// Fake Context7 server speaking the REAL v4 protocol (JSONL transport,
+// resolve-library-id + query-docs) — pinned by the live suite in
+// tests/context7_live.rs against @upstash/context7-mcp.
 const FAKE_C7: &str = r#"import sys, json
-def frame(o):
-    s = json.dumps(o).encode()
-    return b"Content-Length: " + str(len(s)).encode() + b"\r\n\r\n" + s
-buf = b""
-while True:
-    ch = sys.stdin.buffer.read(1)
-    if not ch: break
-    buf += ch
-    if b"\r\n\r\n" not in buf: continue
-    h, _, rest = buf.partition(b"\r\n\r\n")
-    length = 0
-    for line in h.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":")[1].strip())
-    while len(rest) < length:
-        rest += sys.stdin.buffer.read(length - len(rest))
-    msg = json.loads(rest.decode()); buf = b""
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue  # tolerate Content-Length header lines, like the real server
+    msg = json.loads(line)
     m = msg.get("method")
     if m == "initialize":
-        sys.stdout.buffer.write(frame({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake-c7"}}}))
+        out = {"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake-c7"}}}
     elif m == "tools/call":
         name = msg["params"]["name"]
-        text = "library: fastapi/fastapi" if name == "library-search" else "docs: FastAPI route docs here"
-        sys.stdout.buffer.write(frame({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":text}]}}))
-    sys.stdout.buffer.flush()
+        if name == "resolve-library-id":
+            result = {"content":[{"type":"text","text":"- Context7-compatible library ID: /fastapi/fastapi\n- Description: FastAPI"}]}
+        else:
+            result = {"content":[{"type":"text","text":"docs: FastAPI route docs here"}]}
+        out = {"jsonrpc":"2.0","id":msg["id"],"result":result}
+    else:
+        continue
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
 "#;
 
 #[test]

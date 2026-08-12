@@ -5,13 +5,60 @@
 //! The MCP server command is configurable; the default is the official
 //! `@upstash/context7-mcp` package via npx.
 
-use crate::lsp::{encode_frame, read_frame};
-use std::io::{BufReader, Write};
+use crate::lsp::encode_frame;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read one MCP message tolerating both real-world stdio transports
+/// (P0 §16, verified live against @upstash/context7-mcp v4.0.2):
+///
+/// - JSONL: each message is one JSON line (`\n`-terminated, no headers);
+///   this is what the actual Context7 server emits.
+/// - Content-Length framing: header lines then a fixed-size body; this is
+///   what LSP-style servers and SCC's fake test server emit.
+fn read_message<R: BufRead>(reader: &mut R) -> Result<serde_json::Value, String> {
+    let mut first = String::new();
+    if reader.read_line(&mut first).map_err(|e| format!("read: {e}"))? == 0 {
+        return Err("server closed stdout".to_string());
+    }
+    let first = first.trim_end_matches(['\r', '\n']);
+    if first.to_ascii_lowercase().starts_with("content-length:") {
+        // Content-Length framing: consume the remaining headers, then body.
+        let mut content_length: Option<usize> = None;
+        let mut parse_header = |line: &str| {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().ok();
+                }
+            }
+        };
+        parse_header(first);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).map_err(|e| format!("read: {e}"))? == 0 {
+                return Err("server closed mid-headers".to_string());
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            parse_header(line);
+        }
+        let n = content_length.ok_or("content-length missing")?;
+        let mut body = vec![0u8; n];
+        reader
+            .read_exact(&mut body)
+            .map_err(|e| format!("read body: {e}"))?;
+        serde_json::from_slice(&body).map_err(|e| format!("bad JSON frame: {e}"))
+    } else {
+        // JSONL: the first line is the whole message.
+        serde_json::from_str(first).map_err(|e| format!("bad JSONL frame: {e}"))
+    }
+}
 
 pub struct Context7Client {
     child: Child,
@@ -45,7 +92,7 @@ pub fn start(command: &str) -> Result<Context7Client, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdout = stdout;
-        while let Ok(v) = read_frame(&mut stdout) {
+        while let Ok(v) = read_message(&mut stdout) {
             if tx.send(v).is_err() {
                 break;
             }
@@ -58,10 +105,14 @@ pub fn start(command: &str) -> Result<Context7Client, String> {
         rx,
         next_id: 1,
     };
+    // Protocol compatibility (P0 §16): the real Context7 server (v4.x)
+    // answers `2024-11-05` but silently ignores `2025-06-18`; verified live
+    // against @upstash/context7-mcp. Never guess the version — the live
+    // suite (tests/context7_live.rs) pins this behavior.
     let _ = client.request(
         "initialize",
         &serde_json::json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "scc", "version": env!("CARGO_PKG_VERSION")}
         }),
@@ -81,7 +132,12 @@ impl Context7Client {
         if let Some(id) = id {
             msg["id"] = serde_json::json!(id);
         }
-        let frame = encode_frame(&msg);
+        let mut frame = encode_frame(&msg);
+        // Real-server compatibility (P0 §16, verified against
+        // @upstash/context7-mcp v4.0.2): its stdio transport reads the
+        // header via readline and requires the body to be line-terminated;
+        // without the trailing newline the server never sees the message.
+        frame.push(b'\n');
         self.stdin.write_all(&frame)?;
         self.stdin.flush()?;
         Ok(())
@@ -146,19 +202,37 @@ impl Context7Client {
 
     /// Look up a library by `owner/name` and fetch its docs. Returns labeled
     /// markdown (external documentation — never repository facts).
+    ///
+    /// Real-server protocol (P0 §16, verified against @upstash/context7-mcp
+    /// v4.0.2): `resolve-library-id` with `{libraryName, query}` returns a
+    /// text list of libraries; the first `Context7-compatible library ID`
+    /// feeds `query-docs` with `{libraryId, query}`.
     pub fn docs_for(&mut self, dependency: &str) -> Result<String, String> {
-        let search = self.call_tool("library-search", &serde_json::json!({"q": dependency}))?;
-        let text = extract_text(&search);
+        let resolved = self.call_tool(
+            "resolve-library-id",
+            &serde_json::json!({"libraryName": dependency, "query": dependency}),
+        )?;
+        let text = extract_text(&resolved);
         if text.is_empty() {
             return Err(format!("context7: no results for '{dependency}'"));
         }
+        let library_id = text
+            .lines()
+            .find_map(|l| {
+                let t = l.trim().trim_start_matches("- ").trim();
+                t.strip_prefix("Context7-compatible library ID:")
+                    .map(|s| s.trim().to_string())
+            })
+            .ok_or_else(|| {
+                format!("context7: resolve-library-id returned no library id: {text}")
+            })?;
         let docs = self.call_tool(
             "query-docs",
-            &serde_json::json!({"library": dependency, "query": dependency}),
+            &serde_json::json!({"libraryId": library_id, "query": dependency}),
         )?;
         let docs_text = extract_text(&docs);
         Ok(format!(
-            "<!-- CONTEXT7 EXTERNAL DOCUMENTATION for {dependency} — external, not repository facts -->\n{}\n{}",
+            "<!-- CONTEXT7 EXTERNAL DOCUMENTATION for {dependency} ({library_id}) — external, not repository facts -->\n{}\n{}",
             text, docs_text
         ))
     }
@@ -187,38 +261,35 @@ impl Drop for Context7Client {
 mod tests {
     use super::*;
 
+    // Fake server speaking the REAL Context7 v4 protocol (JSONL transport,
+    // resolve-library-id + query-docs tools) so the unit test pins the same
+    // contract the live suite (tests/context7_live.rs) verifies.
     const FAKE_SERVER: &str = r#"import sys, json
-def frame(obj):
-    s = json.dumps(obj).encode()
-    return b"Content-Length: " + str(len(s)).encode() + b"\r\n\r\n" + s
-buf = b""
-while True:
-    chunk = sys.stdin.buffer.read(1)
-    if not chunk: break
-    buf += chunk
-    if b"\r\n\r\n" not in buf: continue
-    header, _, rest = buf.partition(b"\r\n\r\n")
-    length = 0
-    for line in header.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":")[1].strip())
-    while len(rest) < length:
-        rest += sys.stdin.buffer.read(length - len(rest))
-    msg = json.loads(rest.decode())
-    buf = b""
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue  # tolerate Content-Length header lines, like the real server
+    msg = json.loads(line)
     method = msg.get("method")
     if method == "initialize":
-        sys.stdout.buffer.write(frame({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake-c7"}}}))
+        out = {"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake-c7"}}}
     elif method == "tools/list":
-        sys.stdout.buffer.write(frame({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"library-search"},{"name":"query-docs"}]}}))
+        out = {"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"resolve-library-id"},{"name":"query-docs"}]}}
     elif method == "tools/call":
         name = msg["params"]["name"]
-        if name == "library-search":
-            result = {"content":[{"type":"text","text":"library: fastapi/fastapi"}]}
+        if name == "resolve-library-id":
+            args = msg["params"].get("arguments", {})
+            assert "libraryName" in args and "query" in args
+            result = {"content":[{"type":"text","text":"- Context7-compatible library ID: /fastapi/fastapi\n- Description: FastAPI"}]}
         else:
+            args = msg["params"].get("arguments", {})
+            assert args.get("libraryId") == "/fastapi/fastapi"
             result = {"content":[{"type":"text","text":"docs: FastAPI route docs here"}]}
-        sys.stdout.buffer.write(frame({"jsonrpc":"2.0","id":msg["id"],"result":result}))
-    sys.stdout.buffer.flush()
+        out = {"jsonrpc":"2.0","id":msg["id"],"result":result}
+    else:
+        continue
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
 "#;
 
     #[test]
@@ -230,6 +301,20 @@ while True:
         let mut client = start(&cmd).unwrap();
         let out = client.docs_for("fastapi/fastapi").unwrap();
         assert!(out.contains("CONTEXT7 EXTERNAL DOCUMENTATION"), "{out}");
+        assert!(out.contains("/fastapi/fastapi"), "{out}");
+        assert!(out.contains("FastAPI route docs"), "{out}");
+    }
+
+    #[test]
+    fn client_speaks_jsonl_transport() {
+        // the real Context7 server emits JSONL (no Content-Length headers);
+        // the client must tolerate both transports
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake_path = dir.path().join("fake_c7_jsonl.py");
+        std::fs::write(&fake_path, FAKE_SERVER).unwrap();
+        let cmd = format!("python3 {}", fake_path.display());
+        let mut client = start(&cmd).unwrap();
+        let out = client.docs_for("fastapi/fastapi").unwrap();
         assert!(out.contains("FastAPI route docs"), "{out}");
     }
 
@@ -241,9 +326,14 @@ while True:
     #[test]
     fn framing_helpers_roundtrip() {
         let msg = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        // Content-Length framing parses
         let frame = encode_frame(&msg);
         let mut reader = std::io::Cursor::new(frame);
-        let parsed = read_frame(&mut reader).unwrap();
+        let parsed = read_message(&mut reader).unwrap();
+        assert_eq!(parsed["id"], 1);
+        // JSONL framing parses
+        let mut reader = std::io::Cursor::new(format!("{}\n", msg).into_bytes());
+        let parsed = read_message(&mut reader).unwrap();
         assert_eq!(parsed["id"], 1);
     }
 }

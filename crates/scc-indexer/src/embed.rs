@@ -17,6 +17,25 @@ pub struct EmbedConfig {
 }
 
 impl EmbedConfig {
+    /// True when the endpoint is NOT loopback — repository-derived content
+    /// (entity names, goal text) would leave the machine. Loopback providers
+    /// (default ollama at 127.0.0.1) are local and need no remote-model
+    /// permission.
+    pub fn is_remote(&self) -> bool {
+        let host = self
+            .base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or("");
+        !matches!(
+            host.trim_matches(['[', ']']),
+            "" | "127.0.0.1" | "::1" | "localhost" | "0.0.0.0"
+        )
+    }
+}
+
+impl EmbedConfig {
     /// Resolve the config from the SCC inference config. `local` maps to the
     /// default Ollama OpenAI-compatible endpoint.
     pub fn from_config(cfg: &crate::config::InferenceConfig) -> EmbedConfig {

@@ -147,6 +147,111 @@ fn mcp_unknown_tool_returns_error() {
 }
 
 #[test]
+fn context_parity_across_cli_http_mcp() {
+    // P0 §10: transport must not change semantic quality — the same
+    // task_context request yields the same pack content on CLI, HTTP, MCP.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let goal = "change transcript normalization";
+
+    // CLI (JSON pack)
+    let cli_json = run_ok(&dir, &["context", "task", "--json", goal]);
+    let cli: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
+    let cli_content = cli["content"].as_str().unwrap().to_string();
+
+    // HTTP daemon
+    let port = 20000 + (std::process::id() % 20000) as u16;
+    let addr = format!("127.0.0.1:{port}");
+    std::fs::write(
+        dir.join(".scc/config.yaml"),
+        format!("schema: 1\nindex:\n  watch: false\nsecurity:\n  listen: {addr}\n"),
+    )
+    .unwrap();
+    let mut child = Command::new(scc())
+        .arg("serve")
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..40 {
+        if std::net::TcpStream::connect(addr.as_str()).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "daemon did not start");
+    let post = |path: &str, body: &str| -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(addr.as_str()).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut buf = String::new();
+        use std::io::Read;
+        stream.read_to_string(&mut buf).unwrap();
+        let status: u16 = buf.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = buf.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    };
+    let (s, http_body) = post(
+        "/v1/context/task",
+        &format!(r#"{{"goal":"{goal}"}}"#),
+    );
+    assert_eq!(s, 200);
+    let http: serde_json::Value = serde_json::from_str(&http_body).unwrap();
+    let http_content = http["content"].as_str().unwrap().to_string();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    // MCP server
+    let mut child = Command::new(scc())
+        .arg("mcp")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let send = |stdin: &mut std::process::ChildStdin, msg: &str| {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    };
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"parity"}}}"#,
+    );
+    send(
+        &mut stdin,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"task_context","arguments":{{"goal":"{goal}"}}}}}}"#
+        ),
+    );
+    drop(stdin);
+    let mut stdout = String::new();
+    use std::io::Read;
+    child.stdout.take().unwrap().read_to_string(&mut stdout).unwrap();
+    let _ = child.wait();
+    let mut mcp_content = String::new();
+    for line in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v.get("id").and_then(|i| i.as_i64()) == Some(2) {
+            mcp_content = v["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        }
+    }
+    assert!(!mcp_content.is_empty(), "MCP answered: {stdout}");
+
+    // parity: identical content on every transport
+    assert_eq!(cli_content, http_content, "CLI and HTTP packs differ");
+    assert_eq!(cli_content, mcp_content, "CLI and MCP packs differ");
+}
+
+#[test]
 fn http_daemon_endpoints() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);

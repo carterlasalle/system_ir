@@ -86,12 +86,31 @@ impl Reranker for CliReranker {
     }
 }
 
+/// Remote-model policy (P0, docs/SECURITY.md): repository-derived content
+/// may leave the machine only when `inference.enabled` AND
+/// `security.allow_remote_models` are both true. Loopback providers need
+/// only `inference.enabled`. Fails closed.
+pub fn remote_inference_allowed(config: &scc_indexer::Config) -> bool {
+    if !config.inference.enabled {
+        return false;
+    }
+    let cfg = EmbedConfig::from_config(&config.inference);
+    !cfg.is_remote() || config.security.allow_remote_models
+}
+
 /// `scc embed` — compute and store embeddings for all embeddable entities.
 pub fn cmd_embed(root: &Path) -> crate::Result<()> {
     let config = crate::load_config(root)?;
     if !config.inference.enabled {
         return Err(crate::CliError::Other(
             "inference is disabled — set `inference.enabled: true` in .scc/config.yaml".into(),
+        ));
+    }
+    if !remote_inference_allowed(&config) {
+        return Err(crate::CliError::Other(
+            "remote inference blocked: repository-derived content would leave the machine — \
+             set `security.allow_remote_models: true` to allow it (or use a loopback provider)"
+                .into(),
         ));
     }
     let store = crate::open_store(root)?;
@@ -117,7 +136,13 @@ pub fn rankers(
     config: &scc_indexer::Config,
     goal: &str,
 ) -> (Option<EmbeddingScorer>, Option<CliReranker>) {
-    if !config.inference.enabled {
+    if !remote_inference_allowed(config) {
+        if config.inference.enabled {
+            eprintln!(
+                "scc: warning: remote inference blocked by security policy \
+                 (security.allow_remote_models is false); using lexical ranking only"
+            );
+        }
         return (None, None);
     }
     let cfg = EmbedConfig::from_config(&config.inference);
@@ -161,6 +186,50 @@ mod tests {
         }];
         rr.rerank("goal", &mut cands);
         assert_eq!(cands.len(), 1); // no panic, no reorder
+    }
+
+    #[test]
+    fn remote_policy_fails_closed() {
+        // loopback: allowed with inference.enabled alone
+        let mut local = scc_indexer::Config::default();
+        local.inference.enabled = true;
+        local.inference.base_url = "http://127.0.0.1:11434/v1".into();
+        assert!(remote_inference_allowed(&local));
+
+        // remote endpoint: blocked unless allow_remote_models is set
+        let mut remote = local.clone();
+        remote.inference.base_url = "https://api.openai.com/v1".into();
+        assert!(!remote_inference_allowed(&remote), "remote must fail closed");
+        remote.security.allow_remote_models = true;
+        assert!(remote_inference_allowed(&remote));
+
+        // inference disabled: nothing allowed
+        let mut off = remote.clone();
+        off.inference.enabled = false;
+        assert!(!remote_inference_allowed(&off));
+
+        // empty base_url resolves to the local ollama default
+        let mut local2 = scc_indexer::Config::default();
+        local2.inference.enabled = true;
+        local2.inference.provider = "local".into();
+        assert!(remote_inference_allowed(&local2));
+    }
+
+    #[test]
+    fn remote_classification_covers_common_hosts() {
+        let mk = |base_url: &str| EmbedConfig {
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key: None,
+            rerank_model: None,
+        };
+        assert!(!mk("http://127.0.0.1:11434/v1").is_remote());
+        assert!(!mk("http://localhost:11434").is_remote());
+        assert!(!mk("http://[::1]:11434/v1").is_remote());
+        assert!(!mk("http://0.0.0.0:8080").is_remote());
+        assert!(mk("https://api.openai.com/v1").is_remote());
+        assert!(mk("https://gateway.example/v1").is_remote());
+        assert!(mk("http://192.168.1.10:8080").is_remote());
     }
 
     #[test]

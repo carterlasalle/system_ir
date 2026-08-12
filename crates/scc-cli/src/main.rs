@@ -177,6 +177,10 @@ enum Commands {
         #[command(subcommand)]
         sub: BenchSub,
     },
+
+    /// Print the SCC state directory (honors SCC_STATE_DIR; used by agent
+    /// integrations so a read-only repository with external state works)
+    StatePath,
 }
 
 #[derive(Subcommand)]
@@ -507,6 +511,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Commands::StatePath => {
+            println!("{}", scc_cli::state_dir(&root).display());
+            Ok(())
+        }
     };
 
     match result {
