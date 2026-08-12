@@ -27,6 +27,14 @@ fn tools() -> Vec<Tool> {
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         },
         Tool {
+            name: "system_atlas",
+            description: "Full System Atlas: complete architecture for session startup (purpose, components, flows, ownership, contracts, invariants, failure paths, deployment, trust boundaries). The primary agent startup tool.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"token_budget": {"type": "integer", "description": "Optional token budget (default context.atlas_tokens)"}}
+            }),
+        },
+        Tool {
             name: "task_context",
             description: "Task-specific system context pack for a coding goal. Primary agent operation.",
             input_schema: serde_json::json!({
@@ -201,6 +209,10 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
 
     match name {
         "system_overview" => Ok(comp.ctx().system_overview().content),
+        "system_atlas" => {
+            let budget = args.get("token_budget").and_then(|b| b.as_u64()).map(|b| b as usize);
+            Ok(comp.ctx().system_atlas(budget).content)
+        }
         "task_context" => {
             let goal = str_arg("goal");
             if goal.is_empty() {
@@ -251,7 +263,7 @@ mod tests {
             assert_eq!(t.input_schema["type"], "object");
             assert!(t.input_schema.get("properties").is_some());
         }
-        assert_eq!(tools().len(), 6, "the six semantic tools only");
+        assert_eq!(tools().len(), 7, "the seven semantic tools only");
     }
 
     #[test]

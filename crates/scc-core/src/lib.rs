@@ -292,6 +292,105 @@ impl Evidence {
 }
 
 // ---------------------------------------------------------------------------
+// System Atlas (Wave 2 — the startup architecture artifact)
+// ---------------------------------------------------------------------------
+
+/// One architectural component in the atlas. Purpose is the highest-ranked
+/// responsibility claim; consumes/produces come from data-flow edges;
+/// upstream/downstream from dependency edges; retry/failure from extracted
+/// failure behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasComponent {
+    pub name: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub implementation: Vec<String>,
+    #[serde(default)]
+    pub consumes: Vec<String>,
+    #[serde(default)]
+    pub produces: Vec<String>,
+    #[serde(default)]
+    pub upstream: Vec<String>,
+    #[serde(default)]
+    pub downstream: Vec<String>,
+    #[serde(default)]
+    pub failure_behavior: Vec<String>,
+    #[serde(default)]
+    pub owns: Vec<AtlasOwnershipClaim>,
+}
+
+/// A typed ownership claim (provenance preserved — DECLARED intent never
+/// promoted).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasOwnershipClaim {
+    pub target: String,
+    pub provenance: String,
+}
+
+/// A condensed flow: steps collapsed to "Actor: operation" lines, with
+/// branch/async/failure markers preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasFlow {
+    pub name: String,
+    pub kind: FlowKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasEntrypoint {
+    pub name: String,
+    pub kind: String,
+    pub trigger: String,
+    #[serde(default)]
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasInvariant {
+    pub statement: String,
+    pub severity: Severity,
+}
+
+/// The full System Atlas: structured architecture before rendering. This is
+/// the machine model handed to agents at session start (docs/SYSTEM_DESIGN.md
+/// §8, Wave 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemAtlas {
+    pub repository: String,
+    pub revision: String,
+    pub indexed_at: String,
+    pub freshness: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub components: Vec<AtlasComponent>,
+    #[serde(default)]
+    pub entrypoints: Vec<AtlasEntrypoint>,
+    #[serde(default)]
+    pub contracts: Vec<String>,
+    #[serde(default)]
+    pub flows: Vec<AtlasFlow>,
+    #[serde(default)]
+    pub invariants: Vec<AtlasInvariant>,
+    #[serde(default)]
+    pub deployment_units: Vec<String>,
+    #[serde(default)]
+    pub external_systems: Vec<String>,
+    #[serde(default)]
+    pub trust_boundaries: Vec<String>,
+    #[serde(default)]
+    pub async_boundaries: Vec<String>,
+    #[serde(default)]
+    pub implementation_map: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub evidence_summary: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Whole-document export
 // ---------------------------------------------------------------------------
 

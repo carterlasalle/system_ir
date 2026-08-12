@@ -143,6 +143,81 @@ fn stale_worktree_never_serves_cached_pack() {
 }
 
 #[test]
+fn atlas_describes_system_accurately() {
+    // Wave 2 QA: the agent should be able to explain the system from the
+    // atlas alone — purpose, architecture, flows, ownership, contracts,
+    // freshness — with no source exploration.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let atlas = run_ok(&dir, &["atlas"]);
+    assert!(atlas.contains("SYSTEM PURPOSE"), "{atlas}");
+    assert!(atlas.contains("normalized radio transcripts"), "purpose: {atlas}");
+    assert!(atlas.contains("ARCHITECTURE"), "{atlas}");
+    assert!(atlas.contains("SERVICES"), "{atlas}");
+    assert!(atlas.contains("TranscriptRepository"), "component purpose: {atlas}");
+    assert!(atlas.contains("get-/api/transcripts"), "flow: {atlas}");
+    assert!(atlas.contains("handle_transcripts"), "flow step: {atlas}");
+    assert!(atlas.contains("DATA OWNERSHIP"), "{atlas}");
+    assert!(atlas.contains("services owns db"), "ownership: {atlas}");
+    assert!(atlas.contains("CONTRACTS"), "{atlas}");
+    assert!(atlas.contains("GET /api/transcripts"), "contract: {atlas}");
+    assert!(atlas.contains("EVIDENCE STATUS"), "{atlas}");
+    assert!(atlas.contains("FRESH"), "freshness: {atlas}");
+    assert!(atlas.contains("Raw transcripts are immutable"), "invariant/README purpose: {atlas}");
+}
+
+#[test]
+fn atlas_excludes_stale_facts_and_warns() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    // modify without re-indexing
+    let f = dir.join("services/transcripts.py");
+    let mut src = std::fs::read_to_string(&f).unwrap();
+    src.push_str("\n# worktree edit\n");
+    std::fs::write(&f, src).unwrap();
+    let atlas = run_ok(&dir, &["atlas"]);
+    assert!(
+        atlas.contains("services/transcripts.py changed since indexing"),
+        "stale warning must surface: {atlas}"
+    );
+    // re-index -> fresh again
+    run_ok(&dir, &["index", "--quiet"]);
+    let atlas2 = run_ok(&dir, &["atlas"]);
+    assert!(!atlas2.contains("changed since indexing"), "{atlas2}");
+}
+
+#[test]
+fn atlas_budget_accounting_is_honest() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    // tight budget: the renderer drops low-priority sections and reports it
+    // — it never silently cuts critical content
+    let out = run_ok(&dir, &["atlas", "--budget", "200", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["budget"], 200);
+    assert!(
+        v["truncated"].as_bool().unwrap()
+            || v["exceeded_soft_budget"].as_bool().unwrap(),
+        "tight budget must be reported: {out}"
+    );
+    // critical sections never dropped
+    let dropped: Vec<&str> = v["dropped_sections"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for critical in ["CRITICAL INVARIANTS", "DATA OWNERSHIP", "CONTRACTS"] {
+        assert!(!dropped.contains(&critical), "dropped critical: {dropped:?}");
+    }
+}
+
+#[test]
 fn task_cache_hits_within_an_epoch_and_misses_across() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());

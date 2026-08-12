@@ -101,13 +101,14 @@ fn mcp_server_exposes_six_semantic_tools() {
         names,
         vec![
             "system_overview",
+            "system_atlas",
             "task_context",
             "component_context",
             "flow_context",
             "impact_context",
             "verify_context"
         ],
-        "exactly the six semantic tools"
+        "the seven semantic tools"
     );
     let overview_text = by_id[&3]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(overview_text.contains("IDENTITY"));

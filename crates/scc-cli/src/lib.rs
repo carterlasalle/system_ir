@@ -140,6 +140,7 @@ pub fn compiler<'a>(
     let settings = scc_context::ContextSettings {
         startup_tokens: config.context.startup_tokens,
         task_tokens: config.context.task_tokens,
+        atlas_tokens: config.context.atlas_tokens,
         include_low_confidence_inference: config.context.include_low_confidence_inference,
         rank_salt: format!(
             "{}:{}:{}",

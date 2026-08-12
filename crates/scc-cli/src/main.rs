@@ -68,6 +68,15 @@ enum Commands {
         json: bool,
     },
 
+    /// Full System Atlas: complete architecture for agent session startup
+    Atlas {
+        /// Token budget (default: context.atlas_tokens, 15000)
+        #[arg(long)]
+        budget: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Verify freshness, evidence integrity, and drift
     Verify {
         /// Only print warnings (for hooks)
@@ -258,6 +267,10 @@ enum ContextSub {
         budget: Option<usize>,
         #[arg(long)]
         json: bool,
+        /// Hook mode (UserPromptSubmit): prints nothing unless
+        /// context.inject_task_focus is enabled; caps the focus budget.
+        #[arg(long, hide = true)]
+        hook: bool,
     },
     /// Component context pack
     Component {
@@ -359,8 +372,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => commands::cmd_watch(&root),
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {
-            ContextSub::Task { goal, files, symbols, budget, json } => {
-                commands::cmd_context_task(&root, &goal, &files, &symbols, budget, json)
+            ContextSub::Task { goal, files, symbols, budget, json, hook } => {
+                commands::cmd_context_task(&root, &goal, &files, &symbols, budget, json, hook)
             }
             ContextSub::Component { id, json } => commands::cmd_context_component(&root, &id, json),
             ContextSub::Flow { id, json } => commands::cmd_context_flow(&root, &id, json),
@@ -388,6 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Impact { diff, files, symbols, json } => {
             commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json)
         }
+        Commands::Atlas { budget, json } => commands::cmd_atlas(&root, budget, json),
         Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
         Commands::Drift { json } => commands::cmd_drift(&root, json),
         Commands::Export { format } => commands::cmd_export(&root, &format),

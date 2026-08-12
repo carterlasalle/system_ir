@@ -105,6 +105,21 @@ pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
     Ok(())
 }
 
+/// `scc atlas [--budget N] [--json]` — the full System Atlas.
+pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let config = load_config(root)?;
+    let stale = crate::stale_paths(&store)?;
+    let comp = compiler(&store, &config, stale)?;
+    let pack = comp.ctx().system_atlas(budget);
+    if json {
+        println!("{}", serde_json::to_string(&pack)?);
+    } else {
+        print!("{}", pack.content);
+    }
+    Ok(())
+}
+
 pub fn cmd_context_task(
     root: &Path,
     goal: &str,
@@ -112,7 +127,22 @@ pub fn cmd_context_task(
     symbols: &[String],
     budget: Option<usize>,
     json: bool,
+    hook: bool,
 ) -> crate::Result<()> {
+    if hook {
+        // Wave 2 (§37): UserPromptSubmit injects a task focus only when
+        // context.inject_task_focus is enabled; otherwise silent no-op.
+        let config = load_config(root)?;
+        if !config.context.inject_task_focus {
+            return Ok(());
+        }
+    }
+    // hook mode keeps the focus small (<= 1500 tokens, §37 option B)
+    let budget = if hook {
+        Some(budget.unwrap_or(1500).min(1500))
+    } else {
+        budget
+    };
     let pack_json = cmd_context_task_json(root, goal, files, symbols, budget)?;
     if json {
         println!("{pack_json}");

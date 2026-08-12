@@ -22,7 +22,8 @@ SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
 "$SCC_BIN" verify --warnings 2>/dev/null
 "$SCC_BIN" checkpoint load --inject 2>/dev/null
 echo ""
-"$SCC_BIN" overview 2>/dev/null
+# Wave 2: the FULL System Atlas is the startup architecture injection.
+"$SCC_BIN" atlas 2>/dev/null
 "#;
 
 const USER_PROMPT_SUBMIT: &str = r#"#!/usr/bin/env bash
@@ -44,8 +45,10 @@ len=${#prompt}
 [ "$len" -lt 40 ] && exit 0
 SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
 [ -n "$SCC_STATE" ] && [ -f "$SCC_STATE/scc.db" ] || exit 0
-echo "<!-- SCC TASK CONTEXT (auto-injected) -->"
-"$SCC_BIN" context task "$prompt" 2>/dev/null
+# Wave 2 (§37): the Atlas is already in context; UserPromptSubmit injects
+# a small task focus ONLY when context.inject_task_focus is true (the CLI
+# itself is the gatekeeper — prints nothing when disabled).
+"$SCC_BIN" context task "$prompt" --hook 2>/dev/null
 "#;
 
 const POST_TOOL_USE: &str = r#"#!/usr/bin/env bash
@@ -88,7 +91,8 @@ PYEOF
 "#;
 
 const PRE_COMPACT: &str = r#"#!/usr/bin/env bash
-# SCC PreCompact: persist a checkpoint so rehydration is transparent.
+# SCC PreCompact: re-inject the System Atlas + task checkpoint so the
+# architecture survives compaction (Wave 2 §38).
 SCC_BIN="${SCC_BIN:-scc}"
 command -v "$SCC_BIN" >/dev/null 2>&1 || exit 0
 SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
@@ -96,15 +100,25 @@ SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
 python3 - "$SCC_BIN" <<'PYEOF'
 import json, subprocess, sys
 scc = sys.argv[1]
+def run(args, timeout=15):
+    try:
+        return subprocess.run([scc] + args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
 try:
-    save = subprocess.run([scc, "checkpoint", "save", "--json"], capture_output=True, text=True, timeout=10)
-    load = subprocess.run([scc, "checkpoint", "load", "--inject"], capture_output=True, text=True, timeout=10)
-    content = load.stdout.strip() if load.returncode == 0 and load.stdout.strip() else "SCC checkpoint unavailable at compaction time."
-    if not content:
-        content = json.dumps(json.loads(save.stdout)) if save.returncode == 0 and save.stdout.strip() else content
+    save = run(["checkpoint", "save", "--json"], 10)
+    checkpoint = run(["checkpoint", "load", "--inject"], 10)
+    if not checkpoint.strip():
+        checkpoint = save if save.strip() else "SCC checkpoint unavailable at compaction time."
+    atlas = run(["atlas"])
+    if not atlas.strip():
+        atlas = "SCC atlas unavailable at compaction time."
+    content = "SYSTEM ATLAS (re-injected after compaction)\n\n" + atlas
+    if checkpoint.strip():
+        content += "\n\nTASK CHECKPOINT\n\n" + checkpoint
 except Exception:
-    content = "SCC checkpoint unavailable at compaction time."
-print(json.dumps({"files": {"scc-checkpoint.md": content}}))
+    content = "SCC rehydration unavailable at compaction time."
+print(json.dumps({"files": {"scc-rehydrate.md": content}}))
 PYEOF
 "#;
 

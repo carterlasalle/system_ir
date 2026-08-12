@@ -104,6 +104,16 @@ fn route(
             let budget = req.get("token_budget").and_then(|b| b.as_u64()).map(|b| b as usize);
             Ok((200, serde_json::to_string(&comp.ctx().task_context(goal, &files, &symbols, budget))?))
         }
+        ("GET", "/v1/atlas") => {
+            let store = crate::open_store(root)?;
+            if store.snapshot_status()?.is_none() {
+                return json_err(409, "not indexed".into());
+            }
+            let config = crate::load_config(root)?;
+            let stale = crate::stale_paths(&store)?;
+            let comp = crate::compiler(&store, &config, stale)?;
+            Ok((200, serde_json::to_string(&comp.ctx().system_atlas(None))?))
+        }
         ("GET", p) if p.starts_with("/v1/components/") => {
             let id = p.trim_start_matches("/v1/components/");
             let store = crate::open_store(root)?;

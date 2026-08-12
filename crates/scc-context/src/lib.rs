@@ -4,6 +4,7 @@
 //! an agent task. Packs are structured text with bounded token budgets,
 //! evidence status, and warnings. STALE facts never enter trusted sections.
 
+pub mod atlas;
 pub mod packs;
 pub mod rank;
 
@@ -17,6 +18,7 @@ use std::collections::BTreeMap;
 pub struct ContextSettings {
     pub startup_tokens: usize,
     pub task_tokens: usize,
+    pub atlas_tokens: usize,
     pub include_low_confidence_inference: bool,
     /// Salt for the task-pack cache: derived from the active ranker
     /// configuration so enabling/disabling embeddings invalidates cached
@@ -29,6 +31,7 @@ impl Default for ContextSettings {
         ContextSettings {
             startup_tokens: 6000,
             task_tokens: 10000,
+            atlas_tokens: 15000,
             include_low_confidence_inference: false,
             rank_salt: String::new(),
         }
@@ -205,6 +208,41 @@ impl<'a> ContextCompiler<'a> {
 
     pub fn system_overview(&self) -> ContextPack {
         packs::overview(self)
+    }
+
+    /// Full System Atlas (Wave 2): the startup architecture artifact.
+    /// Cached under the model epoch + stale set like task packs — a stale
+    /// atlas is never served. Budgets are honored honestly: if the minimum
+    /// safe atlas exceeds the budget, `exceeded_soft_budget` is set instead
+    /// of silently cutting critical content.
+    pub fn system_atlas(&self, budget: Option<usize>) -> ContextPack {
+        let budget = budget.unwrap_or(self.settings.atlas_tokens);
+        let epoch = self.store.cache_epoch().unwrap_or_else(|_| "no-epoch".into());
+        let key = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"atlas");
+            h.update(budget.to_string().as_bytes());
+            h.update(self.settings.rank_salt.as_bytes());
+            h.update(epoch.as_bytes());
+            let mut stale: Vec<&String> = self.stale_paths.iter().collect();
+            stale.sort();
+            for p in stale {
+                h.update(p.as_bytes());
+                h.update(b"\0");
+            }
+            format!("atlas:{}", &h.finalize().to_hex()[..20])
+        };
+        if let Ok(Some(cached)) = self.store.cache_get(&key, &epoch) {
+            if let Ok(pack) = serde_json::from_str::<ContextPack>(&cached) {
+                return pack;
+            }
+        }
+        let atlas = atlas::build_atlas(self);
+        let pack = atlas::render_atlas(self, &atlas, budget);
+        if let Ok(json) = serde_json::to_string(&pack) {
+            let _ = self.store.cache_put(&key, &json, &epoch);
+        }
+        pack
     }
 
     pub fn task_context(

@@ -119,7 +119,7 @@ pub fn bench_index(root: &Path, files: usize, lines: usize) -> crate::Result<Ben
 
     // task pack
     let t = Instant::now();
-    crate::commands::cmd_context_task(&dir, "find the helper computation", &[], &[], None, true)?;
+    crate::commands::cmd_context_task(&dir, "find the helper computation", &[], &[], None, true, false)?;
     let task_pack_ms = t.elapsed().as_millis() as u64;
 
     let _store = crate::open_store(&dir)?;

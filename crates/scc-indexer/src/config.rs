@@ -39,6 +39,14 @@ pub struct ContextConfig {
     pub startup_tokens: usize,
     pub task_tokens: usize,
     pub include_low_confidence_inference: bool,
+    /// Full System Atlas token budget (agent startup architecture, 15–20k
+    /// default; small repos naturally produce less).
+    pub atlas_tokens: usize,
+    /// UserPromptSubmit behavior: `false` (default) injects nothing — the
+    /// atlas is already in context and the agent calls SCC on demand;
+    /// `true` injects a small task focus (<= 1500 tokens) for
+    /// repository-changing prompts.
+    pub inject_task_focus: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +173,8 @@ impl Default for ContextConfig {
             startup_tokens: 6000,
             task_tokens: 10000,
             include_low_confidence_inference: false,
+            atlas_tokens: 15000,
+            inject_task_focus: false,
         }
     }
 }

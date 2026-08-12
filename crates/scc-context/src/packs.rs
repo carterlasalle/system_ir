@@ -12,15 +12,15 @@ use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
 use scc_graph::TrustedGraphView;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-struct Section {
-    title: String,
-    body: String,
+pub(crate) struct Section {
+    pub(crate) title: String,
+    pub(crate) body: String,
     /// 10 = never cut, 9 = never cut, 5 = lowest
-    priority: u8,
+    pub(crate) priority: u8,
 }
 
 impl Section {
-    fn new(title: &str, body: String, priority: u8) -> Section {
+    pub(crate) fn new(title: &str, body: String, priority: u8) -> Section {
         Section {
             title: title.to_string(),
             body,
@@ -85,7 +85,7 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
 }
 
 /// Render a pack and record honest budget accounting on it.
-fn finish(
+pub(crate) fn finish(
     pack: &mut ContextPack,
     sections: Vec<Section>,
     budget: usize,
@@ -111,7 +111,7 @@ fn assemble(sections: &[Section]) -> String {
     out.trim_end().to_string()
 }
 
-fn entity_name(view: &TrustedGraphView, id: &str) -> String {
+pub(crate) fn entity_name(view: &TrustedGraphView, id: &str) -> String {
     view.name_of(id)
 }
 
