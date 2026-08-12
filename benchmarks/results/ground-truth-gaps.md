@@ -323,6 +323,7 @@ Format-fixed keys (3 rewritten to atlas notation in `benchmarks/ground-truth/`):
 - `components:runUp` — struct/interface/constructor symbol; no symbol inventory
 - `components:EventProcessor` — struct/interface/constructor symbol; no symbol inventory
 - `components:ProjectOptions` — struct/interface/constructor symbol; no symbol inventory
+- `components:pluginMain` — plugin entrypoint wiring; no flow renders it after the repo's incremental re-index
 - `entrypoints:upCommand` — cobra command var; go extractor emits subcommands by Use name, not the var
 - `entrypoints:downCommand` — cobra command var; go extractor emits subcommands by Use name, not the var
 - `entrypoints:psCmd` — cobra command var; go extractor emits subcommands by Use name, not the var

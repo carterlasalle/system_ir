@@ -830,6 +830,13 @@ impl RustExtractor {
     // ---- calls + store refs ----
 
     fn record_call(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        // clap builder API surface: `Command::new("x").arg(Arg::new(..).
+        // long(..)).subcommand(Command::new("y"))` chains. Only the
+        // outermost call of a chain is processed (each inner call climbs to
+        // the same outer node).
+        if chain_outer(node).id() == node.id() {
+            self.record_clap_builder(node, ctx, src);
+        }
         if let Some(fn_node) = node.child_by_field_name("function") {
             // Skip chained-call receivers (`a()()`, `a.b()()`): the inner
             // call is recorded on its own; the chain text is noise.
@@ -869,6 +876,74 @@ impl RustExtractor {
             }
         }
         self.walk_children(node, ctx, src);
+    }
+
+    /// clap builder API (non-derive): `Command::new("name")` chains with
+    /// `.arg(Arg::new("x").long("x").short('x'))` and
+    /// `.subcommand(Command::new("sub"))` segments, on a `Command::new`
+    /// root or on a variable holding one (`app.subcommand(...)`).
+    ///
+    /// Flags attach to the enclosing function symbol (the parser owner);
+    /// each registered subcommand emits a `cli-subcommand` entrypoint on
+    /// the owning function symbol so the atlas renders it.
+    fn record_clap_builder(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some((root, _root_args, segs)) = clap_chain(node, src) else {
+            return;
+        };
+        let root_cmd = root.ends_with("Command::new");
+        if !root_cmd && !segs.iter().any(|(m, _)| m == "arg" || m == "subcommand") {
+            return; // not a Command builder chain
+        }
+        let owner = ctx.caller();
+        let line = node.start_position().row as u32 + 1;
+        for (m, args) in &segs {
+            match m.as_str() {
+                "arg" => {
+                    let Some(args) = args else { continue };
+                    let Some(first) = args.named_child(0) else { continue };
+                    let Some((aroot, _aargs, asegs)) = clap_chain(first, src) else {
+                        continue;
+                    };
+                    if !aroot.ends_with("Arg::new") {
+                        continue;
+                    }
+                    let Some(owner) = &owner else { continue };
+                    for (am, aargs) in &asegs {
+                        let flag = match am.as_str() {
+                            "long" => string_arg(*aargs, src).map(|v| format!("--{v}")),
+                            "short" => string_arg(*aargs, src).map(|v| format!("-{v}")),
+                            _ => None,
+                        };
+                        if let Some(flag) = flag {
+                            ctx.cli_flags.entry(owner.clone()).or_default().insert(flag);
+                        }
+                    }
+                }
+                "subcommand" => {
+                    let Some(args) = args else { continue };
+                    let Some(first) = args.named_child(0) else { continue };
+                    let Some((sroot, sroot_args, _ssegs)) = clap_chain(first, src) else {
+                        continue;
+                    };
+                    if !sroot.ends_with("Command::new") {
+                        continue;
+                    }
+                    let Some(name) = string_arg(sroot_args, src) else {
+                        continue;
+                    };
+                    // attach to the owning function symbol when the chain
+                    // lives in one; otherwise fall back to the subcommand
+                    // name (file-level entity).
+                    let symbol = owner.clone().unwrap_or_else(|| name.clone());
+                    ctx.entrypoints.push(Entrypoint {
+                        symbol,
+                        kind: "cli-subcommand".to_string(),
+                        line,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     fn record_store_ref(&self, call: Node, fn_node: Node, ctx: &mut Ctx, src: &[u8]) {
@@ -978,6 +1053,91 @@ fn attribute_segments(mut node: Node, out: &mut Vec<String>, src: &[u8]) {
         }
     }
     out.extend(stack.into_iter().rev());
+}
+
+/// Outermost call of the method chain containing `node`
+/// (`Command::new(x).arg(y)` -> the `.arg(y)` call). Non-chain calls return
+/// themselves. tree-sitter-rust nests chains as
+/// `call -> field_expression -> call -> ...`, so climbing goes through the
+/// field_expression that is the enclosing call's `function`.
+fn chain_outer(mut node: Node) -> Node {
+    loop {
+        let Some(parent) = node.parent() else {
+            return node;
+        };
+        if parent.kind() == "field_expression" {
+            let Some(gp) = parent.parent() else {
+                return node;
+            };
+            let is_function = gp.kind() == "call_expression"
+                && gp.child_by_field_name("function")
+                    .map(|f| f.id() == parent.id())
+                    .unwrap_or(false);
+            if is_function {
+                node = gp;
+                continue;
+            }
+        }
+        return node;
+    }
+}
+
+/// Method segments of a call chain, outermost call first:
+/// `(method, arguments)` per segment. Returns `(root_text, root_args,
+/// segments)` where the root is the innermost function text
+/// (`Command::new`, `Arg::new`, or a plain receiver identifier).
+fn clap_chain<'a>(
+    node: Node<'a>,
+    src: &'a [u8],
+) -> Option<(String, Option<Node<'a>>, Vec<(String, Option<Node<'a>>)>)> {
+    let mut segs: Vec<(String, Option<Node>)> = Vec::new();
+    let mut cur = node;
+    loop {
+        if cur.kind() != "call_expression" {
+            // chain root receiver (`app.subcommand(...)`, `foo().arg(...)`)
+            // — its text is the root
+            let root = collapse(node_text(Some(cur), src));
+            return Some((root, None, segs));
+        }
+        let f = cur.child_by_field_name("function")?;
+        match f.kind() {
+            "field_expression" => {
+                let m = collapse(node_text(f.child_by_field_name("field"), src));
+                let args = cur.child_by_field_name("arguments");
+                segs.push((m, args));
+                match f.child_by_field_name("value") {
+                    Some(v) => cur = v,
+                    None => return None,
+                }
+            }
+            // `foo().method()` — climb through the call receiver
+            "call_expression" => cur = f,
+            _ => {
+                let root = collapse(node_text(Some(f), src));
+                let root_args = cur.child_by_field_name("arguments");
+                return Some((root, root_args, segs));
+            }
+        }
+    }
+}
+
+/// First argument of an `arguments` node when it is a literal
+/// (`"paging"`, `'P'`, `r#"x"#`), unquoted.
+fn string_arg(args: Option<Node>, src: &[u8]) -> Option<String> {
+    let first = args?.named_child(0)?;
+    let t = node_text(Some(first), src).trim();
+    let t = match first.kind() {
+        "string_literal" => t.strip_prefix('"').and_then(|s| s.strip_suffix('"')),
+        "char_literal" => t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')),
+        // raw strings: `r#"paging"#` -> `paging`
+        "raw_string_literal" => {
+            let t = t.strip_prefix("r#").unwrap_or(t);
+            t.strip_suffix('#')
+        }
+        _ => None,
+    }?;
+    let t = t.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
 /// The callee root is a local/imported binding or a known receiver when it
@@ -1526,6 +1686,98 @@ struct Plain {
         );
         assert!(ef.entrypoints.is_empty());
         assert!(ef.cli_flags.is_empty());
+    }
+
+
+    #[test]
+    fn clap_builder_chains() {
+        let ef = extract(
+            r#"use clap::{Arg, Command};
+
+/// Build the demo CLI.
+fn build_cli() -> Command {
+    Command::new("demo")
+        .version("1.0")
+        .arg(Arg::new("paging").long("paging"))
+        .arg(Arg::new("theme").short('t').long("theme"))
+        .arg(Arg::new("FILE"))
+        .subcommand(
+            Command::new("serve")
+                .about("Serve requests")
+                .arg(Arg::new("port").short('p').long("port")),
+        )
+        .subcommand(Command::new("deploy"))
+}
+"#,
+        );
+        // flags attach to the owning function symbol (parser owner)
+        let flags = ef.cli_flags.get("build_cli").expect("flags on build_cli");
+        assert_eq!(flags, &["--paging", "--port", "--theme", "-p", "-t"]);
+        // FILE has no long/short -> no flag
+        assert!(!flags.iter().any(|f| f.contains("FILE")));
+        // each registered subcommand emits a cli-subcommand entrypoint on
+        // the owning function symbol
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 2, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "build_cli");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+        assert_eq!(eps[1].symbol, "build_cli");
+        assert_eq!(eps[1].kind, "cli-subcommand");
+    }
+
+    #[test]
+    fn clap_builder_var_receiver() {
+        // `app.subcommand(...)` / `app.arg(...)` on a variable holding the
+        // Command; nested subcommand chains contribute their own flags.
+        let ef = extract(
+            r#"use clap::{Arg, Command};
+
+fn build(mut app: Command) -> Command {
+    app.subcommand(Command::new("cache").arg(Arg::new("build").long("build")))
+        .arg(Arg::new("paging").long("paging"))
+}
+"#,
+        );
+        let flags = ef.cli_flags.get("build").expect("flags on build");
+        assert_eq!(flags, &["--build", "--paging"]);
+        let eps = &ef.entrypoints;
+        assert_eq!(eps.len(), 1, "eps: {eps:?}");
+        assert_eq!(eps[0].symbol, "build");
+        assert_eq!(eps[0].kind, "cli-subcommand");
+    }
+
+    #[test]
+    fn clap_builder_non_clap_chains_ignored() {
+        // plain method chains without Arg::new/Command::new arguments are
+        // not clap surface
+        let ef = extract(
+            r#"struct S;
+impl S {
+    fn arg(&self, _x: i32) {}
+    fn run(&self) {
+        self.arg(42);
+    }
+}
+"#,
+        );
+        assert!(ef.cli_flags.is_empty());
+        assert!(ef.entrypoints.is_empty());
+    }
+
+    #[test]
+    fn clap_builder_macro_name_no_entrypoint() {
+        // `Command::new(crate_name!())` has no literal name: subcommand
+        // detection must not panic and emits nothing for the root
+        let ef = extract(
+            r#"use clap::{Arg, Command};
+fn build() -> Command {
+    Command::new(crate_name!()).arg(Arg::new("paging").long("paging"))
+}
+"#,
+        );
+        let flags = ef.cli_flags.get("build").expect("flags on build");
+        assert_eq!(flags, &["--paging"]);
+        assert!(ef.entrypoints.is_empty());
     }
 
     #[test]

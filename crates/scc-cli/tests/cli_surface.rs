@@ -58,6 +58,18 @@ fn cli_surface_export_and_flows() {
         "cli.rs file entrypoints: {cli_rs_eps:?}"
     );
 
+    // rust clap builder API: `Command::new(..).arg(Arg::new(..).long(..))`
+    // chains attach flags to the function that builds the Command; each
+    // registered subcommand emits a cli-subcommand entrypoint there.
+    assert_eq!(
+        flags_of("symbol", "build_cli"),
+        vec!["--paging", "--port", "--theme", "-p", "-t"]
+    );
+    assert_eq!(
+        eps_of("symbol", "build_cli"),
+        vec!["cli-subcommand", "cli-subcommand"]
+    );
+
     // go cobra: flags on the function that owns the parser (init)
     assert_eq!(flags_of("symbol", "init"), vec!["--env", "--paging", "--port"]);
     let go_eps = eps_of("file", "main.go");
