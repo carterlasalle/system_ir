@@ -385,7 +385,7 @@ impl LanguageExtractor for TypeScriptExtractor {
         }
 
         out
-    }
+        }
 }
 
 /// Traversal context inherited by a subtree.
@@ -1661,7 +1661,7 @@ mod tests {
 
     fn extract(path: &str, content: &str) -> ExtractedFile {
         TypeScriptExtractor::default().extract(&SourceFile::new(path, content))
-    }
+        }
 
     fn find<'a>(syms: &'a [Symbol], name: &str) -> &'a Symbol {
         syms.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("symbol {name} not found"))

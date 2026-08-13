@@ -45,7 +45,7 @@ impl LanguageExtractor for GoExtractor {
         scan_cobra_commands(tree.root_node(), src, &mut ctx.command_uses);
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
-    }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ impl Ctx {
             cli_flags,
             ..ExtractedFile::default()
         }
-    }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,7 +1063,7 @@ mod tests {
     fn extract(src: &str) -> ExtractedFile {
         let f = SourceFile::new("main.go", src);
         GoExtractor::default().extract(&f)
-    }
+        }
 
     fn find_symbol<'a>(ef: &'a ExtractedFile, name: &str) -> &'a Symbol {
         ef.symbols

@@ -48,7 +48,7 @@ impl LanguageExtractor for RustExtractor {
         let mut ctx = Ctx::default();
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
-    }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +424,9 @@ impl Ctx {
             retries: self.retries,
             entrypoints: self.entrypoints,
             cli_flags,
+            facts: Vec::new(),
         }
-    }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,7 +1311,7 @@ mod tests {
     fn extract(src: &str) -> ExtractedFile {
         let f = SourceFile::new("test.rs", src);
         RustExtractor::default().extract(&f)
-    }
+        }
 
     fn find_symbol<'a>(ef: &'a ExtractedFile, name: &str) -> &'a Symbol {
         ef.symbols

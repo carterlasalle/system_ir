@@ -213,7 +213,30 @@ pub struct Entrypoint {
     pub line: u32,
 }
 
-/// Everything a language extractor returns for one file.
+
+
+
+/// One semantic fact (Wave 9): a first-class representation beyond
+/// symbols/calls/routes. Every fact carries its owning symbol so the
+/// writer can attach store evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SemanticFact {
+    /// A public API surface element: `(symbol, export_kind)` where
+    /// export_kind is class/function/trait/interface/macro/type/module.
+    PublicExport { symbol: String, kind: String },
+    /// A decorator/annotation attached to `target` (e.g. @app.get,
+    /// @Controller, #[derive(...)]).
+    Annotation { name: String, target: String },
+    /// A class/struct field (state surface).
+    Field { owner: String, name: String, mutable: bool },
+    /// A framework registration: route/middleware/plugin/DI/event
+    /// registration performed by `owner` naming `target` with a `kind`.
+    Registration { owner: String, kind: String, target: String },
+    /// Configuration ownership: `owner` reads/writes config `key`.
+    Configuration { owner: String, key: String },
+    /// A callback/hook handled by `owner` (framework invokes it).
+    Callback { owner: String, callback: String },
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtractedFile {
     pub symbols: Vec<Symbol>,
@@ -228,6 +251,10 @@ pub struct ExtractedFile {
     /// symbol name. Values are `-`/`--`-prefixed, sorted, deduped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cli_flags: BTreeMap<String, Vec<String>>,
+    /// Semantic facts (public exports, annotations, fields, registrations,
+    /// configuration, callbacks) — additive to the classic extraction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<SemanticFact>,
 }
 
 /// A language extractor. Must be deterministic and side-effect free.

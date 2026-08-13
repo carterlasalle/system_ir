@@ -672,6 +672,14 @@ pub mod kinds {
     pub const FLOW: &str = "flow";
     pub const WORKFLOW: &str = "workflow";
     pub const STATE: &str = "state";
+    // Semantic fact layer (Wave 9): first-class representations the
+    // extractors emit for framework/library semantics.
+    pub const EXPORT: &str = "export";
+    pub const ANNOTATION: &str = "annotation";
+    pub const FIELD: &str = "field";
+    pub const REGISTRY: &str = "registry";
+    pub const MIDDLEWARE: &str = "middleware";
+    pub const DI_BINDING: &str = "di_binding";
     pub const TRANSITION: &str = "transition";
     pub const RESOURCE: &str = "resource";
     pub const TRUST_BOUNDARY: &str = "trust_boundary";
@@ -715,6 +723,13 @@ pub mod predicates {
     pub const OBSERVED_AS: &str = "observed_as";
     pub const DECLARED_AS: &str = "declared_as";
     pub const IMPLEMENTED_BY: &str = "implemented_by";
+    // Semantic fact layer (Wave 9)
+    pub const EXPORTS: &str = "exports";
+    pub const ANNOTATES: &str = "annotates";
+    pub const REGISTERS: &str = "registers";
+    pub const INJECTS: &str = "injects";
+    pub const HANDLES_CALLBACK: &str = "handles_callback";
+    pub const DECORATES: &str = "decorates";
 
     /// All predicates in the documented ontology.
     pub const ALL: &[&str] = &[

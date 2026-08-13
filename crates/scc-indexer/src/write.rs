@@ -244,6 +244,179 @@ impl<'a> Writer<'a> {
             }
         }
 
+        // semantic facts (Wave 9): public exports, annotations, fields,
+        // registrations, configuration, callbacks → entities + typed
+        // relationships with the owning symbol's evidence
+        let sym_evidence = |name: &str| -> Vec<String> {
+            written
+                .symbol_ids
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, id)| self.store.get_entity(id).ok().flatten())
+                .map(|e| e.evidence)
+                .unwrap_or_default()
+        };
+        for fact in &ef.facts {
+            match fact {
+                crate::model::SemanticFact::PublicExport { symbol, kind } => {
+                    if let Some((_, sym_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == symbol)
+                    {
+                        let export_id =
+                            entity_id(self.repo_id, scc_core::kinds::EXPORT, symbol);
+                        let mut se = scc_core::Entity::new(
+                            export_id.clone(),
+                            scc_core::kinds::EXPORT,
+                            symbol.clone(),
+                        );
+                        se.attr("kind", serde_json::json!(kind));
+                        se.evidence = sym_evidence(symbol);
+                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["exports", sym_id, &export_id]),
+                            sym_id.clone(),
+                            scc_core::predicates::EXPORTS,
+                            export_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::Annotation { name, target } => {
+                    if let Some((_, target_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == target)
+                    {
+                        let ann_id =
+                            entity_id(self.repo_id, scc_core::kinds::ANNOTATION, name);
+                        let se = scc_core::Entity::new(
+                            ann_id.clone(),
+                            scc_core::kinds::ANNOTATION,
+                            name.clone(),
+                        );
+                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["annotates", &ann_id, target_id]),
+                            ann_id,
+                            scc_core::predicates::ANNOTATES,
+                            target_id.clone(),
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::Field {
+                    owner,
+                    name,
+                    mutable,
+                } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let field_id = entity_id(
+                            self.repo_id,
+                            scc_core::kinds::FIELD,
+                            &format!("{owner}.{name}"),
+                        );
+                        let mut se = scc_core::Entity::new(
+                            field_id.clone(),
+                            scc_core::kinds::FIELD,
+                            format!("{owner}.{name}"),
+                        );
+                        se.attr("mutable", serde_json::json!(mutable));
+                        se.attr("owner", serde_json::json!(owner));
+                        se.evidence = sym_evidence(owner);
+                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["contains", owner_id, &field_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::CONTAINS,
+                            field_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::Registration {
+                    owner,
+                    kind,
+                    target,
+                } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let target_id = written
+                            .symbol_ids
+                            .iter()
+                            .find(|(n, _)| n == target)
+                            .map(|(_, id)| id.clone())
+                            .unwrap_or_else(|| {
+                                entity_id(self.repo_id, scc_core::kinds::CONTRACT, target)
+                            });
+                        let rel = Relationship::new(
+                            rel_id(&["registers", owner_id, &target_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::REGISTERS,
+                            target_id,
+                            Provenance::Extracted,
+                        );
+                        let mut rel = rel;
+                        if kind == "route" || kind == "middleware" || kind == "event" {
+                            // registered surfaces are contracts themselves
+                            let _ = &mut rel;
+                        }
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::Configuration { owner, key } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let cfg_id = entity_id(
+                            self.repo_id,
+                            scc_core::kinds::CONFIGURATION,
+                            key,
+                        );
+                        let se = scc_core::Entity::new(
+                            cfg_id.clone(),
+                            scc_core::kinds::CONFIGURATION,
+                            key.clone(),
+                        );
+                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["configured_by", &cfg_id, owner_id]),
+                            cfg_id,
+                            scc_core::predicates::CONFIGURED_BY,
+                            owner_id.clone(),
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::Callback { owner, callback } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let cb_id = written
+                            .symbol_ids
+                            .iter()
+                            .find(|(n, _)| n == callback)
+                            .map(|(_, id)| id.clone())
+                            .unwrap_or_else(|| {
+                                entity_id(self.repo_id, scc_core::kinds::SYMBOL, callback)
+                            });
+                        let rel = Relationship::new(
+                            rel_id(&["handles_callback", owner_id, &cb_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::HANDLES_CALLBACK,
+                            cb_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+            }
+        }
+
         // resolved calls
         let symbol_by_name: std::collections::HashMap<&str, &str> = written
             .symbol_ids
@@ -546,6 +719,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{SemanticFact, Symbol};
 
     #[test]
     fn ids_are_deterministic() {
@@ -561,5 +735,79 @@ mod tests {
     fn truncate_works() {
         assert_eq!(truncate("short", 10), "short");
         assert!(truncate(&"x".repeat(300), 240).ends_with('…'));
+    }
+
+    #[test]
+    fn semantic_facts_translate_to_entities_and_relationships() {
+        // Wave 9: PublicExport + Field + Registration facts must produce
+        // typed entities and relationships with the owning symbol's evidence.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = scc_store::Store::open(&dir.path().join("scc.db"), &root).unwrap();
+
+        let mut ef = ExtractedFile::default();
+        ef.symbols.push(Symbol {
+            name: "serve".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            start_line: 1,
+            end_line: 2,
+            exported: true,
+            docstring: None,
+            parent: None,
+        });
+        ef.facts = vec![
+            SemanticFact::PublicExport {
+                symbol: "serve".into(),
+                kind: "function".into(),
+            },
+            SemanticFact::Field {
+                owner: "serve".into(),
+                name: "port".into(),
+                mutable: true,
+            },
+            SemanticFact::Registration {
+                owner: "serve".into(),
+                kind: "route".into(),
+                target: "GET /ping".into(),
+            },
+        ];
+
+        let writer = Writer::new(&store, "r", "rev");
+        writer
+            .write_source("main.py", "h", &ef, &[], &[], &SymbolIndex::new("r"))
+            .unwrap();
+
+        let exps = store.entities_by_kind(scc_core::kinds::EXPORT).unwrap();
+        assert_eq!(exps.len(), 1, "{exps:?}");
+        assert_eq!(exps[0].name, "serve");
+        assert_eq!(
+            exps[0].attributes["kind"],
+            serde_json::json!("function"),
+            "export kind recorded"
+        );
+
+        let fields = store.entities_by_kind(scc_core::kinds::FIELD).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "serve.port");
+
+        let rels = store.all_relationships().unwrap();
+        assert!(
+            rels.iter()
+                .any(|r| r.predicate == scc_core::predicates::EXPORTS),
+            "EXPORTS relationship: {rels:?}"
+        );
+        assert!(
+            rels.iter()
+                .any(|r| r.predicate == scc_core::predicates::REGISTERS),
+            "REGISTERS relationship: {rels:?}"
+        );
+        assert!(
+            rels.iter()
+                .any(|r| r.predicate == scc_core::predicates::CONTAINS
+                    && r.object.contains("serve.port")),
+            "field CONTAINS relationship"
+        );
     }
 }
