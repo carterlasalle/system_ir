@@ -6,27 +6,27 @@ results:        /Users/rocket/system_ir/benchmarks/results/holdout-v3.txt
 layer                     dev    holdout        gap
 architecture            0.907      0.378     -0.529
 entrypoints             0.418      0.422     +0.004
-behavior                0.306      0.007     -0.299
+behavior                0.306      0.057     -0.249
 state_authority         0.367      0.450     +0.083
 contracts               0.237      0.051     -0.186
-overall (gate)          0.447      0.262     -0.185
+overall (gate)          0.447      0.272     -0.175
 
 scored: dev 20 (skipped 0) | holdout 20 (skipped 0)
 precision: dev 0.005 | holdout 0.004
-resolved calls (upgraded): dev 363 | holdout 1722
-density (facts/1k tokens): dev 0.97 | holdout 0.48
-atlas tokens: dev 27827 | holdout 46673
+resolved calls (upgraded): dev 140 | holdout 1168
+density (facts/1k tokens): dev 0.97 | holdout 0.50
+atlas tokens: dev 27847 | holdout 46657
 
-## verdict: OVERFIT (gap = -0.185; tolerance = 0.050)
+## verdict: OVERFIT (gap = -0.175; tolerance = 0.050)
 The holdout corpus lags the dev corpus by more than the tolerance band; rules tuned on the dev corpus do not generalize to unseen repos.
 
 ## holdout repo overall recall (sorted)
   aiohttp                     0.254
-  axios                       0.120
-  black                       0.435
+  axios                       0.149
+  black                       0.468
   chi                         0.224
-  click                       0.278
-  cobra                       0.122
+  click                       0.306
+  cobra                       0.147
   django                      0.332
   guava                       0.575
   helm                        0.090
@@ -34,7 +34,7 @@ The holdout corpus lags the dev corpus by more than the tolerance band; rules tu
   netty                       0.555
   rayon                       0.188
   react                       0.233
-  requests                    0.329
+  requests                    0.415
   ripgrep                     0.236
   tokio                       0.126
   vitest                      0.186
