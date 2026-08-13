@@ -556,6 +556,98 @@ pub struct AtlasInvariant {
     pub severity: Severity,
 }
 
+/// One first-class contract in the atlas (Wave 9): a typed, evidence-backed
+/// contract surface (http/cli/event/config/annotation) with its producer
+/// symbol and the symbols that consume it. `operations` carries the concrete
+/// contract strings (route `GET /api/x`, flag `--paging`, event
+/// `user.created`, config key `DEBUG`, annotation `router.get`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contract {
+    pub id: String,
+    /// `"http" | "cli" | "event" | "config" | "annotation"`.
+    pub kind: String,
+    /// Producer entity id (handler symbol, owning symbol, topic, ...).
+    #[serde(default)]
+    pub producer: String,
+    /// Consuming entity ids (symbols with HANDLES/CONSUMES/READS edges).
+    #[serde(default)]
+    pub consumers: Vec<String>,
+    /// Concrete contract strings rendered as `{kind}: {operation}`.
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+impl Contract {
+    pub fn new(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        producer: impl Into<String>,
+    ) -> Self {
+        Contract {
+            id: id.into(),
+            kind: kind.into(),
+            producer: producer.into(),
+            consumers: Vec::new(),
+            operations: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+}
+
+/// How a symbol can be invoked from outside the process (Wave 9): the
+/// invocation surfaces the flow compiler seeds entrypoints from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationSurfaceKind {
+    /// OS process spawn / executable entry.
+    Process,
+    /// HTTP route handler.
+    Http,
+    /// CLI subcommand / flag surface.
+    Cli,
+    /// Public API export (EXPORTS evidence).
+    PublicApi,
+    /// Event/topic handler.
+    Event,
+    /// Queue consumer (SUBSCRIBES evidence).
+    Queue,
+    /// Scheduled job.
+    Schedule,
+    /// Plugin/extension registration.
+    Plugin,
+    /// Framework callback (HANDLES_CALLBACK evidence).
+    FrameworkCallback,
+    /// Lifecycle callback (JUnit @Before*/@After* annotation facts).
+    Lifecycle,
+}
+
+impl InvocationSurfaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvocationSurfaceKind::Process => "process",
+            InvocationSurfaceKind::Http => "http",
+            InvocationSurfaceKind::Cli => "cli",
+            InvocationSurfaceKind::PublicApi => "public_api",
+            InvocationSurfaceKind::Event => "event",
+            InvocationSurfaceKind::Queue => "queue",
+            InvocationSurfaceKind::Schedule => "schedule",
+            InvocationSurfaceKind::Plugin => "plugin",
+            InvocationSurfaceKind::FrameworkCallback => "framework_callback",
+            InvocationSurfaceKind::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+/// One invocation surface: a symbol reachable from outside the process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvocationSurface {
+    pub symbol: String,
+    pub kind: InvocationSurfaceKind,
+    pub trigger: String,
+}
+
 /// The full System Atlas: structured architecture before rendering. This is
 /// the machine model handed to agents at session start (docs/SYSTEM_DESIGN.md
 /// §8, Wave 2).
@@ -571,7 +663,11 @@ pub struct SystemAtlas {
     #[serde(default)]
     pub entrypoints: Vec<AtlasEntrypoint>,
     #[serde(default)]
-    pub contracts: Vec<String>,
+    pub contracts: Vec<Contract>,
+    /// Explicit uncertainty/coverage map (Wave 9): section key -> line.
+    /// What the model knows AND what it does not.
+    #[serde(default)]
+    pub coverage: BTreeMap<String, String>,
     #[serde(default)]
     pub flows: Vec<AtlasFlow>,
     #[serde(default)]
@@ -925,5 +1021,35 @@ mod tests {
             encode_component("foo-bar"),
             "underscore and dash must not collide"
         );
+    }
+
+    #[test]
+    fn contract_kind_renders_as_operation_lines() {
+        let mut c = Contract::new(
+            "repo://repo/contract/http/get--api-x",
+            "http",
+            "repo://repo/symbol/main.py/handler",
+        );
+        c.operations.push("GET /api/x".into());
+        c.consumers.push("repo://repo/symbol/main.py/handler".into());
+        let lines: Vec<String> = c
+            .operations
+            .iter()
+            .map(|op| format!("{}: {}", c.kind, op))
+            .collect();
+        assert_eq!(lines, vec!["http: GET /api/x"]);
+    }
+
+    #[test]
+    fn invocation_surface_kinds_stringify() {
+        assert_eq!(InvocationSurfaceKind::PublicApi.as_str(), "public_api");
+        assert_eq!(InvocationSurfaceKind::Queue.as_str(), "queue");
+        assert_eq!(InvocationSurfaceKind::Lifecycle.as_str(), "lifecycle");
+        assert_eq!(InvocationSurfaceKind::FrameworkCallback.as_str(), "framework_callback");
+        // serde roundtrip is snake_case-stable
+        let json = serde_json::to_string(&InvocationSurfaceKind::PublicApi).unwrap();
+        assert_eq!(json, "\"public_api\"");
+        let back: InvocationSurfaceKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, InvocationSurfaceKind::PublicApi);
     }
 }

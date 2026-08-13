@@ -218,10 +218,37 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             symbol: e.id.clone(),
         });
     }
+    // Wave 9: invocation-surface seeds (public exports → public_api, queue
+    // consumers → queue, framework callbacks → framework_callback,
+    // lifecycle callbacks → lifecycle, event handlers → event). Additive and
+    // deterministic (invocation_surfaces sorts its output). Deduped by
+    // (name, kind): a symbol that is several surfaces at once (exported AND
+    // callback registrar) renders under each kind — the atlas has no
+    // unique-id constraint.
+    let mut surface_names: BTreeSet<(String, String)> = entrypoints
+        .iter()
+        .map(|e| (e.name.clone(), e.kind.clone()))
+        .collect();
+    for s in scc_graph::flows::invocation_surfaces(view.graph) {
+        let name = view.name_of(&s.symbol);
+        let kind = s.kind.as_str().to_string();
+        if !surface_names.insert((name.clone(), kind.clone())) {
+            continue;
+        }
+        entrypoints.push(AtlasEntrypoint {
+            name,
+            kind,
+            trigger: s.trigger.clone(),
+            symbol: s.symbol.clone(),
+        });
+    }
     entrypoints.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // ---- contracts ----
-    let mut contracts: BTreeSet<String> = BTreeSet::new();
+    // ---- contracts (Wave 9: first-class, typed) ----
+    let mut contracts: Vec<scc_core::Contract> = Vec::new();
+    let mut contract_seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+
+    // http: ROUTE entities (producer = handler symbol)
     for r in view.entities_of_kind(scc_core::kinds::ROUTE) {
         let method = r
             .attributes
@@ -233,53 +260,168 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !path.is_empty() {
-            contracts.insert(format!("{method} {path}").trim().to_string());
+        if path.is_empty() {
+            continue;
         }
-    }
-
-    // CLI contracts: symbols carrying `cli_flags: ["--flag", ...]` attrs
-    // (extractor contract). Deterministic order: grouped by the component
-    // that contains the symbol, flags sorted within each group; symbols not
-    // inside any component fall into a `cli` group.
-    let mut symbol_comp: BTreeMap<String, String> = BTreeMap::new();
-    for c in view.components() {
-        for r in view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
-            for sr in view.out_pred(&r.object, scc_core::predicates::CONTAINS) {
-                symbol_comp.insert(sr.object.clone(), c.name.clone());
+        let handler = r
+            .attributes
+            .get("handler")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut consumers: BTreeSet<String> = BTreeSet::new();
+        for pred in [
+            scc_core::predicates::HANDLES,
+            scc_core::predicates::CONSUMES,
+            scc_core::predicates::READS,
+        ] {
+            for rel in view.in_pred(&r.id, pred) {
+                consumers.insert(entity_name(view, &rel.subject));
             }
         }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: r.id.clone(),
+                kind: "http".into(),
+                producer: handler,
+                consumers: consumers.into_iter().collect(),
+                operations: vec![format!("{method} {path}").trim().to_string()],
+                evidence: r.evidence.clone(),
+            },
+        );
     }
-    let mut cli_by_comp: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut cli_unattributed: BTreeSet<String> = BTreeSet::new();
+
+    // cli: SYMBOL entities carrying `cli_flags: ["--flag", ...]` attrs
+    // (producer = the owning symbol)
     for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
         let Some(flags) = e.attributes.get("cli_flags").and_then(|v| v.as_array()) else {
             continue;
         };
-        let flags: BTreeSet<String> = flags
+        let mut ops: Vec<String> = flags
             .iter()
             .filter_map(|f| f.as_str().map(String::from))
             .collect();
-        if flags.is_empty() {
+        ops.sort();
+        ops.dedup();
+        if ops.is_empty() {
             continue;
         }
-        match symbol_comp.get(&e.id) {
-            Some(comp) => cli_by_comp
-                .entry(comp.clone())
-                .or_default()
-                .extend(flags),
-            None => cli_unattributed.extend(flags),
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: scc_core::entity_id(&store.repo_id, scc_core::kinds::CONTRACT, &format!("cli:{}", e.name)),
+                kind: "cli".into(),
+                producer: e.id.clone(),
+                consumers: Vec::new(),
+                operations: ops,
+                evidence: e.evidence.clone(),
+            },
+        );
+    }
+
+    // event: TOPIC entities with PUBLISHES/SUBSCRIBES edges (producer = the
+    // topic; consumers = the publishing/subscribing symbols)
+    for t in view.entities_of_kind(scc_core::kinds::TOPIC) {
+        let mut consumers: BTreeSet<String> = BTreeSet::new();
+        let mut any = false;
+        for pred in [
+            scc_core::predicates::PUBLISHES,
+            scc_core::predicates::SUBSCRIBES,
+            scc_core::predicates::CONSUMES,
+        ] {
+            for rel in view.in_pred(&t.id, pred) {
+                consumers.insert(entity_name(view, &rel.subject));
+                any = true;
+            }
         }
+        if !any {
+            continue;
+        }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: t.id.clone(),
+                kind: "event".into(),
+                producer: t.id.clone(),
+                consumers: consumers.into_iter().collect(),
+                operations: vec![t.name.clone()],
+                evidence: t.evidence.clone(),
+            },
+        );
     }
-    for (comp, flags) in &cli_by_comp {
-        contracts.insert(format!("{}: {}", comp, flags.iter().cloned().collect::<Vec<_>>().join(", ")));
+
+    // config: CONFIGURATION entities (producer = the owning symbol via
+    // CONFIGURED_BY; consumers = READS edges + the configured-by symbols)
+    for c in view.entities_of_kind(scc_core::kinds::CONFIGURATION) {
+        let mut owners: Vec<String> = view
+            .out_pred(&c.id, scc_core::predicates::CONFIGURED_BY)
+            .into_iter()
+            .map(|r| r.object.clone())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let producer = owners
+            .first()
+            .cloned()
+            .unwrap_or_else(|| c.id.clone());
+        let mut consumers: BTreeSet<String> = BTreeSet::new();
+        for pred in [
+            scc_core::predicates::READS,
+            scc_core::predicates::CONSUMES,
+            scc_core::predicates::HANDLES,
+        ] {
+            for rel in view.in_pred(&c.id, pred) {
+                consumers.insert(entity_name(view, &rel.subject));
+            }
+        }
+        for o in &owners {
+            consumers.insert(entity_name(view, o));
+        }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: c.id.clone(),
+                kind: "config".into(),
+                producer,
+                consumers: consumers.into_iter().collect(),
+                operations: vec![c.name.clone()],
+                evidence: c.evidence.clone(),
+            },
+        );
     }
-    if !cli_unattributed.is_empty() {
-        contracts.insert(format!(
-            "cli: {}",
-            cli_unattributed.iter().cloned().collect::<Vec<_>>().join(", ")
-        ));
+
+    // annotation: ANNOTATION entities (producer = the annotation; consumers
+    // = the annotated symbols)
+    for a in view.entities_of_kind(scc_core::kinds::ANNOTATION) {
+        let mut consumers: BTreeSet<String> = BTreeSet::new();
+        for rel in view.out_pred(&a.id, scc_core::predicates::ANNOTATES) {
+            consumers.insert(entity_name(view, &rel.object));
+        }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: a.id.clone(),
+                kind: "annotation".into(),
+                producer: a.id.clone(),
+                consumers: consumers.into_iter().collect(),
+                operations: vec![a.name.clone()],
+                evidence: a.evidence.clone(),
+            },
+        );
     }
+    // deterministic order for the machine model
+    contracts.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(a.operations.join("\u{1}").cmp(&b.operations.join("\u{1}")))
+            .then(a.producer.cmp(&b.producer))
+    });
 
     // ---- flows: SEQUENCES project from the canonical FlowGraph (P1 §18);
     // the old linear flows table is never the atlas's sequence source ----
@@ -472,7 +614,8 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         purpose,
         components,
         entrypoints,
-        contracts: contracts.into_iter().collect(),
+        contracts,
+        coverage: compute_coverage(ctx),
         flows,
         invariants,
         deployment_units,
@@ -487,6 +630,207 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         evidence_summary,
         warnings,
     }
+}
+
+/// Push one contract, merging consumers/evidence when the same
+/// (kind, operations) surface was already recorded (e.g. the same CLI flag
+/// owned by two symbols). Deterministic: consumers/evidence stay sorted.
+fn push_contract(
+    contracts: &mut Vec<scc_core::Contract>,
+    seen: &mut BTreeMap<(String, String), usize>,
+    c: scc_core::Contract,
+) {
+    let key = (c.kind.clone(), c.operations.join("\u{1}"));
+    if let Some(&idx) = seen.get(&key) {
+        let existing = &mut contracts[idx];
+        for s in c.consumers {
+            if !existing.consumers.contains(&s) {
+                existing.consumers.push(s);
+            }
+        }
+        for e in c.evidence {
+            if !existing.evidence.contains(&e) {
+                existing.evidence.push(e);
+            }
+        }
+        existing.consumers.sort();
+        existing.evidence.sort();
+        return;
+    }
+    seen.insert(key, contracts.len());
+    contracts.push(c);
+}
+
+/// Languages with a real extractor (the indexer's language map). Files in
+/// any other language are scanned but never parsed — the honest `unparsed`
+/// remainder of the coverage map.
+const EXTRACTOR_LANGUAGES: [&str; 6] = [
+    "python",
+    "typescript",
+    "javascript",
+    "go",
+    "java",
+    "rust",
+];
+
+/// Deterministic model-coverage facts (Wave 9): what the model knows AND
+/// what it does not. Every line is computed from the trusted view + store —
+/// no heuristics, no fabrication; when a quantity is unobservable the line
+/// says so explicitly.
+fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
+    let view = &ctx.view;
+    let store = ctx.store;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+
+    // ---- parsed source files % ----
+    let files = store.all_files().unwrap_or_default();
+    let total = files.len();
+    let parsed = files
+        .iter()
+        .filter(|(_, _, lang, _, _)| EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .count();
+    let pct = parsed.checked_mul(100).map(|n| n / total.max(1)).unwrap_or(0);
+    out.insert(
+        "parsed_source_files".to_string(),
+        format!("{pct}% ({parsed}/{total})"),
+    );
+
+    // ---- exported API identified ----
+    let exports = view.entities_of_kind(scc_core::kinds::EXPORT);
+    let export_edges = view
+        .all_rels()
+        .iter()
+        .filter(|r| r.predicate == scc_core::predicates::EXPORTS)
+        .count();
+    out.insert(
+        "exported_api".to_string(),
+        if exports.is_empty() {
+            "none (no EXPORTS evidence)".to_string()
+        } else {
+            format!("{} export entit{} ({} EXPORTS edges)", exports.len(), if exports.len() == 1 { "y" } else { "ies" }, export_edges)
+        },
+    );
+
+    // ---- call targets resolved % ----
+    // RESOLVED (compiler/LSP proof) + EXTRACTED calls with a target that
+    // resolves to an existing entity (symbol or external API), over every
+    // stored CALLS edge. Unresolved calls are never persisted, so the
+    // interesting limit is the LSP-vs-candidate split plus the
+    // external/dynamic receiver count below.
+    let calls: Vec<&scc_core::Relationship> = view
+        .all_rels()
+        .into_iter()
+        .filter(|r| r.predicate == scc_core::predicates::CALLS)
+        .collect();
+    let total_calls = calls.len();
+    let lsp_resolved = calls
+        .iter()
+        .filter(|r| r.provenance == scc_core::Provenance::Resolved)
+        .count();
+    let with_target = calls
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.provenance,
+                scc_core::Provenance::Resolved | scc_core::Provenance::Extracted
+            ) && view.entity(&r.object).is_some()
+        })
+        .count();
+    let pct = with_target.checked_mul(100).map(|n| n / total_calls.max(1)).unwrap_or(0);
+    out.insert(
+        "call_targets_resolved".to_string(),
+        if pct >= 100 {
+            format!("{pct}% ({with_target}/{total_calls}, {lsp_resolved} LSP-RESOLVED)")
+        } else {
+            format!("{pct}% ({with_target}/{total_calls}, {lsp_resolved} LSP-RESOLVED) — exploration still justified in unresolved regions")
+        },
+    );
+
+    // ---- dynamic receivers unresolved ----
+    // Calls whose target is not a local symbol (external/dynamic receivers)
+    // are stored with the external target; unknown-receiver calls are not
+    // persisted at all — reported honestly as such.
+    let unresolved = calls
+        .iter()
+        .filter(|r| {
+            r.provenance != scc_core::Provenance::Resolved
+                && view
+                    .entity(&r.object)
+                    .map(|e| e.kind != scc_core::kinds::SYMBOL)
+                    .unwrap_or(true)
+        })
+        .count();
+    out.insert(
+        "dynamic_receivers_unresolved".to_string(),
+        format!(
+            "{unresolved} (calls whose target is not a local symbol; unknown-receiver calls are not persisted)"
+        ),
+    );
+
+    // ---- invocation surfaces ----
+    let surfaces = scc_graph::flows::invocation_surfaces(view.graph);
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in &surfaces {
+        *by_kind.entry(s.kind.as_str()).or_insert(0) += 1;
+    }
+    let summary: Vec<String> = by_kind
+        .iter()
+        .map(|(k, v)| format!("{k} {v}"))
+        .collect();
+    out.insert(
+        "invocation_surfaces".to_string(),
+        format!("{} ({})", surfaces.len(), summary.join(", ")),
+    );
+
+    // ---- framework registrations unknown ----
+    let known_regs = view
+        .all_rels()
+        .iter()
+        .filter(|r| r.predicate == scc_core::predicates::REGISTERS)
+        .count();
+    out.insert(
+        "framework_registrations_unknown".to_string(),
+        format!("0 ({known_regs} known registrations — unknown surfaces only reported with registry evidence)"),
+    );
+
+    // ---- stale evidence ----
+    let stale = view.stale_paths();
+    out.insert(
+        "stale_evidence".to_string(),
+        if stale.is_empty() {
+            "0 (model FRESH)".to_string()
+        } else {
+            format!("{} changed file(s)", stale.len())
+        },
+    );
+
+    // ---- unparsed files ----
+    let unparsed = files
+        .iter()
+        .filter(|(_, _, lang, _, _)| !EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .count();
+    out.insert(
+        "unparsed_files".to_string(),
+        format!("{unparsed} (config/docs/infra — scanned but not source-parsed)"),
+    );
+
+    // ---- model epoch generations ----
+    let epoch = store.model_epoch().unwrap_or(scc_store::ModelEpoch::zero());
+    let gens = epoch.source
+        + epoch.semantic
+        + epoch.evidence
+        + epoch.intent
+        + epoch.runtime
+        + epoch.derived;
+    out.insert(
+        "model_epoch_generations".to_string(),
+        format!(
+            "{gens} (source {}, semantic {}, evidence {}, intent {}, runtime {}, derived {})",
+            epoch.source, epoch.semantic, epoch.evidence, epoch.intent, epoch.runtime, epoch.derived
+        ),
+    );
+
+    out
 }
 
 /// Render the atlas as compact structured text (agent-facing).
@@ -709,13 +1053,23 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         10,
     ));
 
-    // CONTRACTS (never cut)
+    // CONTRACTS (never cut) — rendered as `{kind}: {operation}` lines from
+    // the first-class Contract model (Wave 9), preserving the contract
+    // strings (route `GET /api/x`, flag `--paging`, event `user.created`,
+    // config key `DEBUG`) so pre-Wave-9 consumers keep matching.
     sections.push(Section::new(
         "CONTRACTS",
         if atlas.contracts.is_empty() {
             "(none)".into()
         } else {
-            atlas.contracts.join("\n")
+            let mut lines: Vec<String> = Vec::new();
+            for c in &atlas.contracts {
+                for op in &c.operations {
+                    lines.push(format!("{}: {}", c.kind, op));
+                }
+            }
+            lines.sort();
+            lines.join("\n")
         },
         9,
     ));
@@ -837,6 +1191,23 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     sections.push(Section::new("RUNTIME", runtime, 8));
 
+    // MODEL COVERAGE (Wave 9): the explicit uncertainty/coverage map — what
+    // the model knows AND what it does not. Priority 7: droppable before
+    // any critical section, so a tight budget never hides invariants.
+    let mut coverage = String::new();
+    for (k, v) in &atlas.coverage {
+        coverage.push_str(&format!("{k}: {v}\n"));
+    }
+    sections.push(Section::new(
+        "MODEL COVERAGE",
+        if coverage.is_empty() {
+            "(none)".into()
+        } else {
+            coverage
+        },
+        7,
+    ));
+
     let warnings = atlas.warnings.clone();
     finish(&mut pack, sections, budget, warnings);
     pack.entity_ids = comp_ids(ctx);
@@ -957,10 +1328,252 @@ fn severity_str(s: scc_core::Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scc_core::{
+        entity_id, kinds, predicates, relationship_id, symbol_id, Entity, Provenance,
+        Relationship,
+    };
+    use scc_store::Store;
+
+    fn test_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = "repo";
+
+        // files: 2 parsed python + 1 unparsed json
+        store.upsert_file("app.py", "h1", "python", "source", 10).unwrap();
+        store.upsert_file("lib.py", "h2", "python", "source", 10).unwrap();
+        store.upsert_file("config.json", "h3", "json", "config", 10).unwrap();
+
+        // symbols
+        let mk = |n: &str| symbol_id(repo, "app.py", n);
+        for n in ["handler", "worker", "reader"] {
+            let mut e = Entity::new(mk(n), kinds::SYMBOL, n);
+            e.attr("file", serde_json::json!("app.py"));
+            store.insert_entity(&e, &["app.py".to_string()]).unwrap();
+        }
+        // cli flags on worker
+        let mut w = store.get_entity(&mk("worker")).unwrap().unwrap();
+        w.attributes
+            .insert("cli_flags".into(), serde_json::json!(["--queue", "--verbose"]));
+        store.insert_entity(&w, &["app.py".to_string()]).unwrap();
+
+        // route with handler
+        let route_id = entity_id(repo, kinds::ROUTE, "GET /api/x");
+        let mut re = Entity::new(route_id.clone(), kinds::ROUTE, "GET /api/x");
+        re.attr("method", serde_json::json!("GET"));
+        re.attr("path", serde_json::json!("/api/x"));
+        re.attr("handler", serde_json::json!(mk("handler")));
+        store.insert_entity(&re, &["app.py".to_string()]).unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(1),
+                    mk("handler"),
+                    predicates::HANDLES,
+                    route_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        // export: handler EXPORTS export(handler, function)
+        let exp_id = entity_id(repo, kinds::EXPORT, "handler");
+        let mut ex = Entity::new(exp_id.clone(), kinds::EXPORT, "handler");
+        ex.attr("kind", serde_json::json!("function"));
+        store.insert_entity(&ex, &["app.py".to_string()]).unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(2),
+                    mk("handler"),
+                    predicates::EXPORTS,
+                    exp_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        // configuration DEBUG configured-by reader
+        let cfg_id = entity_id(repo, kinds::CONFIGURATION, "DEBUG");
+        store
+            .insert_entity(
+                &Entity::new(cfg_id.clone(), kinds::CONFIGURATION, "DEBUG"),
+                &["app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(3),
+                    cfg_id,
+                    predicates::CONFIGURED_BY,
+                    mk("reader"),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        // calls: one EXTRACTED to a local symbol, one EXTRACTED to a missing
+        // external target, one RESOLVED (LSP proof)
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(4),
+                    mk("handler"),
+                    predicates::CALLS,
+                    mk("worker"),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        let ext_id = entity_id(repo, kinds::EXTERNAL_API, "os");
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(5),
+                    mk("handler"),
+                    predicates::CALLS,
+                    ext_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(6),
+                    mk("worker"),
+                    predicates::CALLS,
+                    mk("reader"),
+                    Provenance::Resolved,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        // topic jobs + worker SUBSCRIBES
+        let topic_id = entity_id(repo, kinds::TOPIC, "jobs");
+        store
+            .insert_entity(
+                &Entity::new(topic_id.clone(), kinds::TOPIC, "jobs"),
+                &["app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(7),
+                    mk("worker"),
+                    predicates::SUBSCRIBES,
+                    topic_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        let _graph = scc_graph::RealityGraph::load(&store).unwrap();
+        (dir, store)
+    }
 
     #[test]
     fn kinds_stringify() {
         assert_eq!(flow_kind_str(FlowKind::Sequence), "sequence");
         assert_eq!(severity_str(scc_core::Severity::Critical), "CRITICAL");
+    }
+
+    #[test]
+    fn contracts_and_coverage_from_fact_layer() {
+        let (_dir, store) = test_store();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let atlas = build_atlas(&ctx);
+
+        // contract kinds: http (route), cli (flags), config (DEBUG),
+        // event (topic jobs) — no annotations in this fixture
+        let kinds_found: BTreeSet<String> = atlas.contracts.iter().map(|c| c.kind.clone()).collect();
+        assert_eq!(
+            kinds_found,
+            BTreeSet::from([
+                "http".to_string(),
+                "cli".to_string(),
+                "config".to_string(),
+                "event".to_string()
+            ]),
+            "contract kinds: {:?}",
+            atlas.contracts
+        );
+        let http = atlas.contracts.iter().find(|c| c.kind == "http").unwrap();
+        assert_eq!(http.operations, vec!["GET /api/x"]);
+        assert!(
+            http.consumers.iter().any(|c| c == "handler"),
+            "handler consumes the route: {:?}",
+            http.consumers
+        );
+        let cli = atlas.contracts.iter().find(|c| c.kind == "cli").unwrap();
+        assert_eq!(cli.operations, vec!["--queue", "--verbose"]);
+        let cfg = atlas.contracts.iter().find(|c| c.kind == "config").unwrap();
+        assert_eq!(cfg.operations, vec!["DEBUG"]);
+        assert!(
+            cfg.consumers.iter().any(|c| c == "reader"),
+            "reader consumes DEBUG: {:?}",
+            cfg.consumers
+        );
+
+        // rendered CONTRACTS lines are `{kind}: {operation}`
+        let lines: Vec<String> = atlas
+            .contracts
+            .iter()
+            .flat_map(|c| c.operations.iter().map(|op| format!("{}: {}", c.kind, op)))
+            .collect();
+        for want in ["http: GET /api/x", "cli: --queue", "config: DEBUG", "event: jobs"] {
+            assert!(lines.contains(&want.to_string()), "missing {want}: {lines:?}");
+        }
+
+        // coverage map: honest, deterministic numbers from the store
+        assert_eq!(
+            atlas.coverage.get("parsed_source_files").unwrap(),
+            "66% (2/3)"
+        );
+        assert_eq!(
+            atlas.coverage.get("unparsed_files").unwrap(),
+            "1 (config/docs/infra — scanned but not source-parsed)"
+        );
+        assert!(
+            atlas.coverage.get("exported_api").unwrap().starts_with("1 export entity"),
+            "{:?}",
+            atlas.coverage.get("exported_api")
+        );
+        // 3 calls: 2 with existing targets (worker symbol, reader symbol),
+        // 1 external target with no entity → 66%, 1 LSP-RESOLVED
+        assert_eq!(
+            atlas.coverage.get("call_targets_resolved").unwrap(),
+            "66% (2/3, 1 LSP-RESOLVED) — exploration still justified in unresolved regions"
+        );
+        assert_eq!(
+            atlas.coverage.get("dynamic_receivers_unresolved").unwrap(),
+            "1 (calls whose target is not a local symbol; unknown-receiver calls are not persisted)"
+        );
+        // invocation surfaces: public_api (handler) + queue (worker)
+        assert!(
+            atlas.coverage.get("invocation_surfaces").unwrap().starts_with("2 ("),
+            "{:?}",
+            atlas.coverage.get("invocation_surfaces")
+        );
+        assert_eq!(atlas.coverage.get("stale_evidence").unwrap(), "0 (model FRESH)");
+        assert!(atlas.coverage.contains_key("model_epoch_generations"));
+        assert!(atlas.coverage.contains_key("framework_registrations_unknown"));
+
+        // atlas entrypoints carry the surface kinds
+        let ep_kinds: BTreeSet<&str> = atlas.entrypoints.iter().map(|e| e.kind.as_str()).collect();
+        assert!(ep_kinds.contains("public_api"), "{ep_kinds:?}");
+        assert!(ep_kinds.contains("queue"), "{ep_kinds:?}");
     }
 }

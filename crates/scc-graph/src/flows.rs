@@ -10,7 +10,10 @@
 use crate::components::{component_for_path, ComponentCandidate, prov_rank};
 use crate::{RealityGraph, Result};
 use scc_core::kinds;
-use scc_core::{entity_id, Flow, FlowKind, FlowStep, Provenance, Relationship};
+use scc_core::{
+    entity_id, Flow, FlowKind, FlowStep, InvocationSurface, InvocationSurfaceKind, Provenance,
+    Relationship,
+};
 use scc_store::Store;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -22,7 +25,174 @@ pub struct FlowEntrypoint {
     pub name: String,
     pub trigger: String,
     pub symbol_id: String,
-    pub kind: String, // "route" | "entrypoint" | "intent"
+    pub kind: String, // "route" | "entrypoint" | "intent" | surface kinds
+}
+
+/// JUnit lifecycle annotation names (java extractor emits these as
+/// ANNOTATION facts; the annotated method is a Lifecycle invocation
+/// surface).
+const LIFECYCLE_ANNOTATIONS: [&str; 8] = [
+    "Before",
+    "After",
+    "BeforeClass",
+    "AfterClass",
+    "BeforeAll",
+    "AfterAll",
+    "BeforeEach",
+    "AfterEach",
+];
+
+/// Last path segment of an entity id — the display-name fallback when the
+/// referenced entity does not exist in the graph (matches `name_of`).
+fn last_segment(id: &str) -> String {
+    id.rsplit('/').next().unwrap_or(id).to_string()
+}
+
+/// Seed invocation surfaces from the Wave 9 semantic-fact layer
+/// (deterministic — sorted by (kind, symbol, trigger)):
+/// - public exports: `symbol EXPORTS export` relationships → PublicApi
+/// - queue consumers: `symbol SUBSCRIBES topic` relationships → Queue
+/// - framework callbacks: `owner HANDLES_CALLBACK callback` → FrameworkCallback
+/// - lifecycle callbacks: JUnit @Before*/@After* annotation facts → Lifecycle
+/// - event handlers: `symbol CONSUMES|PUBLISHES topic` relationships → Event
+pub fn invocation_surfaces(graph: &RealityGraph) -> Vec<InvocationSurface> {
+    let mut out: Vec<InvocationSurface> = Vec::new();
+    // dedup key: (kind, symbol id) — keep the first occurrence after a
+    // deterministic sort so multi-trigger symbols pick a stable trigger
+    let mut seen: HashSet<(InvocationSurfaceKind, String)> = HashSet::new();
+
+    // relationships processed in a deterministic order
+    let mut rels: Vec<&Relationship> = graph.all_rels();
+    rels.sort_by(|a, b| {
+        a.subject
+            .cmp(&b.subject)
+            .then(a.predicate.cmp(&b.predicate))
+            .then(a.object.cmp(&b.object))
+    });
+
+    // public exports → PublicApi
+    for r in rels.iter().copied() {
+        if r.predicate != scc_core::predicates::EXPORTS {
+            continue;
+        }
+        let Some(sym) = graph.entity(&r.subject) else { continue };
+        if sym.name.is_empty() {
+            continue;
+        }
+        let kind_attr = graph
+            .entity(&r.object)
+            .and_then(|e| e.attributes.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let key = (InvocationSurfaceKind::PublicApi, r.subject.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: r.subject.clone(),
+                kind: InvocationSurfaceKind::PublicApi,
+                trigger: if kind_attr.is_empty() {
+                    format!("export:{}", sym.name)
+                } else {
+                    format!("export:{} ({kind_attr})", sym.name)
+                },
+            });
+        }
+    }
+
+    // queue consumers → Queue
+    for r in rels.iter().copied() {
+        if r.predicate != scc_core::predicates::SUBSCRIBES {
+            continue;
+        }
+        if graph.entity(&r.subject).is_none() {
+            continue;
+        }
+        let target = graph
+            .entity(&r.object)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| last_segment(&r.object));
+        let key = (InvocationSurfaceKind::Queue, r.subject.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: r.subject.clone(),
+                kind: InvocationSurfaceKind::Queue,
+                trigger: format!("subscribe:{target}"),
+            });
+        }
+    }
+
+    // framework callbacks → FrameworkCallback
+    for r in rels.iter().copied() {
+        if r.predicate != scc_core::predicates::HANDLES_CALLBACK {
+            continue;
+        }
+        if graph.entity(&r.subject).is_none() {
+            continue;
+        }
+        let cb = graph
+            .entity(&r.object)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| last_segment(&r.object));
+        let key = (InvocationSurfaceKind::FrameworkCallback, r.subject.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: r.subject.clone(),
+                kind: InvocationSurfaceKind::FrameworkCallback,
+                trigger: format!("callback:{cb}"),
+            });
+        }
+    }
+
+    // lifecycle callbacks (JUnit @Before*/@After* annotation facts) →
+    // Lifecycle: the annotation entity names the hook, the ANNOTATES
+    // target is the lifecycle method.
+    for a in graph.entities_of_kind(kinds::ANNOTATION) {
+        if !LIFECYCLE_ANNOTATIONS.contains(&a.name.as_str()) {
+            continue;
+        }
+        for r in graph.out_pred(&a.id, scc_core::predicates::ANNOTATES) {
+            let key = (InvocationSurfaceKind::Lifecycle, r.object.clone());
+            if seen.insert(key.clone()) {
+                out.push(InvocationSurface {
+                    symbol: r.object.clone(),
+                    kind: InvocationSurfaceKind::Lifecycle,
+                    trigger: format!("lifecycle:{}", a.name),
+                });
+            }
+        }
+    }
+
+    // event handlers → Event (topics with CONSUMES/PUBLISHES edges)
+    for t in graph.entities_of_kind(kinds::TOPIC) {
+        let mut handlers: BTreeMap<String, String> = BTreeMap::new(); // symbol -> trigger
+        for pred in [
+            scc_core::predicates::CONSUMES,
+            scc_core::predicates::PUBLISHES,
+        ] {
+            for r in graph.in_pred(&t.id, pred) {
+                handlers.entry(r.subject.clone()).or_insert_with(|| format!("event:{}", t.name));
+            }
+        }
+        let mut handlers: Vec<(String, String)> = handlers.into_iter().collect();
+        handlers.sort();
+        for (sym, trigger) in handlers {
+            let key = (InvocationSurfaceKind::Event, sym.clone());
+            if seen.insert(key.clone()) {
+                out.push(InvocationSurface {
+                    symbol: sym,
+                    kind: InvocationSurfaceKind::Event,
+                    trigger,
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(a.symbol.cmp(&b.symbol))
+            .then(a.trigger.cmp(&b.trigger))
+    });
+    out
 }
 
 /// Collect entrypoints: routes (handlers), declared intent flows, symbols
@@ -33,6 +203,11 @@ pub fn collect_entrypoints(
     intent: &[(String, serde_json::Value)],
 ) -> Vec<FlowEntrypoint> {
     let mut out: Vec<FlowEntrypoint> = Vec::new();
+    // Flow ids key on the entrypoint name, so names must stay unique across
+    // kinds: a symbol that is several invocation surfaces at once seeds the
+    // first surface kind (deterministic enum order) and is skipped for the
+    // rest. `invocation_surfaces()` keeps the full multi-kind list for the
+    // atlas entrypoints and coverage counts.
     let mut seen: HashSet<String> = HashSet::new();
 
     // routes
@@ -90,6 +265,26 @@ pub fn collect_entrypoints(
                 trigger: format!("entrypoint:{}", e.name),
                 symbol_id: e.id.clone(),
                 kind: "entrypoint".into(),
+            });
+        }
+    }
+
+    // Wave 9: invocation-surface seeds (public exports, queue consumers,
+    // framework callbacks, lifecycle callbacks, event handlers) — additive
+    // and deterministic (invocation_surfaces sorts its output). Name-dedup
+    // keeps flow ids unique (a symbol already seeded as an entrypoint does
+    // not seed a second flow).
+    for s in invocation_surfaces(graph) {
+        let Some(e) = graph.entity(&s.symbol) else { continue };
+        if e.name.is_empty() {
+            continue;
+        }
+        if seen.insert(e.name.clone()) {
+            out.push(FlowEntrypoint {
+                name: e.name.clone(),
+                trigger: s.trigger.clone(),
+                symbol_id: s.symbol.clone(),
+                kind: s.kind.as_str().to_string(),
             });
         }
     }
@@ -550,6 +745,168 @@ mod tests {
         for p in &paths {
             assert_eq!(p[0], mk("a"));
             assert!(p.len() <= MAX_DEPTH + 1);
+        }
+    }
+
+    #[test]
+    fn invocation_surfaces_seed_from_semantic_facts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = "repo";
+        let mk_sym = |n: &str| scc_core::symbol_id(repo, "app.py", n);
+
+        // symbols
+        for n in ["create_app", "worker", "setup", "handler", "listener"] {
+            let mut e = scc_core::Entity::new(mk_sym(n), kinds::SYMBOL, n);
+            e.attr("file", serde_json::json!("app.py"));
+            store.insert_entity(&e, &["app.py".to_string()]).unwrap();
+        }
+        // public export: create_app EXPORTS export(create_app, kind=function)
+        let exp_id = scc_core::entity_id(repo, kinds::EXPORT, "create_app");
+        let mut exp = scc_core::Entity::new(exp_id.clone(), kinds::EXPORT, "create_app");
+        exp.attr("kind", serde_json::json!("function"));
+        store.insert_entity(&exp, &["app.py".to_string()]).unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(1),
+                    mk_sym("create_app"),
+                    scc_core::predicates::EXPORTS,
+                    exp_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        // queue consumer: worker SUBSCRIBES topic(jobs)
+        let topic_id = scc_core::entity_id(repo, kinds::TOPIC, "jobs");
+        store
+            .insert_entity(&scc_core::Entity::new(topic_id.clone(), kinds::TOPIC, "jobs"), &["app.py".to_string()])
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(2),
+                    mk_sym("worker"),
+                    scc_core::predicates::SUBSCRIBES,
+                    topic_id.clone(),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        // event handler: handler CONSUMES topic(jobs)
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(3),
+                    mk_sym("handler"),
+                    scc_core::predicates::CONSUMES,
+                    topic_id,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        // framework callback: listener HANDLES_CALLBACK setup
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(4),
+                    mk_sym("listener"),
+                    scc_core::predicates::HANDLES_CALLBACK,
+                    mk_sym("setup"),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+        // lifecycle: annotation Before ANNOTATES setup
+        let ann_id = scc_core::entity_id(repo, kinds::ANNOTATION, "Before");
+        store
+            .insert_entity(&scc_core::Entity::new(ann_id.clone(), kinds::ANNOTATION, "Before"), &["app.py".to_string()])
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(5),
+                    ann_id,
+                    scc_core::predicates::ANNOTATES,
+                    mk_sym("setup"),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        let g = RealityGraph::load(&store).unwrap();
+        let surfaces = invocation_surfaces(&g);
+
+        let kinds_of = |k: InvocationSurfaceKind| -> Vec<String> {
+            surfaces
+                .iter()
+                .filter(|s| s.kind == k)
+                .map(|s| format!("{}:{}", s.symbol, s.trigger))
+                .collect()
+        };
+        assert_eq!(
+            kinds_of(InvocationSurfaceKind::PublicApi),
+            vec![format!("{}:export:create_app (function)", mk_sym("create_app"))],
+            "public export surfaces: {surfaces:?}"
+        );
+        assert_eq!(
+            kinds_of(InvocationSurfaceKind::Queue),
+            vec![format!("{}:subscribe:jobs", mk_sym("worker"))],
+            "queue surfaces: {surfaces:?}"
+        );
+        assert_eq!(
+            kinds_of(InvocationSurfaceKind::FrameworkCallback),
+            vec![format!("{}:callback:setup", mk_sym("listener"))],
+            "callback surfaces: {surfaces:?}"
+        );
+        assert_eq!(
+            kinds_of(InvocationSurfaceKind::Lifecycle),
+            vec![format!("{}:lifecycle:Before", mk_sym("setup"))],
+            "lifecycle surfaces: {surfaces:?}"
+        );
+        assert_eq!(
+            kinds_of(InvocationSurfaceKind::Event),
+            vec![format!("{}:event:jobs", mk_sym("handler"))],
+            "event surfaces: {surfaces:?}"
+        );
+
+        // deterministic ordering (InvocationSurfaceKind enum order)
+        let kinds: Vec<&str> = surfaces.iter().map(|s| s.kind.as_str()).collect();
+        let mut sorted = kinds.clone();
+        sorted.sort_by_key(|k| match *k {
+            "process" => 0,
+            "http" => 1,
+            "cli" => 2,
+            "public_api" => 3,
+            "event" => 4,
+            "queue" => 5,
+            "schedule" => 6,
+            "plugin" => 7,
+            "framework_callback" => 8,
+            "lifecycle" => 9,
+            _ => 10,
+        });
+        assert_eq!(kinds, sorted, "surfaces must be deterministically ordered");
+
+        // collect_entrypoints picks the surfaces up (kind strings carried)
+        let eps = collect_entrypoints(&g, &store, &[]);
+        let surface_kinds: Vec<String> = eps
+            .iter()
+            .filter(|e| !matches!(e.kind.as_str(), "route" | "entrypoint" | "intent"))
+            .map(|e| e.kind.clone())
+            .collect();
+        for want in ["public_api", "queue", "framework_callback", "lifecycle", "event"] {
+            assert!(
+                surface_kinds.iter().any(|k| k == want),
+                "entrypoints must include {want}: {surface_kinds:?}"
+            );
         }
     }
 }

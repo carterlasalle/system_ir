@@ -456,7 +456,13 @@ fn build_layers(ctx: &ContextCompiler<'_>, pack: &scc_context::ContextPack) -> A
         }
     }
 
-    let contracts = atlas.contracts.to_vec();
+    // Wave 9: contracts are first-class `Contract` records; the layer
+    // haystack keeps the contract strings (operations) exactly as before.
+    let contracts: Vec<String> = atlas
+        .contracts
+        .iter()
+        .flat_map(|c| c.operations.iter().cloned())
+        .collect();
 
     AtlasLayers {
         architecture: norm_join(arch_parts),

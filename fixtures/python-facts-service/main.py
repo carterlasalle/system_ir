@@ -81,3 +81,16 @@ def create_app() -> FastAPI:
         pass
 
     return app
+
+
+def main() -> None:
+    """CLI entry: argparse surface (cli_flags + cli-subcommand entrypoint)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="facts")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--verbose", action="store_true")
+    sub = parser.add_subparsers()
+    serve = sub.add_parser("serve")
+    serve.add_argument("--workers", type=int, default=1)
+    parser.parse_args()
