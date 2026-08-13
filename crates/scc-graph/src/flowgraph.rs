@@ -17,6 +17,7 @@
 //! concern only (ComponentSpan).
 
 use crate::flows::{collect_entrypoints, walk_calls};
+use crate::components::prov_rank;
 use crate::RealityGraph;
 use scc_core::{
     entity_id, FlowEdge, FlowEdgeKind, FlowGraph, FlowKind, FlowNode, Provenance,
@@ -61,7 +62,29 @@ impl EdgeTable {
         evidence: Vec<String>,
     ) {
         let k = (from, to, format!("{kind:?}"));
-        if self.seen.contains(&k) {
+        // Dedupe is provenance-rank-wins, never first-wins: a target the
+        // language server RESOLVED must not be demoted by an earlier
+        // native EXTRACTED candidate for the same (from, to, kind) triple
+        // (and vice versa, a native candidate keeps the edge when no LSP
+        // evidence exists — holdout repos). Evidence merges.
+        if let Some(existing) = self
+            .edges
+            .iter_mut()
+            .find(|e| e.from == from && e.to == to && format!("{:?}", e.kind) == format!("{kind:?}"))
+        {
+            let have = existing.provenance.unwrap_or(Provenance::Inferred);
+            if prov_rank(prov) > prov_rank(have) {
+                existing.provenance = Some(prov);
+                existing.confidence = prov.default_confidence();
+            }
+            if existing.condition.is_none() {
+                existing.condition = condition;
+            }
+            for e in evidence {
+                if !existing.evidence.contains(&e) {
+                    existing.evidence.push(e);
+                }
+            }
             return;
         }
         self.seen.insert(k);
@@ -160,7 +183,9 @@ pub fn compile_flow_graphs(
                         .insert(r.object.clone());
                     let key = (sym.clone(), r.object.clone());
                     let entry = call_rel.entry(key).or_insert((r.provenance, Vec::new()));
-                    entry.0 = r.provenance;
+                    if prov_rank(r.provenance) > prov_rank(entry.0) {
+                        entry.0 = r.provenance;
+                    }
                     for e in &r.evidence {
                         if !entry.1.contains(e) {
                             entry.1.push(e.clone());
@@ -516,6 +541,35 @@ mod tests {
     fn node_key_and_op() {
         assert_eq!(key("services", "save"), ("services".to_string(), "save".to_string()));
         assert_eq!(op_of(&RealityGraph::empty(), "repo://r/symbol/x.py/f"), "repo://r/symbol/x.py/f");
+    }
+
+    #[test]
+    fn edge_dedupe_is_provenance_rank_wins() {
+        // The same (from, to, kind) triple pushed twice — once with a
+        // native EXTRACTED candidate, once with LSP RESOLVED proof — keeps
+        // the RESOLVED provenance (dedupe is rank-wins, never first-wins),
+        // and a native-only triple keeps its EXTRACTED provenance (flows
+        // exist without LSP).
+        let mut t = EdgeTable::new();
+        t.push(0, 1, FlowEdgeKind::Next, None, Provenance::Extracted, vec!["ev:native".into()]);
+        t.push(0, 1, FlowEdgeKind::Next, None, Provenance::Resolved, vec!["ev:lsp".into()]);
+        assert_eq!(t.edges.len(), 1, "duplicate triple dedupes to one edge");
+        assert_eq!(
+            t.edges[0].provenance,
+            Some(Provenance::Resolved),
+            "RESOLVED wins over an earlier EXTRACTED candidate"
+        );
+        assert!(t.edges[0].evidence.contains(&"ev:native".to_string()));
+        assert!(t.edges[0].evidence.contains(&"ev:lsp".to_string()));
+        assert_eq!(t.in_degree.get(&1), Some(&1), "in-degree counted once");
+
+        let mut native = EdgeTable::new();
+        native.push(0, 1, FlowEdgeKind::Next, None, Provenance::Extracted, Vec::new());
+        assert_eq!(
+            native.edges[0].provenance,
+            Some(Provenance::Extracted),
+            "native-only edge keeps EXTRACTED provenance"
+        );
     }
 
     #[test]

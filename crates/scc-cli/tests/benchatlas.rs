@@ -137,7 +137,7 @@ fn bench_atlas_holdout_compares_and_writes_results_file() {
     // (temp dirs), holdout corpus at <root>/benchmarks/holdout with ground
     // truth at <root>/benchmarks/holdout-ground-truth. The run must print
     // both reports, the gap summary, and write
-    // <root>/benchmarks/results/holdout-v2.txt.
+    // <root>/benchmarks/results/holdout-v3.txt.
     let ws = workspace();
     let tmp = tempfile::TempDir::new().unwrap();
     let corpus = tmp.path().join("corpus");
@@ -197,7 +197,7 @@ fn bench_atlas_holdout_compares_and_writes_results_file() {
         stdout.contains("NO OVERFIT") || stdout.contains("BORDERLINE") || stdout.contains("OVERFIT"),
         "verdict string missing: {stdout}"
     );
-    let results = tmp.path().join("benchmarks/results/holdout-v2.txt");
+    let results = tmp.path().join("benchmarks/results/holdout-v3.txt");
     let text = std::fs::read_to_string(&results)
         .unwrap_or_else(|e| panic!("results file missing: {e}"));
     assert!(text.contains("overall (gate)"), "{text}");

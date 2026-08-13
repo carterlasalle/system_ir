@@ -11,6 +11,7 @@
 //! native resolver's `self`/`this` rule can resolve `self.method()` calls
 //! (resolve.rs splits on '.' — `Type::method` names would never resolve).
 
+use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
@@ -45,7 +46,10 @@ impl LanguageExtractor for RustExtractor {
         let Some(tree) = parser.parse(&file.content, None) else {
             return ExtractedFile::default();
         };
-        let mut ctx = Ctx::default();
+        let mut ctx = Ctx {
+            module_name: facts::module_stem(&file.path),
+            ..Default::default()
+        };
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
         }
@@ -487,6 +491,9 @@ struct Ctx {
     /// (verified in `into_extracted`, once imports are complete).
     reg_candidates: Vec<SemanticFact>,
     scopes: Vec<Scope>,
+    /// Module-symbol name (file stem) owning crate-level STATE facts
+    /// (`static` items).
+    module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
 }
@@ -518,8 +525,31 @@ impl Ctx {
         facts.extend(self.reg_candidates.into_iter().filter(|_| has_axum));
         facts.sort_by_key(fact_key);
         facts.dedup();
+        // Crate-level `static` items are STATE facts owned by the module
+        // symbol (file stem). Ensure it exists unless a real same-named
+        // symbol is declared in this file (Field facts then attach to it —
+        // same file, same component attribution, no id clash).
+        let module_owned = facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::Field { owner, .. } if owner == &self.module_name));
+        let mut symbols = self.symbols;
+        if module_owned
+            && !self.module_name.is_empty()
+            && !symbols.iter().any(|s| s.name == self.module_name)
+        {
+            symbols.push(Symbol {
+                name: self.module_name.clone(),
+                kind: SymbolKind::Module,
+                signature: None,
+                start_line: 1,
+                end_line: 1,
+                exported: false,
+                docstring: None,
+                parent: None,
+            });
+        }
         ExtractedFile {
-            symbols: self.symbols,
+            symbols,
             imports: self.imports,
             calls: self.calls,
             routes: Vec::new(),
@@ -677,6 +707,27 @@ impl RustExtractor {
                 symbol: sym_name.clone(),
                 kind: kind.to_string(),
             });
+        }
+        // Wave 9 builder/factory contracts inside `impl` blocks:
+        // `fn new()/builder()/from_*()` constructors make the type a
+        // factory; `fn with_x(mut self) -> Self` chains make it a builder.
+        if in_impl && !ctx.top_name().is_empty() {
+            let ty = ctx.top_name();
+            if facts::is_factory_name("rust", &name) {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: ty.clone(),
+                    kind: "factory".to_string(),
+                    target: ty.clone(),
+                });
+            } else if facts::is_builder_chain_method(&name)
+                && fn_returns_self_type(node, src)
+            {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: ty.clone(),
+                    kind: "builder".to_string(),
+                    target: ty,
+                });
+            }
         }
         ctx.scopes.push(Scope {
             name: sym_name,
@@ -836,6 +887,8 @@ impl RustExtractor {
         self.walk_children(node, ctx, src);
     }
 
+    /// `const` / `static` items → Const symbols; `static` items additionally
+    /// become mutable crate-level STATE facts.
     fn walk_const(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -860,6 +913,15 @@ impl RustExtractor {
             ctx.facts.push(SemanticFact::PublicExport {
                 symbol: name.clone(),
                 kind: "const".to_string(),
+            });
+        }
+        // `static` items are mutable crate-level state (a `const` is a
+        // compile-time constant — not state).
+        if node.kind() == "static_item" && !ctx.module_name.is_empty() {
+            ctx.facts.push(SemanticFact::Field {
+                owner: ctx.module_name.clone(),
+                name: name.clone(),
+                mutable: true,
             });
         }
         self.walk_children(node, ctx, src);
@@ -1458,6 +1520,15 @@ fn known_receiver(fn_node: Node, src: &[u8]) -> bool {
     }
 }
 
+/// True when a function's return type mentions `Self` (`-> Self`,
+/// `-> &mut Self`) — fluent builder chain evidence.
+fn fn_returns_self_type(node: Node, src: &[u8]) -> bool {
+    let Some(rt) = node.child_by_field_name("return_type") else {
+        return false;
+    };
+    node_text(Some(rt), src).contains("Self")
+}
+
 fn signature(name: &str, fn_node: Node, src: &[u8]) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(params) = fn_node.child_by_field_name("parameters") {
@@ -1668,7 +1739,11 @@ impl Service {
 }
 "#,
         );
-        assert_eq!(ef.symbols.len(), 10);
+        assert_eq!(ef.symbols.len(), 11);
+        // `static FLAG` is module-level state: the file-stem module symbol
+        // owns it (kind Module, not exported).
+        let module = find_symbol(&ef, "test");
+        assert_eq!(module.kind, SymbolKind::Module);
 
         let max = find_symbol(&ef, "MAX");
         assert_eq!(max.kind, SymbolKind::Const);
@@ -2365,5 +2440,66 @@ fn router() { Router::new().route("/a", get(a)).route("/b", get(b)); }
         let ja = serde_json::to_string(&a).unwrap();
         let jb = serde_json::to_string(&b).unwrap();
         assert_eq!(ja, jb);
+    }
+
+    #[test]
+    fn facts_impl_factory_and_builder_plus_static_state() {
+        // tokio-style `Builder::new_multi_thread()` factory +
+        // `with_worker_threads(mut self) -> Self` builder chain; a
+        // crate-level `static` is mutable module state.
+        let ef = extract(
+            r#"static MAX_BLOCKING: usize = 512;
+
+pub struct Builder { threads: usize }
+
+impl Builder {
+    pub fn new() -> Builder { Builder { threads: 1 } }
+    pub fn new_multi_thread() -> Builder { Builder { threads: 4 } }
+    pub fn with_worker_threads(mut self, n: usize) -> Self { self.threads = n; self }
+    pub fn set_name(&mut self, _n: &str) -> &mut Self { self }
+    fn helper() {}
+}
+"#,
+        );
+        let regs: Vec<(String, String, String)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.clone(), kind.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            regs.contains(&("Builder".into(), "factory".into(), "Builder".into())),
+            "impl new factory missing: {regs:?}"
+        );
+        assert!(
+            regs.contains(&("Builder".into(), "builder".into(), "Builder".into())),
+            "fluent with_/set_ builder missing: {regs:?}"
+        );
+        assert_eq!(regs.iter().filter(|(o, k, _)| o == "Builder" && k == "factory").count(), 1, "new + new_multi_thread dedupe to one factory fact: {regs:?}");
+        let fields: Vec<(String, String, bool)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.clone(), name.clone(), *mutable))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fields.contains(&("test".into(), "MAX_BLOCKING".into(), true)),
+            "static item state missing: {fields:?}"
+        );
+        assert!(
+            ef.symbols
+                .iter()
+                .any(|s| s.name == "test" && s.kind == SymbolKind::Module),
+            "module symbol missing: {:?}",
+            ef.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
     }
 }

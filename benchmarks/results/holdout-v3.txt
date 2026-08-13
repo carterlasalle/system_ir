@@ -1,23 +1,23 @@
-# Holdout v2 — dev corpus vs blind holdout
+# Holdout v3 — dev corpus vs blind holdout
 dev corpus:     corpus: /Users/rocket/system_ir/benchmarks/corpus
 holdout corpus: holdout: /Users/rocket/system_ir/benchmarks/holdout
-results:        /Users/rocket/system_ir/benchmarks/results/holdout-v2.txt
+results:        /Users/rocket/system_ir/benchmarks/results/holdout-v3.txt
 
 layer                     dev    holdout        gap
-architecture            0.907      0.364     -0.544
+architecture            0.907      0.378     -0.529
 entrypoints             0.418      0.422     +0.004
-behavior                0.300      0.007     -0.293
+behavior                0.306      0.007     -0.299
 state_authority         0.367      0.450     +0.083
 contracts               0.237      0.051     -0.186
-overall (gate)          0.446      0.259     -0.187
+overall (gate)          0.447      0.262     -0.185
 
 scored: dev 20 (skipped 0) | holdout 20 (skipped 0)
-precision: dev 0.005 | holdout 0.002
-resolved calls (upgraded): dev 657 | holdout 3028
-density (facts/1k tokens): dev 0.98 | holdout 0.48
-atlas tokens: dev 27585 | holdout 46394
+precision: dev 0.005 | holdout 0.004
+resolved calls (upgraded): dev 363 | holdout 1722
+density (facts/1k tokens): dev 0.97 | holdout 0.48
+atlas tokens: dev 27827 | holdout 46673
 
-## verdict: OVERFIT (gap = -0.187; tolerance = 0.050)
+## verdict: OVERFIT (gap = -0.185; tolerance = 0.050)
 The holdout corpus lags the dev corpus by more than the tolerance band; rules tuned on the dev corpus do not generalize to unseen repos.
 
 ## holdout repo overall recall (sorted)
@@ -29,8 +29,8 @@ The holdout corpus lags the dev corpus by more than the tolerance band; rules tu
   cobra                       0.122
   django                      0.332
   guava                       0.575
-  helm                        0.070
-  kustomize                   0.240
+  helm                        0.090
+  kustomize                   0.276
   netty                       0.555
   rayon                       0.188
   react                       0.233

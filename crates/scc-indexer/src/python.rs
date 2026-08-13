@@ -3,6 +3,7 @@
 //! Pure, deterministic extraction: `(path, content) -> ExtractedFile`.
 //! Syntax-level only; cross-file resolution happens in `resolve.rs`.
 
+use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
     SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
@@ -37,7 +38,10 @@ impl LanguageExtractor for PythonExtractor {
         let Some(tree) = parser.parse(&file.content, None) else {
             return ExtractedFile::default();
         };
-        let mut ctx = Ctx::default();
+        let mut ctx = Ctx {
+            module_name: facts::module_stem(&file.path),
+            ..Default::default()
+        };
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
         }
@@ -504,6 +508,12 @@ struct Ctx {
     all_exports: Vec<String>,
     /// Root module names imported in this file (framework verification).
     imported_modules: BTreeSet<String>,
+    /// Module-symbol name (file stem) owning module-level STATE facts.
+    module_name: String,
+    /// Module-level factory functions (name → class it constructs, when a
+    /// `return ClassName(...)` is statically visible; resolved against
+    /// collected class symbols in `into_extracted`).
+    factory_returns: BTreeMap<String, String>,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
 }
@@ -531,10 +541,34 @@ impl Ctx {
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
         let mut facts = self.facts;
+        // Module-level globals are STATE facts owned by the module symbol.
+        // Ensure the module symbol exists (named after the file stem) unless
+        // a real symbol of the same name is declared in this file — then the
+        // Field facts attach to that symbol instead (same file → same
+        // component attribution, no id collision).
+        let module_owned = self
+            .fields
+            .keys()
+            .any(|(owner, _)| owner == &self.module_name);
+        let mut symbols = self.symbols;
+        if module_owned
+            && !self.module_name.is_empty()
+            && !symbols.iter().any(|s| s.name == self.module_name)
+        {
+            symbols.push(Symbol {
+                name: self.module_name.clone(),
+                kind: SymbolKind::Module,
+                signature: None,
+                start_line: 1,
+                end_line: 1,
+                exported: false,
+                docstring: None,
+                parent: None,
+            });
+        }
         // Resolve `__all__` entries against module-level symbols so the
         // export kind is function/class where we can prove it.
-        let module_symbols: BTreeMap<&str, SymbolKind> = self
-            .symbols
+        let module_symbols: BTreeMap<&str, SymbolKind> = symbols
             .iter()
             .filter(|s| s.parent.is_none())
             .map(|s| (s.name.as_str(), s.kind))
@@ -550,13 +584,30 @@ impl Ctx {
                 kind: kind.to_string(),
             });
         }
+        // Module-level factory functions: resolve the constructed class as
+        // the registration target when statically visible.
+        for (fn_name, candidate) in &self.factory_returns {
+            if module_symbols.get(candidate.as_str()) == Some(&SymbolKind::Class) {
+                facts.push(SemanticFact::Registration {
+                    owner: fn_name.clone(),
+                    kind: "factory".to_string(),
+                    target: candidate.clone(),
+                });
+            } else {
+                facts.push(SemanticFact::Registration {
+                    owner: fn_name.clone(),
+                    kind: "factory".to_string(),
+                    target: fn_name.clone(),
+                });
+            }
+        }
         for ((owner, name), mutable) in self.fields {
             facts.push(SemanticFact::Field { owner, name, mutable });
         }
         facts.sort_by_key(fact_sort_key);
         facts.dedup_by(|a, b| a == b);
         ExtractedFile {
-            symbols: self.symbols,
+            symbols,
             imports: self.imports,
             calls: self.calls,
             routes: self.routes,
@@ -686,6 +737,25 @@ impl PythonExtractor {
                 line: start_line,
             });
         }
+        // Wave 9 builder/factory contracts.
+        if in_class {
+            // Fluent builder method: `.set_x()/.with_x()/.add_x()` returning
+            // self makes the class a builder (requests-style request/
+            // session configuration).
+            if facts::is_builder_chain_method(&name) && fn_returns_self(node, src) {
+                let class = ctx.top_name();
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: class.clone(),
+                    kind: "builder".to_string(),
+                    target: class,
+                });
+            }
+        } else if facts::is_factory_name("python", &name) {
+            // Module-level factory function (create_session, make_client...).
+            let target = factory_return_class(node, src)
+                .unwrap_or_else(|| name.clone());
+            ctx.factory_returns.entry(name.clone()).or_insert(target);
+        }
         ctx.scopes.push(Scope {
             name: sym_name,
             is_class: false,
@@ -798,6 +868,22 @@ impl PythonExtractor {
                     kind: "task".to_string(),
                     target: sym.to_string(),
                 });
+            }
+            // `@classmethod` / `@staticmethod` factories (`of`, `from_`,
+            // `create`, `build`, ...) make the class a factory.
+            if matches!(method.as_str(), "classmethod" | "staticmethod") {
+                let class = sym.rsplit_once('.').map(|(c, _)| c).unwrap_or("");
+                let plain = def_plain.unwrap_or("");
+                if !class.is_empty()
+                    && sym.contains('.')
+                    && facts::is_factory_name("python", plain)
+                {
+                    ctx.facts.push(SemanticFact::Registration {
+                        owner: class.to_string(),
+                        kind: "factory".to_string(),
+                        target: class.to_string(),
+                    });
+                }
             }
         }
         // retry/backoff decoration
@@ -1039,7 +1125,9 @@ impl PythonExtractor {
                 }
             }
         }
-        // `__all__ = [...]` at module level
+        // `__all__ = [...]` at module level + module-level globals (STATE
+        // facts owned by the module symbol; python has no const, so every
+        // module binding is mutable state).
         if ctx.scopes.is_empty() {
             if let Some(l) = left {
                 if l.kind() == "identifier" && node_text(Some(l), src) == "__all__" {
@@ -1052,6 +1140,15 @@ impl PythonExtractor {
                                 }
                             }
                         }
+                    }
+                } else if l.kind() == "identifier" && !ctx.module_name.is_empty() {
+                    let name = clean(node_text(Some(l), src));
+                    if !name.is_empty() {
+                        let owner = ctx.module_name.clone();
+                        ctx.fields
+                            .entry((owner, name))
+                            .and_modify(|m| *m = true)
+                            .or_insert(true);
                     }
                 }
             }
@@ -1670,6 +1767,54 @@ fn first_positional_arg_text(call: Node, src: &[u8]) -> Option<String> {
 
 /// Heuristic mutability of a field initializer: mutable containers and call
 /// results are treated as mutable state; literals (str/int/bool/None) are not.
+///
+/// True when a method body contains a bare `return self` (fluent builder
+/// evidence for `.set_x()/.with_x()/.add_x()` chains). The returned
+/// expression is a direct named child of the `return_statement` (no
+/// `value` field in this grammar version).
+fn fn_returns_self(node: Node, src: &[u8]) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    for c in body.named_children(&mut cursor) {
+        if c.kind() != "return_statement" {
+            continue;
+        }
+        if let Some(v) = c.named_children(&mut c.walk()).next() {
+            if v.kind() == "identifier" && node_text(Some(v), src) == "self" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Class a module-level factory function constructs: the first
+/// `return ClassName(...)` with a plain identifier callee.
+fn factory_return_class(node: Node, src: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    for c in body.named_children(&mut cursor) {
+        if c.kind() != "return_statement" {
+            continue;
+        }
+        let v = c.named_children(&mut c.walk()).next()?;
+        if v.kind() != "call" {
+            continue;
+        }
+        let f = v.child_by_field_name("function")?;
+        if f.kind() != "identifier" {
+            continue;
+        }
+        let n = clean(node_text(Some(f), src));
+        if !n.is_empty() {
+            return Some(n);
+        }
+    }
+    None
+}
+
 fn value_is_mutable(right: Option<Node>) -> bool {
     let Some(r) = right else {
         return false;
@@ -2374,12 +2519,25 @@ mod tests {
             1
         );
 
-        // no framework import → registrations suppressed
+        // no framework import → framework registrations suppressed; the
+        // module-level factory contract (`create_app`) still surfaces.
         let bare = extract("def create_app():\n    app.include_router(router)\n    return app\n");
-        assert!(bare
-            .facts
-            .iter()
-            .all(|f| !matches!(f, SemanticFact::Registration { .. })));
+        assert!(bare.facts.iter().all(|f| !matches!(
+            f,
+            SemanticFact::Registration { kind, .. } if kind != "factory"
+        )));
+        assert_eq!(
+            facts_of(
+                &bare,
+                &SemanticFact::Registration {
+                    owner: "create_app".into(),
+                    kind: "factory".into(),
+                    target: "create_app".into(),
+                }
+            )
+            .len(),
+            1
+        );
 
         // celery task registration targets the decorated function
         let celery = extract("from celery import Celery\n\ncelery = Celery(\"facts\")\n\n@celery.task\ndef send_email(address):\n    return None\n");
@@ -2479,5 +2637,82 @@ mod tests {
         for f in &ef.facts {
             assert!(seen.insert(format!("{f:?}")), "duplicate fact: {f:?}");
         }
+    }
+
+    fn regs(ef: &ExtractedFile) -> Vec<(String, String, String)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.clone(), kind.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fields(ef: &ExtractedFile) -> Vec<(String, String, bool)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.clone(), name.clone(), *mutable))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn facts_module_globals_are_state() {
+        // Module-level assignments are mutable STATE owned by the module
+        // symbol (file stem `test`), with `__all__` excluded.
+        let ef = extract(
+            "import logging\n\nDEFAULT_TIMEOUT = 30\nlogger = logging.getLogger(\"app\")\n__all__ = [\"DEFAULT_TIMEOUT\"]\n",
+        );
+        let fs = fields(&ef);
+        assert!(
+            fs.contains(&("test".into(), "DEFAULT_TIMEOUT".into(), true)),
+            "module global missing: {fs:?}"
+        );
+        assert!(
+            fs.contains(&("test".into(), "logger".into(), true)),
+            "module global (call result) missing: {fs:?}"
+        );
+        assert!(
+            !fs.iter().any(|(_, n, _)| n == "__all__"),
+            "__all__ must not be state: {fs:?}"
+        );
+        // the module symbol owns the globals
+        assert!(
+            ef.symbols
+                .iter()
+                .any(|s| s.name == "test" && s.kind == SymbolKind::Module),
+            "module symbol missing: {:?}",
+            ef.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn facts_fluent_builder_and_factories_python() {
+        // requests-style: Session.with_timeout returns self → builder;
+        // @classmethod from_config → factory; create_session → module
+        // factory resolving its constructed class.
+        let ef = extract(
+            "class Session:\n    def __init__(self):\n        self._timeout = 30\n    def with_timeout(self, t):\n        self._timeout = t\n        return self\n    @classmethod\n    def from_config(cls, cfg):\n        return cls(cfg)\n\ndef create_session(cfg):\n    return Session(cfg)\n",
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("Session".into(), "builder".into(), "Session".into())),
+            "fluent builder missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("Session".into(), "factory".into(), "Session".into())),
+            "classmethod factory missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("create_session".into(), "factory".into(), "Session".into())),
+            "module factory must resolve its class: {rs:?}"
+        );
     }
 }

@@ -7,6 +7,7 @@
 //! input: error/missing nodes are skipped and the traversal is iterative
 //! (no recursion depth limits).
 
+use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
     SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
@@ -404,6 +405,30 @@ impl LanguageExtractor for TypeScriptExtractor {
         // (nest decorators, express registrations, react/svelte callbacks)
         // are gated on the matching import; see `collect_facts`.
         out.facts = collect_facts(&root, src, &file.path, &out.imports);
+
+        // Module-level mutable globals (`let x = ...`) are STATE facts owned
+        // by the module symbol (file stem). Ensure that symbol exists unless
+        // a real same-named symbol is declared in this file (Field facts then
+        // attach to it — same file, same component attribution, no id clash).
+        let module_name = facts::module_stem(&file.path);
+        let needs_module = out.facts.iter().any(|f| {
+            matches!(f, SemanticFact::Field { owner, .. } if owner == &module_name)
+        });
+        if needs_module
+            && !module_name.is_empty()
+            && !out.symbols.iter().any(|s| s.name == module_name)
+        {
+            out.symbols.push(Symbol {
+                name: module_name.clone(),
+                kind: SymbolKind::Module,
+                signature: None,
+                start_line: 1,
+                end_line: 1,
+                exported: false,
+                docstring: None,
+                parent: None,
+            });
+        }
 
         out
         }
@@ -824,6 +849,8 @@ fn last_named_arg(call: &Node, src: &[u8]) -> Option<String> {
 /// panics: hostile input just yields fewer facts.
 /// panics: hostile input just yields fewer facts.
 fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec<SemanticFact> {
+    // Module-symbol name (file stem): owner of module-level STATE facts.
+    let module_name = facts::module_stem(path);
     let nest = has_import(imports, |m| m.starts_with("@nestjs/"));
     let express = has_import(imports, |m| m == "express");
     let react = has_import(imports, |m| m == "react");
@@ -995,6 +1022,50 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                         }
                     }
                 }
+                // Static factory methods (`static of/create/from/...`) and
+                // fluent builder chains (`.withX()/.setX()/.addX()` returning
+                // `this`) make the class a factory/builder.
+                if module_level {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        let mut cur = body.walk();
+                        for m in body.named_children(&mut cur) {
+                            if m.kind() != "method_definition" {
+                                continue;
+                            }
+                            let mname = m
+                                .child_by_field_name("name")
+                                .map(|n| node_text(&n, src).to_string())
+                                .unwrap_or_default();
+                            if mname.is_empty() {
+                                continue;
+                            }
+                            // `static` is a direct keyword child of the
+                            // method_definition (no modifiers field here).
+                            let is_static = m
+                                .children(&mut m.walk())
+                                .any(|k| k.kind() == "static");
+                            if is_static && facts::is_factory_name("typescript", &mname) {
+                                facts.push(SemanticFact::Registration {
+                                    owner: name.clone(),
+                                    kind: "factory".into(),
+                                    target: name.clone(),
+                                });
+                                facts.push(SemanticFact::PublicExport {
+                                    symbol: format!("{name}.{mname}"),
+                                    kind: "method".into(),
+                                });
+                            } else if facts::is_builder_chain_method(&mname)
+                                && method_returns_this(m, src)
+                            {
+                                facts.push(SemanticFact::Registration {
+                                    owner: name.clone(),
+                                    kind: "builder".into(),
+                                    target: name.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
                 // Decorators on a plain (non-exported) decorated class.
                 if nest {
                     let mut cur = node.walk();
@@ -1036,15 +1107,27 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                 }
             }
             "function_declaration" | "generator_function_declaration" => {
-                if module_level && is_exported(&node) {
+                if module_level {
                     let n = node
                         .child_by_field_name("name")
                         .map(|n| node_text(&n, src).to_string())
                         .unwrap_or_default();
-                    if !n.is_empty() {
+                    if n.is_empty() {
+                        continue;
+                    }
+                    if is_exported(&node) {
                         facts.push(SemanticFact::PublicExport {
-                            symbol: n,
+                            symbol: n.clone(),
                             kind: "function".into(),
+                        });
+                    }
+                    // Module-level factory functions (vue `createApp`,
+                    // axios-style `createInstance`/`createClient`).
+                    if facts::is_factory_name("typescript", &n) {
+                        facts.push(SemanticFact::Registration {
+                            owner: n.clone(),
+                            kind: "factory".into(),
+                            target: n,
                         });
                     }
                 }
@@ -1094,6 +1177,13 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
             "lexical_declaration" => {
                 if module_level {
                     let exported = is_exported(&node);
+                    // `let` bindings are mutable module state; `const` is
+                    // intent-immutable (skip). The declaration keyword is the
+                    // `kind` field (`let`/`const`/`var`).
+                    let is_let = node
+                        .child_by_field_name("kind")
+                        .map(|k| node_text(&k, src) == "let")
+                        .unwrap_or(false);
                     let mut cur = node.walk();
                     for d in node.named_children(&mut cur) {
                         if d.kind() != "variable_declarator" {
@@ -1106,11 +1196,35 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                         if name.is_empty() {
                             continue;
                         }
+                        if is_let {
+                            facts.push(SemanticFact::Field {
+                                owner: module_name.clone(),
+                                name: name.clone(),
+                                mutable: true,
+                            });
+                        }
                         if exported {
                             facts.push(SemanticFact::PublicExport {
                                 symbol: name.clone(),
                                 kind: "const".into(),
                             });
+                        }
+                        // Module-level arrow/function consts with factory-ish
+                        // names (vue `createApp = (...) => ...`).
+                        if facts::is_factory_name("typescript", &name) {
+                            let fn_val = d.child_by_field_name("value").map(|v| {
+                                matches!(
+                                    v.kind(),
+                                    "arrow_function" | "function_expression" | "generator_function"
+                                )
+                            });
+                            if fn_val.unwrap_or(false) {
+                                facts.push(SemanticFact::Registration {
+                                    owner: name.clone(),
+                                    kind: "factory".into(),
+                                    target: name.clone(),
+                                });
+                            }
                         }
                         // next.config: the exported config object registers
                         // with the next framework (filename-verified).
@@ -1122,6 +1236,45 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                                         kind: "next-config".into(),
                                         target: "next".into(),
                                     });
+                                }
+                            }
+                        }
+                        // Object-literal factory namespaces (zod `z = {
+                        // object(...), string(...) }`, axios `axios = {
+                        // create(...) }`): function-valued properties with
+                        // factory-ish names are factories of that namespace.
+                        if let Some(v) = d.child_by_field_name("value") {
+                            if v.kind() == "object" {
+                                let mut cur2 = v.walk();
+                                for pair in v.named_children(&mut cur2) {
+                                    if pair.kind() != "pair" {
+                                        continue;
+                                    }
+                                    let key = pair
+                                        .child_by_field_name("key")
+                                        .map(|k| node_text(&k, src).to_string())
+                                        .unwrap_or_default();
+                                    if key.is_empty()
+                                        || !facts::is_namespace_factory_key(&key)
+                                    {
+                                        continue;
+                                    }
+                                    let fn_val = pair
+                                        .child_by_field_name("value")
+                                        .map(|vv| {
+                                            matches!(
+                                                vv.kind(),
+                                                "arrow_function" | "function_expression"
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if fn_val {
+                                        facts.push(SemanticFact::Registration {
+                                            owner: name.clone(),
+                                            kind: "factory".into(),
+                                            target: key,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1738,6 +1891,27 @@ fn signature_of(decl: &Node, src: &[u8]) -> Option<String> {
 }
 
 /// Signature for a const with a function/arrow value.
+/// True when a class method body contains `return this;` (fluent builder
+/// evidence for `.withX()/.setX()/.addX()` chains). The returned `this`
+/// is a direct child of the `return_statement` (no `argument` field in
+/// this grammar version).
+fn method_returns_this(node: Node, src: &[u8]) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cur = body.walk();
+    for c in body.named_children(&mut cur) {
+        if c.kind() != "return_statement" {
+            continue;
+        }
+        let mut c2 = c.walk();
+        if c.children(&mut c2).any(|k| node_text(&k, src) == "this") {
+            return true;
+        }
+    }
+    false
+}
+
 fn const_signature(declarator: &Node, src: &[u8]) -> Option<String> {
     let name = field_text(declarator, "name", src).unwrap_or_default();
     let value = declarator.child_by_field_name("value")?;
@@ -3519,5 +3693,111 @@ export class M {}
         assert!(ef2.facts.is_empty());
         let ef3 = extract("src/broken3.ts", "app.get(\" / broken\nprocess.env.");
         assert!(ef3.facts.is_empty());
+    }
+
+    fn regs(ef: &ExtractedFile) -> Vec<(&str, &str, &str)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.as_str(), kind.as_str(), target.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fields(ef: &ExtractedFile) -> Vec<(&str, &str, bool)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.as_str(), name.as_str(), *mutable))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn facts_module_level_let_is_state() {
+        // `let` bindings at module level are mutable STATE owned by the
+        // module symbol (file stem); `const` is intent-immutable → skipped.
+        let ef = extract(
+            "src/client.ts",
+            "let timeout = 3000;\nconst VERSION = \"1.0\";\nexport function createClient(cfg: unknown) { return timeout; }\n",
+        );
+        let fs = fields(&ef);
+        assert!(
+            fs.contains(&("client", "timeout", true)),
+            "module let global missing: {fs:?}"
+        );
+        assert!(
+            !fs.iter().any(|(_, n, _)| *n == "VERSION"),
+            "const must not be mutable state: {fs:?}"
+        );
+        // the module symbol owns the global
+        assert!(
+            ef.symbols
+                .iter()
+                .any(|s| s.name == "client" && s.kind == SymbolKind::Module),
+            "module symbol missing: {:?}",
+            ef.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        // createClient is a module factory
+        assert!(
+            regs(&ef).contains(&("createClient", "factory", "createClient")),
+            "factory registration missing: {:?}",
+            regs(&ef)
+        );
+    }
+
+    #[test]
+    fn facts_class_static_factory_and_fluent_builder() {
+        let ef = extract(
+            "src/pool.ts",
+            "export class Pool {\n  static create(opts: unknown): Pool { return new Pool(opts); }\n  static of(x: unknown): Pool { return new Pool(x); }\n  withTimeout(ms: number): this { this.ms = ms; return this; }\n}\n",
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("Pool", "factory", "Pool")),
+            "static factory missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("Pool", "builder", "Pool")),
+            "fluent builder missing: {rs:?}"
+        );
+        // the factory method itself is public surface
+        assert!(
+            ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::PublicExport { symbol, kind } if symbol == "Pool.create" && kind == "method"
+            )),
+            "factory method export missing: {:?}",
+            ef.facts
+        );
+    }
+
+    #[test]
+    fn facts_object_literal_factory_namespace() {
+        // zod-style `z = { object(...), string(...) }` / axios-style
+        // `axios = { create(...) }`.
+        let ef = extract(
+            "src/z.ts",
+            "export const z = {\n  object: (shape: unknown) => new ZodObject(shape),\n  string: () => new ZodString(),\n  name: \"zod\",\n};\n",
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("z", "factory", "object")),
+            "object factory missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("z", "factory", "string")),
+            "string factory missing: {rs:?}"
+        );
+        assert!(
+            !rs.iter().any(|(_, _, t)| *t == "name"),
+            "non-function property must not be a factory: {rs:?}"
+        );
     }
 }

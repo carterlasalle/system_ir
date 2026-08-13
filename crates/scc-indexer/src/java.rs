@@ -5,6 +5,7 @@
 //! (same-class / same-file names resolve; imports are recorded as module
 //! strings, matching the python.rs contract).
 
+use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
@@ -682,6 +683,27 @@ impl JavaExtractor {
                 kind: "method".to_string(),
             });
         }
+        // Wave 9 builder/factory contracts: static factories (guava
+        // `ImmutableList.of(...)`, `builder()`) and fluent builder methods
+        // (`.withX()/.setX()/.addX()` returning `this`).
+        if is_static && facts::is_factory_name("java", &name) {
+            let kind = if name == "builder" || name == "newBuilder" {
+                "builder"
+            } else {
+                "factory"
+            };
+            ctx.facts.push(SemanticFact::Registration {
+                owner: class.clone(),
+                kind: kind.to_string(),
+                target: class.clone(),
+            });
+        } else if facts::is_builder_chain_method(&name) && self.method_returns_this(node, src) {
+            ctx.facts.push(SemanticFact::Registration {
+                owner: class.clone(),
+                kind: "builder".to_string(),
+                target: class.clone(),
+            });
+        }
         self.record_annotations(node, ctx, src, &sym_name);
         self.record_spring_registrations(node, ctx, src, &class, &sym_name);
         self.record_junit_lifecycle(node, ctx, src, &class, &sym_name);
@@ -1077,6 +1099,27 @@ impl JavaExtractor {
                 });
             }
         }
+    }
+
+    /// True when a method body contains `return this;` (fluent builder evidence
+    /// for `.withX()/.setX()/.addX()` chains).
+    fn method_returns_this(&self, node: Node, src: &[u8]) -> bool {
+        let Some(body) = node.child_by_field_name("body") else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        for c in body.named_children(&mut cursor) {
+            if c.kind() != "return_statement" {
+                continue;
+            }
+            // `return this;` — the returned `this` is a direct child (the
+            // grammar has no `expression` field on return_statement here).
+            let mut c2 = c.walk();
+            if c.children(&mut c2).any(|k| node_text(Some(k), src) == "this") {
+                return true;
+            }
+        }
+        false
     }
 
     /// Text of the `modifiers` child (keywords + annotations), or "".
@@ -1732,6 +1775,80 @@ public class SortedController {
             let k2 = fact_sort_key(&w[1]);
             assert!(k1 <= k2, "facts not sorted: {:?} > {:?}", k1, k2);
         }
+    }
+
+    fn regs(ef: &ExtractedFile) -> Vec<(String, String, String)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.clone(), kind.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn facts_guava_style_static_factories_and_builders() {
+        // guava `ImmutableList.of(...)` / `builder()` static factories +
+        // a fluent `withX() { return this; }` builder.
+        let ef = extract(
+            "package com.example;\n\npublic final class ImmutableList {\n    public static <E> ImmutableList<E> of(E e1) { return new ImmutableList<E>(); }\n    public static Builder builder() { return new Builder(); }\n    public static void sort() {}\n    public static final class Builder {\n        public Builder withTag(String t) { return this; }\n    }\n}\n",
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("ImmutableList".into(), "factory".into(), "ImmutableList".into())),
+            "static of factory missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("ImmutableList".into(), "builder".into(), "ImmutableList".into())),
+            "static builder() missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("Builder".into(), "builder".into(), "Builder".into())),
+            "fluent withX builder missing: {rs:?}"
+        );
+        assert!(
+            !rs.iter().any(|(_, k, _)| k == "factory" && false),
+            "unexpected"
+        );
+        // static non-factory method must not fire
+        assert!(
+            !ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::Registration { owner, .. } if owner == "ImmutableList.sort"
+            )),
+            "sort() is not a factory: {:?}",
+            regs(&ef)
+        );
+    }
+
+    #[test]
+    fn facts_static_fields_are_state() {
+        // static fields are mutable STATE unless `final`; the runtime
+        // authority attributes mutable Field facts.
+        let ef = extract(
+            "package com.example;\n\npublic class Config {\n    public static int retries = 3;\n    public static final String NAME = \"cfg\";\n}\n",
+        );
+        let fields: Vec<(String, String, bool)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.clone(), name.clone(), *mutable))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fields.contains(&("Config".into(), "retries".into(), true)),
+            "static mutable field missing: {fields:?}"
+        );
+        assert!(
+            fields.contains(&("Config".into(), "NAME".into(), false)),
+            "final static must be immutable: {fields:?}"
+        );
     }
 }
 

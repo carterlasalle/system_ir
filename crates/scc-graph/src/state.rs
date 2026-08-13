@@ -698,4 +698,104 @@ mod tests {
         let runtime = state.get(S_RUNTIME).map(|v| v.as_slice()).unwrap_or(&[]);
         assert!(runtime.is_empty(), "immutable field is not runtime state: {runtime:?}");
     }
+
+    /// Wave 9 symbol→state authority: module-level globals (owned by the
+    /// module symbol) and class statics are mutable FIELD facts attributed
+    /// to their component in the RUNTIME STATE section + claims bridge.
+    #[test]
+    fn module_global_and_static_state_attribute_to_component() {
+        let (_dir, store) = open();
+        let repo = store.repo_id.clone();
+        component(&store, "api", &["api/app.py"]);
+
+        // module symbol (file stem) owns a module-level mutable global
+        let module = sym(&store, "api/app.py", "app");
+        attach(&store, "api", &module, "api/app.py");
+        let field = entity_id(&repo, kinds::FIELD, "app.DEFAULT_TIMEOUT");
+        store
+            .insert_entity(
+                Entity::new(field.clone(), kinds::FIELD, "app.DEFAULT_TIMEOUT")
+                    .attr("mutable", serde_json::json!(true))
+                    .attr("owner", serde_json::json!("app")),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:f:dt",
+                    module,
+                    predicates::CONTAINS,
+                    field,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // static field on a class in the same file
+        let cfg = sym(&store, "api/app.py", "Config");
+        attach(&store, "api", &cfg, "api/app.py");
+        let stat = entity_id(&repo, kinds::FIELD, "Config.retries");
+        store
+            .insert_entity(
+                Entity::new(stat.clone(), kinds::FIELD, "Config.retries")
+                    .attr("mutable", serde_json::json!(true))
+                    .attr("owner", serde_json::json!("Config")),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:f:r",
+                    cfg,
+                    predicates::CONTAINS,
+                    stat,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let mut symbol_comp: HashMap<String, String> = HashMap::new();
+        for c in &graph.components {
+            for r in graph.out_pred(&c.id, predicates::CONTAINS) {
+                for sr in graph.out_pred(&r.object, predicates::CONTAINS) {
+                    symbol_comp.insert(sr.object.clone(), c.name.clone());
+                }
+            }
+        }
+
+        let state = compile_state_authority(&graph, &symbol_comp);
+        let runtime = &state[S_RUNTIME];
+        assert!(
+            runtime
+                .iter()
+                .any(|l| l == "api owns app.DEFAULT_TIMEOUT (mutable) (EXTRACTED)"),
+            "module global missing from runtime state: {runtime:?}"
+        );
+        assert!(
+            runtime
+                .iter()
+                .any(|l| l == "api owns Config.retries (mutable) (EXTRACTED)"),
+            "class static missing from runtime state: {runtime:?}"
+        );
+
+        // structured claims bridge carries the same attributions
+        let claims = compile_state_claims(&graph, &symbol_comp);
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.component == "api" && c.target == "app.DEFAULT_TIMEOUT"),
+            "claims missing module global: {claims:?}"
+        );
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.component == "api" && c.target == "Config.retries"),
+            "claims missing class static: {claims:?}"
+        );
+    }
 }

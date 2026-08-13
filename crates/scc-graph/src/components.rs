@@ -26,6 +26,7 @@ pub const RELPREFIX: &str = "rel:comp:";
 pub const BOUNDARY_DECLARED: &str = "declared";
 pub const BOUNDARY_PACKAGE: &str = "package";
 pub const BOUNDARY_DEPLOYMENT: &str = "deployment";
+pub const BOUNDARY_CLI: &str = "cli";
 pub const BOUNDARY_CODE_REGION: &str = "code-region";
 pub const BOUNDARY_ROOT: &str = "root";
 
@@ -51,6 +52,7 @@ fn boundary_rank(kind: &str) -> u8 {
     match kind {
         BOUNDARY_DECLARED => 3,
         BOUNDARY_DEPLOYMENT => 2,
+        BOUNDARY_CLI => 2,
         BOUNDARY_PACKAGE => 1,
         _ => 0,
     }
@@ -375,6 +377,58 @@ fn manifest_package_candidates(root: &std::path::Path) -> Vec<ComponentCandidate
     out
 }
 
+/// Directories holding CLI registrations (clap/cobra/argparse/click):
+/// the parent dir of every file with `cli-subcommand` entrypoints and of
+/// every file whose symbols carry `cli-subcommand` entrypoints or
+/// `cli_flags`. Each such directory becomes its own `boundary_kind=cli`
+/// component (the CLI package), so the clusterer never folds it into a
+/// generic top-level code-region component. Root-level registration files
+/// map to the `root` dir. Deterministic (BTreeSet, sorted).
+fn cli_package_dirs(graph: &RealityGraph) -> BTreeSet<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    let note_file = |fname: &str, dirs: &mut BTreeSet<String>| {
+        let dir = match fname.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => "root".to_string(),
+        };
+        dirs.insert(dir);
+    };
+    // file-level cli entrypoints (no symbol, e.g. clap Subcommand enum or
+    // cobra registrations landing on the file entity)
+    for f in graph.entities_of_kind(kinds::FILE) {
+        let has_cli = f
+            .attributes
+            .get("entrypoints")
+            .and_then(|v| v.as_array())
+            .map(|eps| eps.iter().any(|e| e.as_str() == Some("cli-subcommand")))
+            .unwrap_or(false);
+        if has_cli {
+            note_file(&f.name, &mut dirs);
+        }
+    }
+    // symbol-level cli evidence: `cli-subcommand` entrypoints or `cli_flags`
+    for e in graph.entities_of_kind(kinds::SYMBOL) {
+        let is_cli = e
+            .attributes
+            .get("entrypoints")
+            .and_then(|v| v.as_array())
+            .map(|eps| eps.iter().any(|e| e.as_str() == Some("cli-subcommand")))
+            .unwrap_or(false)
+            || e
+                .attributes
+                .get("cli_flags")
+                .and_then(|v| v.as_array())
+                .map(|fl| !fl.is_empty())
+                .unwrap_or(false);
+        if is_cli {
+            if let Some(file) = e.attributes.get("file").and_then(|v| v.as_str()) {
+                note_file(file, &mut dirs);
+            }
+        }
+    }
+    dirs
+}
+
 pub fn compile_components(
     graph: &RealityGraph,
     store: &Store,
@@ -460,6 +514,25 @@ pub fn compile_components(
                     boundary_kind: BOUNDARY_DEPLOYMENT.to_string(),
                 });
             }
+        }
+    }
+    // CLI package dirs (clap/cobra/argparse/click registrations) become
+    // their own `cli`-boundary components, so the top-dir fallback below
+    // never demotes them to a generic code-region component
+    for dir in cli_package_dirs(graph) {
+        if let Some(c) = candidates.iter_mut().find(|c| c.name == dir) {
+            if !c.dirs.contains(&dir) {
+                c.dirs.push(dir);
+            }
+            if boundary_rank(BOUNDARY_CLI) > boundary_rank(&c.boundary_kind) {
+                c.boundary_kind = BOUNDARY_CLI.to_string();
+            }
+        } else {
+            candidates.push(ComponentCandidate {
+                name: dir.clone(),
+                dirs: vec![dir.clone()],
+                boundary_kind: BOUNDARY_CLI.to_string(),
+            });
         }
     }
     // top-level source dirs so nothing is orphaned; root-level files all
@@ -797,6 +870,9 @@ pub fn compile_components(
         let mut score: f64 = match cand.boundary_kind.as_str() {
             BOUNDARY_DEPLOYMENT => 5.0,
             BOUNDARY_PACKAGE => 4.0,
+            // CLI packages are real evidence-backed boundaries (like
+            // workspace packages), not bare directory fallbacks
+            BOUNDARY_CLI => 4.0,
             BOUNDARY_CODE_REGION | BOUNDARY_ROOT => 1.0,
             // declared intent carries its authority in `boundary_kind`;
             // the clustering score only counts graph evidence (plan §28)
@@ -1945,6 +2021,100 @@ mod tests {
             assert!(c.attributes.contains_key("boundary_kind"), "{}", c.name);
             assert!(c.attributes.contains_key("clustering_score"), "{}", c.name);
         }
+    }
+
+    #[test]
+    fn cli_package_dirs_become_cli_boundary_components() {
+        // Wave 9: a directory holding CLI registrations (cli-subcommand
+        // entrypoints / cli_flags on its symbols or file) becomes its own
+        // `cli`-boundary component instead of a generic code-region dir —
+        // and the CLI package dir out-prefixes the bare top-level dir for
+        // path assignment.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let _repo = store.repo_id.clone();
+
+        // CLI registrations inside cmd/helm (cobra-style): a symbol owning
+        // flags and a symbol with a subcommand entrypoint
+        let (helm_file, helm_syms) =
+            insert_file_with_symbols(&store, "cmd/helm/helm.go", &["rootCmd", "serveCmd"]);
+        let mut flag_sym = store.get_entity(&helm_syms[0]).unwrap().unwrap();
+        flag_sym
+            .attributes
+            .insert("file".into(), serde_json::json!("cmd/helm/helm.go"));
+        flag_sym
+            .attributes
+            .insert("cli_flags".into(), serde_json::json!(["--port", "--env"]));
+        store.insert_entity(&flag_sym, &["cmd/helm/helm.go".into()]).unwrap();
+        let mut ep_sym = store.get_entity(&helm_syms[1]).unwrap().unwrap();
+        ep_sym
+            .attributes
+            .insert("file".into(), serde_json::json!("cmd/helm/helm.go"));
+        ep_sym.attributes
+            .insert("entrypoints".into(), serde_json::json!(["cli-subcommand"]));
+        store.insert_entity(&ep_sym, &["cmd/helm/helm.go".into()]).unwrap();
+
+        // plain files elsewhere: pkg/util.go (generic) + root README
+        let (pkg_file, _) = insert_file_with_symbols(&store, "pkg/util.go", &["Util"]);
+        let _ = (helm_file, pkg_file);
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &[], &[]).unwrap();
+        let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
+            comps.iter().map(|c| (c.name.as_str(), c)).collect();
+
+        let cli = by_name["cmd/helm"];
+        assert_eq!(cli.attributes["boundary_kind"], serde_json::json!("cli"));
+        assert_eq!(
+            cli.attributes["layer"],
+            serde_json::json!("component"),
+            "cli components are authoritative components, not code regions"
+        );
+        // the cli dir owns its registration file, not the generic dir
+        let impl_paths = cli.attributes["implementation"]["paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(impl_paths, vec!["cmd/helm"]);
+        // sibling dir stays a plain code-region component
+        assert_eq!(
+            by_name["pkg"].attributes["boundary_kind"],
+            serde_json::json!("code-region")
+        );
+        assert_eq!(by_name["root"].attributes["boundary_kind"], serde_json::json!("root"));
+    }
+
+    #[test]
+    fn cli_evidence_in_root_dir_promotes_root_boundary() {
+        // Root-level CLI registrations (e.g. a single-package CLI repo)
+        // promote the root component to the cli boundary: the whole dir is
+        // the CLI package, so it must not read as a bare root fallback.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let _repo = store.repo_id.clone();
+        let (_, syms) = insert_file_with_symbols(&store, "cli.py", &["main"]);
+        let mut sym = store.get_entity(&syms[0]).unwrap().unwrap();
+        sym.attributes.insert("file".into(), serde_json::json!("cli.py"));
+        sym.attributes
+            .insert("cli_flags".into(), serde_json::json!(["--verbose"]));
+        store.insert_entity(&sym, &["cli.py".into()]).unwrap();
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &[], &[]).unwrap();
+        let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
+            comps.iter().map(|c| (c.name.as_str(), c)).collect();
+        assert_eq!(
+            by_name["root"].attributes["boundary_kind"],
+            serde_json::json!("cli")
+        );
     }
 
     #[test]

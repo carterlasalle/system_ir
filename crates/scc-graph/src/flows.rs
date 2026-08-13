@@ -486,8 +486,17 @@ pub fn find_symbol_by_name(graph: &RealityGraph, name: &str) -> Option<String> {
         .map(|e| e.id.clone())
 }
 
-/// Walk resolved call edges from an entry symbol, returning all reachable
-/// call paths (each capped by MAX_DEPTH).
+/// Walk evidence-grade call edges from an entry symbol, returning all
+/// reachable call paths (each capped by MAX_DEPTH).
+///
+/// Evidence grade: EXTRACTED (native extractor candidates — same-file
+/// calls whose target the native resolver found) and RESOLVED (LSP/SCIP
+/// proof). Flows seed from BOTH so behavior exists WITHOUT a language
+/// server — holdout repos are indexed natively and must still emit flows.
+/// RESOLVED edges are explored first (a deterministic, provenance-ranked
+/// expansion), so LSP-backed chains stay the preferred spine while native
+/// chains remain first-class; downstream compilers attach each edge's
+/// honest provenance (Extracted vs Resolved) to the flow steps.
 pub(crate) fn walk_calls(
     graph: &RealityGraph,
     entry: &str,
@@ -506,14 +515,20 @@ pub(crate) fn walk_calls(
             paths.push(path);
             continue;
         }
-        let call_targets: Vec<String> = graph
+        let mut call_targets: Vec<(u8, String)> = graph
             .out_pred(&sym, scc_core::predicates::CALLS)
             .into_iter()
             // evidence-grade edges only: EXTRACTED (native candidates) and
             // RESOLVED (LSP/SCIP proof) — never INFERRED/STALE
             .filter(|r| matches!(r.provenance, Provenance::Extracted | Provenance::Resolved))
-            .map(|r| r.object.clone())
+            .map(|r| (prov_rank(r.provenance), r.object.clone()))
             .collect();
+        // RESOLVED first, then target id — deterministic and
+        // proof-preferred: when a symbol has both an LSP-resolved edge and
+        // a native candidate to the same target, the resolved chain is
+        // explored before the native one.
+        call_targets.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let call_targets: Vec<String> = call_targets.into_iter().map(|(_, t)| t).collect();
         if call_targets.is_empty() {
             paths.push(path);
             continue;
@@ -1094,6 +1109,78 @@ mod tests {
                 "entrypoints must include {want}: {surface_kinds:?}"
             );
         }
+    }
+
+    #[test]
+    fn walk_calls_follows_extracted_and_prefers_resolved() {
+        // Behavior flows must exist WITHOUT a language server: the native
+        // extractor's EXTRACTED call edges are first-class traversal
+        // evidence. When a symbol has both an EXTRACTED native candidate
+        // and a RESOLVED (LSP) edge, the resolved chain is explored first
+        // (proof-preferred), and both chains reach the caller's paths.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mk = |n: &str| scc_core::symbol_id("repo", "x.py", n);
+
+        let mut rid = 0usize;
+        let mut rel = |s: &str, t: &str, prov: Provenance| {
+            rid += 1;
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        scc_core::relationship_id(rid as u64),
+                        mk(s),
+                        scc_core::predicates::CALLS,
+                        mk(t),
+                        prov,
+                    ),
+                    "x.py",
+                )
+                .unwrap();
+        };
+        // entry: native (EXTRACTED) edge to `native_step` AND an
+        // LSP-resolved edge to `resolved_step`; both continue one hop.
+        rel("entry", "native_step", Provenance::Extracted);
+        rel("native_step", "native_leaf", Provenance::Extracted);
+        rel("entry", "resolved_step", Provenance::Resolved);
+        rel("resolved_step", "resolved_leaf", Provenance::Resolved);
+        // INFERRED and STALE edges are never followed
+        rel("entry", "inferred_step", Provenance::Inferred);
+        rel("entry", "stale_step", Provenance::Stale);
+
+        let g = RealityGraph::load(&store).unwrap();
+        let paths = walk_calls(&g, &mk("entry"));
+        assert!(!paths.is_empty(), "entry with no evidence-grade edges yields its own path");
+
+        // both evidence-grade chains are reached...
+        let ends_with = |p: &[String], tail: &[&str]| -> bool {
+            p.len() >= tail.len()
+                && tail
+                    .iter()
+                    .zip(p.iter().skip(p.len() - tail.len()))
+                    .all(|(want, have)| have.ends_with(want))
+        };
+        assert!(
+            paths.iter().any(|p| ends_with(p, &["native_step", "native_leaf"])),
+            "EXTRACTED native chain must be traversed: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| ends_with(p, &["resolved_step", "resolved_leaf"])),
+            "RESOLVED chain must be traversed: {paths:?}"
+        );
+        // ...and the RESOLVED chain is explored first (proof-preferred)
+        assert!(
+            paths[0][1] == mk("resolved_step"),
+            "RESOLVED targets expand before EXTRACTED ones: {paths:?}"
+        );
+        // ...but INFERRED/STALE never appear
+        let all: Vec<String> = paths.iter().map(|p| p.join(">")).collect();
+        assert!(
+            !all.iter().any(|p| p.contains("inferred_step") || p.contains("stale_step")),
+            "only evidence-grade edges are followed: {all:?}"
+        );
     }
 
     #[test]

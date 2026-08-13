@@ -5,6 +5,7 @@
 //! Mirrors `python.rs` structurally: document-order walk, defensive
 //! unwraps_or everywhere — hostile input never panics.
 
+use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
@@ -39,7 +40,10 @@ impl LanguageExtractor for GoExtractor {
         let Some(tree) = parser.parse(&file.content, None) else {
             return ExtractedFile::default();
         };
-        let mut ctx = Ctx::default();
+        let mut ctx = Ctx {
+            module_name: facts::module_stem(&file.path),
+            ..Default::default()
+        };
         // prepass: `var cmd = ...cobra.Command{Use: "x"}` bindings, used to
         // name `rootCmd.AddCommand(cmd)` subcommands.
         scan_cobra_commands(tree.root_node(), src, &mut ctx.command_uses);
@@ -455,6 +459,8 @@ struct Ctx {
     cli_flags: BTreeMap<String, BTreeSet<String>>,
     /// Subcommand names already emitted as entrypoints.
     seen_subcommands: BTreeSet<String>,
+    /// Module-symbol name (file stem) owning package-level STATE facts.
+    module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
 }
@@ -497,8 +503,31 @@ impl Ctx {
         // deterministic fact order: (owning symbol, family, detail)
         let mut facts = self.facts;
         facts.sort_by_key(fact_sort_key);
+        // Package-level `var` bindings are STATE facts owned by the module
+        // symbol (file stem). Ensure it exists unless a real same-named
+        // symbol is declared in this file (Field facts then attach to it —
+        // same file, same component attribution, no id clash).
+        let module_owned = facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::Field { owner, .. } if owner == &self.module_name));
+        let mut symbols = self.symbols;
+        if module_owned
+            && !self.module_name.is_empty()
+            && !symbols.iter().any(|s| s.name == self.module_name)
+        {
+            symbols.push(Symbol {
+                name: self.module_name.clone(),
+                kind: SymbolKind::Module,
+                signature: None,
+                start_line: 1,
+                end_line: 1,
+                exported: false,
+                docstring: None,
+                parent: None,
+            });
+        }
         ExtractedFile {
-            symbols: self.symbols,
+            symbols,
             imports: self.imports,
             calls: self.calls,
             store_refs: self.store_refs,
@@ -575,6 +604,16 @@ impl GoExtractor {
                 kind: "function".to_string(),
             });
         }
+        // Package-level `New*` factory functions (zerolog `New(w) Logger`,
+        // `NewConsoleWriter`...): the result type names what they construct.
+        if ctx.scopes.is_empty() && facts::is_factory_name("go", &name) {
+            let target = result_type_root(node, src).unwrap_or_else(|| name.clone());
+            ctx.facts.push(SemanticFact::Registration {
+                owner: name.clone(),
+                kind: "factory".to_string(),
+                target,
+            });
+        }
         ctx.scopes.push(name);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
@@ -601,13 +640,30 @@ impl GoExtractor {
             end_line,
             exported: is_exported(&name),
             docstring: leading_doc(node, src),
-            parent,
+            parent: parent.clone(),
         });
         if is_exported(&name) {
             ctx.facts.push(SemanticFact::PublicExport {
                 symbol: sym_name.clone(),
                 kind: "method".to_string(),
             });
+        }
+        // Fluent builder / compositional methods on a type: `.WithX()/
+        // .SetX()/.AddX()` returning the receiver type, or `.AddX()` taking
+        // the receiver type (cobra `Command.AddCommand(cmds ...*Command)`).
+        let recv = parent.clone().unwrap_or_default();
+        if !recv.is_empty() && facts::is_builder_chain_method(&name) {
+            let chain_returns =
+                result_type_root(node, src).as_deref() == Some(recv.as_str());
+            let composes = name.starts_with("Add")
+                && method_has_own_type_param(node, &recv, src);
+            if chain_returns || composes {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: recv.clone(),
+                    kind: "builder".to_string(),
+                    target: recv,
+                });
+            }
         }
         ctx.scopes.push(sym_name);
         self.walk_children(node, ctx, src);
@@ -735,6 +791,18 @@ impl GoExtractor {
                 }
             }
             for name in names {
+                // Package-level `var` bindings are mutable module state
+                // (go `const` is compile-time immutable — not state).
+                if node.kind() == "var_declaration"
+                    && ctx.scopes.is_empty()
+                    && !ctx.module_name.is_empty()
+                {
+                    ctx.facts.push(SemanticFact::Field {
+                        owner: ctx.module_name.clone(),
+                        name: name.clone(),
+                        mutable: true,
+                    });
+                }
                 ctx.symbols.push(Symbol {
                     name: name.clone(),
                     kind,
@@ -1653,6 +1721,50 @@ fn signature(name: &str, fn_node: Node, src: &[u8]) -> String {
 
 /// Receiver type of a method: `(s *Store)` / `(s Store)` / `(s *pkg.Store)`
 /// → `Store`. Drops pointer/package prefixes and generic instantiation.
+/// Root identifier of a function/method result type: `*Context` →
+/// `Context`, `pkg.Context` → `Context`, `[]*Thing` → `Thing`. `None` for
+/// no result or multi-return `(a, b)`.
+fn result_type_root(fn_node: Node, src: &[u8]) -> Option<String> {
+    let result = fn_node.child_by_field_name("result")?;
+    let mut t = collapse(node_text(Some(result), src));
+    while let Some(rest) = t.strip_prefix('*') {
+        t = rest.trim().to_string();
+    }
+    while let Some(rest) = t.strip_prefix('[') {
+        t = rest.trim().to_string();
+    }
+    if t.starts_with('(') {
+        return None; // multi-return
+    }
+    let last = t.rsplit('.').next().unwrap_or(&t);
+    let end = last
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(last.len());
+    if end == 0 {
+        None
+    } else {
+        Some(last[..end].to_string())
+    }
+}
+
+/// Whether any parameter of `method` mentions the receiver's type name
+/// (`AddCommand(cmds ...*Command)` on `*Command`).
+fn method_has_own_type_param(method: Node, ty: &str, src: &[u8]) -> bool {
+    let Some(params) = method.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cur = params.walk();
+    for p in params.named_children(&mut cur) {
+        let t = collapse(node_text(Some(p), src));
+        if t.split(['*', '[', ']', ' ', '.', '<', '>'])
+            .any(|seg| seg == ty)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn receiver_type(receiver: Option<Node>, src: &[u8]) -> Option<String> {
     let plist = receiver?;
     let mut cursor = plist.walk();
@@ -2178,5 +2290,84 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted, "facts must be emitted in sorted order");
+    }
+
+    fn regs(ef: &ExtractedFile) -> Vec<(String, String, String)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.clone(), kind.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn facts_zerolog_style_new_factories() {
+        // zerolog `func New(w io.Writer) Logger` + `NewConsoleWriter(...)
+        // ConsoleWriter`: package-level New* functions are factories whose
+        // target is the result type.
+        let ef = extract(
+            "package zerolog\n\nfunc New(w io.Writer) Logger { return Logger{} }\nfunc NewConsoleWriter(opts ...func(w *ConsoleWriter)) ConsoleWriter { return ConsoleWriter{} }\nfunc helpers() {}\n",
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("New".into(), "factory".into(), "Logger".into())),
+            "New factory missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&(
+                "NewConsoleWriter".into(),
+                "factory".into(),
+                "ConsoleWriter".into()
+            )),
+            "NewConsoleWriter factory missing: {rs:?}"
+        );
+        assert!(
+            !rs.iter().any(|(o, _, _)| o == "helpers"),
+            "plain function must not be a factory: {rs:?}"
+        );
+    }
+
+    #[test]
+    fn facts_package_vars_are_state_and_cobra_builder() {
+        // `var` at package level → mutable module state (owner = module
+        // symbol); a `func (c *Command) AddCommand(cmds ...*Command)`
+        // method makes Command a compositional builder.
+        let ef = extract(
+            "package main\n\nvar SecretKey = \"dev\"\n\nconst Max = 3\n\ntype Command struct{ sub []*Command }\n\nfunc (c *Command) AddCommand(cmds ...*Command) { c.sub = append(c.sub, cmds...) }\nfunc (c *Command) WithName(n string) *Command { return c }\n",
+        );
+        let fields: Vec<(String, String, bool)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.clone(), name.clone(), *mutable))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fields.contains(&("main".into(), "SecretKey".into(), true)),
+            "package var state missing: {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|(_, n, _)| n == "Max"),
+            "const must not be state: {fields:?}"
+        );
+        assert!(
+            ef.symbols
+                .iter()
+                .any(|s| s.name == "main" && s.kind == SymbolKind::Module),
+            "module symbol missing: {:?}",
+            ef.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        let rs = regs(&ef);
+        assert!(
+            rs.contains(&("Command".into(), "builder".into(), "Command".into())),
+            "AddCommand builder missing: {rs:?}"
+        );
     }
 }

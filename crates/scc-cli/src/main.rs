@@ -293,7 +293,7 @@ enum BenchSub {
         diagnose: bool,
         /// Blind holdout protocol: score the dev corpus AND the holdout
         /// corpus (benchmarks/holdout + benchmarks/holdout-ground-truth),
-        /// compare per-layer recall, write benchmarks/results/holdout-v2.txt
+        /// compare per-layer recall, write benchmarks/results/holdout-v3.txt
         /// and print the overfit verdict
         #[arg(long)]
         holdout: bool,

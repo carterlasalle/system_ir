@@ -498,13 +498,49 @@ fn layer_haystack<'a>(section: &str, layers: &'a AtlasLayers, text_norm: &'a str
 /// Recall for one layer: fraction of ground-truth key strings found
 /// (case-insensitive, aliases applied) in the layer's structured haystack.
 /// An empty ground truth scores 1.0 (nothing to miss).
+/// Whether a ground-truth chain item (`A -> B -> C`) matches the layer's
+/// haystack: each step must appear — in order — in the per-step lines.
+/// Chain items never match a plain substring test (the haystack is one
+/// step per line), so this is the honest interpretation of a chain.
+fn chain_matches(chain: &str, haystack: &str) -> bool {
+    let steps: Vec<String> = chain.split(" -> ").map(norm).collect();
+    if steps.len() < 2 {
+        return false;
+    }
+    let lines: Vec<&str> = haystack.lines().collect();
+    let mut pos = 0usize;
+    for step in steps {
+        let mut found = false;
+        while pos < lines.len() {
+            if norm(lines[pos]).contains(&step) {
+                found = true;
+                pos += 1;
+                break;
+            }
+            pos += 1;
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+fn item_matches(item: &str, haystack: &str) -> bool {
+    if item.contains(" -> ") {
+        chain_matches(item, haystack)
+    } else {
+        haystack.contains(&norm(item))
+    }
+}
+
 fn layer_recall(items: &[String], haystack: &str) -> (f64, usize, usize) {
     if items.is_empty() {
         return (1.0, 0, 0);
     }
     let mut hit = 0usize;
     for item in items {
-        if haystack.contains(&norm(item)) {
+        if item_matches(item, haystack) {
             hit += 1;
         }
     }
@@ -513,7 +549,7 @@ fn layer_recall(items: &[String], haystack: &str) -> (f64, usize, usize) {
 
 /// Whether one ground-truth item matches its layer's structured haystack.
 fn item_matched(section: &str, item: &str, layers: &AtlasLayers, text_norm: &str) -> bool {
-    layer_haystack(section, layers, text_norm).contains(&norm(item))
+    item_matches(item, layer_haystack(section, layers, text_norm))
 }
 
 /// Flow-edge precision: the fraction of canonical flow-graph edges whose
@@ -871,7 +907,7 @@ impl HoldoutComparison {
 
 /// Run the holdout protocol: score the dev corpus and the blind holdout
 /// corpus with the same recall pipeline, compute per-layer gaps, write
-/// `benchmarks/results/holdout-v2.txt`, and return the comparison.
+/// `benchmarks/results/holdout-v3.txt`, and return the comparison.
 ///
 /// `corpus`/`ground_truth` (when given) select the DEV corpus, exactly as in
 /// `run_atlas_bench` (defaults: `benchmarks/corpus` +
@@ -890,7 +926,7 @@ pub fn run_atlas_holdout(
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = crate::find_root(&cwd);
     let results_dir = root.join("benchmarks").join("results");
-    let results_file = results_dir.join("holdout-v2.txt");
+    let results_file = results_dir.join("holdout-v3.txt");
 
     let dev = run_atlas_bench(corpus, ground_truth, diagnose, resolve)?;
 
@@ -934,10 +970,10 @@ pub fn run_atlas_holdout(
 }
 
 impl HoldoutComparison {
-    /// Deterministic markdown text for `benchmarks/results/holdout-v2.txt`.
+    /// Deterministic markdown text for `benchmarks/results/holdout-v3.txt`.
     fn to_results_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("# Holdout v2 — dev corpus vs blind holdout\n");
+        out.push_str("# Holdout v3 — dev corpus vs blind holdout\n");
         out.push_str(&format!("dev corpus:     {}\n", self.dev.mode));
         out.push_str(&format!("holdout corpus: {}\n", self.holdout.mode));
         out.push_str(&format!(
@@ -1838,7 +1874,7 @@ mod tests {
             gap_contracts: HoldoutComparison::layer_gap(dev.mean_contracts, holdout.mean_contracts),
             gap_overall: HoldoutComparison::layer_gap(dev.mean_overall, holdout.mean_overall),
             verdict: holdout_verdict(dev.mean_overall, holdout.mean_overall),
-            results_file: "benchmarks/results/holdout-v2.txt".to_string(),
+            results_file: "benchmarks/results/holdout-v3.txt".to_string(),
             dev,
             holdout,
         };
@@ -1849,6 +1885,22 @@ mod tests {
         assert!(text.contains("verdict: BORDERLINE"));
         assert!(text.contains("-0.040"), "gap -0.04 rendered: {text}");
     }
+    #[test]
+    fn behavior_chains_match_in_order() {
+        // P1: ground-truth chains (A -> B -> C) match the per-step haystack
+        // as an in-order subsequence, not as a substring.
+        let hay = "src: Command.main\n-> src: Command.parse_args\n-> src: Command.invoke";
+        assert!(chain_matches("Command.main -> Command.parse_args -> Command.invoke", hay));
+        // gaps allowed (other steps between), order required
+        let hay2 = "a: X\nb: main\nc: mid\nd: parse_args\ne: end\nf: invoke";
+        assert!(chain_matches("main -> parse_args -> invoke", hay2));
+        // wrong order must NOT match
+        assert!(!chain_matches("invoke -> main", hay));
+        assert!(!chain_matches("main -> invoke -> parse_args", hay2));
+        // plain items still substring-match
+        assert!(item_matches("parse_args", hay));
+    }
+
 }
 
 
