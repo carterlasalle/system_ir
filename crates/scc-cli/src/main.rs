@@ -293,10 +293,17 @@ enum BenchSub {
         diagnose: bool,
         /// Blind holdout protocol: score the dev corpus AND the holdout
         /// corpus (benchmarks/holdout + benchmarks/holdout-ground-truth),
-        /// compare per-layer recall, write benchmarks/results/holdout-v1.txt
+        /// compare per-layer recall, write benchmarks/results/holdout-v2.txt
         /// and print the overfit verdict
         #[arg(long)]
         holdout: bool,
+        /// Skip the semantic resolution pass (pyright + tsserver) before
+        /// scoring: the atlas then runs on native extraction only, and
+        /// `resolved_calls` reports 0. Default is ON (resolve before
+        /// scoring, so behavior flows seed from resolved call chains)
+        /// for both the dev and holdout corpora.
+        #[arg(long)]
+        no_resolve: bool,
     },
 }
 
@@ -623,12 +630,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json,
                 diagnose,
                 holdout,
+                no_resolve,
             } => {
+                let resolve = !no_resolve;
                 if holdout {
                     match scc_cli::benchatlas::run_atlas_holdout(
                         corpus.as_deref(),
                         ground_truth.as_deref(),
                         diagnose,
+                        resolve,
                     ) {
                         Ok(comparison) => {
                             if json {
@@ -649,6 +659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         corpus.as_deref(),
                         ground_truth.as_deref(),
                         diagnose,
+                        resolve,
                     ) {
                         Ok(report) => {
                             if json {

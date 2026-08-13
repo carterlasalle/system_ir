@@ -294,11 +294,30 @@ fn exported_class_names(graph: &RealityGraph) -> BTreeSet<String> {
     out
 }
 
-/// How many public-api surfaces a flow pass is willing to seed (the full
-/// surface list stays in the atlas entrypoints; the FLOWS view stays
-/// bounded). Deterministic: the first N surfaces in invocation_surfaces'
-/// (kind, symbol, trigger) order.
-const PUBLIC_API_FLOW_SEED_CAP: usize = 24;
+/// Public-api flow seeds are budgeted in two deterministic classes so the
+/// FLOWS view stays compact (the full surface list still reaches the atlas
+/// entrypoints) while the budget spends itself on behavior:
+///
+/// - **chain surfaces** seed first: an exported symbol with outgoing
+///   EXTRACTED/RESOLVED CALLS edges is a behavior-flow candidate. Within
+///   the class the order is by resolved-chain length (deepest first), then
+///   symbol id — NOT alphabetical file order, which let benchmark/script/
+///   error-constant noise crowd out the library's real API in chain-rich
+///   repos (e.g. a framework repo with hundreds of exported symbols).
+/// - **leaf surfaces** (single-step exports) fill the remainder.
+const PUBLIC_API_CHAIN_SEED_CAP: usize = 48;
+const PUBLIC_API_LEAF_SEED_CAP: usize = 16;
+
+/// Length of the longest call chain `walk_calls` reaches from `sym` (node
+/// count; 1 when the symbol has no evidence-grade call edges). Cheap for
+/// leaves (no edges -> immediate return).
+fn chain_length(graph: &RealityGraph, sym: &str) -> usize {
+    walk_calls(graph, sym)
+        .into_iter()
+        .map(|p| p.len())
+        .max()
+        .unwrap_or(1)
+}
 
 /// Collect entrypoints: routes (handlers), declared intent flows, symbols
 /// marked as entrypoints (main-guard / bin / module-entry).
@@ -377,22 +396,49 @@ pub fn collect_entrypoints(
     // Wave 9/10: invocation-surface seeds (public exports, exported-module
     // and exported-class-method surfaces, queue consumers, framework
     // callbacks, lifecycle callbacks, event handlers) — additive and
-    // deterministic (invocation_surfaces sorts its output). Name-dedup
-    // keeps flow ids unique (a symbol already seeded as an entrypoint does
-    // not seed a second flow). The public-api bulk (every exported symbol
-    // in a framework repo) is bounded here so the FLOWS view stays compact;
-    // the full surface list still reaches the atlas entrypoints.
-    let mut public_api_seeded = 0usize;
-    for s in invocation_surfaces(graph) {
-        let Some(e) = graph.entity(&s.symbol) else { continue };
-        if e.name.is_empty() {
-            continue;
-        }
+    // deterministic. Name-dedup keeps flow ids unique (a symbol already
+    // seeded as an entrypoint does not seed a second flow).
+    //
+    // The public-api bulk (every exported symbol in a framework repo) is
+    // bounded by class so the FLOWS view stays compact; the full surface
+    // list still reaches the atlas entrypoints. Chain surfaces (exports
+    // whose walk reaches real callees) seed FIRST — the behavior flows —
+    // ordered by chain length descending, then leaf exports; this keeps
+    // the cap from being spent on alphabetical file-order noise
+    // (benchmarks, scripts, error constants) at the expense of the
+    // library's real API. Non-public-api surfaces (queue consumers,
+    // framework/lifecycle callbacks, event handlers) are naturally few and
+    // seed uncapped in invocation_surfaces' deterministic order.
+    let mut surfaces = invocation_surfaces(graph);
+    let mut public_api: Vec<InvocationSurface> = Vec::new();
+    let mut others: Vec<InvocationSurface> = Vec::new();
+    for s in surfaces.drain(..) {
         if s.kind == InvocationSurfaceKind::PublicApi {
-            if public_api_seeded >= PUBLIC_API_FLOW_SEED_CAP {
-                continue;
-            }
-            public_api_seeded += 1;
+            public_api.push(s);
+        } else {
+            others.push(s);
+        }
+    }
+    let mut chained: Vec<(usize, InvocationSurface)> = Vec::new();
+    let mut leaves: Vec<InvocationSurface> = Vec::new();
+    for s in public_api {
+        let len = chain_length(graph, &s.symbol);
+        if len >= 2 {
+            chained.push((len, s));
+        } else {
+            leaves.push(s);
+        }
+    }
+    chained.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.symbol.cmp(&b.1.symbol))
+            .then(a.1.trigger.cmp(&b.1.trigger))
+    });
+    leaves.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.trigger.cmp(&b.trigger)));
+    let mut seed_public = |s: &InvocationSurface, out: &mut Vec<FlowEntrypoint>| {
+        let Some(e) = graph.entity(&s.symbol) else { return };
+        if e.name.is_empty() {
+            return;
         }
         if seen.insert(flow_key(&e.name)) {
             out.push(FlowEntrypoint {
@@ -402,6 +448,31 @@ pub fn collect_entrypoints(
                 kind: s.kind.as_str().to_string(),
             });
         }
+    };
+    let mut chain_seeded = 0usize;
+    for (_, s) in chained {
+        if chain_seeded >= PUBLIC_API_CHAIN_SEED_CAP {
+            break;
+        }
+        let before = out.len();
+        seed_public(&s, &mut out);
+        if out.len() > before {
+            chain_seeded += 1;
+        }
+    }
+    let mut leaf_seeded = 0usize;
+    for s in leaves {
+        if leaf_seeded >= PUBLIC_API_LEAF_SEED_CAP {
+            break;
+        }
+        let before = out.len();
+        seed_public(&s, &mut out);
+        if out.len() > before {
+            leaf_seeded += 1;
+        }
+    }
+    for s in others {
+        seed_public(&s, &mut out);
     }
     let _ = store;
     out
@@ -1023,5 +1094,128 @@ mod tests {
                 "entrypoints must include {want}: {surface_kinds:?}"
             );
         }
+    }
+
+    #[test]
+    fn public_api_chain_surfaces_seed_before_leaves() {
+        // Exported symbols in one file: `deep` reaches a 3-node chain,
+        // `mid` a 2-node chain, `leaf` has no call edges. The chain class
+        // must seed before the leaf class, deepest first — even though the
+        // leaf sorts before both by symbol id (the old id-order cap spent
+        // itself on exactly this noise).
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mk = |n: &str| scc_core::symbol_id("repo", "x.py", n);
+
+        for n in ["deep", "deep2", "mid", "mid2", "leaf", "leaf2"] {
+            let mut e = scc_core::Entity::new(mk(n), kinds::SYMBOL, n);
+            e.attr("file", serde_json::json!("x.py"));
+            e.attr("exported", serde_json::json!(true));
+            store.insert_entity(&e, &["x.py".to_string()]).unwrap();
+        }
+        // deep -> deep2 -> (leaf2 as a third hop); mid -> mid2
+        let mut rid = 0usize;
+        let mut call = |s: &str, t: &str| {
+            rid += 1;
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        scc_core::relationship_id(rid as u64),
+                        s.to_string(),
+                        scc_core::predicates::CALLS,
+                        t.to_string(),
+                        Provenance::Resolved,
+                    ),
+                    "x.py",
+                )
+                .unwrap();
+        };
+        call(&mk("deep"), &mk("deep2"));
+        call(&mk("deep2"), &mk("leaf2"));
+        call(&mk("mid"), &mk("mid2"));
+
+        let g = RealityGraph::load(&store).unwrap();
+        let eps = collect_entrypoints(&g, &store, &[]);
+        let pub_names: Vec<String> = eps
+            .iter()
+            .filter(|e| e.kind == "public_api")
+            .map(|e| e.name.clone())
+            .collect();
+        // deepest chain first, then the 2-node chain, then leaves — the
+        // chain targets are themselves exported, so deep2 (a 2-node chain
+        // via its edge to leaf2) and mid (2-node) rank in the chain class;
+        // mid2 (no outgoing edges) is a leaf.
+        assert_eq!(
+            pub_names,
+            vec!["deep", "deep2", "mid", "leaf", "leaf2", "mid2"],
+            "chain surfaces (deepest first) seed before leaves: {pub_names:?}"
+        );
+    }
+
+    #[test]
+    fn public_api_seed_budgets_are_bounded_by_class() {
+        // CHAIN_CAP + 5 chained exports and LEAF_CAP + 5 leaves: exactly
+        // the chain budget is spent on chained surfaces (id order), then
+        // the leaf budget on leaves; nothing beyond.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mk = |n: &str| scc_core::symbol_id("repo", "x.py", n);
+
+        let mut rid = 0usize;
+        for i in 0..(PUBLIC_API_CHAIN_SEED_CAP + 5) {
+            let c = format!("chain{i:02}");
+            let t = format!("target{i:02}");
+            for n in [&c, &t] {
+                let mut e = scc_core::Entity::new(mk(n), kinds::SYMBOL, n);
+                e.attr("file", serde_json::json!("x.py"));
+                e.attr("exported", serde_json::json!(true));
+                store.insert_entity(&e, &["x.py".to_string()]).unwrap();
+            }
+            rid += 1;
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        scc_core::relationship_id(rid as u64),
+                        mk(&c),
+                        scc_core::predicates::CALLS,
+                        mk(&t),
+                        Provenance::Extracted,
+                    ),
+                    "x.py",
+                )
+                .unwrap();
+        }
+        for i in 0..(PUBLIC_API_LEAF_SEED_CAP + 5) {
+            let n = format!("leaf{i:02}");
+            let mut e = scc_core::Entity::new(mk(&n), kinds::SYMBOL, &n);
+            e.attr("file", serde_json::json!("x.py"));
+            e.attr("exported", serde_json::json!(true));
+            store.insert_entity(&e, &["x.py".to_string()]).unwrap();
+        }
+
+        let g = RealityGraph::load(&store).unwrap();
+        let eps = collect_entrypoints(&g, &store, &[]);
+        let pub_names: Vec<String> = eps
+            .iter()
+            .filter(|e| e.kind == "public_api")
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(pub_names.len(), PUBLIC_API_CHAIN_SEED_CAP + PUBLIC_API_LEAF_SEED_CAP);
+        let chains: Vec<&String> = pub_names.iter().filter(|n| n.starts_with("chain")).collect();
+        let leaves: Vec<&String> = pub_names.iter().filter(|n| n.starts_with("leaf")).collect();
+        assert_eq!(chains.len(), PUBLIC_API_CHAIN_SEED_CAP, "chain budget fully spent");
+        assert_eq!(leaves.len(), PUBLIC_API_LEAF_SEED_CAP, "leaf budget fully spent");
+        // deterministic id order within each class
+        assert!(chains.windows(2).all(|w| w[0] < w[1]), "{pub_names:?}");
+        assert!(leaves.windows(2).all(|w| w[0] < w[1]), "{pub_names:?}");
+        // chain class entirely precedes the leaf class
+        let first_leaf = pub_names.iter().position(|n| n.starts_with("leaf")).unwrap();
+        assert!(chains.iter().all(|n| {
+            pub_names.iter().position(|p| p == *n).unwrap() < first_leaf
+        }));
     }
 }

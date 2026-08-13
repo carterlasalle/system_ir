@@ -203,6 +203,9 @@ pub struct RepoRecall {
     pub density: f64,
     /// Rendered atlas token count.
     pub atlas_tokens: usize,
+    /// Number of call edges upgraded to RESOLVED by the semantic backends
+    /// (pyright/tsserver) before scoring; 0 when `--no-resolve`.
+    pub resolved_calls: usize,
     /// Number of ground-truth items in the (informational) landmarks layer.
     pub landmark_items: usize,
     /// When set, the repo was not scored (missing dir / missing ground
@@ -241,6 +244,7 @@ impl Default for RepoRecall {
             precision: 0.0,
             density: 0.0,
             atlas_tokens: 0,
+            resolved_calls: 0,
             landmark_items: 0,
             skipped_reason: None,
             missed: Vec::new(),
@@ -575,12 +579,34 @@ fn token_density(matched_startup: usize, tokens: usize) -> f64 {
 /// data stores; contracts), except the informational `tests` layer which is
 /// matched against the rendered text. `diagnose` additionally classifies
 /// every missed item by gap kind.
+///
+/// `resolve` runs the language-aware semantic backends (pyright + tsserver)
+/// on the freshly indexed repo before the atlas is built, so call chains
+/// upgrade from EXTRACTED candidates to RESOLVED edges and the behavior
+/// flows are seeded from resolved paths; the per-repo `resolved_calls`
+/// reports how many edges were upgraded (0 with `--no-resolve` or when the
+/// backends are unavailable — resolution degrades, never fails the run).
 pub fn score_repo(
     repo_dir: &Path,
     gt: &GroundTruthDoc,
     diagnose: bool,
+    resolve: bool,
 ) -> Result<RepoRecall, String> {
     crate::commands::cmd_index(repo_dir, true).map_err(|e| format!("index failed: {e}"))?;
+    let resolved_calls = if resolve {
+        match crate::resolve_and_recompile(repo_dir) {
+            Ok(rep) => rep.upgraded,
+            Err(e) => {
+                eprintln!(
+                    "benchatlas: semantic resolution skipped for {}: {e}",
+                    repo_dir.display()
+                );
+                0
+            }
+        }
+    } else {
+        0
+    };
     let store = crate::open_store(repo_dir).map_err(|e| format!("store: {e}"))?;
     let config = crate::load_config(repo_dir).map_err(|e| format!("config: {e}"))?;
     let stale = crate::stale_paths(&store).map_err(|e| format!("stale: {e}"))?;
@@ -654,6 +680,7 @@ pub fn score_repo(
         precision,
         density,
         atlas_tokens: pack.tokens,
+        resolved_calls,
         landmark_items: gt.landmarks.len(),
         skipped_reason: None,
         missed,
@@ -670,6 +697,7 @@ pub fn run_atlas_recall(
     ground_truth_dir: &Path,
     repo_names: &[String],
     diagnose: bool,
+    resolve: bool,
 ) -> Result<AtlasRecallReport, String> {
     let mut names: Vec<&String> = repo_names.iter().collect();
     names.sort();
@@ -699,7 +727,7 @@ pub fn run_atlas_recall(
                 continue;
             }
         };
-        match score_repo(&repo_dir, &gt, diagnose) {
+        match score_repo(&repo_dir, &gt, diagnose, resolve) {
             Ok(r) => {
                 report.mean_architecture += r.architecture;
                 report.mean_entrypoints += r.entrypoints;
@@ -758,6 +786,7 @@ pub fn run_atlas_bench(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
     diagnose: bool,
+    resolve: bool,
 ) -> Result<AtlasRecallReport, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = crate::find_root(&cwd);
@@ -766,7 +795,7 @@ pub fn run_atlas_bench(
     // Fixtures fallback: no corpus dir (or an empty one) -> run over the
     // golden fixtures with ground truth synthesized from tasks.json.
     if corpus.is_none() && repo_dirs(&default_corpus).is_empty() {
-        return fixtures_fallback(&root, diagnose);
+        return fixtures_fallback(&root, diagnose, resolve);
     }
     if let Some(p) = corpus {
         if !p.is_dir() {
@@ -780,7 +809,7 @@ pub fn run_atlas_bench(
         None => root.join("benchmarks").join("ground-truth"),
     };
     let names = repo_dirs(&corpus_dir);
-    run_atlas_recall(&corpus_dir, &gt_dir, &names, diagnose)
+    run_atlas_recall(&corpus_dir, &gt_dir, &names, diagnose, resolve)
 }
 
 /// Overfit verdict over the dev-vs-holdout overall gap.
@@ -842,24 +871,28 @@ impl HoldoutComparison {
 
 /// Run the holdout protocol: score the dev corpus and the blind holdout
 /// corpus with the same recall pipeline, compute per-layer gaps, write
-/// `benchmarks/results/holdout-v1.txt`, and return the comparison.
+/// `benchmarks/results/holdout-v2.txt`, and return the comparison.
 ///
 /// `corpus`/`ground_truth` (when given) select the DEV corpus, exactly as in
 /// `run_atlas_bench` (defaults: `benchmarks/corpus` +
 /// `benchmarks/ground-truth`). The holdout dirs are fixed protocol paths:
 /// `benchmarks/holdout` + `benchmarks/holdout-ground-truth`. The holdout
 /// corpus must exist — a missing dir is an error, not a silent empty run.
+///
+/// `resolve` applies to BOTH corpora (the same pipeline must score dev and
+/// holdout identically).
 pub fn run_atlas_holdout(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
     diagnose: bool,
+    resolve: bool,
 ) -> Result<HoldoutComparison, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = crate::find_root(&cwd);
     let results_dir = root.join("benchmarks").join("results");
-    let results_file = results_dir.join("holdout-v1.txt");
+    let results_file = results_dir.join("holdout-v2.txt");
 
-    let dev = run_atlas_bench(corpus, ground_truth, diagnose)?;
+    let dev = run_atlas_bench(corpus, ground_truth, diagnose, resolve)?;
 
     let holdout_corpus = root.join("benchmarks").join("holdout");
     let holdout_gt = root.join("benchmarks").join("holdout-ground-truth");
@@ -876,7 +909,7 @@ pub fn run_atlas_holdout(
             holdout_corpus.display()
         ));
     }
-    let mut holdout = run_atlas_recall(&holdout_corpus, &holdout_gt, &names, diagnose)?;
+    let mut holdout = run_atlas_recall(&holdout_corpus, &holdout_gt, &names, diagnose, resolve)?;
     holdout.mode = format!("holdout: {}", holdout_corpus.display());
 
     let c = HoldoutComparison {
@@ -901,10 +934,10 @@ pub fn run_atlas_holdout(
 }
 
 impl HoldoutComparison {
-    /// Deterministic markdown text for `benchmarks/results/holdout-v1.txt`.
+    /// Deterministic markdown text for `benchmarks/results/holdout-v2.txt`.
     fn to_results_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("# Holdout v1 — dev corpus vs blind holdout\n");
+        out.push_str("# Holdout v2 — dev corpus vs blind holdout\n");
         out.push_str(&format!("dev corpus:     {}\n", self.dev.mode));
         out.push_str(&format!("holdout corpus: {}\n", self.holdout.mode));
         out.push_str(&format!(
@@ -940,6 +973,11 @@ impl HoldoutComparison {
         out.push_str(&format!(
             "precision: dev {:.3} | holdout {:.3}\n",
             self.dev.mean_precision, self.holdout.mean_precision
+        ));
+        let dev_resolved: usize = self.dev.repos.iter().map(|r| r.resolved_calls).sum();
+        let holdout_resolved: usize = self.holdout.repos.iter().map(|r| r.resolved_calls).sum();
+        out.push_str(&format!(
+            "resolved calls (upgraded): dev {dev_resolved} | holdout {holdout_resolved}\n"
         ));
         out.push_str(&format!(
             "density (facts/1k tokens): dev {:.2} | holdout {:.2}\n",
@@ -1036,7 +1074,7 @@ fn repo_dirs(dir: &Path) -> Vec<String> {
 /// Hermetic fixtures run: copy the golden fixtures into a temp corpus (the
 /// real fixtures are never indexed into) and synthesize ground-truth docs
 /// from `benchmarks/tasks.json`.
-fn fixtures_fallback(root: &Path, diagnose: bool) -> Result<AtlasRecallReport, String> {
+fn fixtures_fallback(root: &Path, diagnose: bool, resolve: bool) -> Result<AtlasRecallReport, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let tasks_path = root.join("benchmarks").join("tasks.json");
     let text = std::fs::read_to_string(&tasks_path)
@@ -1067,7 +1105,7 @@ fn fixtures_fallback(root: &Path, diagnose: bool) -> Result<AtlasRecallReport, S
             .map_err(|e| e.to_string())?;
     }
 
-    let mut report = run_atlas_recall(&tmp_corpus, &tmp_gt, &names, diagnose)?;
+    let mut report = run_atlas_recall(&tmp_corpus, &tmp_gt, &names, diagnose, resolve)?;
     report.mode = "fixtures fallback (ground truth from benchmarks/tasks.json)".to_string();
     Ok(report)
 }
@@ -1386,8 +1424,13 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
                 repo.repo, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"
             ),
             None => {
+                let note = if repo.resolved_calls > 0 {
+                    format!("resolved:{}", repo.resolved_calls)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}",
+                    "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}  {}",
                     repo.repo,
                     repo.architecture,
                     repo.entrypoints,
@@ -1399,7 +1442,8 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
                     repo.overall,
                     repo.precision,
                     repo.density,
-                    repo.atlas_tokens
+                    repo.atlas_tokens,
+                    note
                 );
                 for m in &repo.missed {
                     println!("      missed: {m}");
@@ -1423,6 +1467,10 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
         r.mean_atlas_tokens.round() as usize
     );
     println!("  scored: {}   skipped: {}", r.scored, r.skipped);
+    let resolved_total: usize = r.repos.iter().map(|repo| repo.resolved_calls).sum();
+    if resolved_total > 0 {
+        println!("  resolved calls (semantic backends upgraded): {resolved_total}");
+    }
     println!(
         "  gate: {} (overall mean recall {:.3} >= {ATLAS_GATE})",
         if r.gate_passed { "PASS" } else { "FAIL" },
@@ -1623,7 +1671,7 @@ mod tests {
         std::fs::create_dir_all(corpus.join("repo-a")).unwrap();
 
         let names = ["repo-b".to_string(), "repo-a".to_string()];
-        let report = run_atlas_recall(&corpus, &gt, &names, false).unwrap();
+        let report = run_atlas_recall(&corpus, &gt, &names, false, false).unwrap();
         assert_eq!(report.scored, 0);
         assert_eq!(report.skipped, 2);
         assert!(!report.gate_passed);
@@ -1672,13 +1720,15 @@ mod tests {
         );
 
         let report =
-            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], false)
+            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], false, false)
                 .unwrap();
         assert_eq!(report.scored, 1);
         assert_eq!(report.skipped, 0);
         assert!(report.gate_passed == (report.mean_overall >= ATLAS_GATE));
         let r = &report.repos[0];
         assert!(r.skipped_reason.is_none());
+        // without the semantic pass the repo reports zero resolved calls
+        assert_eq!(r.resolved_calls, 0);
         // overall is the equal-weighted mean of the five startup layers
         let expect = (r.architecture + r.entrypoints + r.behavior + r.state_authority + r.contracts) / 5.0;
         assert!((r.overall - expect).abs() < 1e-9);
@@ -1704,7 +1754,7 @@ mod tests {
         );
 
         let report =
-            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], true)
+            run_atlas_recall(&tmp.path().join("corpus"), &tmp.path().join("ground-truth"), &["synth".to_string()], true, false)
                 .unwrap();
         let r = &report.repos[0];
         assert!(!r.gaps.is_empty(), "diagnose produced gap findings");
@@ -1788,7 +1838,7 @@ mod tests {
             gap_contracts: HoldoutComparison::layer_gap(dev.mean_contracts, holdout.mean_contracts),
             gap_overall: HoldoutComparison::layer_gap(dev.mean_overall, holdout.mean_overall),
             verdict: holdout_verdict(dev.mean_overall, holdout.mean_overall),
-            results_file: "benchmarks/results/holdout-v1.txt".to_string(),
+            results_file: "benchmarks/results/holdout-v2.txt".to_string(),
             dev,
             holdout,
         };

@@ -132,6 +132,249 @@ pub fn component_for_path(path: &str, candidates: &[ComponentCandidate]) -> Stri
     }
 }
 
+/// Normalize a manifest-declared directory: strip a leading `./` and any
+/// trailing slashes. Deterministic.
+fn norm_manifest_dir(p: &str) -> String {
+    let t = p.trim();
+    let t = t.strip_prefix("./").unwrap_or(t);
+    t.trim_end_matches('/').to_string()
+}
+
+/// Collect the `"..."` string values of a (possibly multi-line) TOML array
+/// assigned to `key` — e.g. `members = [\n "a",\n "b",\n]`. Stops at the
+/// first `]` that is not inside a string literal. `key` must be a bare
+/// token (`exclude_members` must not match `members`).
+fn toml_string_array(table: &str, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = table;
+    while let Some(pos) = rest.find(key) {
+        let before_ok = pos == 0
+            || !rest[..pos]
+                .chars()
+                .last()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let after_trim = rest[pos + key.len()..].trim_start();
+        if before_ok && after_trim.starts_with('=') {
+            let mut scan = &after_trim[1..];
+            loop {
+                let open = scan.find('"');
+                let close = scan.find(']');
+                match (open, close) {
+                    (Some(q), Some(c)) if q < c => match scan[q + 1..].find('"') {
+                        Some(e) => {
+                            out.push(scan[q + 1..q + 1 + e].to_string());
+                            scan = &scan[q + 1 + e + 1..];
+                        }
+                        None => break,
+                    },
+                    _ => break, // ']' first (or unterminated string): done
+                }
+            }
+            break;
+        }
+        rest = &rest[pos + key.len()..];
+    }
+    out
+}
+
+/// Return the text of a TOML table (from its header line up to the next
+/// top-level header or EOF). `header` must match exactly, e.g.
+/// `[workspace]` (so `[workspace.dependencies]` is not a false match).
+fn toml_table(text: &str, header: &str) -> Option<String> {
+    let mut start: Option<usize> = None;
+    let mut end = text.lines().count();
+    for (i, line) in text.lines().enumerate() {
+        let l = line.trim();
+        if start.is_none() {
+            if l == header {
+                start = Some(i);
+            }
+            continue;
+        }
+        if l.starts_with('[') && l.ends_with(']') {
+            end = i;
+            break;
+        }
+    }
+    let start = start?;
+    Some(
+        text.lines()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// `[package] name = "..."` from a crate manifest (only inside the
+/// `[package]` table).
+fn toml_package_name(text: &str) -> Option<String> {
+    let table = toml_table(text, "[package]")?;
+    for line in table.lines() {
+        let l = line.trim();
+        if let Some(eq) = l.find('=') {
+            if l[..eq].trim() == "name" {
+                let v = l[eq + 1..].trim();
+                if let Some(s) = v.strip_prefix('"') {
+                    if let Some(e) = s.find('"') {
+                        return Some(s[..e].to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// go.work `use` directives (block form `use ( ... )` and inline form
+/// `use ./path`) as normalized module directories.
+fn gowork_use_dirs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let toks: Vec<&str> = lines[i].split_whitespace().collect();
+        if toks.first() == Some(&"use") {
+            if toks.len() >= 2 && toks[1].starts_with('(') {
+                // `use ( ./a ./b )` on one line, or `use (` + block
+                for t in &toks[1..] {
+                    let t = t.trim_matches(|c| c == '(' || c == ')');
+                    if !t.is_empty() {
+                        out.push(norm_manifest_dir(t));
+                    }
+                }
+                i += 1;
+                while i < lines.len() && lines[i] != ")" {
+                    let l = lines[i];
+                    if !l.is_empty() && !l.starts_with("//") {
+                        out.push(norm_manifest_dir(l));
+                    }
+                    i += 1;
+                }
+            } else if toks.len() >= 2 {
+                out.push(norm_manifest_dir(toks[1]));
+            } else {
+                // bare `use` + block on following lines
+                i += 1;
+                while i < lines.len() && lines[i] != ")" {
+                    let l = lines[i];
+                    if !l.is_empty() && !l.starts_with("//") {
+                        out.push(norm_manifest_dir(l));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Resolve a cargo package's name from its own Cargo.toml `[package] name`;
+/// falls back to the directory name when the manifest is missing or
+/// unparseable.
+fn crate_name(root: &std::path::Path, dir: &str) -> String {
+    if let Ok(text) = std::fs::read_to_string(root.join(dir).join("Cargo.toml")) {
+        if let Some(n) = toml_package_name(&text) {
+            if !n.is_empty() {
+                return n;
+            }
+        }
+    }
+    dir.rsplit('/').next().unwrap_or(dir).to_string()
+}
+
+/// Cargo workspace members from the root `Cargo.toml` `[workspace]` table:
+/// `members = [...]` (expanding `dir/*` globs against the filesystem,
+/// sorted) minus `exclude = [...]`. Returns (crate name, member dir) pairs.
+fn cargo_workspace_members(root: &std::path::Path) -> Vec<(String, String)> {
+    let text = match std::fs::read_to_string(root.join("Cargo.toml")) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let Some(ws) = toml_table(&text, "[workspace]") else {
+        return Vec::new();
+    };
+    let members = toml_string_array(&ws, "members");
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let excludes: BTreeSet<String> =
+        toml_string_array(&ws, "exclude").into_iter().map(|e| norm_manifest_dir(&e)).collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for m in members {
+        let m = norm_manifest_dir(&m);
+        if m.is_empty() || m == "." || excludes.contains(&m) {
+            continue;
+        }
+        if let Some(glob_dir) = m.strip_suffix("/*") {
+            let base = root.join(glob_dir);
+            let mut dirs: Vec<String> = std::fs::read_dir(&base)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|n| !n.starts_with('.'))
+                        .filter(|n| {
+                            root.join(format!("{glob_dir}/{n}")).join("Cargo.toml").is_file()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            dirs.sort();
+            for d in dirs {
+                let dir = format!("{glob_dir}/{d}");
+                if excludes.contains(&dir) {
+                    continue;
+                }
+                out.push((crate_name(root, &dir), dir));
+            }
+        } else if root.join(&m).is_dir() {
+            out.push((crate_name(root, &m), m));
+        }
+        // stale (missing) members are skipped deterministically
+    }
+    out
+}
+
+fn merge_manifest_candidate(out: &mut Vec<ComponentCandidate>, name: String, dir: String) {
+    if let Some(c) = out.iter_mut().find(|c| c.name == name) {
+        if !c.dirs.contains(&dir) {
+            c.dirs.push(dir);
+        }
+        if boundary_rank(BOUNDARY_PACKAGE) > boundary_rank(&c.boundary_kind) {
+            c.boundary_kind = BOUNDARY_PACKAGE.to_string();
+        }
+    } else {
+        out.push(ComponentCandidate {
+            name,
+            dirs: vec![dir],
+            boundary_kind: BOUNDARY_PACKAGE.to_string(),
+        });
+    }
+}
+
+/// Workspace-member component candidates from manifests the config
+/// extractors do not model: Cargo.toml `[workspace] members` (with
+/// `[package] name` for crate names) and go.work `use (...)` modules.
+/// File-based and deterministic; member dirs later out-prefix the top-dir
+/// fallback via longest-prefix matching in [`component_for_path`].
+fn manifest_package_candidates(root: &std::path::Path) -> Vec<ComponentCandidate> {
+    let mut out: Vec<ComponentCandidate> = Vec::new();
+    for (name, dir) in cargo_workspace_members(root) {
+        merge_manifest_candidate(&mut out, name, dir);
+    }
+    for dir in gowork_use_dirs(&std::fs::read_to_string(root.join("go.work")).unwrap_or_default()) {
+        if dir.is_empty() || dir == "." || !root.join(&dir).is_dir() {
+            continue; // stale module: deterministic skip
+        }
+        let name = dir.rsplit('/').next().unwrap_or(&dir).to_string();
+        merge_manifest_candidate(&mut out, name, dir);
+    }
+    out
+}
+
 pub fn compile_components(
     graph: &RealityGraph,
     store: &Store,
@@ -184,6 +427,15 @@ pub fn compile_components(
                     boundary_kind: BOUNDARY_PACKAGE.to_string(),
                 });
             }
+        }
+    }
+    // workspace members from manifests the config extractors don't model
+    // (Cargo.toml `[workspace] members`, go.work `use (...)`): file-based,
+    // deterministic; member dirs win over the top-dir fallback below via
+    // longest-prefix matching in `component_for_path`.
+    for cand in manifest_package_candidates(&store.root) {
+        for dir in cand.dirs {
+            merge_manifest_candidate(&mut candidates, cand.name.clone(), dir);
         }
     }
     // deployment units with build contexts
@@ -2067,5 +2319,193 @@ mod tests {
         assert!(score(api) > score(web), "evidence-rich candidate outranks a bare dir");
         assert_eq!(api.attributes["boundary_kind"], serde_json::json!("declared"));
         assert_eq!(web.attributes["boundary_kind"], serde_json::json!("code-region"));
+    }
+
+    #[test]
+    fn manifest_parsing_is_deterministic() {
+        // Cargo workspace member + exclude arrays, multi-line and inline
+        let ws = "[workspace]\nmembers = [\n  \"crates/a\",\n  \"crates/b\",\n]\nexclude = [\"crates/a\"]\n";
+        assert_eq!(
+            toml_string_array(ws, "members"),
+            vec!["crates/a", "crates/b"]
+        );
+        assert_eq!(toml_string_array(ws, "exclude"), vec!["crates/a"]);
+        // `exclude_members` must not match the `members` key
+        let trick = "[workspace]\nexclude_members = [\"x\"]\nmembers = [\"crates/a\"]\n";
+        assert_eq!(toml_string_array(trick, "members"), vec!["crates/a"]);
+        // [package] name inside a crate manifest
+        let pkg = "[package]\nname = \"grep-cli\"\nversion = \"0.1.0\"\n";
+        assert_eq!(toml_package_name(pkg).as_deref(), Some("grep-cli"));
+        // `name` outside the [package] table is ignored
+        let deps = "[dependencies]\nname = \"x\"\n";
+        assert_eq!(toml_package_name(deps), None);
+        // go.work: block + inline use directives, comments ignored
+        let gow = "go 1.22.0\n\nuse (\n\t./cmd/app\n\t./internal/lib\n\t// a comment\n)\n\nuse ./third\n";
+        assert_eq!(
+            gowork_use_dirs(gow),
+            vec!["cmd/app", "internal/lib", "third"]
+        );
+        // `user` must not parse as a `use` directive
+        assert_eq!(gowork_use_dirs("user = \"x\"\nuse ./only\n"), vec!["only"]);
+        assert!(gowork_use_dirs("go 1.22\n\nmodule = \"nouse\"\n").is_empty());
+    }
+
+    #[test]
+    fn cargo_workspace_members_compile_to_package_components() {
+        // EPIC-040 compiler gap: workspace crates become per-crate
+        // components, not one top-dir blob. A synthetic Cargo workspace
+        // (members via a `crates/*` glob, two crates) yields one
+        // package-boundary component per crate and routes member files
+        // into their crate — never into a single "crates" component.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"top\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/beta/Cargo.toml"),
+            "[package]\nname = \"beta\"\n",
+        )
+        .unwrap();
+
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let (fa, sa) =
+            insert_file_with_symbols(&store, "crates/alpha/src/lib.rs", &["alpha_run"]);
+        let (fb, sb) =
+            insert_file_with_symbols(&store, "crates/beta/src/lib.rs", &["beta_run"]);
+        let (_fr, _sr) = insert_file_with_symbols(&store, "README.md", &["readme"]);
+        let _ = (&fa, &fb, &sa, &sb);
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &[], &[]).unwrap();
+        let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
+            comps.iter().map(|c| (c.name.as_str(), c)).collect();
+
+        assert!(by_name.contains_key("alpha"), "per-crate component: {comps:?}");
+        assert!(by_name.contains_key("beta"), "per-crate component: {comps:?}");
+        assert_eq!(
+            by_name["alpha"].attributes["boundary_kind"].as_str(),
+            Some(BOUNDARY_PACKAGE)
+        );
+        assert_eq!(
+            by_name["beta"].attributes["boundary_kind"].as_str(),
+            Some(BOUNDARY_PACKAGE)
+        );
+        assert_eq!(
+            by_name["alpha"].attributes["implementation"]["paths"],
+            json!(["crates/alpha"])
+        );
+        assert_eq!(
+            by_name["beta"].attributes["implementation"]["paths"],
+            json!(["crates/beta"])
+        );
+        // member symbols land in their crate's component
+        let alpha_syms = by_name["alpha"].attributes["implementation"]["symbols"]
+            .as_array()
+            .unwrap();
+        assert!(alpha_syms.iter().any(|s| s == "alpha_run"));
+        let beta_syms = by_name["beta"].attributes["implementation"]["symbols"]
+            .as_array()
+            .unwrap();
+        assert!(beta_syms.iter().any(|s| s == "beta_run"));
+        // the top-level dir is NOT a single component: any "crates"
+        // fallback exists only as an empty shell, never holding members
+        if let Some(crates) = by_name.get("crates") {
+            let syms = crates.attributes["implementation"]["symbols"]
+                .as_array()
+                .unwrap();
+            assert!(syms.is_empty(), "'crates' must not swallow members: {syms:?}");
+        }
+        // longest-prefix matching routes member files to their crate
+        let cands = vec![
+            ComponentCandidate {
+                name: "alpha".into(),
+                dirs: vec!["crates/alpha".into()],
+                boundary_kind: BOUNDARY_PACKAGE.into(),
+            },
+            ComponentCandidate {
+                name: "beta".into(),
+                dirs: vec!["crates/beta".into()],
+                boundary_kind: BOUNDARY_PACKAGE.into(),
+            },
+            ComponentCandidate {
+                name: "crates".into(),
+                dirs: vec!["crates".into()],
+                boundary_kind: BOUNDARY_CODE_REGION.into(),
+            },
+        ];
+        assert_eq!(component_for_path("crates/alpha/src/lib.rs", &cands), "alpha");
+        assert_eq!(component_for_path("crates/beta/src/lib.rs", &cands), "beta");
+    }
+
+    #[test]
+    fn gowork_modules_compile_to_package_components() {
+        // go.work `use (...)` modules become package-boundary components
+        // too (go is not modeled by the config extractors; components.rs
+        // parses the workspace file directly).
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        for d in ["cmd/app", "internal/lib", "third"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(
+            root.join("go.work"),
+            "go 1.22.0\n\nuse (\n\t./cmd/app\n\t./internal/lib\n)\n\nuse ./third\n",
+        )
+        .unwrap();
+
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let (_fa, sa) = insert_file_with_symbols(&store, "cmd/app/main.go", &["app_main"]);
+        let (_fb, sb) = insert_file_with_symbols(&store, "internal/lib/lib.go", &["lib_fn"]);
+        let (_fc, sc) = insert_file_with_symbols(&store, "third/x.go", &["third_fn"]);
+        let _ = (&sa, &sb, &sc);
+
+        let graph = RealityGraph::load(&store).unwrap();
+        let comps = compile_components(&graph, &store, &[], &[]).unwrap();
+        let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
+            comps.iter().map(|c| (c.name.as_str(), c)).collect();
+
+        for n in ["app", "lib", "third"] {
+            assert!(by_name.contains_key(n), "module component missing: {comps:?}");
+            assert_eq!(
+                by_name[n].attributes["boundary_kind"].as_str(),
+                Some(BOUNDARY_PACKAGE),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            by_name["app"].attributes["implementation"]["paths"],
+            json!(["cmd/app"])
+        );
+        assert_eq!(
+            by_name["lib"].attributes["implementation"]["paths"],
+            json!(["internal/lib"])
+        );
+        let app_syms = by_name["app"].attributes["implementation"]["symbols"]
+            .as_array()
+            .unwrap();
+        assert!(app_syms.iter().any(|s| s == "app_main"));
+        let lib_syms = by_name["lib"].attributes["implementation"]["symbols"]
+            .as_array()
+            .unwrap();
+        assert!(lib_syms.iter().any(|s| s == "lib_fn"));
+        // no single top-level "cmd" blob holds the app module
+        if let Some(cmd) = by_name.get("cmd") {
+            let syms = cmd.attributes["implementation"]["symbols"]
+                .as_array()
+                .unwrap();
+            assert!(syms.is_empty(), "'cmd' must not swallow modules: {syms:?}");
+        }
     }
 }

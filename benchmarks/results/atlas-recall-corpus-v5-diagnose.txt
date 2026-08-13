@@ -1,0 +1,1206 @@
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)
+  mode: corpus: /Users/rocket/system_ir/benchmarks/corpus
+  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec   f/1k  toks  note
+  bat                       1.000  0.800  0.600  0.400  1.000  1.000  0.000    0.760  0.000   1.75 14887  
+      missed: entrypoints:bat cache
+      missed: behavior:App.new
+      missed: behavior:App.inputs
+      missed: state_authority:InputDescription
+      missed: state_authority:PrettyPrinter
+      missed: state_authority:Controller
+      missed: tests:tests/integration_tests.rs
+      missed: tests:tests/snapshot_tests.rs` + `tests/snapshots/
+      missed: tests:tests/test_pretty_printer.rs
+      missed: tests:tests/syntax-tests
+      missed: tests:tests/benchmarks
+      missed: tests:src/syntax_mapping.rs` `mod tests` (line 190)
+      missed: tests:tests/github-actions.rs
+  celery                    1.000  0.250  0.667  0.500  0.625  1.000  0.000    0.608  0.000   0.97 27796  resolved:248
+      missed: entrypoints:@app.task
+      missed: entrypoints:@shared_task
+      missed: entrypoints:app.send_task
+      missed: entrypoints:app.worker_main
+      missed: entrypoints:app.start
+      missed: entrypoints:celery -A proj worker
+      missed: behavior:chord header -> add_unlock_chord_task
+      missed: behavior:worker consumer -> task.run
+      missed: state_authority:app.conf
+      missed: state_authority:task_keyprefix = 'celery-task-meta-'
+      missed: state_authority:celery/worker/state.py
+      missed: contracts:broker='amqp://guest@localhost//'
+      missed: contracts:redis://localhost:6379/0
+      missed: contracts:name='celery.accumulate'
+      missed: tests:t/unit/
+      missed: tests:t/integration/
+      missed: tests:t/unit/app/test_app.py
+      missed: tests:t/unit/tasks/test_canvas.py
+      missed: tests:t/unit/backends/
+      missed: tests:t/unit/worker/
+  clap                      1.000  0.625  0.429  0.143  0.000  1.000  0.400    0.439  0.000   0.89 13477  
+      missed: entrypoints:#[derive(Parser)]
+      missed: entrypoints:clap_complete.generate
+      missed: entrypoints:clap_mangen
+      missed: behavior:Command.new
+      missed: behavior:Arg.new
+      missed: behavior:ArgMatches.get_one
+      missed: behavior:clap_complete.generate_to
+      missed: state_authority:ArgMatches
+      missed: state_authority:Command
+      missed: state_authority:mkeymap
+      missed: state_authority:ArgPredicate
+      missed: state_authority:ValueParser
+      missed: state_authority:StyledStr
+      missed: contracts:long
+      missed: contracts:short('f')
+      missed: contracts:Arg.required
+      missed: contracts:Arg.num_args
+      missed: contracts:ErrorKind.InvalidValue
+      missed: contracts:ErrorKind.UnknownArgument
+      missed: contracts:ErrorKind.DisplayHelp
+      missed: contracts:Command.bin_name
+      missed: contracts:Command.arg_required_else_help
+      missed: tests:clap_builder/src/builder/tests.rs
+      missed: tests:examples/
+      missed: tests:ErrorKind
+  docker-compose            0.667  0.333  0.000  0.571  0.091  1.000  0.000    0.332  0.000   0.33 39912  
+      missed: architecture:api.Compose
+      missed: architecture:types.Project
+      missed: entrypoints:psCmd
+      missed: entrypoints:startCommand
+      missed: entrypoints:stopCommand
+      missed: entrypoints:restartCmd
+      missed: entrypoints:pullCommand
+      missed: entrypoints:logsCmd
+      missed: entrypoints:Up(ctx context.Context, project *types.Project, options api.UpOptions) error
+      missed: entrypoints:Down(ctx context.Context, projectName string, options api.DownOptions) error
+      missed: behavior:up` -> composeService.Up -> create -> start
+      missed: behavior:down` -> composeService.Down -> remove containers/networks
+      missed: behavior:create` -> createNetwork/createVolume/container creation
+      missed: behavior:runUp` -> backend.Up with Create/Build options
+      missed: behavior:ps` -> composeService.Ps -> []api.ContainerSummary
+      missed: behavior:pull` -> composeService.Pull -> image pulls
+      missed: behavior:logs` -> composeService.Logs -> LogConsumer callbacks
+      missed: behavior:exec` -> composeService.Exec -> run command in container
+      missed: state_authority:types.Project
+      missed: state_authority:api.UpOptions
+      missed: state_authority:api.DownOptions
+      missed: contracts:up [OPTIONS] [SERVICE...]
+      missed: contracts:down [OPTIONS] [SERVICES]
+      missed: contracts:ps [OPTIONS] [SERVICE...]
+      missed: contracts:exec [OPTIONS] SERVICE COMMAND [ARGS...]
+      missed: contracts:build [OPTIONS] [SERVICE...]
+      missed: contracts:pull [OPTIONS] [SERVICE...]
+      missed: contracts:restart [OPTIONS] [SERVICE...]
+      missed: contracts:logs [OPTIONS] [SERVICE...]
+      missed: contracts:--force-recreate
+      missed: contracts:--remove-orphans
+      missed: tests:pkg/compose/create_test.go
+      missed: tests:pkg/compose/down_test.go
+      missed: tests:pkg/compose/loader_test.go
+      missed: tests:pkg/compose/executor_test.go
+      missed: tests:cmd/compose/up_test.go
+      missed: tests:cmd/compose/compose_test.go
+      missed: tests:pkg/e2e
+  express                   0.700  0.000  0.125  0.000  0.556  0.000  0.000    0.276  0.000   5.49  2368  
+      missed: architecture:Router
+      missed: architecture:Route
+      missed: architecture:urlencoded
+      missed: entrypoints:require('express')
+      missed: entrypoints:app.listen
+      missed: entrypoints:app.handle
+      missed: entrypoints:app.init
+      missed: entrypoints:app.engine
+      missed: entrypoints:app.param
+      missed: entrypoints:exports.application
+      missed: behavior:app.route` -> `router.route
+      missed: behavior:methods.forEach` -> `app.get
+      missed: behavior:app.listen` -> `http.createServer(this)` -> `app.handle
+      missed: behavior:app.render` -> `tryRender` -> `View.prototype.render
+      missed: behavior:res.sendFile` -> `sendfile` helper
+      missed: behavior:res.redirect
+      missed: behavior:res.json
+      missed: state_authority:this.router
+      missed: state_authority:this.settings
+      missed: state_authority:this.engines
+      missed: state_authority:this.cache
+      missed: state_authority:res.locals
+      missed: state_authority:req.app
+      missed: state_authority:trustProxyDefaultSymbol
+      missed: contracts:case sensitive routing
+      missed: contracts:view engine
+      missed: contracts:query parser
+      missed: contracts:res.status(code)
+      missed: landmarks:methods
+      missed: landmarks:app.request
+      missed: tests:test/app.router.js
+      missed: tests:test/app.param.js
+      missed: tests:test/app.head.js
+      missed: tests:test/app.options.js
+      missed: tests:test/res.json.js
+      missed: tests:test/req.ip.js
+      missed: tests:test/req.route.js
+      missed: tests:test/utils.js
+  fastapi                   1.000  0.667  0.857  0.000  0.714  1.000  0.000    0.648  0.004   0.78 25583  resolved:173
+      missed: entrypoints:app.get
+      missed: entrypoints:app.post
+      missed: entrypoints:fastapi = "fastapi.cli:main"
+      missed: behavior:generate_operation_id
+      missed: state_authority:self.dependency_overrides
+      missed: state_authority:self.router
+      missed: state_authority:app.state
+      missed: state_authority:model_name_map
+      missed: state_authority:app.openapi_url
+      missed: contracts:read_items_items__get
+      missed: contracts:response_model=Item
+      missed: tests:tests/test_application.py
+      missed: tests:tests/test_dependencies_utils.py
+      missed: tests:tests/test_router_include_context.py
+      missed: tests:tests/test_openapi_separate_input_output_schemas.py
+      missed: tests:tests/test_fastapi_cli.py
+      missed: tests:docs_src/app_testing/tutorial003_py310.py
+      missed: tests:tests/test_dependency_overrides.py
+  flask                     1.000  0.333  1.000  0.500  0.857  1.000  0.000    0.738  0.000   1.75 15993  resolved:59
+      missed: entrypoints:app.run
+      missed: entrypoints:@app.route
+      missed: entrypoints:@app.get
+      missed: entrypoints:@app.post
+      missed: entrypoints:flask = "flask.cli:main"
+      missed: entrypoints:flask run
+      missed: state_authority:app.view_functions
+      missed: state_authority:self.url_map
+      missed: state_authority:jinja_env
+      missed: contracts:flask routes
+      missed: tests:tests/test_basic.py
+      missed: tests:tests/test_blueprints.py
+      missed: tests:tests/test_cli.py
+      missed: tests:tests/test_templating.py
+      missed: tests:tests/test_user_error_handler.py
+      missed: tests:tests/test_session_interface.py
+      missed: tests:tests/test_views.py
+  gin                       1.000  0.750  0.167  1.000  0.000  1.000  0.000    0.583  0.000   0.87 21777  
+      missed: entrypoints:gin.New()
+      missed: entrypoints:gin.Default()
+      missed: behavior:gin.Default
+      missed: behavior:ServeHTTP
+      missed: behavior:Context.JSON
+      missed: behavior:RouterGroup.handle
+      missed: behavior:Context.Next
+      missed: contracts:router.GET("/ping"
+      missed: contracts:GET /test
+      missed: contracts:GET /:count
+      missed: contracts:GET /v1/:path
+      missed: contracts:GET /test/:param
+      missed: contracts:POST /
+      missed: contracts:Engine.NoRoute
+      missed: contracts:Context.Param
+      missed: contracts:Context.ShouldBindJSON
+      missed: tests:gin_test.go
+      missed: tests:gin_integration_test.go
+      missed: tests:benchmarks_test.go
+      missed: tests:context_test.go
+      missed: tests:auth_test.go
+      missed: tests:errors_test.go
+      missed: tests:router.Group("/users")
+  gorilla-mux               1.000  1.000  0.800  0.800  0.000  1.000  0.000    0.720  0.000   1.11 14439  
+      missed: behavior:NewRouter
+      missed: state_authority:varsKey
+      missed: contracts:r.HandleFunc("/api", emptyHandler).Methods("POST")
+      missed: contracts:Queries("time", "{time:[0-9]+}")
+      missed: contracts:Queries("foo", "{foo:[0-9]+}")
+      missed: contracts:PathPrefix("/sub/").Subrouter()
+      missed: contracts:Subrouter
+      missed: contracts:Host("{subdomain}.domain.com")
+      missed: contracts:r.HandleFunc("/", func1).Name("func1")
+      missed: contracts:{name:pattern}
+      missed: tests:mux_test.go
+      missed: tests:route_test.go
+      missed: tests:regexp_test.go
+      missed: tests:example_route_test.go
+      missed: tests:example_authentication_middleware_test.go
+      missed: tests:example_cors_method_middleware_test.go
+      missed: tests:mux_httpserver_test.go
+      missed: tests:bench_test.go
+  junit4                    1.000  0.571  0.000  0.857  0.000  1.000  0.714    0.486  0.000   0.60 31605  
+      missed: entrypoints:runClasses(Class<?>... classes)
+      missed: entrypoints:@RunWith
+      missed: entrypoints:@Test
+      missed: behavior:JUnitCore.run` -> Request.classes -> Computer -> Runner
+      missed: behavior:BlockJUnit4ClassRunner` -> MethodRoadie -> RunRules -> before/test/after
+      missed: behavior:ParentRunner.run` -> runChildren
+      missed: behavior:RunNotifier.fireTestStarted` -> listeners
+      missed: behavior:--filter` -> FilterFactories -> Filter
+      missed: behavior:assertThrows` -> ThrowingRunnable.run() inside try/catch
+      missed: behavior:@RunWith(Parameterized.class)` -> Parameterized -> per-parameter-set child runners
+      missed: state_authority:RuleContainer
+      missed: contracts:@Test
+      missed: contracts:timeout()
+      missed: contracts:assertEquals(Object expected, Object actual)
+      missed: contracts:assertThrows
+      missed: contracts:@Before
+      missed: contracts:@BeforeClass
+      missed: contracts:@Rule
+      missed: contracts:@Ignore
+      missed: contracts:@FixMethodOrder(MethodSorters.NAME_ASCENDING)
+      missed: tests:JUnitCoreReturnsCorrectExitCodeTest
+      missed: tests:ExpectedTest
+  kind                      0.400  0.000  0.000  0.000  0.667  1.000  0.000    0.213  0.000   0.53 18696  
+      missed: architecture:create.Cluster
+      missed: architecture:delete.Cluster
+      missed: architecture:nodeimage.Build
+      missed: architecture:app.Main
+      missed: architecture:providers.Provider
+      missed: architecture:internalencoding
+      missed: entrypoints:main.go
+      missed: entrypoints:pkg/cmd/kind/root.go
+      missed: entrypoints:pkg/cmd/kind/create/create.go
+      missed: entrypoints:pkg/cmd/kind/create/cluster/createcluster.go
+      missed: entrypoints:pkg/cmd/kind/delete/delete.go
+      missed: entrypoints:pkg/cmd/kind/get/get.go
+      missed: entrypoints:func (p *Provider) Create(name string, options ...CreateOption) error
+      missed: entrypoints:func (p *Provider) Delete(name, explicitKubeconfigPath string) error
+      missed: entrypoints:func (p *Provider) List() ([]string, error)
+      missed: behavior:kind create cluster` -> NewProvider -> Provider.Create -> create.Cluster
+      missed: behavior:CreateWithConfigFile` -> internalencoding.Load -> Cluster config
+      missed: behavior:CreateWithWaitForReady` -> wait for control-plane readiness
+      missed: behavior:Provider.Delete
+      missed: behavior:pkg/cmd/kind/get/kubeconfig
+      missed: behavior:nodeimage.Build` -> docker build of node image
+      missed: behavior:docker.NewProvider
+      missed: behavior:CreateWithWaitForReady
+      missed: state_authority:DefaultClusterName
+      missed: state_authority:providers.Provider
+      missed: state_authority:docker.NewProvider
+      missed: state_authority:podman.NewProvider
+      missed: state_authority:nerdctl.NewProvider
+      missed: state_authority:pkg/cluster/internal/kubeconfig
+      missed: state_authority:v1alpha4
+      missed: contracts:kind.x-k8s.io/v1alpha4
+      missed: contracts:ControlPlaneRole NodeRole = "control-plane"
+      missed: contracts:WorkerRole NodeRole = "worker"
+      missed: tests:pkg/internal/apis/config/encoding/load_test.go
+      missed: tests:pkg/internal/apis/config/validate_test.go
+      missed: tests:pkg/internal/apis/config/cluster_util_test.go
+      missed: tests:pkg/cluster/internal/providers/docker/network_test.go
+      missed: tests:pkg/cluster/internal/providers/common/namer_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/write_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/remove_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/merge_test.go
+  microservices-demo        0.917  0.000  0.000  0.000  0.000  1.000  0.000    0.183  0.000   0.63 17589  
+      missed: architecture:loadgenerator
+      missed: entrypoints:src/checkoutservice/main.go
+      missed: entrypoints:src/currencyservice/server.js
+      missed: entrypoints:src/productcatalogservice/server.go
+      missed: entrypoints:src/adservice/src/main/java/hipstershop/AdService.java
+      missed: entrypoints:src/emailservice/email_server.py
+      missed: entrypoints:src/recommendationservice/recommendation_server.py
+      missed: entrypoints:src/shippingservice/main.go
+      missed: entrypoints:src/frontend/main.go
+      missed: entrypoints:src/cartservice/src/Program.cs
+      missed: entrypoints:src/paymentservice/server.js
+      missed: behavior:ListProducts` -> catalog_loader.go -> products.json
+      missed: behavior:getCart` -> CartService.GetCart
+      missed: behavior:PlaceOrder` -> GetCart -> GetQuote -> Charge -> SendOrderConfirmation -> ShipOrder
+      missed: behavior:AddItem` -> CartService -> cartstore
+      missed: behavior:Convert` -> CurrencyService
+      missed: behavior:GetAds` -> AdService
+      missed: behavior:ListRecommendations` -> RecommendationService
+      missed: behavior:homeHandler` -> getProducts -> ProductCatalogService.ListProducts
+      missed: state_authority:redis-cart
+      missed: state_authority:RedisCartStore
+      missed: state_authority:ICartStore
+      missed: state_authority:SpannerCartStore
+      missed: state_authority:src/productcatalogservice/products.json
+      missed: state_authority:cookieSessionID
+      missed: state_authority:kubernetes-manifests
+      missed: state_authority:helm-chart
+      missed: state_authority:skaffold.yaml
+      missed: contracts:rpc GetCart(GetCartRequest) returns (Cart)
+      missed: contracts:rpc ListProducts(Empty) returns (ListProductsResponse)
+      missed: contracts:rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse)
+      missed: contracts:rpc GetSupportedCurrencies(Empty) returns (GetSupportedCurrenciesResponse)
+      missed: contracts:containerPort: 9555
+      missed: contracts:port: 7070
+      missed: contracts:port: 5050
+      missed: contracts:port: 50051
+      missed: contracts:port: 3550
+      missed: contracts:/_healthz
+      missed: contracts:GET /product/{id}
+      missed: tests:src/productcatalogservice/product_catalog_test.go
+      missed: tests:src/shippingservice/shippingservice_test.go
+      missed: tests:src/frontend/validator/validator_test.go
+      missed: tests:src/checkoutservice/money/money_test.go
+      missed: tests:src/frontend/money/money_test.go
+      missed: tests:src/loadgenerator/locustfile.py
+  mockito                   1.000  0.333  0.000  0.571  0.000  1.000  0.875    0.381  0.000   0.22 62965  
+      missed: entrypoints:mock(Class<T> classToMock)
+      missed: entrypoints:when(T methodCall)
+      missed: entrypoints:verify(T mock)
+      missed: entrypoints:mockitoSession()
+      missed: entrypoints:spy(T object)
+      missed: entrypoints:doReturn(Object toBeReturned)
+      missed: behavior:mock()` -> MockitoCore.mock -> MockMaker.createMock
+      missed: behavior:when()` -> MockitoCore.when -> stubbingStarted() -> OngoingStubbing.thenReturn
+      missed: behavior:verify()` -> MockitoCore.verify -> VerificationModeFactory.times(1)
+      missed: behavior:any()`/`eq()` -> reportMatcher() -> matcher stack
+      missed: behavior:timeout(long millis)
+      missed: behavior:inOrder(mocks)` -> InOrder.verify
+      missed: behavior:MockitoExtension.beforeEach
+      missed: behavior:doThrow(Throwable...)` -> MOCKITO_CORE.stubber() -> Stubber.doThrow
+      missed: state_authority:mockito-core
+      missed: state_authority:MockUtil
+      missed: state_authority:GlobalConfiguration
+      missed: contracts:OngoingStubbing
+      missed: contracts:VerificationMode
+      missed: contracts:ArgumentMatcher<T>
+      missed: contracts:ArgumentCaptor
+      missed: contracts:@Mock
+      missed: contracts:@InjectMocks
+      missed: contracts:Strictness.STRICT_STUBS
+      missed: contracts:MockSettings.extraInterfaces
+      missed: contracts:@Captor
+      missed: tests:ArgumentCaptorTest
+  nest                      1.000  0.143  0.125  0.571  0.000  0.833  0.000    0.368  0.000   0.37 32682  resolved:138
+      missed: entrypoints:NestFactory.create(AppModule)
+      missed: entrypoints:NestFactory.createMicroservice
+      missed: entrypoints:NestFactory.createApplicationContext
+      missed: entrypoints:app.listen(port)
+      missed: entrypoints:@Controller('cats')
+      missed: entrypoints:packages/core/index.ts
+      missed: behavior:NestFactory.create` -> `NestApplication
+      missed: behavior:Controller` -> `RoutesResolver
+      missed: behavior:MessagePattern` -> server
+      missed: behavior:Test.createTestingModule` -> `TestingModuleBuilder.compile` -> `TestingModule
+      missed: behavior:NestContainer` -> `InstanceLoader` -> `Injector
+      missed: behavior:ExpressAdapter` -> `RouterMethodFactory
+      missed: behavior:NestFactory.create` -> `GraphInspector
+      missed: state_authority:ModulesContainer
+      missed: state_authority:InstanceLoader
+      missed: state_authority:DependenciesScanner
+      missed: contracts:@Controller('cats')
+      missed: contracts:@Get(':id')
+      missed: contracts:@Param('id', new ParseIntPipe())
+      missed: contracts:@UseGuards(RolesGuard)
+      missed: contracts:Test.createTestingModule
+      missed: contracts:NestExpressApplication
+      missed: contracts:@EventPattern
+      missed: contracts:Transport
+      missed: contracts:APP_GUARD
+      missed: landmarks:Param` / `Body` / `Query
+      missed: tests:packages/core/test
+      missed: tests:integration/
+      missed: tests:sample/01-cats-app/src/cats/cats.controller.spec.ts
+      missed: tests:sample/19-auth-jwt/e2e/app/app.e2e-spec.ts
+      missed: tests:sample/02-gateways/e2e/events-gateway/gateway.e2e-spec.ts
+      missed: tests:sample/26-queues/e2e/audio/audio.e2e-spec.ts
+      missed: tests:packages/common/test
+  prettier                  1.000  0.429  0.000  0.250  0.091  1.000  0.000    0.354  0.093   0.61 24522  
+      missed: entrypoints:src/index.js
+      missed: entrypoints:src/cli/index.js
+      missed: entrypoints:src/standalone.js
+      missed: entrypoints:src/cli/context.js
+      missed: behavior:format` -> `coreFormat` -> `parse` -> `printAstToDoc` -> `printDocToString
+      missed: behavior:check` -> `format` text comparison
+      missed: behavior:parse` -> `resolveParser` -> `parser.preprocess
+      missed: behavior:printAstToDoc` -> `prepareToPrint` -> doc cache Map
+      missed: behavior:formatFiles` -> `formatFile` -> `writeOutput
+      missed: behavior:listDifferent` -> `prettier.check
+      missed: behavior:formatFile` -> `mockable.writeFormattedFile
+      missed: behavior:normalizeInputAndOptions` -> `normalizeFormatOptions
+      missed: state_authority:printAstToDoc
+      missed: state_authority:resolveConfig
+      missed: state_authority:editorconfig
+      missed: state_authority:context.argv
+      missed: state_authority:mockable
+      missed: state_authority:directory-ignorer
+      missed: contracts:--write
+      missed: contracts:--check
+      missed: contracts:--list-different
+      missed: contracts:--debug-check
+      missed: contracts:--log-level
+      missed: contracts:babel
+      missed: contracts:postcss
+      missed: contracts:html
+      missed: contracts:yaml
+      missed: contracts:CATEGORY_OUTPUT
+      missed: tests:tests/format
+      missed: tests:tests/unit
+      missed: tests:tests/integration
+      missed: tests:tests/config
+      missed: tests:tests/dts
+      missed: tests:tests/format/js
+      missed: tests:tests/format/css
+      missed: tests:tests/unit/doc-builders.js
+      missed: tests:tests/unit/editorconfig-to-prettier.js
+  pydantic                  1.000  1.000  0.167  0.500  0.000  1.000  0.000    0.533  0.000   0.53 36015  
+      missed: behavior:__get_pydantic_core_schema__
+      missed: behavior:model_rebuild
+      missed: behavior:TypeAdapter.json_schema
+      missed: behavior:model_post_init
+      missed: behavior:__pydantic_init_subclass__
+      missed: state_authority:__pydantic_fields__
+      missed: state_authority:model_extra
+      missed: state_authority:ConfigDict.validate_assignment
+      missed: contracts:model_config = ConfigDict(validate_assignment=True)
+      missed: contracts:strict=True
+      missed: contracts:mode='json'
+      missed: contracts:ConfigDict(defer_build=True)
+      missed: contracts:indent
+      missed: contracts:mode='validation'
+      missed: tests:tests/test_main.py
+      missed: tests:tests/test_type_adapter.py
+      missed: tests:tests/test_json_schema.py
+      missed: tests:tests/test_validators.py
+      missed: tests:tests/test_model_validator.py
+      missed: tests:tests/test_dataclasses.py
+      missed: tests:tests/test_create_model.py
+      missed: tests:tests/test_errors.py
+  serde                     0.750  0.000  0.400  0.000  0.000  1.000  0.000    0.230  0.000   0.39 12825  
+      missed: architecture:de::value
+      missed: entrypoints:#[derive(Serialize)]
+      missed: entrypoints:#[derive(Deserialize)]
+      missed: entrypoints:Serialize::serialize
+      missed: entrypoints:Deserialize::deserialize
+      missed: entrypoints:serde_json::to_string
+      missed: entrypoints:serde_json::from_str
+      missed: behavior:Serialize.serialize
+      missed: behavior:serde_json::to_string
+      missed: behavior:Deserializer.deserialize_enum
+      missed: state_authority:serde/src/private
+      missed: state_authority:serde_derive_internals
+      missed: state_authority:serde_core/src
+      missed: state_authority:Content
+      missed: state_authority:serde_core/src/format.rs
+      missed: contracts:serialize_struct
+      missed: contracts:deserialize_struct
+      missed: contracts:#[serde(tag = "t", content = "c")]
+      missed: contracts:Error::custom
+      missed: contracts:serde_test::Token
+      missed: contracts:serde_json::to_string
+      missed: tests:test_suite/tests/test_ser.rs
+      missed: tests:test_suite/tests/test_de.rs
+      missed: tests:test_suite/tests/test_roundtrip.rs
+      missed: tests:test_suite/tests/test_annotations.rs
+      missed: tests:test_suite/tests/test_enum_adjacently_tagged.rs
+      missed: tests:test_suite/tests/regression/issue2565.rs
+      missed: tests:test_suite/tests/ui
+  shadcn-ui                 0.714  0.000  0.000  0.000  0.000  0.800  0.000    0.143  0.000   0.34 14735  resolved:32
+      missed: architecture:@shadcn/react
+      missed: architecture:@shadcn/helpers
+      missed: entrypoints:npx shadcn init
+      missed: entrypoints:shadcn add
+      missed: entrypoints:npx shadcn create
+      missed: entrypoints:next dev --turbopack --port 4000
+      missed: entrypoints:scripts/build-registry.mts
+      missed: entrypoints:apps/v4/app/(app)/docs/[[...slug]]/page.tsx
+      missed: entrypoints:apps/v4/app/(app)/blocks/[...categories]/page.tsx
+      missed: entrypoints:apps/v4/app/api/search/route.ts
+      missed: behavior:build-registry.mts
+      missed: behavior:add` command -> fetch item address -> apply component to project
+      missed: behavior:components.json
+      missed: behavior:packages/shadcn/src/commands/apply.ts
+      missed: behavior:apps/v4/lib/source.ts
+      missed: behavior:createFromSource
+      missed: behavior:capture-registry.mts
+      missed: behavior:capture-explore.mts
+      missed: state_authority:apps/v4/registry.json
+      missed: state_authority:apps/v4/components.json
+      missed: state_authority:apps/v4/lib/registry.ts
+      missed: state_authority:apps/v4/lib/config.ts
+      missed: state_authority:registry/new-york-v4
+      missed: state_authority:registry/bases
+      missed: state_authority:apps/v4/lib/themes.ts
+      missed: contracts:"button"
+      missed: contracts:apps/v4/registry/new-york-v4/ui/card.tsx
+      missed: contracts:apps/v4/registry/new-york-v4/ui/dialog.tsx
+      missed: contracts:npx shadcn init
+      missed: contracts:shadcn add
+      missed: contracts:--yes
+      missed: contracts:data-slot="dialog"
+      missed: contracts:data-slot="card"
+      missed: contracts:[[...slug]]
+      missed: landmarks:apps/v4/source.config.ts
+      missed: tests:packages/shadcn/src/commands/add.test.ts
+      missed: tests:packages/shadcn/src/commands/init.test.ts
+      missed: tests:packages/shadcn/src/commands/build.test.ts
+      missed: tests:packages/shadcn/src/commands/apply.test.ts
+      missed: tests:packages/shadcn/test
+      missed: tests:apps/v4/registry/calendar.test.ts
+      missed: tests:apps/v4/registry/config.test.ts
+      missed: tests:packages/tests
+  sqlalchemy                1.000  1.000  0.167  0.167  0.143  1.000  0.000    0.495  0.000   0.24 106810  resolved:406
+      missed: behavior:create_engine -> Engine.connect -> Connection.execute
+      missed: behavior:Session.execute -> ORMExecuteState
+      missed: behavior:declarative_base -> Mapper.configure
+      missed: behavior:Transaction -> commit/rollback
+      missed: behavior:QueuePool -> _ConnectionFairy
+      missed: state_authority:engine.pool
+      missed: state_authority:Session identity map
+      missed: state_authority:sessionmaker(bind=engine)
+      missed: state_authority:_sa_instance_state
+      missed: state_authority:Session.connection
+      missed: contracts:create_engine("sqlite://")
+      missed: contracts:"sqlite:///:memory:"
+      missed: contracts:LABEL_STYLE_TABLENAME_PLUS_COL
+      missed: contracts:select(t1).where(t1.c.c2 == t2.c.c1)
+      missed: contracts:test_session_commit_rollback
+      missed: contracts:name = "sqlite"
+      missed: tests:test/orm/test_session.py
+      missed: tests:test/orm/test_query.py
+      missed: tests:test/engine/test_transaction.py
+      missed: tests:test/engine/test_pool.py
+      missed: tests:test/dialect/sqlite/
+      missed: tests:test/aaa_profiling/test_orm.py
+      missed: tests:test/aaa_profiling/test_pool.py
+  svelte                    1.000  0.125  0.500  0.500  0.000  1.000  0.000    0.425  0.000   1.18 16909  resolved:71
+      missed: entrypoints:src/index-server.js
+      missed: entrypoints:svelte/compiler
+      missed: entrypoints:svelte/internal
+      missed: entrypoints:svelte/store` / `svelte/motion
+      missed: entrypoints:phases/1-parse
+      missed: entrypoints:phases/2-analyze
+      missed: entrypoints:phases/3-transform
+      missed: behavior:compile
+      missed: behavior:migrate
+      missed: behavior:preprocess
+      missed: behavior:flushSync` / `fork
+      missed: state_authority:mounted_components
+      missed: state_authority:get_or_init_context_map
+      missed: state_authority:active_reaction
+      missed: state_authority:STATE_SYMBOL
+      missed: contracts:$state
+      missed: contracts:$derived
+      missed: contracts:$effect
+      missed: contracts:$props
+      missed: contracts:bind:value
+      missed: contracts:bind:this
+      missed: contracts:bind:group
+      missed: contracts:runes
+      missed: contracts:css
+      missed: contracts:mount
+      missed: tests:packages/svelte/tests/compiler-errors
+      missed: tests:packages/svelte/tests/runtime-runes
+      missed: tests:packages/svelte/tests/runtime-legacy
+      missed: tests:packages/svelte/tests/runtime-browser
+      missed: tests:packages/svelte/tests/parser-modern
+      missed: tests:packages/svelte/tests/parser-legacy
+      missed: tests:packages/svelte/tests/snapshot
+      missed: tests:packages/svelte/tests/server-side-rendering
+      missed: tests:packages/svelte/tests/store
+  mean                      0.907  0.418  0.300  0.367  0.237  0.932  0.099    0.446  0.005   0.98 27579
+  scored: 20   skipped: 0
+  resolved calls (semantic backends upgraded): 1127
+  gate: FAIL (overall mean recall 0.446 >= 0.5)
+
+gap-kind histogram (all sections):
+  ALIAS        58
+  COMPILER     265
+  EXTRACTOR    189
+  PROJECTION   53
+
+Per-repo gap lines (regenerated into benchmarks/results/ground-truth-gaps.md):
+
+## bat
+- `entrypoints:bat cache` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:App.new` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:App.inputs` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:InputDescription` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:PrettyPrinter` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:Controller` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `tests:tests/integration_tests.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/snapshot_tests.rs` + `tests/snapshots/` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:tests/test_pretty_printer.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/syntax-tests` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/benchmarks` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/syntax_mapping.rs` `mod tests` (line 190)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:tests/github-actions.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## celery
+- `entrypoints:@app.task` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:@shared_task` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:app.send_task` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.worker_main` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.start` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:celery -A proj worker` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:chord header -> add_unlock_chord_task` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:worker consumer -> task.run` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:app.conf` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:task_keyprefix = 'celery-task-meta-'` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:celery/worker/state.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:broker='amqp://guest@localhost//'` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:redis://localhost:6379/0` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:name='celery.accumulate'` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:t/unit/` — COMPILER GAP: reached a flow but was never compiled into a component
+- `tests:t/integration/` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:t/unit/app/test_app.py` — COMPILER GAP: reached a flow but was never compiled into a component
+- `tests:t/unit/tasks/test_canvas.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:t/unit/backends/` — COMPILER GAP: reached a flow but was never compiled into a component
+- `tests:t/unit/worker/` — COMPILER GAP: reached a flow but was never compiled into a component
+
+## clap
+- `entrypoints:#[derive(Parser)]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:clap_complete.generate` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:clap_mangen` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:Command.new` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:Arg.new` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:ArgMatches.get_one` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:clap_complete.generate_to` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:ArgMatches` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:Command` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:mkeymap` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:ArgPredicate` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:ValueParser` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:StyledStr` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:long` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:short('f')` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Arg.required` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:Arg.num_args` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:ErrorKind.InvalidValue` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:ErrorKind.UnknownArgument` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:ErrorKind.DisplayHelp` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Command.bin_name` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:Command.arg_required_else_help` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `tests:clap_builder/src/builder/tests.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:examples/` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:ErrorKind` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+
+## docker-compose
+- `architecture:api.Compose` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:types.Project` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:psCmd` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:startCommand` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `entrypoints:stopCommand` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `entrypoints:restartCmd` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pullCommand` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `entrypoints:logsCmd` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:Up(ctx context.Context, project *types.Project, options api.UpOptions) error` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:Down(ctx context.Context, projectName string, options api.DownOptions) error` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:up` -> composeService.Up -> create -> start` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:down` -> composeService.Down -> remove containers/networks` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:create` -> createNetwork/createVolume/container creation` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:runUp` -> backend.Up with Create/Build options` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:ps` -> composeService.Ps -> []api.ContainerSummary` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:pull` -> composeService.Pull -> image pulls` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:logs` -> composeService.Logs -> LogConsumer callbacks` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:exec` -> composeService.Exec -> run command in container` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:types.Project` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:api.UpOptions` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:api.DownOptions` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:up [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:down [OPTIONS] [SERVICES]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:ps [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:exec [OPTIONS] SERVICE COMMAND [ARGS...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:build [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:pull [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:restart [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:logs [OPTIONS] [SERVICE...]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:--force-recreate` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:--remove-orphans` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:pkg/compose/create_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/compose/down_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/compose/loader_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/compose/executor_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:cmd/compose/up_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:cmd/compose/compose_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/e2e` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## express
+- `architecture:Router` — COMPILER GAP: reached a flow but was never compiled into a component
+- `architecture:Route` — COMPILER GAP: reached a flow but was never compiled into a component
+- `architecture:urlencoded` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:require('express')` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:app.listen` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.handle` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.init` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.engine` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.param` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:exports.application` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:app.route` -> `router.route` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:methods.forEach` -> `app.get` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:app.listen` -> `http.createServer(this)` -> `app.handle` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:app.render` -> `tryRender` -> `View.prototype.render` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:res.sendFile` -> `sendfile` helper` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:res.redirect` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:res.json` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:this.router` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:this.settings` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:this.engines` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:this.cache` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:res.locals` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:req.app` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:trustProxyDefaultSymbol` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:case sensitive routing` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:view engine` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:query parser` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:res.status(code)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `landmarks:methods` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `landmarks:app.request` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/app.router.js` — COMPILER GAP: reached a flow but was never compiled into a component
+- `tests:test/app.param.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/app.head.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/app.options.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/res.json.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/req.ip.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/req.route.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/utils.js` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## fastapi
+- `entrypoints:app.get` — ALIAS GAP: present in the rendered atlas text (e.g. README purpose or trust boundaries) under a spelling the structured layers do not carry
+- `entrypoints:app.post` — ALIAS GAP: present in the rendered atlas text (e.g. README purpose or trust boundaries) under a spelling the structured layers do not carry
+- `entrypoints:fastapi = "fastapi.cli:main"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:generate_operation_id` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:self.dependency_overrides` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:self.router` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:app.state` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:model_name_map` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:app.openapi_url` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:read_items_items__get` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:response_model=Item` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:tests/test_application.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_dependencies_utils.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_router_include_context.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_openapi_separate_input_output_schemas.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_fastapi_cli.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:docs_src/app_testing/tutorial003_py310.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_dependency_overrides.py` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## flask
+- `entrypoints:app.run` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:@app.route` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:@app.get` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:@app.post` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:flask = "flask.cli:main"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:flask run` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:app.view_functions` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:self.url_map` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:jinja_env` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:flask routes` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:tests/test_basic.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_blueprints.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_cli.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_templating.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_user_error_handler.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_session_interface.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_views.py` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## gin
+- `entrypoints:gin.New()` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:gin.Default()` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:gin.Default` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:ServeHTTP` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:Context.JSON` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:RouterGroup.handle` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:Context.Next` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:router.GET("/ping"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:GET /test` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:GET /:count` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:GET /v1/:path` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:GET /test/:param` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:POST /` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Engine.NoRoute` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:Context.Param` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:Context.ShouldBindJSON` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `tests:gin_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:gin_integration_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:benchmarks_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:context_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:auth_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:errors_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:router.Group("/users")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+
+## gorilla-mux
+- `behavior:NewRouter` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:varsKey` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:r.HandleFunc("/api", emptyHandler).Methods("POST")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Queries("time", "{time:[0-9]+}")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Queries("foo", "{foo:[0-9]+}")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:PathPrefix("/sub/").Subrouter()` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Subrouter` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:Host("{subdomain}.domain.com")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:r.HandleFunc("/", func1).Name("func1")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:{name:pattern}` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:mux_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:route_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:regexp_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:example_route_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:example_authentication_middleware_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:example_cors_method_middleware_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:mux_httpserver_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:bench_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## junit4
+- `entrypoints:runClasses(Class<?>... classes)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:@RunWith` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:@Test` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:JUnitCore.run` -> Request.classes -> Computer -> Runner` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:BlockJUnit4ClassRunner` -> MethodRoadie -> RunRules -> before/test/after` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:ParentRunner.run` -> runChildren` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:RunNotifier.fireTestStarted` -> listeners` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:--filter` -> FilterFactories -> Filter` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:assertThrows` -> ThrowingRunnable.run() inside try/catch` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:@RunWith(Parameterized.class)` -> Parameterized -> per-parameter-set child runners` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:RuleContainer` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:@Test` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:timeout()` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:assertEquals(Object expected, Object actual)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:assertThrows` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:@Before` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@BeforeClass` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@Rule` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@Ignore` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@FixMethodOrder(MethodSorters.NAME_ASCENDING)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:JUnitCoreReturnsCorrectExitCodeTest` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `tests:ExpectedTest` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+
+## kind
+- `architecture:create.Cluster` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:delete.Cluster` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:nodeimage.Build` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:app.Main` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:providers.Provider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `architecture:internalencoding` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:main.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pkg/cmd/kind/root.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pkg/cmd/kind/create/create.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pkg/cmd/kind/create/cluster/createcluster.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pkg/cmd/kind/delete/delete.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:pkg/cmd/kind/get/get.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:func (p *Provider) Create(name string, options ...CreateOption) error` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:func (p *Provider) Delete(name, explicitKubeconfigPath string) error` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:func (p *Provider) List() ([]string, error)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:kind create cluster` -> NewProvider -> Provider.Create -> create.Cluster` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:CreateWithConfigFile` -> internalencoding.Load -> Cluster config` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:CreateWithWaitForReady` -> wait for control-plane readiness` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Provider.Delete` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:pkg/cmd/kind/get/kubeconfig` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:nodeimage.Build` -> docker build of node image` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:docker.NewProvider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:CreateWithWaitForReady` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:DefaultClusterName` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:providers.Provider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:docker.NewProvider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:podman.NewProvider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:nerdctl.NewProvider` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:pkg/cluster/internal/kubeconfig` — COMPILER GAP: reached a flow but was never compiled into a component
+- `state_authority:v1alpha4` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:kind.x-k8s.io/v1alpha4` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:ControlPlaneRole NodeRole = "control-plane"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:WorkerRole NodeRole = "worker"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:pkg/internal/apis/config/encoding/load_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/internal/apis/config/validate_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/internal/apis/config/cluster_util_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/cluster/internal/providers/docker/network_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/cluster/internal/providers/common/namer_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/write_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/remove_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/merge_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## microservices-demo
+- `architecture:loadgenerator` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/checkoutservice/main.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/currencyservice/server.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/productcatalogservice/server.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/adservice/src/main/java/hipstershop/AdService.java` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/emailservice/email_server.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/recommendationservice/recommendation_server.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/shippingservice/main.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/frontend/main.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/cartservice/src/Program.cs` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:src/paymentservice/server.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:ListProducts` -> catalog_loader.go -> products.json` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:getCart` -> CartService.GetCart` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:PlaceOrder` -> GetCart -> GetQuote -> Charge -> SendOrderConfirmation -> ShipOrder` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:AddItem` -> CartService -> cartstore` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Convert` -> CurrencyService` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:GetAds` -> AdService` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:ListRecommendations` -> RecommendationService` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:homeHandler` -> getProducts -> ProductCatalogService.ListProducts` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:redis-cart` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:RedisCartStore` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:ICartStore` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:SpannerCartStore` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:src/productcatalogservice/products.json` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:cookieSessionID` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:kubernetes-manifests` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:helm-chart` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:skaffold.yaml` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:rpc GetCart(GetCartRequest) returns (Cart)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:rpc ListProducts(Empty) returns (ListProductsResponse)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:rpc GetSupportedCurrencies(Empty) returns (GetSupportedCurrenciesResponse)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:containerPort: 9555` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:port: 7070` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:port: 5050` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:port: 50051` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:port: 3550` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:/_healthz` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:GET /product/{id}` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:src/productcatalogservice/product_catalog_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/shippingservice/shippingservice_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/frontend/validator/validator_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/checkoutservice/money/money_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/frontend/money/money_test.go` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:src/loadgenerator/locustfile.py` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## mockito
+- `entrypoints:mock(Class<T> classToMock)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:when(T methodCall)` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:verify(T mock)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:mockitoSession()` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:spy(T object)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:doReturn(Object toBeReturned)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:mock()` -> MockitoCore.mock -> MockMaker.createMock` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:when()` -> MockitoCore.when -> stubbingStarted() -> OngoingStubbing.thenReturn` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:verify()` -> MockitoCore.verify -> VerificationModeFactory.times(1)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:any()`/`eq()` -> reportMatcher() -> matcher stack` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:timeout(long millis)` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:inOrder(mocks)` -> InOrder.verify` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:MockitoExtension.beforeEach` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:doThrow(Throwable...)` -> MOCKITO_CORE.stubber() -> Stubber.doThrow` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:mockito-core` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:MockUtil` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:GlobalConfiguration` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:OngoingStubbing` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:VerificationMode` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:ArgumentMatcher<T>` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:ArgumentCaptor` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:@Mock` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@InjectMocks` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:Strictness.STRICT_STUBS` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:MockSettings.extraInterfaces` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:@Captor` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:ArgumentCaptorTest` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+
+## nest
+- `entrypoints:NestFactory.create(AppModule)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:NestFactory.createMicroservice` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:NestFactory.createApplicationContext` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:app.listen(port)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:@Controller('cats')` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:packages/core/index.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:NestFactory.create` -> `NestApplication` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Controller` -> `RoutesResolver` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:MessagePattern` -> server` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Test.createTestingModule` -> `TestingModuleBuilder.compile` -> `TestingModule` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:NestContainer` -> `InstanceLoader` -> `Injector` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:ExpressAdapter` -> `RouterMethodFactory` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:NestFactory.create` -> `GraphInspector` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:ModulesContainer` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:InstanceLoader` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:DependenciesScanner` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:@Controller('cats')` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:@Get(':id')` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:@Param('id', new ParseIntPipe())` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:@UseGuards(RolesGuard)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Test.createTestingModule` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:NestExpressApplication` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:@EventPattern` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:Transport` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:APP_GUARD` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `landmarks:Param` / `Body` / `Query` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:packages/core/test` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:integration/` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:sample/01-cats-app/src/cats/cats.controller.spec.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:sample/19-auth-jwt/e2e/app/app.e2e-spec.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:sample/02-gateways/e2e/events-gateway/gateway.e2e-spec.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:sample/26-queues/e2e/audio/audio.e2e-spec.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/common/test` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## prettier
+- `entrypoints:src/index.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/cli/index.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/standalone.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:src/cli/context.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:format` -> `coreFormat` -> `parse` -> `printAstToDoc` -> `printDocToString` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:check` -> `format` text comparison` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:parse` -> `resolveParser` -> `parser.preprocess` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:printAstToDoc` -> `prepareToPrint` -> doc cache Map` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:formatFiles` -> `formatFile` -> `writeOutput` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:listDifferent` -> `prettier.check` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:formatFile` -> `mockable.writeFormattedFile` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:normalizeInputAndOptions` -> `normalizeFormatOptions` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:printAstToDoc` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:resolveConfig` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:editorconfig` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:context.argv` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:mockable` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:directory-ignorer` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:--write` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:--check` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:--list-different` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:--debug-check` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:--log-level` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:babel` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:postcss` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:html` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:yaml` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:CATEGORY_OUTPUT` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `tests:tests/format` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/unit` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/integration` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/config` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/dts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/format/js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/format/css` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/unit/doc-builders.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/unit/editorconfig-to-prettier.js` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## pydantic
+- `behavior:__get_pydantic_core_schema__` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:model_rebuild` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:TypeAdapter.json_schema` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:model_post_init` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:__pydantic_init_subclass__` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:__pydantic_fields__` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:model_extra` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:ConfigDict.validate_assignment` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:model_config = ConfigDict(validate_assignment=True)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:strict=True` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:mode='json'` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:ConfigDict(defer_build=True)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:indent` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:mode='validation'` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_main.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_type_adapter.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_json_schema.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_validators.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_model_validator.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_dataclasses.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_create_model.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:tests/test_errors.py` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## serde
+- `architecture:de::value` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:#[derive(Serialize)]` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:#[derive(Deserialize)]` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:Serialize::serialize` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:Deserialize::deserialize` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:serde_json::to_string` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:serde_json::from_str` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Serialize.serialize` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:serde_json::to_string` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Deserializer.deserialize_enum` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:serde/src/private` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:serde_derive_internals` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:serde_core/src` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:Content` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:serde_core/src/format.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:serialize_struct` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:deserialize_struct` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:#[serde(tag = "t", content = "c")]` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:Error::custom` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:serde_test::Token` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:serde_json::to_string` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:test_suite/tests/test_ser.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/test_de.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/test_roundtrip.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/test_annotations.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/test_enum_adjacently_tagged.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/regression/issue2565.rs` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test_suite/tests/ui` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## shadcn-ui
+- `architecture:@shadcn/react` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `architecture:@shadcn/helpers` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:npx shadcn init` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:shadcn add` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `entrypoints:npx shadcn create` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:next dev --turbopack --port 4000` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:scripts/build-registry.mts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:apps/v4/app/(app)/docs/[[...slug]]/page.tsx` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:apps/v4/app/(app)/blocks/[...categories]/page.tsx` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:apps/v4/app/api/search/route.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:build-registry.mts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:add` command -> fetch item address -> apply component to project` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:components.json` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:packages/shadcn/src/commands/apply.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:apps/v4/lib/source.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:createFromSource` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:capture-registry.mts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:capture-explore.mts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:apps/v4/registry.json` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:apps/v4/components.json` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:apps/v4/lib/registry.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:apps/v4/lib/config.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:registry/new-york-v4` — COMPILER GAP: present in the store but not compiled into components or flows
+- `state_authority:registry/bases` — COMPILER GAP: reached a flow but was never compiled into a component
+- `state_authority:apps/v4/lib/themes.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:"button"` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:apps/v4/registry/new-york-v4/ui/card.tsx` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:apps/v4/registry/new-york-v4/ui/dialog.tsx` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:npx shadcn init` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:shadcn add` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:--yes` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:data-slot="dialog"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:data-slot="card"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:[[...slug]]` — COMPILER GAP: present in the store but not compiled into components or flows
+- `landmarks:apps/v4/source.config.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/shadcn/src/commands/add.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/shadcn/src/commands/init.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/shadcn/src/commands/build.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/shadcn/src/commands/apply.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/shadcn/test` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:apps/v4/registry/calendar.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:apps/v4/registry/config.test.ts` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/tests` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## sqlalchemy
+- `behavior:create_engine -> Engine.connect -> Connection.execute` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Session.execute -> ORMExecuteState` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:declarative_base -> Mapper.configure` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:Transaction -> commit/rollback` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `behavior:QueuePool -> _ConnectionFairy` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:engine.pool` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:Session identity map` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:sessionmaker(bind=engine)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:_sa_instance_state` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:Session.connection` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:create_engine("sqlite://")` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:"sqlite:///:memory:"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:LABEL_STYLE_TABLENAME_PLUS_COL` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:select(t1).where(t1.c.c2 == t2.c.c1)` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `contracts:test_session_commit_rollback` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:name = "sqlite"` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `tests:test/orm/test_session.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/orm/test_query.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/engine/test_transaction.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/engine/test_pool.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/dialect/sqlite/` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/aaa_profiling/test_orm.py` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:test/aaa_profiling/test_pool.py` — COMPILER GAP: present in the store but not compiled into components or flows
+
+## svelte
+- `entrypoints:src/index-server.js` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:svelte/compiler` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:svelte/internal` — COMPILER GAP: reached a flow but was never compiled into a component
+- `entrypoints:svelte/store` / `svelte/motion` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `entrypoints:phases/1-parse` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:phases/2-analyze` — COMPILER GAP: present in the store but not compiled into components or flows
+- `entrypoints:phases/3-transform` — COMPILER GAP: present in the store but not compiled into components or flows
+- `behavior:compile` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:migrate` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `behavior:preprocess` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `behavior:flushSync` / `fork` — EXTRACTOR GAP: nothing in the store and no extractor emits this fact
+- `state_authority:mounted_components` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:get_or_init_context_map` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `state_authority:active_reaction` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `state_authority:STATE_SYMBOL` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:$state` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:$derived` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:$effect` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:$props` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:bind:value` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:bind:this` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:bind:group` — COMPILER GAP: present in the store but not compiled into components or flows
+- `contracts:runes` — PROJECTION GAP: compiled into a component but dropped from the rendered atlas by budget/policy/rendering
+- `contracts:css` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `contracts:mount` — ALIAS GAP: compiled into a component and present in the rendered atlas; the structured layer's spelling/aliases did not match
+- `tests:packages/svelte/tests/compiler-errors` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/runtime-runes` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/runtime-legacy` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/runtime-browser` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/parser-modern` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/parser-legacy` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/snapshot` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/server-side-rendering` — COMPILER GAP: present in the store but not compiled into components or flows
+- `tests:packages/svelte/tests/store` — COMPILER GAP: present in the store but not compiled into components or flows

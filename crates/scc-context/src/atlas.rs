@@ -1287,13 +1287,27 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     sections.push(Section::new("ARCHITECTURE", arch, 9));
 
     // PRIMARY FLOWS (never cut); the architecture view is the ARCHITECTURE
-    // section itself — skip it here to avoid duplicating the system
+    // section itself — skip it here to avoid duplicating the system. The
+    // rendered section is bounded so a chain-rich repo's FLOWS view stays
+    // compact: the deepest flows (most step lines) render first, capped at
+    // FLOW_RENDER_CAP flows and FLOW_RENDER_STEP_CAP lines each. The
+    // machine model (`atlas.flows`) carries the full inventory, so the
+    // structured behavior layer is unaffected by the render cap.
+    const FLOW_RENDER_CAP: usize = 32;
+    const FLOW_RENDER_STEP_CAP: usize = 16;
     let mut flows = String::new();
-    for f in atlas
+    let mut render_flows: Vec<&AtlasFlow> = atlas
         .flows
         .iter()
         .filter(|f| f.kind != FlowKind::Architecture)
-    {
+        .collect();
+    render_flows.sort_by(|a, b| {
+        b.steps
+            .len()
+            .cmp(&a.steps.len())
+            .then(a.name.cmp(&b.name))
+    });
+    for f in render_flows.into_iter().take(FLOW_RENDER_CAP) {
         flows.push_str(&format!(
             "\n{} [{}]",
             f.name,
@@ -1302,8 +1316,14 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         if let Some(t) = &f.trigger {
             flows.push_str(&format!("\nTrigger: {t}"));
         }
-        for s in &f.steps {
+        for s in f.steps.iter().take(FLOW_RENDER_STEP_CAP) {
             flows.push_str(&format!("\n{s}"));
+        }
+        if f.steps.len() > FLOW_RENDER_STEP_CAP {
+            flows.push_str(&format!(
+                "\n... +{} more steps",
+                f.steps.len() - FLOW_RENDER_STEP_CAP
+            ));
         }
         flows.push('\n');
     }

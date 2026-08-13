@@ -1,0 +1,19 @@
+# TraceLayer × Oh My Pi — YAML hooks (pi-yaml-hooks)
+# Copy to .omp/hook/hooks.yaml (project) or ~/.omp/agent/hook/hooks.yaml (global).
+# Trust with /hooks-trust; validate with /hooks-validate.
+hooks:
+  - event: session.created
+    actions:
+      - bash: uv run trace hook session-start --format json
+  - event: user.prompt.submit
+    actions:
+      - bash: uv run trace hook prompt-context --format json
+  - event: tool.after.edit
+    actions:
+      - bash: uv run trace hook post-mutation --format json
+  - event: tool.after.write
+    actions:
+      - bash: uv run trace hook post-mutation --format json
+  - event: file.changed
+    actions:
+      - bash: uv run trace index --changed

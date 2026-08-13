@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": ".pi/trace-hook.sh session-start pi"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": ".pi/trace-hook.sh prompt-context pi"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": ".pi/trace-hook.sh pre-mutation pi"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": ".pi/trace-hook.sh post-mutation pi"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": ".pi/trace-hook.sh stop pi"
+      }
+    ]
+  }
+}

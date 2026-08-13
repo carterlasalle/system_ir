@@ -1,0 +1,71 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "$comment": "Template — best-effort mapping of TraceLayer hooks to OpenCode. OpenCode hook schemas evolve; verify the exact event names, matcher syntax, and output handling against your OpenCode version before release. Core `trace hook` protocol is stable; this adapter owns harness serialization.",
+  "hook": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook session-start --format json"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook prompt-context --format json"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write|edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook pre-mutation --format json"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "write|edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook post-mutation --format json"
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook post-batch --format json"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run trace hook stop --format json"
+          }
+        ]
+      }
+    ]
+  }
+}
