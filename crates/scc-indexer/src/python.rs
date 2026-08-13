@@ -476,6 +476,18 @@ fn technology_for(root: &str) -> Option<String> {
     }
 }
 
+/// Serialize-side method names (general, cross-repo idioms) for the
+/// serializer/deserializer pair rule: a class exposing both a serialize
+/// and a deserialize method is a Serialization contract around that type.
+fn is_serialize_side(name: &str) -> bool {
+    matches!(name, "to_dict" | "to_json" | "serialize" | "to_serializable")
+}
+
+/// Deserialize-side method names for the same pair rule.
+fn is_deserialize_side(name: &str) -> bool {
+    matches!(name, "from_dict" | "from_json" | "deserialize" | "from_serializable")
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -542,6 +554,41 @@ impl Ctx {
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
         let mut facts = self.facts;
+        // Contract subclass evidence (Contract ontology): serializer/
+        // deserializer pairs around a type. A class with both a
+        // serialize-side method (`to_dict`/`to_json`/`serialize`) and a
+        // deserialize-side method (`from_dict`/`from_json`/`deserialize`)
+        // is a Serialization contract; the surface is the `ser/de` pair
+        // string. Deterministic: classes sorted, first matching side wins.
+        {
+            let mut class_members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for s in &self.symbols {
+                if s.kind == SymbolKind::Method {
+                    if let Some(parent) = &s.parent {
+                        let plain = s
+                            .name
+                            .rsplit_once('.')
+                            .map(|(_, n)| n)
+                            .unwrap_or(&s.name);
+                        class_members
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(plain.to_string());
+                    }
+                }
+            }
+            for (class, members) in class_members {
+                let ser = members.iter().find(|m| is_serialize_side(m));
+                let de = members.iter().find(|m| is_deserialize_side(m));
+                if let (Some(ser), Some(de)) = (ser, de) {
+                    facts.push(SemanticFact::Registration {
+                        owner: class.clone(),
+                        kind: "serialization".to_string(),
+                        target: format!("{ser}/{de}"),
+                    });
+                }
+            }
+        }
         // Module-level globals are STATE facts owned by the module symbol.
         // Ensure the module symbol exists (named after the file stem) unless
         // a real symbol of the same name is declared in this file — then the

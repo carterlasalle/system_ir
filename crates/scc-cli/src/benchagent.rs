@@ -60,6 +60,95 @@ pub struct AgentBenchSummary {
     pub results: Vec<AgentTaskResult>,
 }
 
+/// A-vs-E agent-behavior gate result: does the atlas variant (E) reduce
+/// exploration vs the baseline (A)?
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentGateResult {
+    pub baseline: AgentBenchSummary,
+    pub atlas: AgentBenchSummary,
+    /// E.mean_search_tool_calls < A.mean_search_tool_calls.
+    pub search_reduced: bool,
+    /// E.mean_files_opened <= A.mean_files_opened + 1.
+    pub files_bounded: bool,
+    /// E.mean_first_correct_ms <= A.mean_first_correct_ms. Fails closed:
+    /// when either side has no first-correct mean (no JSON event stream)
+    /// the clause cannot be verified and is false.
+    pub first_correct_bounded: bool,
+    pub passed: bool,
+}
+
+/// Evaluate the gate clauses from two summaries (A = baseline, E = atlas
+/// variant). The gate FAILS when the atlas variant does not reduce
+/// exploration: requires E.search_tool_calls < A.search_tool_calls AND
+/// E.files_opened <= A.files_opened + 1 AND E.first_correct_ms <=
+/// A.first_correct_ms (means).
+pub fn evaluate_gate(a: &AgentBenchSummary, e: &AgentBenchSummary) -> AgentGateResult {
+    let search_reduced = e.mean_search_tool_calls < a.mean_search_tool_calls;
+    let files_bounded = e.mean_files_opened <= a.mean_files_opened + 1.0;
+    let first_correct_bounded = match (a.mean_first_correct_ms, e.mean_first_correct_ms) {
+        (Some(av), Some(ev)) => ev <= av,
+        _ => false, // fail closed: cannot verify
+    };
+    let passed = search_reduced && files_bounded && first_correct_bounded;
+    AgentGateResult {
+        baseline: a.clone(),
+        atlas: e.clone(),
+        search_reduced,
+        files_bounded,
+        first_correct_bounded,
+        passed,
+    }
+}
+
+/// Run the agent-behavior release gate: score the baseline (A) command and
+/// the atlas variant (E) command over the same corpus with the same
+/// harness, then evaluate the exploration-reduction clauses (see
+/// [`evaluate_gate`]). `min_files` applies to BOTH runs.
+pub fn run_agent_gate(
+    baseline_cmd: &str,
+    atlas_cmd: &str,
+    min_files: f64,
+) -> Result<AgentGateResult, String> {
+    let baseline = run_agent_benchmark(baseline_cmd, min_files)?;
+    let atlas = run_agent_benchmark(atlas_cmd, min_files)?;
+    Ok(evaluate_gate(&baseline, &atlas))
+}
+
+pub fn print_agent_gate(g: &AgentGateResult) {
+    println!("scc bench agent --gate — A (baseline) vs E (atlas variant)");
+    println!("\n--- baseline (A) ---");
+    print_agent_summary(&g.baseline);
+    println!("\n--- atlas variant (E) ---");
+    print_agent_summary(&g.atlas);
+    let a = &g.baseline;
+    let e = &g.atlas;
+    println!("\n=== exploration clauses (means) ===");
+    println!(
+        "  searches:      E {:.3} < A {:.3}              -> {}",
+        e.mean_search_tool_calls,
+        a.mean_search_tool_calls,
+        if g.search_reduced { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  files opened:  E {:.3} <= A {:.3} + 1        -> {}",
+        e.mean_files_opened,
+        a.mean_files_opened,
+        if g.files_bounded { "PASS" } else { "FAIL" }
+    );
+    let first = match (a.mean_first_correct_ms, e.mean_first_correct_ms) {
+        (Some(av), Some(ev)) => format!("E {ev:.0} ms <= A {av:.0} ms"),
+        _ => "not verifiable (missing first-correct mean)".to_string(),
+    };
+    println!(
+        "  first-correct: {first} -> {}",
+        if g.first_correct_bounded { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  gate: {} (atlas variant must reduce exploration: all three clauses)",
+        if g.passed { "PASS" } else { "FAIL" }
+    );
+}
+
 /// `scc bench agent --cmd "<command>"` — the command receives the task goal
 /// via the `SCC_GOAL` env var and the repo path as its working directory
 /// (like `claude -p "$SCC_GOAL"` or `codex exec -- "$SCC_GOAL"`).
@@ -543,5 +632,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gt.files, vec!["a.py"]);
+    }
+
+    fn summary_with(search: f64, files: f64, first: Option<f64>) -> AgentBenchSummary {
+        AgentBenchSummary {
+            tasks: 21,
+            passed: 21,
+            mean_search_tool_calls: search,
+            mean_files_opened: files,
+            mean_first_correct_ms: first,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn agent_gate_evaluates_all_three_clauses() {
+        let a = summary_with(2.0, 4.0, Some(1000.0));
+        // E reduces searches AND files AND first-correct -> PASS
+        let e = summary_with(1.0, 3.0, Some(900.0));
+        let g = evaluate_gate(&a, &e);
+        assert!(g.search_reduced && g.files_bounded && g.first_correct_bounded);
+        assert!(g.passed);
+        // files bounded is <= A + 1, so 5 vs 4 still passes
+        let e2 = summary_with(1.0, 5.0, Some(900.0));
+        let g2 = evaluate_gate(&a, &e2);
+        assert!(g2.files_bounded && g2.passed);
+        // slower first-correct -> FAIL
+        let e3 = summary_with(1.0, 3.0, Some(1500.0));
+        let g3 = evaluate_gate(&a, &e3);
+        assert!(!g3.first_correct_bounded);
+        assert!(!g3.passed);
+        // search must be STRICTLY less (equal does not reduce)
+        let e4 = summary_with(2.0, 3.0, Some(900.0));
+        let g4 = evaluate_gate(&a, &e4);
+        assert!(!g4.search_reduced);
+        assert!(!g4.passed);
+        // fails closed: missing first-correct mean on either side
+        let e5 = summary_with(1.0, 3.0, None);
+        let g5 = evaluate_gate(&a, &e5);
+        assert!(!g5.first_correct_bounded);
+        assert!(!g5.passed);
+    }
+
+    #[test]
+    fn agent_gate_fails_closed_without_json_streams() {
+        // echo produces no JSON event stream -> no first-correct means ->
+        // the gate cannot verify reduction and FAILS closed.
+        let g = run_agent_gate("echo hi", "echo hi", 0.0).unwrap();
+        assert!(!g.passed);
+        assert!(!g.first_correct_bounded);
+        assert_eq!(g.baseline.tasks, 21);
+        assert_eq!(g.atlas.tasks, 21);
     }
 }

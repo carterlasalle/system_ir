@@ -12,6 +12,7 @@ use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
     SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Language, Node, Parser};
 
 /// Tree-sitter based extractor for TypeScript and JavaScript.
@@ -405,7 +406,7 @@ impl LanguageExtractor for TypeScriptExtractor {
         // registrations, configuration ownership, callbacks. Framework facts
         // (nest decorators, express registrations, react/svelte callbacks)
         // are gated on the matching import; see `collect_facts`.
-        out.facts = collect_facts(&root, src, &file.path, &out.imports);
+        out.facts = collect_facts(&root, src, &file.path, &out.imports, &out.symbols);
 
         // Module-level mutable globals (`let x = ...`) are STATE facts owned
         // by the module symbol (file stem). Ensure that symbol exists unless
@@ -634,6 +635,62 @@ fn is_next_config_file(path: &str) -> bool {
     )
 }
 
+/// Serialize-side function/method names (general, cross-repo idioms) for
+/// the serializer/deserializer pair rule.
+fn is_serialize_side(name: &str) -> bool {
+    matches!(name, "toJson" | "toJSON" | "serialize" | "stringify")
+}
+
+/// Deserialize-side function/method names for the same pair rule.
+fn is_deserialize_side(name: &str) -> bool {
+    matches!(name, "fromJson" | "fromJSON" | "deserialize" | "parse")
+}
+
+/// Interface names in a class declaration's `implements` clause
+/// (`class X implements A, B { ... }`). tree-sitter-typescript puts the
+/// clause inside a `class_heritage` node; each entry is a `type` node
+/// wrapping a `type_identifier` (or a `generic_type` for `Foo<T>`).
+fn implemented_interfaces(node: &Node, src: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = node.walk();
+    for child in node.named_children(&mut cur) {
+        if child.kind() != "class_heritage" {
+            continue;
+        }
+        let mut cur2 = child.walk();
+        for clause in child.named_children(&mut cur2) {
+            if clause.kind() != "implements_clause" {
+                continue;
+            }
+            let mut cur3 = clause.walk();
+            for t in clause.named_children(&mut cur3) {
+                // unwrap `type` -> inner identifier/generic_type
+                let inner = if t.kind() == "type" {
+                    t.named_children(&mut t.walk()).next()
+                } else {
+                    Some(t)
+                };
+                let name = match inner.map(|n| n.kind()) {
+                    Some("identifier" | "type_identifier") => inner
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default(),
+                    Some("generic_type") => inner
+                        .and_then(|n| n.child_by_field_name("type"))
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Deterministic total order over facts: (family, owner/symbol, secondary,
 /// tertiary). Identical facts sort adjacent so `dedup` collapses them.
 fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
@@ -849,7 +906,13 @@ fn last_named_arg(call: &Node, src: &[u8]) -> Option<String> {
 /// Collect all semantic facts for one file. Iterative (no recursion), never
 /// panics: hostile input just yields fewer facts.
 /// panics: hostile input just yields fewer facts.
-fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec<SemanticFact> {
+fn collect_facts(
+    root: &Node,
+    src: &[u8],
+    path: &str,
+    imports: &[Import],
+    symbols: &[Symbol],
+) -> Vec<SemanticFact> {
     // Module-symbol name (file stem): owner of module-level STATE facts.
     let module_name = facts::module_stem(path);
     let nest = has_import(imports, |m| m.starts_with("@nestjs/"));
@@ -859,6 +922,13 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
     let next_config = is_next_config_file(path);
 
     let mut facts: Vec<SemanticFact> = Vec::new();
+    // Contract subclass evidence (Contract ontology): exported module-level
+    // function names and per-class method names for the serializer/
+    // deserializer pair rule; declared-symbol names for the extension
+    // interface guard (an interface declared in this file is a symbol, so a
+    // registration targeting it would never materialize a CONTRACT entity).
+    let mut module_fns: BTreeSet<String> = BTreeSet::new();
+    let mut class_methods: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut frames: Vec<(Node, FactCtx)> = vec![(*root, FactCtx::default())];
 
     while let Some((node, ctx)) = frames.pop() {
@@ -987,6 +1057,23 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                     .unwrap_or_default();
                 if name.is_empty() {
                     continue;
+                }
+                // Extension contracts: a class implementing an interface is
+                // an implementation of that extension point. Emitted only
+                // when the interface is not a symbol declared in this file
+                // (a same-file interface would never materialize a CONTRACT
+                // entity; cross-file interfaces are the idiomatic shape).
+                if module_level {
+                    for iface in implemented_interfaces(&node, src) {
+                        if symbols.iter().any(|s| s.name == iface) {
+                            continue;
+                        }
+                        facts.push(SemanticFact::Registration {
+                            owner: name.clone(),
+                            kind: "extension".into(),
+                            target: iface,
+                        });
+                    }
                 }
                 if module_level && is_exported(&node) {
                     facts.push(SemanticFact::PublicExport {
@@ -1121,6 +1208,7 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                             symbol: n.clone(),
                             kind: "function".into(),
                         });
+                        module_fns.insert(n.clone());
                     }
                     // Module-level factory functions (vue `createApp`,
                     // axios-style `createInstance`/`createClient`).
@@ -1130,6 +1218,19 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
                             kind: "factory".into(),
                             target: n,
                         });
+                    }
+                }
+            }
+            "method_definition" => {
+                // Per-class method names for the serializer/deserializer
+                // pair rule.
+                if let Some(class) = &ctx.class {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        class_methods.entry(class.clone()).or_default().insert(n);
                     }
                 }
             }
@@ -1513,6 +1614,35 @@ fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec
         };
         for c in children.iter().rev() {
             frames.push((*c, child_ctx.clone()));
+        }
+    }
+
+    // Contract subclass evidence (Contract ontology): serializer/
+    // deserializer pairs. An exported module-level function pair
+    // (`toJson`+`fromJson`, `serialize`+`deserialize`) or a class method
+    // pair around the class is a Serialization contract; the surface is
+    // the `ser/de` pair string. Deterministic: sorted names, first
+    // matching side wins. Owner is the serializer function (a declared
+    // symbol) or the class.
+    let pair = |members: &BTreeSet<String>| -> Option<(String, String)> {
+        let ser = members.iter().find(|m| is_serialize_side(m))?;
+        let de = members.iter().find(|m| is_deserialize_side(m))?;
+        Some((ser.clone(), de.clone()))
+    };
+    if let Some((ser, de)) = pair(&module_fns) {
+        facts.push(SemanticFact::Registration {
+            owner: ser.clone(),
+            kind: "serialization".to_string(),
+            target: format!("{ser}/{de}"),
+        });
+    }
+    for (class, members) in &class_methods {
+        if let Some((ser, de)) = pair(members) {
+            facts.push(SemanticFact::Registration {
+                owner: class.clone(),
+                kind: "serialization".to_string(),
+                target: format!("{ser}/{de}"),
+            });
         }
     }
 

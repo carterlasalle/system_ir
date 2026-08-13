@@ -229,6 +229,66 @@ pub fn compile_state_authority(
         .collect()
 }
 
+/// Groups of symbol ids that SHARE state authority: distinct symbols
+/// writing the same store (data entities resolve to their owning store, so
+/// `db.users` and `db.orders` count as one target) or read by the same
+/// CONFIGURED_BY configuration target. This is the shared-state-authority
+/// signal for the semantic clustering graph (+4 per pair inside a group).
+///
+/// Deterministic: groups are built over sorted symbol ids and each group is
+/// a sorted `BTreeSet`; groups with fewer than 2 symbols (no pair) are
+/// omitted. Pure function of the graph — nothing is stored or promoted.
+pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
+    // store target -> symbols writing it (data entities resolve to their
+    // owning store so writes to db.users and db.orders share authority)
+    let mut store_syms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut sym_ids: Vec<&String> = graph
+        .entities_of_kind(kinds::SYMBOL)
+        .into_iter()
+        .map(|e| &e.id)
+        .collect();
+    sym_ids.sort();
+    for sym in sym_ids {
+        for r in graph.out_pred(sym, predicates::WRITES) {
+            let target = if r.object.contains("/data/") {
+                graph
+                    .entities
+                    .get(&r.object)
+                    .and_then(|e| e.attributes.get("store"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| scc_core::entity_id(&graph.repo_id, kinds::DATA_STORE, s))
+                    .unwrap_or_else(|| r.object.clone())
+            } else {
+                r.object.clone()
+            };
+            store_syms
+                .entry(target)
+                .or_default()
+                .insert(sym.clone());
+        }
+    }
+    // configuration target -> symbols it configures (CONFIGURED_BY)
+    let mut cfg_syms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for cfg in graph.entities_of_kind(kinds::CONFIGURATION) {
+        let mut rels = graph.out_pred(&cfg.id, predicates::CONFIGURED_BY);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            cfg_syms
+                .entry(cfg.id.clone())
+                .or_default()
+                .insert(r.object.clone());
+        }
+    }
+    let mut out: Vec<BTreeSet<String>> = Vec::new();
+    for group in store_syms.values().chain(cfg_syms.values()) {
+        if group.len() >= 2 {
+            out.push(group.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
 /// One structured state-ownership claim: `component` owns/reads/registers
 /// `target` (evidence `provenance`). The structured bridge from the STATE &
 /// DATA AUTHORITY compiler into the atlas component `owns` claims, so the

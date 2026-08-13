@@ -190,9 +190,9 @@ fn bench_atlas_holdout_compares_and_writes_results_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("=== DEV corpus ==="), "{stdout}");
-    assert!(stdout.contains("=== HOLDOUT corpus ==="), "{stdout}");
-    assert!(stdout.contains("=== gap (holdout - dev) ==="), "{stdout}");
+    assert!(stdout.contains("=== DEVELOPMENT corpus ==="), "{stdout}");
+    assert!(stdout.contains("=== VALIDATION corpus ==="), "{stdout}");
+    assert!(stdout.contains("=== gap (validation - development) ==="), "{stdout}");
     assert!(stdout.contains("verdict:"), "{stdout}");
     assert!(
         stdout.contains("NO OVERFIT") || stdout.contains("BORDERLINE") || stdout.contains("OVERFIT"),
@@ -203,7 +203,7 @@ fn bench_atlas_holdout_compares_and_writes_results_file() {
         .unwrap_or_else(|e| panic!("results file missing: {e}"));
     assert!(text.contains("overall (gate)"), "{text}");
     assert!(text.contains("## verdict:"), "{text}");
-    assert!(text.contains("holdout repo overall recall"), "{text}");
+    assert!(text.contains("validation repo overall recall"), "{text}");
 }
 
 #[test]
@@ -243,6 +243,105 @@ fn bench_atlas_holdout_errors_when_holdout_corpus_missing() {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         stderr.contains("holdout corpus dir not found"),
+        "clear error expected: {stderr}"
+    );
+}
+
+#[test]
+fn bench_atlas_blind_prints_aggregates_only_and_writes_results_file() {
+    // Blind protocol: validation corpus at <root>/benchmarks/holdout and
+    // blind corpus at <root>/benchmarks/blind-test (both with ground
+    // truth). Output must be aggregates ONLY: no per-repo rows, no
+    // filenames, no missed keys; benchmarks/results/blind-v1.txt written.
+    let ws = workspace();
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let validation = tmp.path().join("benchmarks").join("holdout");
+    let validation_gt = tmp.path().join("benchmarks").join("holdout-ground-truth");
+    let blind = tmp.path().join("benchmarks").join("blind-test");
+    let blind_gt = tmp.path().join("benchmarks").join("blind-test-ground-truth");
+    std::fs::create_dir_all(&validation).unwrap();
+    std::fs::create_dir_all(&validation_gt).unwrap();
+    std::fs::create_dir_all(&blind).unwrap();
+    std::fs::create_dir_all(&blind_gt).unwrap();
+    copy_tree(
+        &ws.join("fixtures/http-service-python"),
+        &validation.join("http-service-python"),
+    );
+    copy_tree(
+        &ws.join("fixtures/http-service-python"),
+        &blind.join("http-service-python"),
+    );
+    std::fs::write(
+        validation_gt.join("http-service-python.md"),
+        "## components\n- root\n- services\n## entrypoints\n- handle_transcripts\n## flows\n- TranscriptRepository\n## ownership\n- zzz_missing_store\n## contracts\n- GET /api/transcripts\n- GET /api/zzz_missing\n## tests\n- test_transcripts\n",
+    )
+    .unwrap();
+    // slightly different ground truth so the gap is not trivially zero
+    std::fs::write(
+        blind_gt.join("http-service-python.md"),
+        "## components\n- root\n- services\n## entrypoints\n- handle_transcripts\n## flows\n- TranscriptRepository\n## ownership\n- zzz_missing_store\n## contracts\n- GET /api/transcripts\n## tests\n- test_transcripts\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(golden::scc())
+        .args(["bench", "atlas", "--blind"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("scc bench atlas --blind runs");
+    assert!(
+        out.status.success(),
+        "`scc bench atlas --blind` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("aggregates only"), "{stdout}");
+    assert!(
+        stdout.contains("generalization gap (blind - validation)"),
+        "{stdout}"
+    );
+    // aggregates-only: the repo filename must never appear, and no per-repo
+    // miss lines may leak
+    assert!(
+        !stdout.contains("http-service-python"),
+        "no repo names in blind output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("missed:"),
+        "no missed keys in blind output: {stdout}"
+    );
+    let results = tmp.path().join("benchmarks/results/blind-v1.txt");
+    let text = std::fs::read_to_string(&results)
+        .unwrap_or_else(|e| panic!("blind-v1.txt missing: {e}"));
+    assert!(text.contains("aggregates only"), "{text}");
+    assert!(
+        text.contains("blind-test failures are never shown to tuning agents"),
+        "{text}"
+    );
+    assert!(text.contains("overall (gate)"), "{text}");
+    assert!(!text.contains("http-service-python"), "no repo rows: {text}");
+    assert!(!text.contains("missed:"), "no missed keys: {text}");
+}
+
+#[test]
+fn bench_atlas_blind_refuses_diagnose() {
+    // The blind corpus is not diagnosable: diagnosis prints per-repo miss
+    // lines, which would leak the blind misses.
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("benchmarks/holdout")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("benchmarks/holdout-ground-truth")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("benchmarks/blind-test")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("benchmarks/blind-test-ground-truth")).unwrap();
+
+    let out = std::process::Command::new(golden::scc())
+        .args(["bench", "atlas", "--blind", "--diagnose"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("scc bench atlas --blind --diagnose runs");
+    assert!(!out.status.success(), "expected failure, got success");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("blind corpus is not diagnosable"),
         "clear error expected: {stderr}"
     );
 }

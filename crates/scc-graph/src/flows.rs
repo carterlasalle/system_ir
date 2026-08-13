@@ -7,7 +7,7 @@
 //! recording store/topic/external access; then abstracted to
 //! component-level steps (collapse consecutive same-actor hops).
 
-use crate::components::{component_for_path, ComponentCandidate, prov_rank};
+use crate::components::prov_rank;
 use crate::{RealityGraph, Result};
 use scc_core::kinds;
 use scc_core::{
@@ -551,60 +551,57 @@ pub(crate) fn walk_calls(
     }
     paths
 }
+
+/// Flow-participation groups for semantic clustering: for every flow
+/// entrypoint (routes, entrypoint-attributed symbols, public exports,
+/// queue/callback/event surfaces), the set of symbols reachable via
+/// evidence-grade call chains (the same walk the flow compiler uses).
+/// Returns `(entry symbol, reachable set)` pairs so callers can exclude
+/// verification-seeded flows. Regions whose symbols share a flow cohere
+/// (+3). Deterministic: `collect_entrypoints` iterates sorted collections
+/// and `walk_calls` is deterministic, so the returned groups are stable for
+/// identical graphs.
 // trace:v1 id=impl.scc.flows work=WORK-SCC-005 satisfies=REQ-SCC-FLOW
+pub fn flow_participant_groups(
+    graph: &RealityGraph,
+    store: &Store,
+    intent: &[(String, serde_json::Value)],
+) -> Vec<(String, BTreeSet<String>)> {
+    let mut groups: Vec<(String, BTreeSet<String>)> = Vec::new();
+    for ep in collect_entrypoints(graph, store, intent) {
+        if ep.symbol_id.is_empty() {
+            continue;
+        }
+        let mut members: BTreeSet<String> = BTreeSet::new();
+        members.insert(ep.symbol_id.clone());
+        for path in walk_calls(graph, &ep.symbol_id) {
+            members.extend(path);
+        }
+        // single-symbol flows form no pair — nothing to cohere
+        if members.len() >= 2 {
+            groups.push((ep.symbol_id.clone(), members));
+        }
+    }
+    groups
+}
 
 pub fn compile_flows(
     graph: &RealityGraph,
     store: &Store,
     intent: &[(String, serde_json::Value)],
 ) -> Result<(Vec<Flow>, Vec<Flow>, Option<Flow>)> {
-    // component candidates for path mapping (same rules as component compiler)
-    let mut candidates: Vec<ComponentCandidate> = Vec::new();
-    for (source, claim) in intent {
-        if source == "component" {
-            let name = claim["name"].as_str().unwrap_or("").to_string();
-            let mut dirs: Vec<String> = Vec::new();
-            if let Some(paths) = claim["paths"].as_array() {
-                for p in paths {
-                    if let Some(s) = p.as_str() {
-                        dirs.push(s.to_string());
-                    }
-                }
-            }
-            dirs.push(name.clone());
-            candidates.push(ComponentCandidate {
-                name,
-                dirs,
-                boundary_kind: crate::components::BOUNDARY_DECLARED.to_string(),
-            });
+    // symbol -> component entity id via the STORED components (stage-1
+    // semantic clustering results): component CONTAINS file edges -> file
+    // CONTAINS symbol edges. The clustering result replaces the old
+    // longest-prefix path assignment, so flows must read the same
+    // boundaries the component compiler produced — never a rebuilt
+    // candidate guess.
+    let mut file_comp: HashMap<String, String> = HashMap::new();
+    for c in graph.entities_of_kind(kinds::COMPONENT) {
+        for r in graph.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+            file_comp.insert(r.object.clone(), c.name.clone());
         }
     }
-    let mut top_dirs: HashSet<String> = HashSet::new();
-    for f in graph.entities_of_kind(kinds::FILE) {
-        if f.name.contains('/') {
-            if let Some(seg) = f.name.split('/').next() {
-                if seg != ".scc" {
-                    top_dirs.insert(seg.to_string());
-                }
-            }
-        }
-    }
-    top_dirs.insert("root".to_string());
-    for d in &top_dirs {
-        if !candidates.iter().any(|c| c.name == *d) {
-            candidates.push(ComponentCandidate {
-                name: d.clone(),
-                dirs: vec![d.clone()],
-                boundary_kind: if d == "root" {
-                    crate::components::BOUNDARY_ROOT.to_string()
-                } else {
-                    crate::components::BOUNDARY_CODE_REGION.to_string()
-                },
-            });
-        }
-    }
-
-    // symbol -> component entity id
     let mut symbol_comp: HashMap<String, String> = HashMap::new();
     let comp_name_to_id: HashMap<String, String> = graph
         .entities_of_kind(kinds::COMPONENT)
@@ -613,7 +610,11 @@ pub fn compile_flows(
         .collect();
     for e in graph.entities_of_kind(kinds::SYMBOL) {
         if let Some(file) = e.attributes.get("file").and_then(|v| v.as_str()) {
-            let comp = component_for_path(file, &candidates);
+            let file_id = entity_id(&graph.repo_id, kinds::FILE, file);
+            let comp = file_comp
+                .get(&file_id)
+                .cloned()
+                .unwrap_or_else(|| "root".to_string());
             let cid = comp_name_to_id
                 .get(&comp)
                 .cloned()

@@ -10,7 +10,7 @@ use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 // trace:v1 id=impl.scc.extract.java work=WORK-SCC-004 satisfies=REQ-SCC-IR
 
@@ -441,6 +441,37 @@ impl Ctx {
     }
     fn into_extracted(self) -> ExtractedFile {
         let mut facts = self.facts;
+        // Contract subclass evidence (Contract ontology): serializer/
+        // deserializer pairs around a type. A class with both a
+        // serialize-side method (`toJson`/`serialize`) and a deserialize
+        // side (`fromJson`/`deserialize`) is a Serialization contract; the
+        // surface is the `ser/de` pair string. Deterministic: classes
+        // sorted, first matching side wins.
+        {
+            let mut class_members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for s in &self.symbols {
+                if s.kind == SymbolKind::Method {
+                    if let Some(parent) = &s.parent {
+                        let plain = s.name.rsplit_once('.').map(|(_, n)| n).unwrap_or(&s.name);
+                        class_members
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(plain.to_string());
+                    }
+                }
+            }
+            for (class, members) in class_members {
+                let ser = members.iter().find(|m| is_serialize_side(m));
+                let de = members.iter().find(|m| is_deserialize_side(m));
+                if let (Some(ser), Some(de)) = (ser, de) {
+                    facts.push(SemanticFact::Registration {
+                        owner: class.clone(),
+                        kind: "serialization".to_string(),
+                        target: format!("{ser}/{de}"),
+                    });
+                }
+            }
+        }
         // Deterministic order: (owning symbol, fact kind, tiebreaker).
         facts.sort_by_key(fact_sort_key);
         ExtractedFile {
@@ -465,6 +496,52 @@ impl Ctx {
 
 // ---------------------------------------------------------------------------
 // Walker
+/// Serialize-side method names (general, cross-repo idioms) for the
+/// serializer/deserializer pair rule (gson/jackson-style `toJson`/
+/// `serialize`).
+fn is_serialize_side(name: &str) -> bool {
+    matches!(name, "toJson" | "serialize" | "writeJson")
+}
+
+/// Deserialize-side method names for the same pair rule.
+fn is_deserialize_side(name: &str) -> bool {
+    matches!(name, "fromJson" | "deserialize" | "readJson")
+}
+
+/// Interface names in a class declaration's `implements` clause
+/// (`class X implements A, B { ... }`). tree-sitter-java exposes the list
+/// as the `interfaces` field: `super_interfaces` -> `type_list` -> the
+/// interface types.
+fn implemented_interfaces(node: &Node, src: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = node.walk();
+    for list in node.children_by_field_name("interfaces", &mut cur) {
+        let mut cur2 = list.walk();
+        for type_list in list.named_children(&mut cur2) {
+            if type_list.kind() != "type_list" {
+                continue;
+            }
+            let mut cur3 = type_list.walk();
+            for t in type_list.named_children(&mut cur3) {
+                let name = match t.kind() {
+                    "type_identifier" => node_text(Some(t), src).to_string(),
+                    "generic_type" | "parameterized_type" => t
+                        .child_by_field_name("type")
+                        .map(|n| clean(node_text(Some(n), src)))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 // ---------------------------------------------------------------------------
 
 /// Deterministic order for semantic facts: (owning symbol, fact kind,
@@ -628,6 +705,23 @@ impl JavaExtractor {
             });
         }
         self.record_annotations(node, ctx, src, &name);
+        // Extension contracts: a class implementing an interface is an
+        // implementation of that extension point. Emitted only when the
+        // interface is not declared in this file (a same-file interface
+        // would never materialize a CONTRACT entity; cross-file interfaces
+        // are the idiomatic shape).
+        if kind == SymbolKind::Class {
+            for iface in implemented_interfaces(&node, src) {
+                if ctx.symbols.iter().any(|s| s.name == iface) {
+                    continue;
+                }
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: name.clone(),
+                    kind: "extension".to_string(),
+                    target: iface,
+                });
+            }
+        }
         ctx.scopes.push(Scope {
             name: name.clone(),
             is_class: true,
@@ -1776,6 +1870,78 @@ public class SortedController {
             let k2 = fact_sort_key(&w[1]);
             assert!(k1 <= k2, "facts not sorted: {:?} > {:?}", k1, k2);
         }
+    }
+
+    #[test]
+    fn contract_subclass_emission_extension_and_serialization() {
+        // Extension: class implementing a cross-file interface (the
+        // interface is not declared here, so the registration target is a
+        // non-local surface and materializes a CONTRACT entity).
+        let ef = extract(
+            r#"
+package com.example.greet;
+
+public class GreetingImpl implements Greeter {
+    public String toJson() { return "{}"; }
+    public static GreetingImpl fromJson(String json) { return new GreetingImpl(); }
+    public String plain() { return ""; }
+}
+"#,
+        );
+        assert!(
+            ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::Registration { owner, kind, target }
+                    if owner == "GreetingImpl" && kind == "extension" && target == "Greeter"
+            )),
+            "extension registration missing: {:?}",
+            ef.facts
+        );
+        assert!(
+            ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::Registration { owner, kind, target }
+                    if owner == "GreetingImpl"
+                        && kind == "serialization"
+                        && target == "toJson/fromJson"
+            )),
+            "serialization pair missing: {:?}",
+            ef.facts
+        );
+        // a class with only one side of the pair is NOT a pair
+        let ef_single = extract(
+            r#"
+package p;
+public class OnlyTo {
+    public String toJson() { return "{}"; }
+}
+"#,
+        );
+        assert!(
+            ef_single
+                .facts
+                .iter()
+                .all(|f| !matches!(f, SemanticFact::Registration { kind, .. } if kind == "serialization")),
+            "single-side class must not be a serialization contract: {:?}",
+            ef_single.facts
+        );
+        // same-file interface: no extension registration (would collide
+        // with the declared interface symbol)
+        let ef_same = extract(
+            r#"
+package p;
+public interface Local { void run(); }
+public class Impl implements Local { public void run() {} }
+"#,
+        );
+        assert!(
+            ef_same
+                .facts
+                .iter()
+                .all(|f| !matches!(f, SemanticFact::Registration { kind, .. } if kind == "extension")),
+            "same-file interface must not emit extension: {:?}",
+            ef_same.facts
+        );
     }
 
     fn regs(ef: &ExtractedFile) -> Vec<(String, String, String)> {

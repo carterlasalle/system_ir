@@ -306,6 +306,47 @@ fn rank(a: Archetype) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Archetype emphasis (semantic clustering): for each archetype the
+/// clustering priors change — one region trait coheres (+PRIOR_WEIGHT)
+/// when the repository matches that archetype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterPrior {
+    /// CLI: command-region files cohere (cli-subcommand/cli_flags symbols).
+    CliCommands,
+    /// Framework: registration-emitting regions cohere (REGISTERS edges).
+    FrameworkRegistrations,
+    /// Service: entrypoint-owning regions cohere (route handlers /
+    /// entrypoint-attributed symbols).
+    ServiceEntrypoints,
+    /// Compiler: phase-named regions cohere (parse/analyze/transform/...).
+    CompilerPhases,
+}
+
+/// Extra weight applied between two regions sharing the prior trait.
+pub const PRIOR_WEIGHT: i32 = 2;
+
+/// The clustering prior for an archetype, or `None` when the archetype adds
+/// no region-trait prior (LibrarySdk's emphasis is the doubled public-surface
+/// cohesion weight in the clustering signal itself; Unknown/Monorepo/Infra/
+/// Plugin rely on the base signal set).
+pub fn cluster_prior(archetype: Archetype) -> Option<ClusterPrior> {
+    match archetype {
+        Archetype::Cli => Some(ClusterPrior::CliCommands),
+        Archetype::WebFramework => Some(ClusterPrior::FrameworkRegistrations),
+        Archetype::ServiceApplication => Some(ClusterPrior::ServiceEntrypoints),
+        Archetype::CompilerLanguageTool => Some(ClusterPrior::CompilerPhases),
+        _ => None,
+    }
+}
+
+/// True when a symbol name matches the compiler/language-tool phase
+/// vocabulary (`parse`/`analyze`/`transform`/`generate`/...). Shared with
+/// archetype detection so the clustering prior uses the same vocabulary.
+pub fn is_phase_symbol(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    PHASE_VERBS.iter().any(|v| n.contains(v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

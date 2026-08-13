@@ -76,9 +76,9 @@ fn go_facts_service_is_web_framework() {
 fn hierarchy_clusterer_groups_architecture_by_layer() {
     // Synthetic two-component repo: api and web write the same store
     // (shared state +4) and call across the boundary (+2) — the greedy
-    // merge at MERGE_THRESHOLD=6 produces a SUBSYSTEM rendered as a
-    // layer-grouped ARCHITECTURE with parent indentation; root stays a
-    // bare code-region leaf.
+    // merge at MERGE_THRESHOLD=6 produces a flat component from the two
+    // cross-dir regions (behavior, not directories); root stays a bare
+    // code-region leaf.
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().join("repo");
     write_hierarchy_fixture(&dir);
@@ -86,15 +86,16 @@ fn hierarchy_clusterer_groups_architecture_by_layer() {
     run_ok(&dir, &["index", "--quiet"]);
     let atlas = run_ok(&dir, &["atlas"]);
     assert!(atlas.contains("ARCHETYPE:"), "archetype header: {atlas}");
-    assert!(atlas.contains("SUBSYSTEM API+WEB"), "{atlas}");
-    // members rendered under the container (parent indentation)
-    assert!(atlas.contains("  API"), "component under subsystem: {atlas}");
-    assert!(atlas.contains("  WEB"), "component under subsystem: {atlas}");
-    // unmerged root stays a bare leaf after the containers
+    // call +2 and shared-state +4 cross api/web: merged flat component
+    assert!(atlas.contains("API+WEB"), "{atlas}");
+    assert!(
+        atlas.contains("Implementation: api, web"),
+        "merged members: {atlas}"
+    );
+    // unmerged root stays a bare leaf
     assert!(atlas.contains("ROOT\nImplementation: root"), "{atlas}");
-    // shared store ownership attributed to both members
-    assert!(atlas.contains("api owns conn (EXTRACTED)"), "{atlas}");
-    assert!(atlas.contains("web owns conn (EXTRACTED)"), "{atlas}");
+    // shared store ownership attributed to the merged component
+    assert!(atlas.contains("Owns: conn (EXTRACTED)"), "{atlas}");
 }
 
 /// Build the two-component repo (api + web share a sqlite store and call

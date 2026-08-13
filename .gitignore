@@ -11,3 +11,5 @@ benchmarks/corpus/*
 benchmarks/holdout/*
 !benchmarks/holdout/README.md
 .trace/cache/
+benchmarks/blind-test/*
+!benchmarks/blind-test/README.md

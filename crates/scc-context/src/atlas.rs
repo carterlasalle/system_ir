@@ -14,7 +14,7 @@ use scc_graph::TrustedGraphView;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
     Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode, AtlasInvariant,
-    AtlasOwnershipClaim, FlowKind, SystemAtlas,
+    AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 // trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-SCC-CTX
@@ -308,6 +308,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             scc_core::Contract {
                 id: r.id.clone(),
                 kind: "http".into(),
+                subclass: ContractSubclass::Http,
                 producer: handler,
                 consumers: consumers.into_iter().collect(),
                 operations: vec![format!("{method} {path}").trim().to_string()],
@@ -337,6 +338,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             scc_core::Contract {
                 id: scc_core::entity_id(&store.repo_id, scc_core::kinds::CONTRACT, &format!("cli:{}", e.name)),
                 kind: "cli".into(),
+                subclass: ContractSubclass::Cli,
                 producer: e.id.clone(),
                 consumers: Vec::new(),
                 operations: ops,
@@ -369,6 +371,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             scc_core::Contract {
                 id: t.id.clone(),
                 kind: "event".into(),
+                subclass: ContractSubclass::Event,
                 producer: t.id.clone(),
                 consumers: consumers.into_iter().collect(),
                 operations: vec![t.name.clone()],
@@ -410,6 +413,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             scc_core::Contract {
                 id: c.id.clone(),
                 kind: "config".into(),
+                subclass: ContractSubclass::Configuration,
                 producer,
                 consumers: consumers.into_iter().collect(),
                 operations: vec![c.name.clone()],
@@ -418,30 +422,111 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         );
     }
 
-    // annotation: ANNOTATION entities (producer = the annotation; consumers
-    // = the annotated symbols)
-    for a in view.entities_of_kind(scc_core::kinds::ANNOTATION) {
+    // subclass contracts: CONTRACT entities carrying a first-class
+    // registration kind (serialization/extension/plugin/rpc/message/schema/
+    // call/factory/builder/...). Framework-specific registration kinds
+    // (`include_router`, `add_middleware`, ...) map to None and stay
+    // public-api: EXPORT entities whose export kind is a callable signature
+    // (function/method/constructor) — the "public fn signature" surface.
+    // The EXPORT entity's symbol is the EXPORTS edge subject; consumers are
+    // the symbols that call it.
+    for e in view.entities_of_kind(scc_core::kinds::EXPORT) {
+        let kind_attr = e
+            .attributes
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !matches!(kind_attr, "function" | "method" | "constructor") {
+            continue;
+        }
+        let symbol = view
+            .in_pred(&e.id, scc_core::predicates::EXPORTS)
+            .into_iter()
+            .next()
+            .map(|r| r.subject.clone())
+            .unwrap_or_default();
         let mut consumers: BTreeSet<String> = BTreeSet::new();
-        for rel in view.out_pred(&a.id, scc_core::predicates::ANNOTATES) {
-            consumers.insert(entity_name(view, &rel.object));
+        for pred in [
+            scc_core::predicates::CALLS,
+            scc_core::predicates::CONSUMES,
+            scc_core::predicates::HANDLES,
+        ] {
+            for rel in view.in_pred(&symbol, pred) {
+                consumers.insert(entity_name(view, &rel.subject));
+            }
         }
         push_contract(
             &mut contracts,
             &mut contract_seen,
             scc_core::Contract {
-                id: a.id.clone(),
-                kind: "annotation".into(),
-                producer: a.id.clone(),
+                id: e.id.clone(),
+                kind: "public-api".into(),
+                subclass: ContractSubclass::PublicApi,
+                producer: symbol,
                 consumers: consumers.into_iter().collect(),
-                operations: vec![a.name.clone()],
-                evidence: a.evidence.clone(),
+                operations: vec![e.name.clone()],
+                evidence: e.evidence.clone(),
             },
         );
     }
-    // deterministic order for the machine model
+
+    // subclass contracts: CONTRACT entities carrying a first-class
+    // registration kind (serialization/extension/plugin/rpc/message/schema/
+    // call/factory/builder/...). Framework-specific registration kinds
+    // (`include_router`, `add_middleware`, ...) map to None and stay
+    // framework semantics (FRAMEWORK SEMANTICS), never first-class
+    // contracts. Annotations are per-symbol framework semantics too — they
+    // render under FRAMEWORK SEMANTICS, not here. Producer = the
+    // registering symbol (REGISTERS subject); consumers = symbols consuming
+    // the surface.
+    for ce in view.entities_of_kind(scc_core::kinds::CONTRACT) {
+        let Some(kind_attr) = ce
+            .attributes
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(subclass) = ContractSubclass::from_kind_str(&kind_attr) else {
+            continue;
+        };
+        let producer = view
+            .in_pred(&ce.id, scc_core::predicates::REGISTERS)
+            .into_iter()
+            .next()
+            .map(|r| r.subject.clone())
+            .unwrap_or_default();
+        let mut consumers: BTreeSet<String> = BTreeSet::new();
+        for pred in [
+            scc_core::predicates::CONSUMES,
+            scc_core::predicates::READS,
+            scc_core::predicates::HANDLES,
+        ] {
+            for rel in view.in_pred(&ce.id, pred) {
+                consumers.insert(entity_name(view, &rel.subject));
+            }
+        }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: ce.id.clone(),
+                kind: subclass.as_str().to_string(),
+                subclass,
+                producer,
+                consumers: consumers.into_iter().collect(),
+                operations: vec![ce.name.clone()],
+                evidence: ce.evidence.clone(),
+            },
+        );
+    }
+    // deterministic order for the machine model: per-subclass groups,
+    // then by operation, then producer
     contracts.sort_by(|a, b| {
-        a.kind
-            .cmp(&b.kind)
+        a.subclass
+            .as_str()
+            .cmp(b.subclass.as_str())
             .then(a.operations.join("\u{1}").cmp(&b.operations.join("\u{1}")))
             .then(a.producer.cmp(&b.producer))
     });
@@ -928,14 +1013,15 @@ fn build_landmarks(
 }
 
 /// Push one contract, merging consumers/evidence when the same
-/// (kind, operations) surface was already recorded (e.g. the same CLI flag
-/// owned by two symbols). Deterministic: consumers/evidence stay sorted.
+/// (subclass, operations) surface was already recorded (e.g. the same CLI
+/// flag owned by two symbols). Deterministic: consumers/evidence stay
+/// sorted.
 fn push_contract(
     contracts: &mut Vec<scc_core::Contract>,
     seen: &mut BTreeMap<(String, String), usize>,
     c: scc_core::Contract,
 ) {
-    let key = (c.kind.clone(), c.operations.join("\u{1}"));
+    let key = (c.subclass.as_str().to_string(), c.operations.join("\u{1}"));
     if let Some(&idx) = seen.get(&key) {
         let existing = &mut contracts[idx];
         for s in c.consumers {
@@ -1385,10 +1471,12 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         10,
     ));
 
-    // CONTRACTS (never cut) — rendered as `{kind}: {operation}` lines from
-    // the first-class Contract model (Wave 9), preserving the contract
-    // strings (route `GET /api/x`, flag `--paging`, event `user.created`,
-    // config key `DEBUG`) so pre-Wave-9 consumers keep matching.
+    // CONTRACTS (never cut) — rendered as per-subclass groups: one
+    // `{subclass}: {operation}` line per operation, sorted so each subclass
+    // family (http/cli/event/config/public-api/extension/serialization/...)
+    // clusters together. Preserves the classic contract strings (route
+    // `GET /api/x`, flag `--paging`, event `user.created`, config key
+    // `DEBUG`) so pre-Wave-9 consumers keep matching.
     sections.push(Section::new(
         "CONTRACTS",
         if atlas.contracts.is_empty() {
@@ -1396,8 +1484,9 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         } else {
             let mut lines: Vec<String> = Vec::new();
             for c in &atlas.contracts {
+                let prefix = c.subclass.as_str();
                 for op in &c.operations {
-                    lines.push(format!("{}: {}", c.kind, op));
+                    lines.push(format!("{prefix}: {op}"));
                 }
             }
             lines.sort();
@@ -1907,8 +1996,9 @@ mod tests {
         let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
         let atlas = build_atlas(&ctx);
 
-        // contract kinds: http (route), cli (flags), config (DEBUG),
-        // event (topic jobs) — no annotations in this fixture
+        // contract subclasses: http (route), cli (flags), config (DEBUG),
+        // event (topic jobs), public-api (exported function signature) —
+        // no annotations in this fixture
         let kinds_found: BTreeSet<String> = atlas.contracts.iter().map(|c| c.kind.clone()).collect();
         assert_eq!(
             kinds_found,
@@ -1916,13 +2006,20 @@ mod tests {
                 "http".to_string(),
                 "cli".to_string(),
                 "config".to_string(),
-                "event".to_string()
+                "event".to_string(),
+                "public-api".to_string()
             ]),
             "contract kinds: {:?}",
             atlas.contracts
         );
+        // every contract carries the typed subclass, and the machine-model
+        // kind agrees with the subclass render prefix
+        for c in &atlas.contracts {
+            assert_eq!(c.kind, c.subclass.as_str(), "kind agrees with subclass: {c:?}");
+        }
         let http = atlas.contracts.iter().find(|c| c.kind == "http").unwrap();
         assert_eq!(http.operations, vec!["GET /api/x"]);
+        assert_eq!(http.subclass, scc_core::ContractSubclass::Http);
         assert!(
             http.consumers.iter().any(|c| c == "handler"),
             "handler consumes the route: {:?}",
@@ -1930,21 +2027,36 @@ mod tests {
         );
         let cli = atlas.contracts.iter().find(|c| c.kind == "cli").unwrap();
         assert_eq!(cli.operations, vec!["--queue", "--verbose"]);
+        assert_eq!(cli.subclass, scc_core::ContractSubclass::Cli);
         let cfg = atlas.contracts.iter().find(|c| c.kind == "config").unwrap();
         assert_eq!(cfg.operations, vec!["DEBUG"]);
+        assert_eq!(cfg.subclass, scc_core::ContractSubclass::Configuration);
         assert!(
             cfg.consumers.iter().any(|c| c == "reader"),
             "reader consumes DEBUG: {:?}",
             cfg.consumers
         );
+        let api = atlas.contracts.iter().find(|c| c.kind == "public-api").unwrap();
+        assert_eq!(api.operations, vec!["handler"]);
+        assert_eq!(api.subclass, scc_core::ContractSubclass::PublicApi);
 
-        // rendered CONTRACTS lines are `{kind}: {operation}`
+        // rendered CONTRACTS lines are `{subclass}: {operation}` per group
         let lines: Vec<String> = atlas
             .contracts
             .iter()
-            .flat_map(|c| c.operations.iter().map(|op| format!("{}: {}", c.kind, op)))
+            .flat_map(|c| {
+                c.operations
+                    .iter()
+                    .map(|op| format!("{}: {}", c.subclass.as_str(), op))
+            })
             .collect();
-        for want in ["http: GET /api/x", "cli: --queue", "config: DEBUG", "event: jobs"] {
+        for want in [
+            "http: GET /api/x",
+            "cli: --queue",
+            "config: DEBUG",
+            "event: jobs",
+            "public-api: handler",
+        ] {
             assert!(lines.contains(&want.to_string()), "missing {want}: {lines:?}");
         }
 

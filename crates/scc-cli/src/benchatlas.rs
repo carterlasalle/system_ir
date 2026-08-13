@@ -19,13 +19,28 @@
 //! (`::` -> `.`, `fn X` -> `X`, `./p` -> `p`) so e.g. `Controller::run`
 //! matches a flow step rendered as `Controller.run`.
 //!
-//! v2 metrics:
-//! - `precision`: fraction of canonical flow-graph edges whose (from-op,
-//!   to-op) pair appears — in order — inside some ground-truth `behavior`
-//!   item (a same-item chain step). A pragmatic false-causal proxy: an edge
-//!   the ground truth never describes may be a spurious causal link.
-//! - `density` (startup_facts_per_1k_tokens): matched startup-required
-//!   items per 1000 atlas tokens; `atlas_tokens` per repo is reported too.
+//! v3 metrics:
+//! - `precision` (startup_required_precision): per startup-required layer,
+//!   |atlas entries in that layer that match a ground-truth item| /
+//!   |atlas entries in that layer| — a too-much-architecture detector: an
+//!   atlas bloated with facts the ground truth never describes scores low.
+//!   `RepoRecall.precision` is the equal-weighted mean over the five
+//!   startup-required layers.
+//! - `F2` per layer: (5 * P * R) / (4 * P + R) from that layer's precision
+//!   P and recall R (zero when P + R == 0); the gate still uses recall.
+//! - `density` (architecture_density): matched startup-required items per
+//!   1000 atlas tokens; `atlas_tokens` per repo is reported too.
+//!
+//! The v1/v2 `--holdout` protocol is now labelled **development** vs
+//! **validation** (the "holdout" corpus has been inspected and tuned
+//! against — calling it blind would be dishonest; the on-disk dirs
+//! `benchmarks/holdout` stay as they are).
+//!
+//! `--blind` scores the NEW frozen corpus (`benchmarks/blind-test` +
+//! `benchmarks/blind-test-ground-truth`), never used by tuning, and prints
+//! ONLY aggregates (overall, per-section means, the validation-vs-blind
+//! generalization gap, precision, density) — no per-repo rows, no missed
+//! keys, no filenames. blind-test failures are never shown to tuning agents.
 //!
 //! `--diagnose` classifies every missed item by WHERE it disappeared
 //! (PARSER/EXTRACTOR/WRITER/RESOLUTION/COMPILER/PROJECTION/ALIAS) via a
@@ -42,7 +57,7 @@ use crate::benchctx::{BenchmarkCorpus, BenchTask};
 use crate::Compiler;
 use scc_context::atlas;
 use scc_context::ContextCompiler;
-use scc_core::{Entity, FlowGraph};
+use scc_core::Entity;
 use scc_indexer::scan::Language;
 use scc_store::Store;
 use serde::Serialize;
@@ -53,11 +68,11 @@ use std::path::{Path, PathBuf};
 /// The floor is over the five startup-required layers ONLY.
 pub const ATLAS_GATE: f64 = 0.5;
 
-/// Holdout verdict tolerance: the blind holdout corpus may lag the dev
+/// Holdout verdict tolerance: the validation corpus may lag the development
 /// corpus by up to this much (overall recall, absolute) before the run is
 /// called OVERFIT. The band absorbs corpus-difficulty, LOC-mix, and
-/// ground-truth-strictness differences; a lag beyond it means the dev-tuned
-/// rules do not generalize to unseen repos.
+/// ground-truth-strictness differences; a lag beyond it means the
+/// development-tuned rules do not generalize to unseen repos.
 pub const HOLDOUT_TOLERANCE: f64 = 0.05;
 
 /// The five startup-required layers that count toward the overall score
@@ -196,10 +211,20 @@ pub struct RepoRecall {
     pub tests: f64,
     /// Equal-weighted mean of the five startup-required layers (the gate).
     pub overall: f64,
-    /// Fraction of canonical flow-graph edges whose (from-op, to-op) pair
-    /// appears in order inside some ground-truth behavior item.
+    /// Mean startup-required precision over the five startup-required
+    /// layers: per layer, |atlas entries that match a ground-truth item| /
+    /// |atlas entries in the layer| (v3 — a too-much-architecture
+    /// detector; see `layer_precision`).
     pub precision: f64,
-    /// Matched startup-required items per 1000 atlas tokens.
+    /// Per-layer startup-required precision (the five startup layers only).
+    pub layer_precision: BTreeMap<String, f64>,
+    /// Per-layer F2 = (5*P*R)/(4*P+R) over the five startup-required
+    /// layers (zero when P+R==0); `f2` is the equal-weighted mean.
+    pub layer_f2: BTreeMap<String, f64>,
+    /// Equal-weighted mean F2 over the five startup-required layers.
+    pub f2: f64,
+    /// Matched startup-required items per 1000 atlas tokens
+    /// (architecture_density).
     pub density: f64,
     /// Rendered atlas token count.
     pub atlas_tokens: usize,
@@ -242,6 +267,9 @@ impl Default for RepoRecall {
             tests: 0.0,
             overall: 0.0,
             precision: 0.0,
+            layer_precision: BTreeMap::new(),
+            layer_f2: BTreeMap::new(),
+            f2: 0.0,
             density: 0.0,
             atlas_tokens: 0,
             resolved_calls: 0,
@@ -271,6 +299,7 @@ pub struct AtlasRecallReport {
     /// repos (the gate).
     pub mean_overall: f64,
     pub mean_precision: f64,
+    pub mean_f2: f64,
     pub mean_density: f64,
     pub mean_atlas_tokens: f64,
     pub scored: usize,
@@ -279,6 +308,52 @@ pub struct AtlasRecallReport {
     /// Gap-kind histogram over all diagnosed items (kind -> count).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gap_histogram: BTreeMap<String, usize>,
+}
+
+impl AtlasRecallReport {
+    /// Clone with all per-repo detail stripped (repos, gaps, histogram):
+    /// only the aggregates survive. The blind protocol keeps this invariant
+    /// end to end — blind-test failures are never shown to tuning agents,
+    /// and the blind JSON / blind-v1.txt output is aggregates-only.
+    pub fn aggregates_only(&self) -> Self {
+        let mut c = self.clone();
+        c.repos.clear();
+        c.gap_histogram.clear();
+        c
+    }
+
+    /// Mean per-layer precision over scored repos (the five startup layers).
+    fn mean_layer_precision(&self) -> BTreeMap<String, f64> {
+        self.mean_layer_map(|r| &r.layer_precision)
+    }
+
+    /// Mean per-layer F2 over scored repos (the five startup layers).
+    fn mean_layer_f2(&self) -> BTreeMap<String, f64> {
+        self.mean_layer_map(|r| &r.layer_f2)
+    }
+
+    fn mean_layer_map(
+        &self,
+        pick: impl Fn(&RepoRecall) -> &BTreeMap<String, f64>,
+    ) -> BTreeMap<String, f64> {
+        let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &self.repos {
+            if r.skipped_reason.is_some() {
+                continue;
+            }
+            for (layer, v) in pick(r) {
+                *sums.entry(layer.clone()).or_insert(0.0) += v;
+                *counts.entry(layer.clone()).or_insert(0) += 1;
+            }
+        }
+        sums.into_iter()
+            .map(|(layer, sum)| {
+                let n = counts.get(&layer).copied().unwrap_or(0).max(1) as f64;
+                (layer, sum / n)
+            })
+            .collect()
+    }
 }
 
 /// Parse a ground-truth markdown doc into per-section key strings.
@@ -552,54 +627,36 @@ fn item_matched(section: &str, item: &str, layers: &AtlasLayers, text_norm: &str
     item_matches(item, layer_haystack(section, layers, text_norm))
 }
 
-/// Flow-edge precision: the fraction of canonical flow-graph edges whose
-/// (from-op, to-op) pair appears — in order — inside some ground-truth
-/// `## behavior` item. An edge the ground truth never describes may be a
-/// spurious causal link; a same-item chain step (e.g. `worker consumer ->
-/// task.run`) supports exactly its consecutive pairs. Empty ground truth
-/// (nothing to contradict any edge) or an empty graph scores 1.0.
-fn flow_edge_precision(graphs: &[FlowGraph], behavior: &[String]) -> f64 {
-    if behavior.is_empty() {
+/// Startup-required precision for one layer: |atlas entries in the layer
+/// that match a ground-truth item| / |atlas entries in the layer|. The
+/// haystack is one normalized entry per line, so entries are countable.
+/// An entry matches when some ground-truth item (chain items included,
+/// against a single line they virtually never match) is contained in it.
+/// An empty layer haystack scores 1.0 (nothing spurious to report).
+fn layer_precision(items: &[String], haystack: &str) -> f64 {
+    let entries: Vec<&str> = haystack.lines().filter(|l| !l.is_empty()).collect();
+    if entries.is_empty() {
         return 1.0;
     }
-    let mut total = 0usize;
-    let mut supported = 0usize;
-    for g in graphs {
-        for e in &g.edges {
-            let from = g
-                .nodes
-                .get(e.from as usize)
-                .map(|n| norm(&n.operation))
-                .unwrap_or_default();
-            let to = g
-                .nodes
-                .get(e.to as usize)
-                .map(|n| norm(&n.operation))
-                .unwrap_or_default();
-            if from.is_empty() || to.is_empty() {
-                continue;
-            }
-            total += 1;
-            let ok = behavior.iter().any(|item| {
-                let it = norm(item);
-                match (it.find(&from), it.find(&to)) {
-                    (Some(a), Some(b)) => a < b,
-                    _ => false,
-                }
-            });
-            if ok {
-                supported += 1;
-            }
-        }
-    }
-    if total == 0 {
-        return 1.0;
-    }
-    supported as f64 / total as f64
+    let matched = entries
+        .iter()
+        .filter(|line| items.iter().any(|item| item_matches(item, line)))
+        .count();
+    matched as f64 / entries.len() as f64
 }
 
-/// Startup facts per 1000 atlas tokens: matched startup-required items over
-/// the rendered pack's token count.
+/// F2 score from precision P and recall R: (5*P*R)/(4*P+R), zero when
+/// P + R == 0. Recall-weighting (beta=2) rewards recall over precision,
+/// matching the gate's recall-first stance while still penalizing bloat.
+fn f2_score(p: f64, r: f64) -> f64 {
+    if p + r == 0.0 {
+        return 0.0;
+    }
+    (5.0 * p * r) / (4.0 * p + r)
+}
+
+/// Startup facts per 1000 atlas tokens (architecture_density): matched
+/// startup-required items over the rendered pack's token count.
 fn token_density(matched_startup: usize, tokens: usize) -> f64 {
     if tokens == 0 {
         return 0.0;
@@ -660,9 +717,32 @@ pub fn score_repo(
     let (tests, _, _) = layer_recall(&gt.tests, text_norm);
     let overall = (architecture + entrypoints + behavior + state_authority + contracts) / 5.0;
 
+    // v3 startup-required precision + F2 per layer (the five startup layers
+    // only — landmarks/tests are informational and excluded, mirroring the
+    // recall gate's anti-bloat stance).
+    let startup_layers = [
+        ("architecture", architecture),
+        ("entrypoints", entrypoints),
+        ("behavior", behavior),
+        ("state_authority", state_authority),
+        ("contracts", contracts),
+    ];
+    let mut layer_precision_map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut layer_f2: BTreeMap<String, f64> = BTreeMap::new();
+    let mut precision_sum = 0.0;
+    let mut f2_sum = 0.0;
+    for (name, recall) in startup_layers {
+        let p = layer_precision(gt.section(name), layer_haystack(name, &layers, text_norm));
+        let f2 = f2_score(p, recall);
+        layer_precision_map.insert(name.to_string(), p);
+        layer_f2.insert(name.to_string(), f2);
+        precision_sum += p;
+        f2_sum += f2;
+    }
+    let precision = precision_sum / startup_layers.len() as f64;
+    let f2 = f2_sum / startup_layers.len() as f64;
+
     let matched_startup = arch_hit + ep_hit + bh_hit + sa_hit + ct_hit;
-    let graphs = store.flow_graphs().unwrap_or_default();
-    let precision = flow_edge_precision(&graphs, &gt.behavior);
     let density = token_density(matched_startup, pack.tokens);
 
     let mut missed: Vec<String> = Vec::new();
@@ -714,6 +794,9 @@ pub fn score_repo(
         tests,
         overall,
         precision,
+        layer_precision: layer_precision_map,
+        layer_f2,
+        f2,
         density,
         atlas_tokens: pack.tokens,
         resolved_calls,
@@ -773,6 +856,7 @@ pub fn run_atlas_recall(
                 report.mean_landmarks += r.landmarks;
                 report.mean_tests += r.tests;
                 report.mean_precision += r.precision;
+                report.mean_f2 += r.f2;
                 report.mean_density += r.density;
                 report.mean_atlas_tokens += r.atlas_tokens as f64;
                 if diagnose {
@@ -803,6 +887,7 @@ pub fn run_atlas_recall(
         report.mean_landmarks /= n;
         report.mean_tests /= n;
         report.mean_precision /= n;
+        report.mean_f2 /= n;
         report.mean_density /= n;
         report.mean_atlas_tokens /= n;
         report.mean_overall = (report.mean_architecture
@@ -887,8 +972,12 @@ pub fn holdout_verdict(dev: f64, holdout: f64) -> HoldoutVerdict {
 #[derive(Debug, Clone, Serialize)]
 pub struct HoldoutComparison {
     pub dev: AtlasRecallReport,
+    /// The validation corpus report (`benchmarks/holdout` — the inspected
+    /// corpus that tuning has seen; the on-disk dir name is kept, only the
+    /// output labels say "validation").
     pub holdout: AtlasRecallReport,
-    /// Per-layer gap = holdout mean - dev mean (fraction, negative = lag).
+    /// Per-layer gap = validation mean - development mean (fraction,
+    /// negative = lag).
     pub gap_architecture: f64,
     pub gap_entrypoints: f64,
     pub gap_behavior: f64,
@@ -906,18 +995,20 @@ impl HoldoutComparison {
     }
 }
 
-/// Run the holdout protocol: score the dev corpus and the blind holdout
-/// corpus with the same recall pipeline, compute per-layer gaps, write
-/// `benchmarks/results/holdout-v3.txt`, and return the comparison.
+/// Run the holdout protocol: score the development corpus and the
+/// validation corpus with the same recall pipeline, compute per-layer gaps,
+/// write `benchmarks/results/holdout-v3.txt`, and return the comparison.
 ///
-/// `corpus`/`ground_truth` (when given) select the DEV corpus, exactly as in
-/// `run_atlas_bench` (defaults: `benchmarks/corpus` +
-/// `benchmarks/ground-truth`). The holdout dirs are fixed protocol paths:
-/// `benchmarks/holdout` + `benchmarks/holdout-ground-truth`. The holdout
-/// corpus must exist — a missing dir is an error, not a silent empty run.
+/// `corpus`/`ground_truth` (when given) select the DEVELOPMENT corpus,
+/// exactly as in `run_atlas_bench` (defaults: `benchmarks/corpus` +
+/// `benchmarks/ground-truth`). The validation dirs are fixed protocol
+/// paths: `benchmarks/holdout` + `benchmarks/holdout-ground-truth` (the
+/// on-disk names are kept from v1; only the output labels say validation).
+/// The validation corpus must exist — a missing dir is an error, not a
+/// silent empty run.
 ///
-/// `resolve` applies to BOTH corpora (the same pipeline must score dev and
-/// holdout identically).
+/// `resolve` applies to BOTH corpora (the same pipeline must score
+/// development and validation identically).
 pub fn run_atlas_holdout(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
@@ -947,7 +1038,7 @@ pub fn run_atlas_holdout(
         ));
     }
     let mut holdout = run_atlas_recall(&holdout_corpus, &holdout_gt, &names, diagnose, resolve)?;
-    holdout.mode = format!("holdout: {}", holdout_corpus.display());
+    holdout.mode = format!("validation: {}", holdout_corpus.display());
 
     let c = HoldoutComparison {
         gap_architecture: HoldoutComparison::layer_gap(dev.mean_architecture, holdout.mean_architecture),
@@ -974,11 +1065,11 @@ impl HoldoutComparison {
     /// Deterministic markdown text for `benchmarks/results/holdout-v3.txt`.
     fn to_results_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("# Holdout v3 — dev corpus vs blind holdout\n");
-        out.push_str(&format!("dev corpus:     {}\n", self.dev.mode));
-        out.push_str(&format!("holdout corpus: {}\n", self.holdout.mode));
+        out.push_str("# Holdout v3 — development corpus vs validation corpus\n");
+        out.push_str(&format!("development corpus: {}\n", self.dev.mode));
+        out.push_str(&format!("validation corpus:  {}\n", self.holdout.mode));
         out.push_str(&format!(
-            "results:        {}\n",
+            "results:            {}\n",
             self.results_file
         ));
         out.push('\n');
@@ -992,38 +1083,58 @@ impl HoldoutComparison {
             ("overall (gate)", self.dev.mean_overall, self.holdout.mean_overall),
         ];
         out.push_str(&format!(
-            "{:<18} {:>10} {:>10} {:>10}\n",
-            "layer", "dev", "holdout", "gap"
+            "{:<18} {:>12} {:>12} {:>10}\n",
+            "layer", "development", "validation", "gap"
         ));
         for (layer, dev, ho) in rows {
             let gap = HoldoutComparison::layer_gap(dev, ho);
             out.push_str(&format!(
-                "{:<18} {:>10.3} {:>10.3} {:>+10.3}\n",
+                "{:<18} {:>12.3} {:>12.3} {:>+10.3}\n",
                 layer, dev, ho, gap
             ));
         }
         out.push('\n');
         out.push_str(&format!(
-            "scored: dev {} (skipped {}) | holdout {} (skipped {})\n",
+            "scored: development {} (skipped {}) | validation {} (skipped {})\n",
             self.dev.scored, self.dev.skipped, self.holdout.scored, self.holdout.skipped
         ));
         out.push_str(&format!(
-            "precision: dev {:.3} | holdout {:.3}\n",
+            "precision: development {:.3} | validation {:.3}\n",
             self.dev.mean_precision, self.holdout.mean_precision
+        ));
+        out.push_str(&format!(
+            "F2: development {:.3} | validation {:.3}\n",
+            self.dev.mean_f2, self.holdout.mean_f2
         ));
         let dev_resolved: usize = self.dev.repos.iter().map(|r| r.resolved_calls).sum();
         let holdout_resolved: usize = self.holdout.repos.iter().map(|r| r.resolved_calls).sum();
         out.push_str(&format!(
-            "resolved calls (upgraded): dev {dev_resolved} | holdout {holdout_resolved}\n"
+            "resolved calls (upgraded): development {dev_resolved} | validation {holdout_resolved}\n"
         ));
         out.push_str(&format!(
-            "density (facts/1k tokens): dev {:.2} | holdout {:.2}\n",
+            "density (facts/1k tokens): development {:.2} | validation {:.2}\n",
             self.dev.mean_density, self.holdout.mean_density
         ));
         out.push_str(&format!(
-            "atlas tokens: dev {:.0} | holdout {:.0}\n",
+            "atlas tokens: development {:.0} | validation {:.0}\n",
             self.dev.mean_atlas_tokens, self.holdout.mean_atlas_tokens
         ));
+        out.push('\n');
+        out.push_str("## per-layer precision + F2 (startup-required layers)\n");
+        out.push_str(&format!(
+            "{:<18} {:>12} {:>12}   {:>12} {:>12}\n",
+            "layer", "P:development", "P:validation", "F2:development", "F2:validation"
+        ));
+        for (layer, _, _) in rows {
+            let p_dev = self.dev.mean_layer_precision().get(layer).copied().unwrap_or(0.0);
+            let p_ho = self.holdout.mean_layer_precision().get(layer).copied().unwrap_or(0.0);
+            let f_dev = self.dev.mean_layer_f2().get(layer).copied().unwrap_or(0.0);
+            let f_ho = self.holdout.mean_layer_f2().get(layer).copied().unwrap_or(0.0);
+            out.push_str(&format!(
+                "{:<18} {:>12.3} {:>12.3}   {:>12.3} {:>12.3}\n",
+                layer, p_dev, p_ho, f_dev, f_ho
+            ));
+        }
         out.push('\n');
         out.push_str(&format!(
             "## verdict: {} (gap = {:.3}; tolerance = {:.3})\n",
@@ -1033,21 +1144,22 @@ impl HoldoutComparison {
         ));
         match self.verdict {
             HoldoutVerdict::NoOverfit => out.push_str(
-                "The blind holdout corpus scores at least as well as the dev corpus; \
-                 the dev-tuned rules generalize to unseen repos.\n",
+                "The validation corpus scores at least as well as the development \
+                 corpus; the development-tuned rules generalize to unseen repos.\n",
             ),
             HoldoutVerdict::Borderline => out.push_str(
-                "The holdout corpus lags the dev corpus, but by less than the tolerance \
-                 band; the gap is consistent with corpus-difficulty/ground-truth noise, \
-                 not demonstrated overfitting.\n",
+                "The validation corpus lags the development corpus, but by less than \
+                 the tolerance band; the gap is consistent with \
+                 corpus-difficulty/ground-truth noise, not demonstrated overfitting.\n",
             ),
             HoldoutVerdict::Overfit => out.push_str(
-                "The holdout corpus lags the dev corpus by more than the tolerance band; \
-                 rules tuned on the dev corpus do not generalize to unseen repos.\n",
+                "The validation corpus lags the development corpus by more than the \
+                 tolerance band; rules tuned on the development corpus do not \
+                 generalize to unseen repos.\n",
             ),
         }
         out.push('\n');
-        out.push_str("## holdout repo overall recall (sorted)\n");
+        out.push_str("## validation repo overall recall (sorted)\n");
         for r in &self.holdout.repos {
             match &r.skipped_reason {
                 Some(reason) => out.push_str(&format!("  {:<24} skipped: {reason}\n", r.repo)),
@@ -1061,14 +1173,15 @@ impl HoldoutComparison {
     }
 }
 
-/// Print the dev and holdout reports side by side plus the gap summary.
+/// Print the development and validation reports side by side plus the gap
+/// summary.
 pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
-    println!("scc bench atlas --holdout — dev corpus vs blind holdout (v1)");
-    println!("\n=== DEV corpus ===");
+    println!("scc bench atlas --holdout — development corpus vs validation corpus (v1)");
+    println!("\n=== DEVELOPMENT corpus ===");
     print_report(&c.dev, diagnose);
-    println!("\n=== HOLDOUT corpus ===");
+    println!("\n=== VALIDATION corpus ===");
     print_report(&c.holdout, diagnose);
-    println!("\n=== gap (holdout - dev) ===");
+    println!("\n=== gap (validation - development) ===");
     println!(
         "  {:<18} {:>10}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}",
         "layer", "gap",
@@ -1080,12 +1193,259 @@ pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
         "overall", c.gap_overall,
     );
     println!(
-        "  verdict: {} (holdout {:.3} vs dev {:.3}; tolerance {:.3})",
+        "  verdict: {} (validation {:.3} vs development {:.3}; tolerance {:.3})",
         c.verdict.as_str(),
         c.holdout.mean_overall,
         c.dev.mean_overall,
         HOLDOUT_TOLERANCE
     );
+    println!(
+        "  F2: development {:.3} | validation {:.3}",
+        c.dev.mean_f2, c.holdout.mean_f2
+    );
+    println!("  results written to: {}", c.results_file);
+}
+
+/// Blind-test protocol comparison: validation-vs-blind generalization.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlindComparison {
+    /// Validation corpus aggregates (`benchmarks/holdout`) — per-repo
+    /// detail stripped.
+    pub validation: AtlasRecallReport,
+    /// Blind corpus aggregates (`benchmarks/blind-test`) — per-repo detail
+    /// stripped: blind-test failures are never shown to tuning agents.
+    pub blind: AtlasRecallReport,
+    /// Per-layer gap = blind mean - validation mean (fraction, negative = lag).
+    pub gap_architecture: f64,
+    pub gap_entrypoints: f64,
+    pub gap_behavior: f64,
+    pub gap_state_authority: f64,
+    pub gap_contracts: f64,
+    pub gap_landmarks: f64,
+    pub gap_tests: f64,
+    pub gap_overall: f64,
+    /// Path of the written results file.
+    pub results_file: String,
+}
+
+/// Score one fixed-protocol corpus with the same recall pipeline; missing
+/// or empty dirs are errors, not silent empty runs.
+fn score_protocol_corpus(
+    corpus: &Path,
+    ground_truth: &Path,
+    resolve: bool,
+    mode_label: &str,
+) -> Result<AtlasRecallReport, String> {
+    if !corpus.is_dir() {
+        return Err(format!(
+            "corpus dir not found (run from the workspace): {}",
+            corpus.display()
+        ));
+    }
+    let names = repo_dirs(corpus);
+    if names.is_empty() {
+        return Err(format!("corpus dir is empty: {}", corpus.display()));
+    }
+    let mut report = run_atlas_recall(corpus, ground_truth, &names, false, resolve)?;
+    report.mode = format!("{mode_label}: {}", corpus.display());
+    Ok(report)
+}
+
+/// Run the blind protocol: score the validation corpus
+/// (`benchmarks/holdout`) and the blind-test corpus (`benchmarks/blind-test`)
+/// with the same recall pipeline, keep ONLY aggregates (per-repo rows,
+/// missed keys, and filenames are stripped — blind-test failures are never
+/// shown to tuning agents), compute the validation-vs-blind generalization
+/// gap, write `benchmarks/results/blind-v1.txt`, and return the comparison.
+///
+/// `--diagnose` is refused: diagnosis prints per-repo miss lines, which
+/// would leak the blind misses ("blind corpus is not diagnosable").
+pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison, String> {
+    if diagnose {
+        return Err("blind corpus is not diagnosable".into());
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = crate::find_root(&cwd);
+    let results_dir = root.join("benchmarks").join("results");
+    let results_file = results_dir.join("blind-v1.txt");
+
+    let validation_corpus = root.join("benchmarks").join("holdout");
+    let validation_gt = root.join("benchmarks").join("holdout-ground-truth");
+    let blind_corpus = root.join("benchmarks").join("blind-test");
+    let blind_gt = root.join("benchmarks").join("blind-test-ground-truth");
+
+    let validation = score_protocol_corpus(&validation_corpus, &validation_gt, resolve, "validation")?;
+    let blind = score_protocol_corpus(&blind_corpus, &blind_gt, resolve, "blind-test")?;
+    // Aggregates only, end to end: drop every per-repo row, missed key,
+    // and filename before the comparison leaves this function.
+    let validation = validation.aggregates_only();
+    let blind = blind.aggregates_only();
+
+    let c = BlindComparison {
+        gap_architecture: HoldoutComparison::layer_gap(
+            validation.mean_architecture,
+            blind.mean_architecture,
+        ),
+        gap_entrypoints: HoldoutComparison::layer_gap(
+            validation.mean_entrypoints,
+            blind.mean_entrypoints,
+        ),
+        gap_behavior: HoldoutComparison::layer_gap(validation.mean_behavior, blind.mean_behavior),
+        gap_state_authority: HoldoutComparison::layer_gap(
+            validation.mean_state_authority,
+            blind.mean_state_authority,
+        ),
+        gap_contracts: HoldoutComparison::layer_gap(
+            validation.mean_contracts,
+            blind.mean_contracts,
+        ),
+        gap_landmarks: HoldoutComparison::layer_gap(validation.mean_landmarks, blind.mean_landmarks),
+        gap_tests: HoldoutComparison::layer_gap(validation.mean_tests, blind.mean_tests),
+        gap_overall: HoldoutComparison::layer_gap(validation.mean_overall, blind.mean_overall),
+        results_file: results_file.display().to_string(),
+        validation,
+        blind,
+    };
+
+    std::fs::create_dir_all(&results_dir).map_err(|e| e.to_string())?;
+    std::fs::write(&results_file, c.to_blind_text()).map_err(|e| e.to_string())?;
+    Ok(c)
+}
+
+impl BlindComparison {
+    /// Deterministic aggregates-only text for
+    /// `benchmarks/results/blind-v1.txt` (aggregates + gap only).
+    fn to_blind_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# Blind v1 — validation vs blind (aggregates only)\n");
+        out.push_str(&format!("validation corpus: {}\n", self.validation.mode));
+        out.push_str(&format!("blind corpus:      {}\n", self.blind.mode));
+        out.push_str(&format!("results:           {}\n", self.results_file));
+        out.push_str(
+            "# blind-test failures are never shown to tuning agents: no per-repo rows, no filenames, no missed keys\n",
+        );
+        out.push('\n');
+
+        let rows: [(&str, f64, f64); 8] = [
+            ("architecture", self.validation.mean_architecture, self.blind.mean_architecture),
+            ("entrypoints", self.validation.mean_entrypoints, self.blind.mean_entrypoints),
+            ("behavior", self.validation.mean_behavior, self.blind.mean_behavior),
+            ("state_authority", self.validation.mean_state_authority, self.blind.mean_state_authority),
+            ("contracts", self.validation.mean_contracts, self.blind.mean_contracts),
+            ("landmarks", self.validation.mean_landmarks, self.blind.mean_landmarks),
+            ("tests", self.validation.mean_tests, self.blind.mean_tests),
+            ("overall (gate)", self.validation.mean_overall, self.blind.mean_overall),
+        ];
+        out.push_str(&format!(
+            "{:<18} {:>12} {:>12} {:>10}\n",
+            "layer", "validation", "blind", "gap"
+        ));
+        for (layer, v, b) in rows {
+            let gap = HoldoutComparison::layer_gap(v, b);
+            out.push_str(&format!(
+                "{:<18} {:>12.3} {:>12.3} {:>+10.3}\n",
+                layer, v, b, gap
+            ));
+        }
+        out.push('\n');
+        out.push_str(&format!(
+            "scored: validation {} (skipped {}) | blind {} (skipped {})\n",
+            self.validation.scored,
+            self.validation.skipped,
+            self.blind.scored,
+            self.blind.skipped
+        ));
+        out.push_str(&format!(
+            "precision: validation {:.3} | blind {:.3}\n",
+            self.validation.mean_precision, self.blind.mean_precision
+        ));
+        out.push_str(&format!(
+            "F2: validation {:.3} | blind {:.3}\n",
+            self.validation.mean_f2, self.blind.mean_f2
+        ));
+        out.push_str(&format!(
+            "density (facts/1k tokens): validation {:.2} | blind {:.2}\n",
+            self.validation.mean_density, self.blind.mean_density
+        ));
+        out.push_str(&format!(
+            "atlas tokens: validation {:.0} | blind {:.0}\n",
+            self.validation.mean_atlas_tokens, self.blind.mean_atlas_tokens
+        ));
+        out.push('\n');
+        out.push_str("## generalization gap (blind - validation) — informational, not gating\n");
+        for (layer, gap) in [
+            ("architecture", self.gap_architecture),
+            ("entrypoints", self.gap_entrypoints),
+            ("behavior", self.gap_behavior),
+            ("state_authority", self.gap_state_authority),
+            ("contracts", self.gap_contracts),
+            ("landmarks", self.gap_landmarks),
+            ("tests", self.gap_tests),
+            ("overall", self.gap_overall),
+        ] {
+            out.push_str(&format!("  {:<18} {:>+10.3}\n", layer, gap));
+        }
+        out.push_str(&format!(
+            "  gate (recall >= {ATLAS_GATE}): blind {} | validation {}\n",
+            if self.blind.gate_passed { "PASS" } else { "FAIL" },
+            if self.validation.gate_passed { "PASS" } else { "FAIL" }
+        ));
+        out
+    }
+}
+
+/// Print the blind protocol: aggregates ONLY (no per-repo rows, no missed
+/// keys, no filenames) plus the validation-vs-blind generalization gap.
+pub fn print_blind_report(c: &BlindComparison) {
+    println!("scc bench atlas --blind — validation vs blind (aggregates only)");
+    println!("  validation corpus: {}", c.validation.mode);
+    println!("  blind corpus:      {}", c.blind.mode);
+    println!("  blind-test failures are never shown to tuning agents.");
+    println!("\n=== per-section means ===");
+    println!(
+        "  {:<18} {:>12} {:>12} {:>10}",
+        "layer", "validation", "blind", "gap"
+    );
+    let rows: [(&str, f64, f64); 8] = [
+        ("architecture", c.validation.mean_architecture, c.blind.mean_architecture),
+        ("entrypoints", c.validation.mean_entrypoints, c.blind.mean_entrypoints),
+        ("behavior", c.validation.mean_behavior, c.blind.mean_behavior),
+        ("state_authority", c.validation.mean_state_authority, c.blind.mean_state_authority),
+        ("contracts", c.validation.mean_contracts, c.blind.mean_contracts),
+        ("landmarks", c.validation.mean_landmarks, c.blind.mean_landmarks),
+        ("tests", c.validation.mean_tests, c.blind.mean_tests),
+        ("overall (gate)", c.validation.mean_overall, c.blind.mean_overall),
+    ];
+    for (layer, v, b) in rows {
+        let gap = HoldoutComparison::layer_gap(v, b);
+        println!("  {:<18} {:>12.3} {:>12.3} {:>+10.3}", layer, v, b, gap);
+    }
+    println!(
+        "  scored: validation {} (skipped {}) | blind {} (skipped {})",
+        c.validation.scored, c.validation.skipped, c.blind.scored, c.blind.skipped
+    );
+    println!(
+        "  precision: validation {:.3} | blind {:.3}   F2: validation {:.3} | blind {:.3}",
+        c.validation.mean_precision, c.blind.mean_precision, c.validation.mean_f2, c.blind.mean_f2
+    );
+    println!(
+        "  density (facts/1k tokens): validation {:.2} | blind {:.2}   atlas tokens: validation {:.0} | blind {:.0}",
+        c.validation.mean_density, c.blind.mean_density,
+        c.validation.mean_atlas_tokens, c.blind.mean_atlas_tokens
+    );
+    println!("\n=== generalization gap (blind - validation) — informational, not gating ===");
+    for (layer, gap) in [
+        ("architecture", c.gap_architecture),
+        ("entrypoints", c.gap_entrypoints),
+        ("behavior", c.gap_behavior),
+        ("state_authority", c.gap_state_authority),
+        ("contracts", c.gap_contracts),
+        ("landmarks", c.gap_landmarks),
+        ("tests", c.gap_tests),
+        ("overall", c.gap_overall),
+    ] {
+        println!("  {:<18} {:>+10.3}", layer, gap);
+    }
     println!("  results written to: {}", c.results_file);
 }
 
@@ -1444,21 +1804,21 @@ fn lang_from_ext(path: &str) -> Option<Language> {
 }
 
 pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
-    println!("scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)");
+    println!("scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)");
     println!("  mode: {}", r.mode);
     println!(
         "  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= {ATLAS_GATE}"
     );
     println!(
-        "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>5}  note",
+        "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>6} {:>5}  note",
         "repo", "arch", "entry", "behav", "state", "contr", "landm", "tests", "overall",
-        "prec", "f/1k", "toks"
+        "prec", "f2", "f/1k", "toks"
     );
     for repo in &r.repos {
         match &repo.skipped_reason {
             Some(reason) => println!(
-                "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>5}  skipped: {reason}",
-                repo.repo, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"
+                "  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6} {:>6} {:>5}  skipped: {reason}",
+                repo.repo, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"
             ),
             None => {
                 let note = if repo.resolved_calls > 0 {
@@ -1467,7 +1827,7 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
                     String::new()
                 };
                 println!(
-                    "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}  {}",
+                    "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.3} {:>6.2} {:>5}  {}",
                     repo.repo,
                     repo.architecture,
                     repo.entrypoints,
@@ -1478,6 +1838,7 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
                     repo.tests,
                     repo.overall,
                     repo.precision,
+                    repo.f2,
                     repo.density,
                     repo.atlas_tokens,
                     note
@@ -1489,7 +1850,7 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
         }
     }
     println!(
-        "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.2} {:>5}",
+        "  {:<24} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>6.3} {:>6.3} {:>6.2} {:>5}",
         "mean",
         r.mean_architecture,
         r.mean_entrypoints,
@@ -1500,6 +1861,7 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
         r.mean_tests,
         r.mean_overall,
         r.mean_precision,
+        r.mean_f2,
         r.mean_density,
         r.mean_atlas_tokens.round() as usize
     );
@@ -1647,49 +2009,113 @@ mod tests {
     }
 
     #[test]
-    fn flow_edge_precision_counts_ordered_pairs_in_behavior_items() {
-        // two graphs: g1 has a supported chain, g2 has an unsupported edge
-        let g1 = FlowGraph {
-            id: "g1".into(),
-            kind: scc_core::FlowKind::Sequence,
-            name: "g1".into(),
-            trigger: None,
-            nodes: vec![
-                scc_core::FlowNode { id: 0, actor: "a".into(), operation: "worker consumer".into(), evidence: vec![] },
-                scc_core::FlowNode { id: 1, actor: "b".into(), operation: "task.run".into(), evidence: vec![] },
-                scc_core::FlowNode { id: 2, actor: "c".into(), operation: "task.retry".into(), evidence: vec![] },
-            ],
-            edges: vec![
-                scc_core::FlowEdge { from: 0, to: 1, kind: scc_core::FlowEdgeKind::Next, condition: None, provenance: None, confidence: 1.0, evidence: vec![] },
-                scc_core::FlowEdge { from: 1, to: 2, kind: scc_core::FlowEdgeKind::Next, condition: None, provenance: None, confidence: 1.0, evidence: vec![] },
-            ],
-            entrypoints: vec![0],
-            exits: vec![2],
-            provenance_summary: Default::default(),
-        };
-        // "worker consumer -> task.run" supports (0,1) but not (1,2)
-        let behavior = vec!["worker consumer -> task.run".to_string()];
-        let prec = flow_edge_precision(&[g1], &behavior);
-        assert!((prec - 0.5).abs() < 1e-9, "1 of 2 edges supported: {prec}");
+    fn layer_precision_counts_atlas_entries_matching_ground_truth() {
+        // One haystack entry per line; an entry matches when a ground-truth
+        // item is contained in it. 2 of 3 entries match -> 2/3.
+        let items = vec!["services".to_string(), "db.items".to_string()];
+        let hay = "services\ndb.items\nzzz_extra_fact";
+        let p = layer_precision(&items, hay);
+        assert!((p - 2.0 / 3.0).abs() < 1e-9, "2/3 entries match: {p}");
 
-        // no behavior ground truth -> 1.0 (nothing to contradict)
-        assert_eq!(flow_edge_precision(&[], &behavior), 1.0);
-        let g_empty = FlowGraph {
-            id: "g".into(),
-            kind: scc_core::FlowKind::Sequence,
-            name: "g".into(),
-            trigger: None,
-            nodes: vec![
-                scc_core::FlowNode { id: 0, actor: "a".into(), operation: "x".into(), evidence: vec![] },
-                scc_core::FlowNode { id: 1, actor: "b".into(), operation: "y".into(), evidence: vec![] },
-            ],
-            edges: vec![],
-            entrypoints: vec![0],
-            exits: vec![1],
-            provenance_summary: Default::default(),
+        // non-matching entries drag precision down
+        let p2 = layer_precision(&items, "services\nzzz_extra_fact\nzzz_extra_fact2");
+        assert!((p2 - 1.0 / 3.0).abs() < 1e-9, "1/3 entries match: {p2}");
+
+        // empty layer haystack -> 1.0 (nothing spurious)
+        assert_eq!(layer_precision(&items, ""), 1.0);
+        // empty ground truth -> no entry can match -> 0.0
+        assert_eq!(layer_precision(&[], hay), 0.0);
+        // normalization applies to both sides
+        let p3 = layer_precision(&["Controller::run".to_string()], "controller.run\nother");
+        assert!((p3 - 0.5).abs() < 1e-9, ":: alias applied: {p3}");
+    }
+
+    #[test]
+    fn f2_score_weights_recall_over_precision() {
+        // F2 = 5PR/(4P+R): recall-favoring harmonic mean.
+        let a = f2_score(0.9, 0.5);
+        let b = f2_score(0.5, 0.9);
+        assert!(b > a, "recall-weighted: {a} vs {b}");
+        // exact values: P=0.5 R=0.5 -> 5*0.25/(2+0.5) = 1.25/2.5 = 0.5
+        assert!((f2_score(0.5, 0.5) - 0.5).abs() < 1e-9);
+        // zero when P+R==0
+        assert_eq!(f2_score(0.0, 0.0), 0.0);
+        assert_eq!(f2_score(0.0, 0.5), 0.0);
+        assert_eq!(f2_score(0.5, 0.0), 0.0);
+        // perfect P and R -> 1.0
+        assert!((f2_score(1.0, 1.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregates_only_strips_per_repo_detail() {
+        let r = AtlasRecallReport {
+            mean_overall: 0.42,
+            repos: vec![RepoRecall {
+                repo: "secret-repo".into(),
+                missed: vec!["architecture:secret_item".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
         };
-        assert_eq!(flow_edge_precision(std::slice::from_ref(&g_empty), &behavior), 1.0, "no edges -> 1.0");
-        assert_eq!(flow_edge_precision(&[g_empty], &[]), 1.0);
+        let a = r.aggregates_only();
+        assert_eq!(a.repos.len(), 0);
+        assert!((a.mean_overall - 0.42).abs() < 1e-9, "aggregates survive");
+    }
+
+    #[test]
+    fn run_atlas_blind_refuses_diagnose() {
+        let err = run_atlas_blind(true, false).unwrap_err();
+        assert!(err.contains("blind corpus is not diagnosable"), "{err}");
+    }
+
+    #[test]
+    fn blind_results_text_is_aggregates_only_and_deterministic() {
+        let mut validation = AtlasRecallReport {
+            mean_architecture: 0.3,
+            mean_overall: 0.27,
+            mean_precision: 0.6,
+            mean_f2: 0.4,
+            scored: 20,
+            ..Default::default()
+        };
+        validation.mean_entrypoints = 0.2;
+        validation.mean_behavior = 0.3;
+        validation.mean_state_authority = 0.3;
+        validation.mean_contracts = 0.2;
+        validation.mean_landmarks = 0.1;
+        validation.mean_tests = 0.1;
+        validation.mean_density = 0.5;
+        validation.mean_atlas_tokens = 46657.0;
+        let mut blind = validation.clone();
+        blind.mean_overall = 0.31;
+        blind.mean_architecture = 0.34;
+        blind.mean_contracts = 0.25;
+
+        let c = BlindComparison {
+            gap_architecture: HoldoutComparison::layer_gap(validation.mean_architecture, blind.mean_architecture),
+            gap_entrypoints: HoldoutComparison::layer_gap(validation.mean_entrypoints, blind.mean_entrypoints),
+            gap_behavior: HoldoutComparison::layer_gap(validation.mean_behavior, blind.mean_behavior),
+            gap_state_authority: HoldoutComparison::layer_gap(validation.mean_state_authority, blind.mean_state_authority),
+            gap_contracts: HoldoutComparison::layer_gap(validation.mean_contracts, blind.mean_contracts),
+            gap_landmarks: HoldoutComparison::layer_gap(validation.mean_landmarks, blind.mean_landmarks),
+            gap_tests: HoldoutComparison::layer_gap(validation.mean_tests, blind.mean_tests),
+            gap_overall: HoldoutComparison::layer_gap(validation.mean_overall, blind.mean_overall),
+            results_file: "benchmarks/results/blind-v1.txt".to_string(),
+            validation,
+            blind,
+        };
+        let text = c.to_blind_text();
+        let text2 = c.to_blind_text();
+        assert_eq!(text, text2, "deterministic output");
+        assert!(text.contains("aggregates only"), "{text}");
+        assert!(text.contains("never shown to tuning agents"), "{text}");
+        assert!(text.contains("overall (gate)"), "{text}");
+        assert!(text.contains("generalization gap"), "{text}");
+        assert!(text.contains("+0.040"), "gap +0.04 rendered: {text}");
+        assert!(
+            !text.contains("missed:"),
+            "no per-repo miss lines in blind output: {text}"
+        );
     }
 
     #[test]
@@ -1775,8 +2201,11 @@ mod tests {
         assert!(r.missed.contains(&"state_authority:zzz_nonexistent_store".to_string()));
         assert!(r.missed.contains(&"contracts:GET /api/zzz_nonexistent".to_string()));
         assert!(!r.missed.contains(&"entrypoints:handle_items".to_string()));
-        // v2 metrics are finite and in range
-        assert!((0.0..=1.0).contains(&r.precision));
+        // v3 metrics are finite and in range
+        assert!((0.0..=1.0).contains(&r.precision), "startup precision: {}", r.precision);
+        assert!((0.0..=1.0).contains(&r.f2), "F2: {}", r.f2);
+        assert_eq!(r.layer_precision.len(), 5, "five startup layers");
+        assert_eq!(r.layer_f2.len(), 5);
         assert!(r.density >= 0.0);
         assert!(r.atlas_tokens > 0, "rendered atlas has tokens");
         assert_eq!(r.landmark_items, 1);
@@ -1882,7 +2311,9 @@ mod tests {
         let text = c.to_results_text();
         let text2 = c.to_results_text();
         assert_eq!(text, text2, "deterministic output");
+        assert!(text.contains("development corpus vs validation corpus"), "{text}");
         assert!(text.contains("overall (gate)"));
+        assert!(text.contains("per-layer precision + F2"), "{text}");
         assert!(text.contains("verdict: BORDERLINE"));
         assert!(text.contains("-0.040"), "gap -0.04 rendered: {text}");
     }

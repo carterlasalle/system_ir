@@ -41,14 +41,10 @@ pub const MERGE_THRESHOLD: i32 = 6;
 /// Greedy merge threshold for the second (service) pass.
 pub const SERVICE_THRESHOLD: i32 = 12;
 
-/// Relationship-id prefix for hierarchy CONTAINS edges (kept distinct from
-/// the component rel prefix so the two clears never cross).
-const HIER_RELPREFIX: &str = "rel:hier:";
-
 /// Authority order for `boundary_kind` when one candidate is created by
 /// several sources: declared intent > deployment units > workspace
 /// packages > directory fallback. Deterministic (fixed precedence).
-fn boundary_rank(kind: &str) -> u8 {
+pub(crate) fn boundary_rank(kind: &str) -> u8 {
     match kind {
         BOUNDARY_DECLARED => 3,
         BOUNDARY_DEPLOYMENT => 2,
@@ -428,17 +424,18 @@ fn cli_package_dirs(graph: &RealityGraph) -> BTreeSet<String> {
     }
     dirs
 }
-// trace:v1 id=impl.scc.components work=WORK-SCC-001 satisfies=REQ-SCC-IR
 
-pub fn compile_components(
+/// Build the component candidates from evidence (declared intent, workspace
+/// packages, deployment-unit build contexts, CLI registration dirs, and the
+/// bare top-level directory fallback). Shared by the component compiler and
+/// the semantic clusterer so both see the same boundary priors.
+// trace:v1 id=impl.scc.components work=WORK-SCC-001 satisfies=REQ-SCC-IR
+pub(crate) fn build_candidates(
     graph: &RealityGraph,
     store: &Store,
     intent: &[(String, serde_json::Value)],
-    pairs: &[crate::cochange::CochangePair],
-) -> Result<Vec<scc_core::Entity>> {
-    let repo_id = &store.repo_id;
-
-    // ---- candidate construction (declared first so they win) ----
+) -> Vec<ComponentCandidate> {
+    // declared first so they win authority
     let mut candidates: Vec<ComponentCandidate> = Vec::new();
     let mut declared_names: HashSet<String> = HashSet::new();
     for (source, claim) in intent {
@@ -562,27 +559,54 @@ pub fn compile_components(
             });
         }
     }
+    candidates
+}
 
-    // ---- assign files to components ----
-    let mut files_in_component: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for f in graph.entities_of_kind(kinds::FILE) {
-        let comp = component_for_path(&f.name, &candidates);
-        files_in_component
-            .entry(comp.to_string())
-            .or_default()
-            .push(f.id.clone());
-    }
+pub fn compile_components(
+    graph: &RealityGraph,
+    store: &Store,
+    intent: &[(String, serde_json::Value)],
+    pairs: &[crate::cochange::CochangePair],
+) -> Result<Vec<scc_core::Entity>> {
+    let repo_id = &store.repo_id;
+    let candidates = build_candidates(graph, store, intent);
 
-    // ---- symbol → component map ----
-    let mut symbol_component: HashMap<String, String> = HashMap::new();
-    for (comp, files) in &files_in_component {
-        for fid in files {
-            for r in graph.out_pred(fid, scc_core::predicates::CONTAINS) {
-                let sym_id = r.object.clone();
-                symbol_component.insert(sym_id, comp.clone());
+    // ---- semantic clustering over ATOMIC regions (generalization wave):
+    // files belong to architecture because of BEHAVIOR, not directories.
+    // The clusterer may SPLIT a top-level dir (its sub-regions land in
+    // different clusters when intra-dir cohesion is low) and may MERGE
+    // regions across dirs (high call+state weight) — the longest-prefix
+    // path assignment is replaced by the clustering result. Path/package/
+    // deployment stay as constraints and priors: authoritative boundaries
+    // are atomic regions, and merging across deployment units requires
+    // weight > SERVICE_THRESHOLD. ----
+    let du_ctxs: Vec<(String, String)> = graph
+        .entities_of_kind(kinds::DEPLOYMENT_UNIT)
+        .into_iter()
+        .filter_map(|du| {
+            let ctx = du.attributes.get("build_context").and_then(|v| v.as_str())?;
+            if ctx == "." || ctx == "./" {
+                return None;
             }
-        }
-    }
+            Some((du.name.clone(), ctx.trim_start_matches("./").to_string()))
+        })
+        .collect();
+    let mut du_ctxs_sorted = du_ctxs;
+    du_ctxs_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let clustering = crate::clustering::cluster_components(
+        graph,
+        store,
+        intent,
+        &candidates,
+        pairs,
+        &du_ctxs_sorted,
+    )?;
+
+    // ---- file/symbol assignment from the clustering result ----
+    let files_in_component: BTreeMap<String, Vec<String>> = clustering.files_in_component;
+    // symbol → component map (cluster membership)
+    let symbol_component: HashMap<String, String> = clustering.symbol_component;
+    let parent_per_comp: BTreeMap<String, String> = clustering.parent_per_comp;
 
     // ---- aggregation ----
     let mut responsibilities: BTreeMap<String, Vec<(String, Provenance, f64)>> = BTreeMap::new();
@@ -751,65 +775,80 @@ pub fn compile_components(
     }
     // deployment units with build contexts, most specific (longest context)
     // first so `parent` picks the tightest unit; name tiebreak for
-    // determinism
-    let mut du_ctxs: Vec<(String, String)> = graph
-        .entities_of_kind(kinds::DEPLOYMENT_UNIT)
-        .into_iter()
-        .filter_map(|du| {
-            let ctx = du.attributes.get("build_context").and_then(|v| v.as_str())?;
-            if ctx == "." || ctx == "./" {
-                return None;
-            }
-            Some((du.name.clone(), ctx.trim_start_matches("./").to_string()))
-        })
-        .collect();
-    du_ctxs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    // component -> deployment unit name whose build context covers its dirs
-    let mut parent_per_comp: BTreeMap<String, String> = BTreeMap::new();
-    for c in &candidates {
-        for (du_name, ctx) in &du_ctxs {
-            let inside = c.dirs.iter().any(|d| {
-                let d = d.trim_end_matches('/');
-                d == ctx.as_str() || d.starts_with(&format!("{ctx}/"))
-            });
-            if inside {
-                parent_per_comp.insert(c.name.clone(), du_name.clone());
-                break;
-            }
-        }
-    }
+    // determinism — the per-component `parent` attribute comes from the
+    // clusterer's parent_per_comp (cluster dirs vs unit build contexts).
 
-    // intent responsibilities / ownership (DECLARED)
+    // intent responsibilities / ownership (DECLARED): attach to every
+    // cluster whose name matches the claim or whose dirs contain the
+    // claim's paths — a merged/split component keeps its members' declared
+    // intent (deterministic: clusters are sorted by name).
     let mut intent_resp: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut intent_owns: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (source, claim) in intent {
         if source == "component" {
             let name = claim["name"].as_str().unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let paths: Vec<String> = claim["paths"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut targets: Vec<String> = Vec::new();
+            for c in &clustering.clusters {
+                // the declared component's REGION is a member of the
+                // cluster (a merged/split component keeps its members'
+                // declared intent); also accept explicit dir containment
+                // and an exact name match
+                let member_region = c.member_regions.iter().any(|&m| {
+                    clustering
+                        .regions
+                        .get(m)
+                        .map(|r| r.name == name)
+                        .unwrap_or(false)
+                });
+                let covered = !paths.is_empty()
+                    && paths.iter().all(|p| {
+                        c.dirs.iter().any(|d| {
+                            let d = d.trim_end_matches('/');
+                            p == d || p.starts_with(&format!("{d}/")) || d.starts_with(&format!("{p}/"))
+                        })
+                    });
+                if member_region || covered || c.name == name {
+                    targets.push(c.name.clone());
+                }
+            }
             if let Some(resp) = claim["responsibility"].as_array() {
-                for r in resp {
-                    if let Some(s) = r.as_str() {
-                        intent_resp.entry(name.clone()).or_default().push(s.to_string());
+                for t in &targets {
+                    for r in resp {
+                        if let Some(s) = r.as_str() {
+                            intent_resp.entry(t.clone()).or_default().push(s.to_string());
+                        }
                     }
                 }
             }
             if let Some(o) = claim["owns"].as_array() {
-                for ow in o {
-                    if let Some(s) = ow.as_str() {
-                        intent_owns.entry(name.clone()).or_default().push(s.to_string());
+                for t in &targets {
+                    for ow in o {
+                        if let Some(s) = ow.as_str() {
+                            intent_owns.entry(t.clone()).or_default().push(s.to_string());
+                        }
                     }
                 }
             }
         }
     }
 
-    // ---- build component entities ----
-    let mut comp_names: Vec<String> = candidates
+    // ---- build component entities (one per clustering result) ----
+    let comp_names: Vec<String> = clustering
+        .clusters
         .iter()
         .map(|c| c.name.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect();
-    comp_names.sort();
 
     let mut out: Vec<scc_core::Entity> = Vec::new();
     for name in comp_names {
@@ -854,11 +893,12 @@ pub fn compile_components(
         }
         e.attr("responsibility", json!(resp));
 
-        let cand = candidates
+        let cluster = clustering
+            .clusters
             .iter()
             .find(|c| c.name == name)
-            .expect("every compiled component has a candidate");
-        let dirs = cand.dirs.clone();
+            .expect("every compiled component is a clustering result");
+        let dirs = cluster.dirs.clone();
         e.attr(
             "implementation",
             json!({
@@ -868,7 +908,7 @@ pub fn compile_components(
         );
 
         // ---- Wave 5: boundary kind + weighted clustering score ----
-        let mut score: f64 = match cand.boundary_kind.as_str() {
+        let mut score: f64 = match cluster.boundary_kind.as_str() {
             BOUNDARY_DEPLOYMENT => 5.0,
             BOUNDARY_PACKAGE => 4.0,
             // CLI packages are real evidence-backed boundaries (like
@@ -909,7 +949,8 @@ pub fn compile_components(
             .count();
         score += 2.0 * co_pairs as f64; // co-change (+2 per pair inside)
         score = (score * 1000.0).round() / 1000.0;
-        e.attr("boundary_kind", json!(cand.boundary_kind.clone()));
+        e.attr("boundary_kind", json!(cluster.boundary_kind.clone()));
+        e.attr("layer", json!(cluster.layer.clone()));
         e.attr("clustering_score", json!(score));
         if let Some(parent) = parent_per_comp.get(&name) {
             e.attr("parent", json!(parent));
@@ -1116,9 +1157,9 @@ pub fn compile_components(
         store.insert_relationship(&r, &src)?;
     }
 
-    // ---- Ontology phase: per-component state attribution + hierarchical
-    // architecture clusterer (additive — the flat list above stays intact;
-    // layers/parents are attributes, containers are extra entities). ----
+    // ---- per-component state attribution + pass-2 service compilation
+    // (additive — the flat clustering list stays intact; services are extra
+    // entities of kind SERVICE with CONTAINS edges to member components). ----
     let state_authority = crate::state::compile_state_authority(graph, &symbol_component);
     for c in out.iter_mut() {
         let mut mine: Vec<String> = Vec::new();
@@ -1139,639 +1180,15 @@ pub fn compile_components(
         }
         c.attr("state_authority", json!(mine));
     }
-    compile_hierarchy(
-        graph,
+    crate::clustering::compile_services(
         store,
-        &mut out,
-        &symbol_component,
+        &out,
+        &clustering.component_weights,
+        &clustering.cross_unit,
         &parent_per_comp,
-        &files_in_component,
-        pairs,
     )?;
 
     Ok(out)
-}
-
-/// Hierarchical architecture clusterer (Ontology phase, second stage).
-///
-/// Builds weighted edges between the atomic candidates from graph evidence:
-/// semantic calls (+2), shared state authority (+4), route ownership (+3),
-/// common entrypoints (+3), event ownership (+3), deployment-boundary
-/// containment (+5), import cohesion (+2), co-change (+1, capped at 5).
-/// Greedy agglomerative merging (max-linkage, deterministic tie-breaks)
-/// then produces the layer stack:
-///   code_region/component (leaf) → subsystem (merge >= 6) → service
-///   (merge >= 12, or a subsystem fully inside one deployment unit).
-///
-/// The flat component list is untouched: layers/parents are ADDITIVE
-/// attributes on the component entities; subsystems/services are extra
-/// entities of kinds SUBSYSTEM/SERVICE with CONTAINS edges to members.
-/// Idempotent — stale hierarchy entities and rels are cleared first.
-fn compile_hierarchy(
-    graph: &RealityGraph,
-    store: &Store,
-    comps: &mut [scc_core::Entity],
-    symbol_comp: &HashMap<String, String>,
-    parent_per_comp: &BTreeMap<String, String>,
-    files_by_comp: &BTreeMap<String, Vec<String>>,
-    pairs: &[crate::cochange::CochangePair],
-) -> Result<()> {
-    clear_hierarchy(store)?;
-
-    let n = comps.len();
-    // leaf layers first (always set, even with < 2 components)
-    for c in comps.iter_mut() {
-        let layer = match c.attributes.get("boundary_kind").and_then(|v| v.as_str()) {
-            Some(BOUNDARY_CODE_REGION) | Some(BOUNDARY_ROOT) => LAYER_CODE_REGION,
-            _ => LAYER_COMPONENT,
-        };
-        c.attr("layer", json!(layer));
-    }
-    if n < 2 {
-        return Ok(());
-    }
-
-    let idx: HashMap<&str, usize> = comps
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.name.as_str(), i))
-        .collect();
-    let mut w: Vec<Vec<i32>> = vec![vec![0i32; n]; n];
-
-    // semantic calls across candidates (+2)
-    let mut syms: Vec<(&String, &String)> = symbol_comp.iter().collect();
-    syms.sort();
-    for (sym, comp_a) in &syms {
-        let Some(&ia) = idx.get(comp_a.as_str()) else { continue };
-        for r in graph.out_pred(sym, scc_core::predicates::CALLS) {
-            if let Some(comp_b) = symbol_comp.get(&r.object) {
-                if let Some(&ib) = idx.get(comp_b.as_str()) {
-                    if ia != ib {
-                        w[ia][ib] += 2;
-                        w[ib][ia] += 2;
-                    }
-                }
-            }
-        }
-    }
-
-    // shared state authority (+4): same store written, or same config read
-    let mut store_comps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut config_comps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (sym, comp) in &syms {
-        for r in graph.out_pred(sym, scc_core::predicates::WRITES) {
-            // data entities resolve to their owning store so writes to
-            // db.users and db.orders count as the same shared authority
-            let target = if r.object.contains("/data/") {
-                graph
-                    .entities
-                    .get(&r.object)
-                    .and_then(|e| e.attributes.get("store"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| entity_id(&graph.repo_id, kinds::DATA_STORE, s))
-                    .unwrap_or_else(|| r.object.clone())
-            } else {
-                r.object.clone()
-            };
-            store_comps
-                .entry(target)
-                .or_default()
-                .insert(comp.to_string());
-        }
-    }
-    for cfg in graph.entities_of_kind(kinds::CONFIGURATION) {
-        for r in graph.out_pred(&cfg.id, scc_core::predicates::CONFIGURED_BY) {
-            if let Some(comp) = symbol_comp.get(&r.object) {
-                config_comps
-                    .entry(cfg.id.clone())
-                    .or_default()
-                    .insert(comp.to_string());
-            }
-        }
-    }
-    for comps_set in store_comps.values().chain(config_comps.values()) {
-        add_pair_weight(&mut w, &idx, comps_set, 4);
-    }
-
-    // route ownership (+3) / common entrypoints (+3): both endpoints own
-    let mut route_comps: BTreeSet<String> = BTreeSet::new();
-    let mut entrypoint_comps: BTreeSet<String> = BTreeSet::new();
-    let mut event_comps: BTreeSet<String> = BTreeSet::new();
-    for (sym, comp) in &syms {
-        if !graph.out_pred(sym, scc_core::predicates::HANDLES).is_empty() {
-            route_comps.insert(comp.to_string());
-        }
-        if let Some(e) = graph.entities.get(*sym) {
-            if let Some(eps) = e.attributes.get("entrypoints").and_then(|v| v.as_array()) {
-                if !eps.is_empty() {
-                    entrypoint_comps.insert(comp.to_string());
-                }
-            }
-        }
-        if !graph.out_pred(sym, scc_core::predicates::PUBLISHES).is_empty()
-            || !graph.out_pred(sym, scc_core::predicates::CONSUMES).is_empty()
-            || !graph.out_pred(sym, scc_core::predicates::SUBSCRIBES).is_empty()
-        {
-            event_comps.insert(comp.to_string());
-        }
-    }
-    add_pair_weight(&mut w, &idx, &route_comps, 3);
-    add_pair_weight(&mut w, &idx, &entrypoint_comps, 3);
-    add_pair_weight(&mut w, &idx, &event_comps, 3);
-
-    // deployment boundary containment (+5): same deployment unit
-    let mut du_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (comp, du) in parent_per_comp {
-        du_groups
-            .entry(du.clone())
-            .or_default()
-            .insert(comp.clone());
-    }
-    for comps_set in du_groups.values() {
-        add_pair_weight(&mut w, &idx, comps_set, 5);
-    }
-
-    // import cohesion (+2): a file in A imports a file in B
-    let mut file_comp: HashMap<String, String> = HashMap::new();
-    for (comp, files) in files_by_comp {
-        for f in files {
-            file_comp.insert(f.clone(), comp.clone());
-        }
-    }
-    for e in graph.entities_of_kind(kinds::FILE) {
-        for r in graph.out_pred(&e.id, scc_core::predicates::IMPORTS) {
-            let is_file = graph
-                .entities
-                .get(&r.object)
-                .map(|t| t.kind == kinds::FILE)
-                .unwrap_or(false);
-            if !is_file {
-                continue;
-            }
-            if let (Some(a), Some(b)) = (file_comp.get(&e.id), file_comp.get(&r.object)) {
-                if let (Some(&ia), Some(&ib)) = (idx.get(a.as_str()), idx.get(b.as_str())) {
-                    if ia != ib {
-                        w[ia][ib] += 2;
-                        w[ib][ia] += 2;
-                    }
-                }
-            }
-        }
-    }
-
-    // co-change (+1 per spanning pair, capped at 5)
-    let dirs: Vec<Vec<String>> = comps
-        .iter()
-        .map(|c| {
-            c.attributes
-                .get("implementation")
-                .and_then(|i| i.get("paths"))
-                .and_then(|p| p.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-    for p in pairs {
-        let mut comp_a: Option<usize> = None;
-        let mut comp_b: Option<usize> = None;
-        for (i, d) in dirs.iter().enumerate() {
-            let refs: Vec<&str> = d.iter().map(|s| s.as_str()).collect();
-            if comp_a.is_none() && crate::cochange::file_in_paths(&p.a, &refs) {
-                comp_a = Some(i);
-            }
-            if comp_b.is_none() && crate::cochange::file_in_paths(&p.b, &refs) {
-                comp_b = Some(i);
-            }
-        }
-        if let (Some(ia), Some(ib)) = (comp_a, comp_b) {
-            if ia != ib && w[ia][ib] < 5 {
-                w[ia][ib] += 1;
-                w[ib][ia] += 1;
-            }
-        }
-    }
-
-    // ---- pass 1: greedy merge at MERGE_THRESHOLD (subsystems) ----
-    let mut dsu = Dsu::new(n);
-    greedy_merge(&mut dsu, &w, n, MERGE_THRESHOLD);
-    let mut clusters: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for i in 0..n {
-        clusters.entry(dsu.find(i)).or_default().push(i);
-    }
-
-    // deployment-scoped promotion: a multi-member cluster entirely inside
-    // one deployment unit is a SERVICE, terminal (never merged further)
-    let mut promoted: BTreeSet<usize> = BTreeSet::new();
-    for (root, members) in &clusters {
-        if members.len() < 2 {
-            continue;
-        }
-        let dus: BTreeSet<&String> = members
-            .iter()
-            .filter_map(|i| parent_per_comp.get(comps[*i].name.as_str()))
-            .collect();
-        if dus.len() == 1 {
-            promoted.insert(*root);
-        }
-    }
-
-    // ---- pass 2: merge clusters at SERVICE_THRESHOLD (services) ----
-    // pass-2 nodes = every pass-1 cluster root (multi-member clusters and
-    // singleton leaves) except deployment-promoted terminals; each node's
-    // members are already merged in dsu2.
-    let mut dsu2 = Dsu::new(n);
-    for (root, members) in &clusters {
-        for m in members {
-            dsu2.union(*root, *m);
-        }
-    }
-    let mut nodes: Vec<usize> = clusters
-        .keys()
-        .filter(|r| !promoted.contains(r))
-        .copied()
-        .collect();
-    nodes.sort();
-    greedy_merge_sum(&mut dsu2, &w, n, SERVICE_THRESHOLD);
-
-    // pass-2 unions: root -> member nodes (cluster roots or leaves)
-    let mut unions: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for r in &nodes {
-        unions.entry(dsu2.find(*r)).or_default().push(*r);
-    }
-
-    // ---- entity + attribute materialization ----
-    // containers: (kind, name, members) — `members` are pass-1 cluster
-    // roots for services, component indices for subsystems/promotions.
-    let repo = &store.repo_id;
-    let mut containers: Vec<(String, String, Vec<usize>)> = Vec::new();
-    let mut svc_of_root: BTreeMap<usize, usize> = BTreeMap::new(); // pass-1 root -> service index
-    for members in unions.values() {
-        if members.len() < 2 {
-            continue;
-        }
-        let name = container_name(comps, &clusters, members, parent_per_comp, true);
-        let ci = containers.len();
-        containers.push((kinds::SERVICE.to_string(), name, members.clone()));
-        for m in members {
-            svc_of_root.insert(*m, ci);
-        }
-    }
-    let mut subsys_of: BTreeMap<usize, usize> = BTreeMap::new(); // comp index -> container index
-    let mut root_container: BTreeMap<usize, usize> = BTreeMap::new(); // pass-1 root -> container index
-    for (root, members) in &clusters {
-        if members.len() < 2 {
-            continue;
-        }
-        let ci = containers.len();
-        if promoted.contains(root) {
-            let du = members
-                .iter()
-                .filter_map(|i| parent_per_comp.get(comps[*i].name.as_str()))
-                .next()
-                .cloned()
-                .unwrap_or_else(|| container_name(comps, &clusters, members, parent_per_comp, false));
-            containers.push((kinds::SERVICE.to_string(), du, members.clone()));
-        } else {
-            let name = container_name(comps, &clusters, members, parent_per_comp, false);
-            containers.push((kinds::SUBSYSTEM.to_string(), name, members.clone()));
-        }
-        root_container.insert(*root, ci);
-        for m in members {
-            subsys_of.insert(*m, ci);
-        }
-    }
-
-    // entity ids + member targets (component entity ids or nested container ids)
-    let mut container_ids: Vec<(String, String)> = Vec::new(); // (kind, id) per container
-    for (kind, name, _) in &containers {
-        container_ids.push((kind.clone(), entity_id(repo, kind, name)));
-    }
-
-    for ((kind, name, members), (_, cid)) in containers.iter().zip(container_ids.iter()) {
-        let mut e = scc_core::Entity::new(cid.clone(), kind.clone(), name.clone());
-        e.attr(
-            "layer",
-            json!(if kind == kinds::SERVICE {
-                LAYER_SERVICE
-            } else {
-                LAYER_SUBSYSTEM
-            }),
-        );
-        let member_names: Vec<String> = members
-            .iter()
-            .map(|m| {
-                if let Some(&ci) = root_container.get(m) {
-                    containers[ci].1.clone()
-                } else {
-                    comps[*m].name.clone()
-                }
-            })
-            .collect();
-        e.attr("members", json!(member_names));
-        // a subsystem nested inside a service records its parent
-        if kind == kinds::SUBSYSTEM {
-            if let Some(root) = root_of_container(&containers, name) {
-                if let Some(&si) = svc_of_root.get(&root) {
-                    e.attr("parent", json!(container_ids[si].1.clone()));
-                }
-            }
-        }
-        store.insert_entity(&e, &[])?;
-    }
-
-
-    // component layers + parents
-    for (i, c) in comps.iter_mut().enumerate() {
-        if let Some(&ci) = subsys_of.get(&i) {
-            let (kind, cid) = &container_ids[ci];
-            c.attr("parent", json!(cid));
-            c.attr(
-                "layer",
-                json!(if kind == kinds::SERVICE {
-                    LAYER_SERVICE
-                } else {
-                    LAYER_SUBSYSTEM
-                }),
-            );
-        }
-    }
-
-    // hierarchy CONTAINS edges (compiler-derived container membership).
-    // Service members are pass-1 roots -> nested container ids (falling
-    // back to component ids for directly-merged leaves); subsystem and
-    // promoted-service members are components -> always component ids.
-    for ((kind, _name, members), (_, cid)) in containers.iter().zip(container_ids.iter()) {
-        for m in members {
-            let target = if kind == kinds::SERVICE {
-                member_target_id(repo, comps, &root_container, &container_ids, *m)
-            } else {
-                entity_id(repo, kinds::COMPONENT, &comps[*m].name)
-            };
-            let r = Relationship::new(
-                hier_rel(&["hier_contains", cid, &target]),
-                cid.clone(),
-                scc_core::predicates::CONTAINS,
-                target,
-                Provenance::Extracted,
-            );
-            store.insert_relationship(&r, "")?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Resolve a container member to the entity id it points at: a pass-1
-/// cluster root maps to its subsystem/service container, everything else to
-/// its component entity.
-fn member_target_id(
-    repo: &str,
-    comps: &[scc_core::Entity],
-    root_container: &BTreeMap<usize, usize>,
-    container_ids: &[(String, String)],
-    member: usize,
-) -> String {
-    if let Some(&ci) = root_container.get(&member) {
-        container_ids[ci].1.clone()
-    } else {
-        entity_id(repo, kinds::COMPONENT, &comps[member].name)
-    }
-}
-
-/// Find the pass-1 cluster root that produced a container (subsystems and
-/// promotions are created one-per-cluster; service unions have none).
-fn root_of_container(
-    containers: &[(String, String, Vec<usize>)],
-    name: &str,
-) -> Option<usize> {
-    for (kind, cname, members) in containers.iter() {
-        if kind != kinds::SUBSYSTEM || cname != name {
-            continue;
-        }
-        // the smallest member index that is itself a cluster root — every
-        // cluster root IS one of its members
-        return members.iter().copied().min();
-    }
-    None
-}
-
-/// Deterministic container name: sorted member names joined with `+`, or
-/// the shared deployment-unit name when every member sits in the same unit.
-/// `expand` is true when `members` are pass-1 cluster roots (service
-/// unions) and false when they are component indices (subsystem clusters /
-/// promotions) — never expand a member that is itself a component.
-fn container_name(
-    comps: &[scc_core::Entity],
-    clusters: &BTreeMap<usize, Vec<usize>>,
-    members: &[usize],
-    parent_per_comp: &BTreeMap<String, String>,
-    expand: bool,
-) -> String {
-    let mut dus: BTreeSet<&String> = BTreeSet::new();
-    for m in members {
-        if expand {
-            if let Some(inner) = clusters.get(m) {
-                for i in inner {
-                    dus.extend(parent_per_comp.get(comps[*i].name.as_str()));
-                }
-                continue;
-            }
-        }
-        dus.extend(parent_per_comp.get(comps[*m].name.as_str()));
-    }
-    if dus.len() == 1 {
-        return dus.into_iter().next().unwrap().clone();
-    }
-    let mut names: Vec<String> = Vec::new();
-    for m in members {
-        if expand {
-            if let Some(inner) = clusters.get(m) {
-                for i in inner {
-                    names.push(comps[*i].name.clone());
-                }
-                continue;
-            }
-        }
-        names.push(comps[*m].name.clone());
-    }
-    names.sort();
-    names.join("+")
-}
-
-/// Add `weight` to every pair inside `set` (deterministic: sorted names).
-fn add_pair_weight(w: &mut [Vec<i32>], idx: &HashMap<&str, usize>, set: &BTreeSet<String>, weight: i32) {
-    let cs: Vec<&String> = set.iter().collect();
-    for (k, a) in cs.iter().enumerate() {
-        let Some(&ia) = idx.get(a.as_str()) else { continue };
-        for b in cs.iter().skip(k + 1) {
-            let Some(&ib) = idx.get(b.as_str()) else { continue };
-            w[ia][ib] += weight;
-            w[ib][ia] += weight;
-        }
-    }
-}
-
-/// Disjoint-set union-find with path compression.
-struct Dsu {
-    parent: Vec<usize>,
-}
-
-impl Dsu {
-    fn new(n: usize) -> Dsu {
-        Dsu {
-            parent: (0..n).collect(),
-        }
-    }
-    fn find(&mut self, mut x: usize) -> usize {
-        let mut root = x;
-        while self.parent[root] != root {
-            root = self.parent[root];
-        }
-        while self.parent[x] != root {
-            let next = self.parent[x];
-            self.parent[x] = root;
-            x = next;
-        }
-        root
-    }
-    fn union(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.parent[rb] = ra;
-        }
-    }
-}
-
-/// Max-linkage weight between two DSU clusters.
-fn cluster_weight(w: &[Vec<i32>], dsu: &mut Dsu, a: usize, b: usize) -> i32 {
-    let (ra, rb) = (dsu.find(a), dsu.find(b));
-    let mut m = 0;
-    for (i, row) in w.iter().enumerate() {
-        if dsu.find(i) != ra {
-            continue;
-        }
-        for (j, cell) in row.iter().enumerate() {
-            if dsu.find(j) != rb {
-                continue;
-            }
-            m = m.max(*cell);
-        }
-    }
-    m
-}
-
-/// Greedy merge: repeatedly union the highest-weight pair while the weight
-/// is >= threshold. Deterministic: on weight ties the smallest (i, j) wins.
-fn greedy_merge(dsu: &mut Dsu, w: &[Vec<i32>], n: usize, threshold: i32) {
-    loop {
-        let mut best: Option<(i32, usize, usize)> = None;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if dsu.find(i) == dsu.find(j) {
-                    continue;
-                }
-                let wi = cluster_weight(w, dsu, i, j);
-                match best {
-                    Some((bw, bi, bj)) => {
-                        if wi > bw || (wi == bw && (i < bi || (i == bi && j < bj))) {
-                            best = Some((wi, i, j));
-                        }
-                    }
-                    None => best = Some((wi, i, j)),
-                }
-            }
-        }
-        match best {
-            Some((wi, i, j)) if wi >= threshold => dsu.union(i, j),
-            _ => break,
-        }
-    }
-}
-
-/// Pass-2 (service) merge: sum-linkage. Pass 1's max-linkage already
-/// absorbed every pair >= MERGE_THRESHOLD, so a cluster pair can only reach
-/// SERVICE_THRESHOLD by *accumulated* cross evidence (e.g. four weak
-/// signals of 3 each) — that is the "merged again at >= 12" step.
-fn cluster_weight_sum(w: &[Vec<i32>], dsu: &mut Dsu, a: usize, b: usize) -> i32 {
-    let (ra, rb) = (dsu.find(a), dsu.find(b));
-    let mut sum = 0;
-    for (i, row) in w.iter().enumerate() {
-        if dsu.find(i) != ra {
-            continue;
-        }
-        for (j, cell) in row.iter().enumerate() {
-            if dsu.find(j) != rb {
-                continue;
-            }
-            sum += *cell;
-        }
-    }
-    sum
-}
-
-/// Greedy sum-linkage merge (see [`cluster_weight_sum`]).
-fn greedy_merge_sum(dsu: &mut Dsu, w: &[Vec<i32>], n: usize, threshold: i32) {
-    loop {
-        let mut best: Option<(i32, usize, usize)> = None;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if dsu.find(i) == dsu.find(j) {
-                    continue;
-                }
-                let wi = cluster_weight_sum(w, dsu, i, j);
-                match best {
-                    Some((bw, bi, bj)) => {
-                        if wi > bw || (wi == bw && (i < bi || (i == bi && j < bj))) {
-                            best = Some((wi, i, j));
-                        }
-                    }
-                    None => best = Some((wi, i, j)),
-                }
-            }
-        }
-        match best {
-            Some((wi, i, j)) if wi >= threshold => dsu.union(i, j),
-            _ => break,
-        }
-    }
-}
-
-fn hier_rel(parts: &[&str]) -> String {
-    let mut h = blake3::Hasher::new();
-    for p in parts {
-        h.update(p.as_bytes());
-        h.update(b"|");
-    }
-    format!("{HIER_RELPREFIX}{}", &h.finalize().to_hex()[..12])
-}
-
-/// Delete stale SUBSYSTEM/SERVICE entities and hierarchy CONTAINS edges so
-/// a recompile never accumulates containers.
-fn clear_hierarchy(store: &Store) -> Result<()> {
-    for kind in [kinds::SUBSYSTEM, kinds::SERVICE] {
-        let ids: Vec<String> = store
-            .entities_by_kind(kind)?
-            .into_iter()
-            .map(|e| e.id)
-            .collect();
-        if !ids.is_empty() {
-            store.delete_entities(&ids)?;
-        }
-    }
-    let rows = store.all_relationships()?;
-    let ids: Vec<String> = rows
-        .into_iter()
-        .filter(|r| r.id.starts_with(HIER_RELPREFIX))
-        .map(|r| r.id)
-        .collect();
-    for id in ids {
-        store.delete_relationship(&id)?;
-    }
-    Ok(())
 }
 
 fn clear_component_relationships(store: &Store) -> Result<()> {
@@ -2006,8 +1423,15 @@ mod tests {
         assert_eq!(kind_of("pkg_a"), BOUNDARY_PACKAGE);
         assert_eq!(kind_of("api"), BOUNDARY_DEPLOYMENT);
         assert_eq!(kind_of("misc"), BOUNDARY_CODE_REGION);
-        assert_eq!(kind_of("services"), BOUNDARY_CODE_REGION, "dir fallback");
         assert_eq!(kind_of("root"), BOUNDARY_ROOT);
+        // semantic clustering: the bare `services` top dir holds NO shell
+        // component — its only file belongs to the deployment region, so
+        // no empty code-region shell survives (behavior-driven, not
+        // directory-driven)
+        assert!(
+            !by_name.contains_key("services"),
+            "empty dir shells are pruned by the clusterer: {comps:?}"
+        );
         // entity kind is never renamed; candidates keep their names
         assert_eq!(by_name["api"].kind, kinds::COMPONENT);
         assert!(by_name.contains_key("api"), "candidate name unchanged");
@@ -2296,84 +1720,68 @@ mod tests {
         let graph = RealityGraph::load(&store).unwrap();
         let comps = compile_components(&graph, &store, &intent, &[]).unwrap();
 
-        // expected weights:
-        //   intra: a-b = 4(store)+2(call) = 6 -> subsystem s1
-        //          c-d = 4(store)+2(call)+3(events) = 9 -> subsystem s2
-        //   cross: a-c = 4(config), a-d = 3(routes), b-c = 2(import),
-        //          b-d = 3(entrypoints) — all < 6, so pass 1 keeps the
-        //          subsystems apart; pass-2 SUM = 4+3+2+3 = 12 >= 12
-        //          -> one service
-        //   e: isolated leaf
+        // expected weights (semantic clustering signal set):
+        //   intra: a-b = 4(shared store)+2(call) = 6 -> one component "a+b"
+        //          c-d = 4(shared store)+2(call) = 6 -> one component "c+d"
+        //          (c/d publish DIFFERENT topics — same-topic event edge
+        //          does not fire)
+        //   cross: a-c = 4(shared config); b-d = 2(cli prior — the repo
+        //          classifies Cli on the cli-subcommand entrypoints, and
+        //          command regions cohere +PRIOR_WEIGHT) — all < 6, so
+        //          pass 1 keeps the pairs apart; pass-2 SUM = 4+2 = 6
+        //          < 12 -> NO service
+        //   e: isolated leaf; root: empty synthetic region
 
-        // flat list intact (a..e + root)
+        // flat components ARE the clustering result: merged pairs, no
+        // directory shells
         let names: std::collections::BTreeSet<&str> =
             comps.iter().map(|c| c.name.as_str()).collect();
-        for n in ["a", "b", "c", "d", "e", "root"] {
-            assert!(names.contains(n), "flat list keeps {n}: {names:?}");
+        for n in ["a+b", "c+d", "e", "root"] {
+            assert!(names.contains(n), "clustering result keeps {n}: {names:?}");
         }
+        assert!(!names.contains("a"), "merged pair has no a shell: {names:?}");
+        assert!(!names.contains("b"), "merged pair has no b shell: {names:?}");
+        assert!(!names.contains("c"), "merged pair has no c shell: {names:?}");
+        assert!(!names.contains("d"), "merged pair has no d shell: {names:?}");
         let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
             comps.iter().map(|c| (c.name.as_str(), c)).collect();
 
-        // containers
+        // no containers: cross evidence (6) is below SERVICE_THRESHOLD (12)
         let services = store.entities_by_kind(kinds::SERVICE).unwrap();
-        assert_eq!(services.len(), 1, "{services:?}");
-        let svc = &services[0];
-        assert_eq!(svc.name, "a+b+c+d");
-        assert_eq!(svc.attributes["layer"], serde_json::json!("service"));
+        assert_eq!(services.len(), 0, "no service at sum 6: {services:?}");
         let subsystems = store.entities_by_kind(kinds::SUBSYSTEM).unwrap();
-        assert_eq!(subsystems.len(), 2, "{subsystems:?}");
-        let s1 = subsystems.iter().find(|s| s.name == "a+b").unwrap();
-        let s2 = subsystems.iter().find(|s| s.name == "c+d").unwrap();
-        assert_eq!(s1.attributes["layer"], serde_json::json!("subsystem"));
-        assert_eq!(s1.attributes["parent"], serde_json::json!(svc.id));
-        assert_eq!(s2.attributes["parent"], serde_json::json!(svc.id));
+        assert_eq!(subsystems.len(), 0, "no subsystem containers anymore: {subsystems:?}");
 
-        // containment: svc -> subsystems; subsystems -> components
-        let rels = store.all_relationships().unwrap();
-        let contains_of = |id: &str| -> std::collections::BTreeSet<String> {
-            rels.iter()
-                .filter(|r| r.predicate == scc_core::predicates::CONTAINS && r.subject == id)
-                .map(|r| r.object.clone())
-                .collect()
-        };
-        let svc_members = contains_of(&svc.id);
-        assert!(svc_members.contains(&s1.id), "{svc_members:?}");
-        assert!(svc_members.contains(&s2.id), "{svc_members:?}");
-        let a_id = scc_core::entity_id(&repo, kinds::COMPONENT, "a");
-        let b_id = scc_core::entity_id(&repo, kinds::COMPONENT, "b");
-        let c_id = scc_core::entity_id(&repo, kinds::COMPONENT, "c");
-        let d_id = scc_core::entity_id(&repo, kinds::COMPONENT, "d");
-        assert_eq!(contains_of(&s1.id), [a_id.clone(), b_id.clone()].into_iter().collect());
-        assert_eq!(contains_of(&s2.id), [c_id.clone(), d_id.clone()].into_iter().collect());
-
-        // component layers + parents
-        assert_eq!(by_name["a"].attributes["layer"], serde_json::json!("subsystem"));
-        assert_eq!(by_name["a"].attributes["parent"], serde_json::json!(s1.id));
-        assert_eq!(by_name["c"].attributes["layer"], serde_json::json!("subsystem"));
-        assert_eq!(by_name["c"].attributes["parent"], serde_json::json!(s2.id));
-        // unmerged leaf: declared intent keeps the component layer
+        // layers: multi-region merges are evidence-backed components; a
+        // declared singleton keeps the component layer; root stays bare
+        assert_eq!(by_name["a+b"].attributes["layer"], serde_json::json!("component"));
+        assert_eq!(by_name["c+d"].attributes["layer"], serde_json::json!("component"));
         assert_eq!(by_name["e"].attributes["layer"], serde_json::json!("component"));
-        assert!(!by_name["e"].attributes.contains_key("parent"), "e must stay a leaf");
         assert_eq!(by_name["root"].attributes["layer"], serde_json::json!("code_region"));
+        // merged clusters carry BOTH member dirs (path/package stay as
+        // priors — the implementation paths are the union)
+        let ab_paths = by_name["a+b"].attributes["implementation"]["paths"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            ab_paths,
+            &vec![serde_json::json!("a"), serde_json::json!("b")],
+            "merged component paths: {ab_paths:?}"
+        );
 
-        // determinism: a second identical compile reproduces the hierarchy
+        // determinism: a second identical compile reproduces the clustering
         let graph2 = RealityGraph::load(&store).unwrap();
         let comps2 = compile_components(&graph2, &store, &intent, &[]).unwrap();
-        let services2 = store.entities_by_kind(kinds::SERVICE).unwrap();
-        let subsystems2 = store.entities_by_kind(kinds::SUBSYSTEM).unwrap();
-        assert_eq!(services2.len(), 1);
-        assert_eq!(subsystems2.len(), 2, "no container accumulation");
-        let rels2 = store.all_relationships().unwrap();
-        assert_eq!(
-            rels2.iter().filter(|r| r.id.starts_with(HIER_RELPREFIX)).count(),
-            rels.iter().filter(|r| r.id.starts_with(HIER_RELPREFIX)).count(),
-            "hierarchy edges stable across recompiles"
-        );
         assert_eq!(comps2.len(), comps.len());
+        let names2: std::collections::BTreeSet<&str> =
+            comps2.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names2, names, "cluster names stable across recompiles");
         for (a, b) in comps.iter().zip(comps2.iter()) {
             assert_eq!(a.attributes.get("layer"), b.attributes.get("layer"), "{}", a.name);
             assert_eq!(a.attributes.get("parent"), b.attributes.get("parent"), "{}", a.name);
         }
+        let services2 = store.entities_by_kind(kinds::SERVICE).unwrap();
+        assert_eq!(services2.len(), 0, "no container accumulation");
     }
 
     #[test]

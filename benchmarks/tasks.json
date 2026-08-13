@@ -177,9 +177,8 @@
           "indexTranscripts"
         ],
         "components": [
-          "api",
-          "frontend",
-          "worker"
+          "api-shared-worker",
+          "frontend"
         ],
         "data": [
           "prisma.transcript"
@@ -209,8 +208,7 @@
           "indexTranscripts"
         ],
         "components": [
-          "worker",
-          "shared"
+          "api-shared-worker"
         ],
         "data": [
           "prisma.transcript"
@@ -236,7 +234,7 @@
         ],
         "symbols": [],
         "components": [
-          "api"
+          "api-shared-worker"
         ],
         "data": [
           "prisma.transcript"
@@ -346,7 +344,7 @@
           "createUser"
         ],
         "components": [
-          "service"
+          "root-service"
         ],
         "routes": [
           "GET /api/users"
@@ -375,7 +373,7 @@
         ],
         "components": [
           "web",
-          "service"
+          "root-service"
         ],
         "tests": [
           "joins-user-names-from-the-api-response"
@@ -402,7 +400,7 @@
           "listUsers"
         ],
         "components": [
-          "service"
+          "root-service"
         ],
         "tests": [
           "joins-user-names-from-the-api-response"

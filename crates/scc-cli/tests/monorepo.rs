@@ -56,9 +56,10 @@ fn acceptance_scenario_entities_identified_before_any_edit() {
     // docs §94 ground truth: API handler, frontend consumer, worker consumer,
     // schema, response contract, tests, affected flow, persistence mapping.
     let must_contain = [
-        "component/api",
+        // semantic clustering: api + shared (db hub) + worker merge into
+        // one backend component; frontend stays separate
+        "component/api-shared-worker",
         "component/frontend",
-        "component/worker",
         "route/get-/api/transcripts",
         "route/post-/api/transcripts",
         "symbol/frontend/view.ts/renderTranscript",
@@ -112,7 +113,8 @@ fn impact_identifies_downstream_consumers() {
     let repo = monorepo_with_intent();
     let impact = run_ok(&workdir(repo.path()), &["impact", "api/routes.ts"]);
     assert!(impact.contains("AFFECTED COMPONENTS"), "{impact}");
-    assert!(impact.contains("api"), "{impact}");
+    // the backend component is the merged api+shared+worker cluster
+    assert!(impact.contains("api+shared+worker"), "{impact}");
     assert!(impact.contains("DOWNSTREAM"), "{impact}");
     assert!(impact.contains("shared"), "{impact}");
     assert!(impact.contains("CONTRACTS"), "{impact}");
@@ -142,10 +144,9 @@ fn precision_and_recall_on_acceptance_task() {
 
     // ground truth (relevant entities for this change)
     let ground_truth = [
-        "component/api",
+        "component/api-shared-worker",
         "component/frontend",
-        "component/worker",
-        "component/shared",
+        "file/shared/db.ts",
         "route/get-/api/transcripts",
         "route/post-/api/transcripts",
         "symbol/frontend/view.ts/renderTranscript",

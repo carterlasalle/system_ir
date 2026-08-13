@@ -491,6 +491,9 @@ struct Ctx {
     /// axum Router registrations: emitted only when the file imports axum
     /// (verified in `into_extracted`, once imports are complete).
     reg_candidates: Vec<SemanticFact>,
+    /// Contract subclass evidence: type → serializer trait names seen on
+    /// it (`Serialize`/`Deserialize` from `#[derive(...)]` or `impl`).
+    serde_impls: BTreeMap<String, BTreeSet<String>>,
     scopes: Vec<Scope>,
     /// Module-symbol name (file stem) owning crate-level STATE facts
     /// (`static` items).
@@ -523,6 +526,21 @@ impl Ctx {
             .iter()
             .any(|i| i.module == "axum" || i.module.starts_with("axum::"));
         let mut facts = self.facts;
+        // Contract subclass evidence (Contract ontology): serializer/
+        // deserializer pairs around a type. A type with BOTH `Serialize`
+        // and `Deserialize` (from `#[derive(Serialize, Deserialize)]` or
+        // `impl Serialize for T` + `impl Deserialize for T`) is a
+        // Serialization contract; the surface is the pair string.
+        // Deterministic: types sorted.
+        for (ty, traits) in &self.serde_impls {
+            if traits.contains("Serialize") && traits.contains("Deserialize") {
+                facts.push(SemanticFact::Registration {
+                    owner: ty.clone(),
+                    kind: "serialization".to_string(),
+                    target: "Serialize/Deserialize".to_string(),
+                });
+            }
+        }
         facts.extend(self.reg_candidates.into_iter().filter(|_| has_axum));
         facts.sort_by_key(fact_key);
         facts.dedup();
@@ -827,6 +845,11 @@ impl RustExtractor {
                 name: d.clone(),
                 target: name.clone(),
             });
+            // Contract subclass evidence: a Serialize/Deserialize derive on
+            // the type is one side of a Serialization pair.
+            if matches!(d.as_str(), "Serialize" | "Deserialize") {
+                ctx.serde_impls.entry(name.clone()).or_default().insert(d.clone());
+            }
         }
         if kind == SymbolKind::Class {
             self.record_struct_fields(node, &name, ctx, src);
@@ -847,6 +870,22 @@ impl RustExtractor {
         if type_name.is_empty() {
             self.walk_children(node, ctx, src);
             return;
+        }
+        // Contract subclass evidence: `impl Serialize for T` /
+        // `impl Deserialize for T` (last path segment, so `serde::Serialize`
+        // counts) are Serialization-pair sides around the type.
+        if let Some(trait_node) = node.child_by_field_name("trait") {
+            let trait_name = clean(node_text(Some(trait_node), src))
+                .rsplit("::")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if matches!(trait_name.as_str(), "Serialize" | "Deserialize") {
+                ctx.serde_impls
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(trait_name);
+            }
         }
         ctx.scopes.push(Scope {
             name: type_name,

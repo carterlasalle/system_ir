@@ -265,6 +265,25 @@ pub(crate) fn file_in_paths(file: &str, paths: &[&str]) -> bool {
     false
 }
 
+/// Co-change weight between two region path sets: +1 per pair spanning the
+/// two sets (one side in `a_paths`, the other in `b_paths`), capped at 5 so
+/// a change-heavy region pair never dominates the clustering graph.
+/// Deterministic: pairs are iterated in their sorted order.
+pub fn cochange_weight(pairs: &[CochangePair], a_paths: &[&str], b_paths: &[&str]) -> i32 {
+    let mut weight = 0;
+    for p in pairs {
+        let a_in = file_in_paths(&p.a, a_paths);
+        let b_in = file_in_paths(&p.b, b_paths);
+        if (a_in && b_in) || (file_in_paths(&p.a, b_paths) && file_in_paths(&p.b, a_paths)) {
+            weight += 1;
+            if weight >= 5 {
+                break;
+            }
+        }
+    }
+    weight
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

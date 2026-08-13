@@ -261,6 +261,17 @@ enum BenchSub {
         /// Minimum mean localization gate
         #[arg(long, default_value_t = 0.0)]
         min_files: f64,
+        /// Agent-behavior release gate: run the baseline (--baseline-cmd)
+        /// AND the atlas variant (--cmd), then FAIL when the atlas variant
+        /// does not reduce exploration (E.search_tool_calls < A.search,
+        /// E.files_opened <= A.files_opened + 1, E.first_correct_ms <=
+        /// A.first_correct_ms; means)
+        #[arg(long)]
+        gate: bool,
+        /// Baseline (A) agent command for --gate; receives the goal via
+        /// $SCC_GOAL, runs in the repo
+        #[arg(long)]
+        baseline_cmd: Option<String>,
     },
     /// Differential resolution benchmark (SCC-126): native vs LSP upgrades
     /// over the fixture corpus, gated on upgrades and unresolved externals
@@ -295,8 +306,18 @@ enum BenchSub {
         /// corpus (benchmarks/holdout + benchmarks/holdout-ground-truth),
         /// compare per-layer recall, write benchmarks/results/holdout-v3.txt
         /// and print the overfit verdict
-        #[arg(long)]
+        #[arg(long, conflicts_with = "blind")]
         holdout: bool,
+        /// Blind-test protocol: score the validation corpus
+        /// (benchmarks/holdout) AND the blind-test corpus
+        /// (benchmarks/blind-test + benchmarks/blind-test-ground-truth),
+        /// print ONLY aggregates (overall, per-section means, the
+        /// validation-vs-blind generalization gap, precision, density — no
+        /// per-repo rows, no missed keys, no filenames), and write
+        /// benchmarks/results/blind-v1.txt. blind-test failures are never
+        /// shown to tuning agents; --diagnose is refused on the blind corpus
+        #[arg(long, conflicts_with = "holdout")]
+        blind: bool,
         /// Skip the semantic resolution pass (pyright + tsserver) before
         /// scoring: the atlas then runs on native extraction only, and
         /// `resolved_calls` reports 0. Default is ON (resolve before
@@ -583,13 +604,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         Commands::Bench { sub } => match sub {
-            BenchSub::Agent { cmd, min_files } => match scc_cli::benchagent::run_agent_benchmark(&cmd, min_files)
-            {
-                Ok(summary) => {
-                    scc_cli::benchagent::print_agent_summary(&summary);
-                    Ok(())
+            BenchSub::Agent { cmd, min_files, gate, baseline_cmd } => {
+                if gate {
+                    let bc = baseline_cmd.ok_or(scc_cli::CliError::Other(
+                        "--gate requires --baseline-cmd (the A-variant command)".into(),
+                    ))?;
+                    match scc_cli::benchagent::run_agent_gate(&bc, &cmd, min_files) {
+                        Ok(g) => {
+                            scc_cli::benchagent::print_agent_gate(&g);
+                            if g.passed {
+                                Ok(())
+                            } else {
+                                Err(scc_cli::CliError::Other(
+                                    "agent-behavior gate FAILED: the atlas variant does not reduce exploration (search calls / files opened / first-correct time)".into(),
+                                ))
+                            }
+                        }
+                        Err(e) => Err(scc_cli::CliError::Other(e)),
+                    }
+                } else {
+                    match scc_cli::benchagent::run_agent_benchmark(&cmd, min_files) {
+                        Ok(summary) => {
+                            scc_cli::benchagent::print_agent_summary(&summary);
+                            Ok(())
+                        }
+                        Err(e) => Err(scc_cli::CliError::Other(e)),
+                    }
                 }
-                Err(e) => Err(scc_cli::CliError::Other(e)),
             },
             BenchSub::Context { min_recall } => match scc_cli::benchctx::run_context_benchmark(min_recall)
             {
@@ -630,10 +671,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json,
                 diagnose,
                 holdout,
+                blind,
                 no_resolve,
             } => {
                 let resolve = !no_resolve;
-                if holdout {
+                if blind {
+                    match scc_cli::benchatlas::run_atlas_blind(diagnose, resolve) {
+                        Ok(comparison) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&comparison)
+                                        .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
+                                );
+                            } else {
+                                scc_cli::benchatlas::print_blind_report(&comparison);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(scc_cli::CliError::Other(e)),
+                    }
+                } else if holdout {
                     match scc_cli::benchatlas::run_atlas_holdout(
                         corpus.as_deref(),
                         ground_truth.as_deref(),

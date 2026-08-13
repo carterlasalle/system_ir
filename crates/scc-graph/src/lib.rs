@@ -5,6 +5,7 @@
 
 pub mod archetype;
 pub mod boundaries;
+pub mod clustering;
 pub mod cochange;
 pub mod components;
 pub mod flowgraph;

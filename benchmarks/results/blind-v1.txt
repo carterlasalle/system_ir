@@ -1,0 +1,32 @@
+# Blind v1 — validation vs blind (aggregates only)
+validation corpus: validation: /Users/rocket/system_ir/benchmarks/holdout
+blind corpus:      blind-test: /Users/rocket/system_ir/benchmarks/blind-test
+results:           /Users/rocket/system_ir/benchmarks/results/blind-v1.txt
+# blind-test failures are never shown to tuning agents: no per-repo rows, no filenames, no missed keys
+
+layer                validation        blind        gap
+architecture              0.597        0.348     -0.249
+entrypoints               0.422        0.217     -0.205
+behavior                  0.057        0.028     -0.029
+state_authority           0.450        0.743     +0.293
+contracts                 0.060        0.015     -0.045
+landmarks                 0.910        0.980     +0.070
+tests                     0.081        0.018     -0.063
+overall (gate)            0.317        0.270     -0.047
+
+scored: validation 20 (skipped 0) | blind 20 (skipped 0)
+precision: validation 0.044 | blind 0.072
+F2: validation 0.100 | blind 0.137
+density (facts/1k tokens): validation 0.42 | blind 0.47
+atlas tokens: validation 195427 | blind 54461
+
+## generalization gap (blind - validation) — informational, not gating
+  architecture           -0.249
+  entrypoints            -0.205
+  behavior               -0.029
+  state_authority        +0.293
+  contracts              -0.045
+  landmarks              +0.070
+  tests                  -0.063
+  overall                -0.047
+  gate (recall >= 0.5): blind FAIL | validation FAIL

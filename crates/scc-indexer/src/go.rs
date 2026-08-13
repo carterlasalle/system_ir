@@ -501,8 +501,40 @@ impl Ctx {
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
+        // Contract subclass evidence (Contract ontology): serializer/
+        // deserializer pairs around a type. A type with both the
+        // `encoding/json` interface pair `MarshalJSON` + `UnmarshalJSON` is
+        // a Serialization contract; the surface is the pair string.
+        // Deterministic: types sorted, method names from symbols.
+        let mut ser_pairs: BTreeMap<String, String> = BTreeMap::new();
+        {
+            let mut type_methods: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for s in &self.symbols {
+                if s.kind == SymbolKind::Method {
+                    if let Some(parent) = &s.parent {
+                        let plain = s.name.rsplit_once('.').map(|(_, n)| n).unwrap_or(&s.name);
+                        type_methods
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(plain.to_string());
+                    }
+                }
+            }
+            for (ty, members) in type_methods {
+                if members.contains("MarshalJSON") && members.contains("UnmarshalJSON") {
+                    ser_pairs.insert(ty, "MarshalJSON/UnmarshalJSON".to_string());
+                }
+            }
+        }
         // deterministic fact order: (owning symbol, family, detail)
         let mut facts = self.facts;
+        for (ty, pair) in ser_pairs {
+            facts.push(SemanticFact::Registration {
+                owner: ty,
+                kind: "serialization".to_string(),
+                target: pair,
+            });
+        }
         facts.sort_by_key(fact_sort_key);
         // Package-level `var` bindings are STATE facts owned by the module
         // symbol (file stem). Ensure it exists unless a real same-named

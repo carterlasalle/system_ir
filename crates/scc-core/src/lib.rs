@@ -567,6 +567,94 @@ pub struct AtlasInvariant {
     pub severity: Severity,
 }
 
+/// First-class contract subclass (Contract ontology): the semantic contract
+/// family, derived by the extractors from general evidence (public fn
+/// signatures, builder/factory structure, event producer/consumer pairs,
+/// serializer/deserializer pairs, interface+implementations, route/flag/
+/// topic/config facts) and rendered by the atlas as per-subclass groups.
+/// The legacy `kind` string stays for back-compat; `subclass` is the typed
+/// family (`http`/`cli`/`event`/`config`/`public-api`/`extension`/
+/// `serialization`/...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractSubclass {
+    /// A callable contract surface (framework callback, task, annotated
+    /// handler, middleware): the framework invokes this callable.
+    CallContract,
+    /// Public API export (function/method signature surface).
+    PublicApi,
+    /// HTTP route.
+    #[default]
+    Http,
+    /// RPC method.
+    Rpc,
+    /// CLI flag / subcommand.
+    Cli,
+    /// Event (topic with producers/consumers).
+    Event,
+    /// Message / queue surface.
+    Message,
+    /// Schema definition (validation/model schema).
+    Schema,
+    /// Configuration key.
+    Configuration,
+    /// Plugin registration.
+    Plugin,
+    /// Extension point: interface + implementations.
+    Extension,
+    /// Serialization pair (serializer/deserializer around a type).
+    Serialization,
+}
+
+impl ContractSubclass {
+    /// Render prefix used by the atlas CONTRACTS section (stable, sorted:
+    /// `http: GET /x`, `cli: --flag`, `event: user.created`, `config: DEBUG`,
+    /// `public-api: Class.method`, `extension: PluginX`, `serialization:
+    /// toJson/fromJson`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractSubclass::CallContract => "call",
+            ContractSubclass::PublicApi => "public-api",
+            ContractSubclass::Http => "http",
+            ContractSubclass::Rpc => "rpc",
+            ContractSubclass::Cli => "cli",
+            ContractSubclass::Event => "event",
+            ContractSubclass::Message => "message",
+            ContractSubclass::Schema => "schema",
+            ContractSubclass::Configuration => "config",
+            ContractSubclass::Plugin => "plugin",
+            ContractSubclass::Extension => "extension",
+            ContractSubclass::Serialization => "serialization",
+        }
+    }
+
+    /// Map a contract/registration kind string to its first-class subclass.
+    /// `None` for framework-specific registration kinds (`include_router`,
+    /// `add_middleware`, ...) that stay framework semantics instead of
+    /// first-class contracts. `factory` → PublicApi and `builder` →
+    /// Configuration are the ontology's builder/factory rule.
+    pub fn from_kind_str(kind: &str) -> Option<ContractSubclass> {
+        Some(match kind {
+            "http" | "route" => ContractSubclass::Http,
+            "cli" => ContractSubclass::Cli,
+            "event" | "topic" => ContractSubclass::Event,
+            "config" | "configuration" | "next-config" => ContractSubclass::Configuration,
+            "factory" | "export" | "public-api" | "public_api" => ContractSubclass::PublicApi,
+            "builder" => ContractSubclass::Configuration,
+            "serialization" | "serialize" | "deserialize" => ContractSubclass::Serialization,
+            "extension" => ContractSubclass::Extension,
+            "plugin" => ContractSubclass::Plugin,
+            "rpc" => ContractSubclass::Rpc,
+            "message" | "queue" => ContractSubclass::Message,
+            "schema" => ContractSubclass::Schema,
+            "call" | "task" | "bean" | "rule" | "middleware" | "callback" => {
+                ContractSubclass::CallContract
+            }
+            _ => return None,
+        })
+    }
+}
+
 /// One first-class contract in the atlas (Wave 9): a typed, evidence-backed
 /// contract surface (http/cli/event/config/annotation) with its producer
 /// symbol and the symbols that consume it. `operations` carries the concrete
@@ -577,6 +665,14 @@ pub struct Contract {
     pub id: String,
     /// `"http" | "cli" | "event" | "config" | "annotation"`.
     pub kind: String,
+    /// Semantic contract subclass (Contract ontology): the typed family
+    /// derived from general evidence — http/cli/event/config from
+    /// route/flag/topic/config facts, public-api from exported fn
+    /// signatures, serialization from serializer/deserializer pairs,
+    /// extension from interface+implementations, and extractor-emitted
+    /// registration kinds mapped by `ContractSubclass::from_kind_str`.
+    #[serde(default)]
+    pub subclass: ContractSubclass,
     /// Producer entity id (handler symbol, owning symbol, topic, ...).
     #[serde(default)]
     pub producer: String,
@@ -599,11 +695,19 @@ impl Contract {
         Contract {
             id: id.into(),
             kind: kind.into(),
+            subclass: ContractSubclass::default(),
             producer: producer.into(),
             consumers: Vec::new(),
             operations: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    /// Set the semantic subclass (builder-style; the atlas sets it on the
+    /// typed families it derives from entity kinds).
+    pub fn with_subclass(mut self, subclass: ContractSubclass) -> Self {
+        self.subclass = subclass;
+        self
     }
 }
 
@@ -1068,6 +1172,86 @@ mod tests {
             .map(|op| format!("{}: {}", c.kind, op))
             .collect();
         assert_eq!(lines, vec!["http: GET /api/x"]);
+    }
+
+    #[test]
+    fn contract_subclass_ontology_maps_and_renders() {
+        // Render prefixes per-subclass (the atlas CONTRACTS group prefixes).
+        assert_eq!(ContractSubclass::Http.as_str(), "http");
+        assert_eq!(ContractSubclass::Cli.as_str(), "cli");
+        assert_eq!(ContractSubclass::Event.as_str(), "event");
+        assert_eq!(ContractSubclass::Configuration.as_str(), "config");
+        assert_eq!(ContractSubclass::PublicApi.as_str(), "public-api");
+        assert_eq!(ContractSubclass::Extension.as_str(), "extension");
+        assert_eq!(ContractSubclass::Serialization.as_str(), "serialization");
+        assert_eq!(ContractSubclass::CallContract.as_str(), "call");
+        assert_eq!(ContractSubclass::Rpc.as_str(), "rpc");
+        assert_eq!(ContractSubclass::Message.as_str(), "message");
+        assert_eq!(ContractSubclass::Schema.as_str(), "schema");
+        assert_eq!(ContractSubclass::Plugin.as_str(), "plugin");
+
+        // Derivation from contract/registration kind strings (the ontology
+        // mapping the atlas applies to extractor-emitted facts).
+        assert_eq!(ContractSubclass::from_kind_str("http"), Some(ContractSubclass::Http));
+        assert_eq!(ContractSubclass::from_kind_str("route"), Some(ContractSubclass::Http));
+        assert_eq!(ContractSubclass::from_kind_str("cli"), Some(ContractSubclass::Cli));
+        assert_eq!(ContractSubclass::from_kind_str("event"), Some(ContractSubclass::Event));
+        assert_eq!(
+            ContractSubclass::from_kind_str("config"),
+            Some(ContractSubclass::Configuration)
+        );
+        assert_eq!(
+            ContractSubclass::from_kind_str("next-config"),
+            Some(ContractSubclass::Configuration)
+        );
+        // builder = Configuration, factory = PublicApi (the ontology rule).
+        assert_eq!(
+            ContractSubclass::from_kind_str("builder"),
+            Some(ContractSubclass::Configuration)
+        );
+        assert_eq!(
+            ContractSubclass::from_kind_str("factory"),
+            Some(ContractSubclass::PublicApi)
+        );
+        assert_eq!(
+            ContractSubclass::from_kind_str("serialization"),
+            Some(ContractSubclass::Serialization)
+        );
+        assert_eq!(
+            ContractSubclass::from_kind_str("extension"),
+            Some(ContractSubclass::Extension)
+        );
+        assert_eq!(ContractSubclass::from_kind_str("plugin"), Some(ContractSubclass::Plugin));
+        assert_eq!(ContractSubclass::from_kind_str("rpc"), Some(ContractSubclass::Rpc));
+        assert_eq!(ContractSubclass::from_kind_str("message"), Some(ContractSubclass::Message));
+        assert_eq!(ContractSubclass::from_kind_str("schema"), Some(ContractSubclass::Schema));
+        assert_eq!(ContractSubclass::from_kind_str("task"), Some(ContractSubclass::CallContract));
+        // framework-specific registration kinds are NOT first-class contracts
+        assert_eq!(ContractSubclass::from_kind_str("include_router"), None);
+        assert_eq!(ContractSubclass::from_kind_str("add_middleware"), None);
+
+        // Contract carries the subclass; `new` defaults to Http, serde
+        // roundtrip preserves it, and a missing field (legacy JSON) defaults.
+        let mut c = Contract::new(
+            "repo://repo/contract/http/get--api-x",
+            "http",
+            "repo://repo/symbol/main.py/handler",
+        );
+        assert_eq!(c.subclass, ContractSubclass::Http);
+        c.subclass = ContractSubclass::Serialization;
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Contract = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subclass, ContractSubclass::Serialization);
+        let legacy = serde_json::json!({
+            "id": "repo://repo/contract/x",
+            "kind": "http",
+            "producer": "p",
+            "operations": ["GET /x"],
+            "evidence": [],
+            "consumers": [],
+        });
+        let c2: Contract = serde_json::from_value(legacy).unwrap();
+        assert_eq!(c2.subclass, ContractSubclass::Http);
     }
 
     #[test]

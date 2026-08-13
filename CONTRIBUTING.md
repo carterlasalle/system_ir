@@ -76,6 +76,20 @@ SCC_BIN=$PWD/target/debug/scc python3 plugins/hermes/test_plugin.py
   references. Paths are sandboxed; symlink escapes are rejected.
 - **Error handling.** Extractors and parsers must never panic on malformed
   input (fuzz-tested). Handlers return structured errors.
+- **Anti-special-case rule (benchmark discipline).** The benchmark corpora
+  (development `benchmarks/corpus`, validation `benchmarks/holdout`, blind
+  `benchmarks/blind-test`) measure generalization to unseen repositories;
+  corpus-specific fixes defeat that measurement.
+  - NEVER add repository-name-specific extraction logic. A rule must be a
+    generic semantic pattern, never keyed off a repo's name or layout.
+  - Framework-specific logic is allowed ONLY if it (a) implements a
+    reusable semantic pattern shared by at least one additional framework,
+    or (b) is isolated in a framework adapter that emits a GENERIC fact
+    type (e.g. FastAPI decorator + NestJS decorator + Spring annotation
+    all emit `RouteRegistration`).
+  - Blind corpus discipline: `benchmarks/blind-test` ground-truth misses
+    are never shown to tuning agents — never print, log, or commit per-repo
+    blind miss lines; use `scc bench atlas --blind` (aggregates only).
 
 ## Adding a language extractor
 
