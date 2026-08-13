@@ -7,6 +7,7 @@
 mod golden;
 
 use golden::{copy_fixture, run_ok, workdir};
+// trace:v1 id=test.scc.coverage verifies=REQ-SCC-CTX exercises=impl.scc.atlas
 
 #[test]
 fn atlas_renders_typed_contracts_surfaces_and_coverage() {

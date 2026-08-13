@@ -1,4 +1,5 @@
 # Flow Compiler Specification
+<!-- trace:v1 id=REQ-SCC-FLOW type=requirement derived_from=PRD-SCC-001 title="Flow compiler: causal flows, branches, lifecycle" -->
 
 ## 1. Purpose
 

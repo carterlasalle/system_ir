@@ -56,6 +56,7 @@ pub struct Tests {
     #[serde(default)]
     pub not_run: Vec<String>,
 }
+// trace:v1 id=impl.scc.checkpoint work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 /// Capture the current checkpoint: git-modified files + current system IR
 /// revision + affected system entities derived from the working tree.

@@ -6,6 +6,7 @@
 mod golden;
 
 use golden::{copy_fixture, run_ok, workdir};
+// trace:v1 id=test.scc.facts.python verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.python
 
 #[test]
 fn python_facts_appear_in_system_ir() {

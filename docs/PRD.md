@@ -1,4 +1,5 @@
 # Product Requirements Document
+<!-- trace:v1 id=PRD-SCC-001 type=prd work=WORK-SCC-001 title="System Context Compiler product requirements" -->
 
 ## 1. Problem
 

@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 mod golden;
+// trace:v1 id=test.scc.cli-components verifies=REQ-SCC-IR exercises=impl.scc.components
 
 #[test]
 fn cli_service_fixture_yields_cli_boundary_component() {

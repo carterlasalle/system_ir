@@ -1,0 +1,20 @@
+[work."WORK-SCC-001"]
+title = "System Context Compiler 10/10 plan execution (waves 1-9)"
+
+[work."WORK-SCC-001".mirrors]
+github_issue = "1"
+
+[work."WORK-SCC-002"]
+title = "External validation: real-repo corpus, ground truth, agent benchmark"
+
+[work."WORK-SCC-003"]
+title = "Benchmark v2: structured ontology, precision, density, gap diagnosis"
+
+[work."WORK-SCC-004"]
+title = "Semantic fact layer + framework semantics across languages"
+
+[work."WORK-SCC-005"]
+title = "Repo ontology: archetypes, hierarchy, state authority, CFG causality"
+
+[work."WORK-SCC-006"]
+title = "Holdout generalization wave"

@@ -1,4 +1,5 @@
 # API and Integrations
+<!-- trace:v1 id=REQ-SCC-API type=requirement derived_from=PRD-SCC-001 title="Agent API: MCP, HTTP, CLI, SDKs" -->
 
 ## 1. Default agent API
 

@@ -7,6 +7,7 @@ mod golden;
 
 use golden::{copy_fixture, run_ok, workdir};
 use std::path::Path;
+// trace:v1 id=test.scc.ontology verifies=REQ-SCC-IR exercises=impl.scc.archetype,impl.scc.components,impl.scc.state
 
 #[test]
 fn cli_service_is_cli_archetype_with_state_subsections() {

@@ -6,6 +6,7 @@
 mod golden;
 
 use golden::{copy_fixture, run_ok, workdir};
+// trace:v1 id=test.scc.cfg verifies=REQ-SCC-FLOW exercises=impl.scc.flowgraph
 
 #[test]
 fn cfg_evidence_drives_branch_async_and_lexical_order() {

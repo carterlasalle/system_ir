@@ -17,6 +17,7 @@ use scc_core::{
     AtlasOwnershipClaim, FlowKind, SystemAtlas,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+// trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 
 /// Structured atlas compilation — pure data, no rendering.
 pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {

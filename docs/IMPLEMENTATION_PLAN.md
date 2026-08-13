@@ -1,4 +1,5 @@
 # Implementation Plan
+<!-- trace:v1 id=PLAN-SCC-001 type=plan work=WORK-SCC-001 implements=SD-SCC-001 title="10/10 implementation plan, waves 1-9" -->
 
 ## Phase 0 — Benchmark harness
 10 representative repos, 5–10 ground-truth tasks each, baseline agent/Serena/graph-tool metrics.

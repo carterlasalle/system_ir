@@ -105,6 +105,7 @@ pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
     }
     Ok(())
 }
+// trace:v1 id=impl.scc.cli work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 /// `scc atlas [--budget N] [--json]` — the full System Atlas.
 pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Result<()> {

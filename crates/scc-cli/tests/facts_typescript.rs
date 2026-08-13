@@ -5,6 +5,7 @@
 
 mod golden;
 use golden::*;
+// trace:v1 id=test.scc.facts.typescript verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.typescript
 
 fn indexed_ir() -> (tempfile::TempDir, serde_json::Value) {
     let repo = copy_fixture("ts-facts-service");

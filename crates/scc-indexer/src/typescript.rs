@@ -18,6 +18,7 @@ use tree_sitter::{Language, Node, Parser};
 ///
 /// `.ts`/`.mts`/`.cts`/`.js`/`.mjs`/`.cjs` use the TypeScript grammar;
 /// `.tsx`/`.jsx` use the TSX grammar.
+// trace:v1 id=impl.scc.extract.typescript work=WORK-SCC-004 satisfies=REQ-SCC-IR
 pub struct TypeScriptExtractor {
     language: Language,
     tsx_language: Language,

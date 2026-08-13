@@ -1,4 +1,5 @@
 # Deployment and Infrastructure
+<!-- trace:v1 id=REQ-SCC-DEPLOY type=requirement derived_from=PRD-SCC-001 title="Deployment modes, Docker, observability" -->
 
 ## 1. Modes
 

@@ -146,6 +146,7 @@ pub fn collect_lexical_candidates_with(
 ) -> Vec<ScoredEntity> {
     collect_lexical_candidates_full(store, view, goal, symbols, limit, scorer, None)
 }
+// trace:v1 id=impl.scc.rank work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 
 /// `collect_lexical_candidates` with both a semantic scorer and a reranker.
 pub fn collect_lexical_candidates_full(

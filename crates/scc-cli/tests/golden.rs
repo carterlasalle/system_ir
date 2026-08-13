@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+// trace:v1 id=test.scc.golden verifies=REQ-SCC-IR exercises=impl.scc.cli,impl.scc.store
 
 pub fn scc() -> &'static str {
     env!("CARGO_BIN_EXE_scc")

@@ -1,6 +1,7 @@
 //! Context benchmark integration tests (docs/TEST_PLAN.md §84–87).
 
 mod golden;
+// trace:v1 id=test.scc.bench.context verifies=REQ-SCC-TEST exercises=impl.scc.bench.context
 
 #[test]
 fn benchmark_corpus_runs_and_meets_recall_gate() {

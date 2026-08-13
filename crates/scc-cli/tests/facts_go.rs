@@ -6,6 +6,7 @@
 
 mod golden;
 use golden::*;
+// trace:v1 id=test.scc.facts.go verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.go
 
 fn go_facts_service() -> tempfile::TempDir {
     let repo = copy_fixture("go-facts-service");

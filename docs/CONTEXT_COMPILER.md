@@ -1,4 +1,5 @@
 # Context Compiler Specification
+<!-- trace:v1 id=REQ-SCC-CTX type=requirement derived_from=PRD-SCC-001 title="Context compiler: packs, budgets, authority" -->
 
 ## 1. Objective
 

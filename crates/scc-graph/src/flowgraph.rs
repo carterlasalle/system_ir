@@ -139,6 +139,7 @@ impl NodeTable {
 ///
 /// `symbol_comp` maps symbol id -> component entity id (same mapping the
 /// projection compilers use, so displays agree).
+// trace:v1 id=impl.scc.flowgraph work=WORK-SCC-005 satisfies=REQ-SCC-FLOW
 pub fn compile_flow_graphs(
     graph: &RealityGraph,
     store: &Store,

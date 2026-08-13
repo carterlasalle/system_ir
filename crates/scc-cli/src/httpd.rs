@@ -56,6 +56,7 @@ fn handle_request(
     let _ = request.respond(response);
     Ok(())
 }
+// trace:v1 id=impl.scc.http work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 fn route(
     root: &Path,

@@ -75,6 +75,7 @@ pub(crate) fn is_builder_chain_method(name: &str) -> bool {
 
 /// Whether `name` starts with `prefix` followed by an uppercase letter or `_`
 /// (`createApp`, `create_instance`).
+// trace:v1 id=impl.scc.facts work=WORK-SCC-004 satisfies=REQ-SCC-IR
 fn starts_upper(name: &str, prefix: &str) -> bool {
     let rest = name.strip_prefix(prefix).unwrap_or("");
     !rest.is_empty()

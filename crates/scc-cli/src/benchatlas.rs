@@ -815,6 +815,7 @@ pub fn run_atlas_recall(
     report.gate_passed = report.mean_overall >= ATLAS_GATE;
     Ok(report)
 }
+// trace:v1 id=impl.scc.bench.atlas work=WORK-SCC-003 verifies=REQ-SCC-TEST
 
 /// Top-level entry for `scc bench atlas`: locate the workspace, resolve the
 /// corpus/ground-truth directories (or the fixtures fallback), and run.

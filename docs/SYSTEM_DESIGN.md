@@ -1,4 +1,5 @@
 # System Design
+<!-- trace:v1 id=SD-SCC-001 type=decision work=WORK-SCC-001 title="System design: architecture, modules, authority model" -->
 
 ## 1. High-level architecture
 

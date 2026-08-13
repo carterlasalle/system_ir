@@ -15,6 +15,7 @@ use golden::{copy_fixture, run_ok, workdir};
 /// machine model carries exports as public-api entrypoints (so ground-truth
 /// entrypoints like `FastAPI.include_router`-style surfaces match).
 #[test]
+// trace:v1 id=test.scc.compiler verifies=REQ-SCC-CTX exercises=impl.scc.atlas
 fn atlas_renders_fact_layer_sections() {
     let repo = copy_fixture("python-facts-service");
     let dir = workdir(repo.path());

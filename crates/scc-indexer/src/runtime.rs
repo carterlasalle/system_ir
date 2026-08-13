@@ -225,6 +225,7 @@ fn walk_trace_paths<'a>(
 ///
 /// Spans without a resolvable parent in the same trace contribute edges from
 /// `"root"`. An empty body yields zero stats; malformed JSON returns `Err`.
+// trace:v1 id=impl.scc.runtime work=WORK-SCC-001 satisfies=REQ-SCC-DATA
 pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String> {
     if body.trim().is_empty() {
         return Ok(TraceStats {

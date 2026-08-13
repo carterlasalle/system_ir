@@ -551,6 +551,7 @@ pub(crate) fn walk_calls(
     }
     paths
 }
+// trace:v1 id=impl.scc.flows work=WORK-SCC-005 satisfies=REQ-SCC-FLOW
 
 pub fn compile_flows(
     graph: &RealityGraph,

@@ -12,6 +12,7 @@ use crate::model::{
 };
 use std::collections::BTreeMap;
 use tree_sitter::{Node, Parser};
+// trace:v1 id=impl.scc.extract.java work=WORK-SCC-004 satisfies=REQ-SCC-IR
 
 /// Java extractor. Uses the tree-sitter-java grammar.
 pub struct JavaExtractor {

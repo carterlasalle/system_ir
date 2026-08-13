@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 mod golden;
+// trace:v1 id=test.scc.facts.rust verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.rust
 
 #[test]
 fn rust_facts_surface_in_system_ir() {

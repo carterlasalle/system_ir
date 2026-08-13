@@ -63,6 +63,7 @@ pub struct AgentBenchSummary {
 /// `scc bench agent --cmd "<command>"` — the command receives the task goal
 /// via the `SCC_GOAL` env var and the repo path as its working directory
 /// (like `claude -p "$SCC_GOAL"` or `codex exec -- "$SCC_GOAL"`).
+// trace:v1 id=impl.scc.bench.agent work=WORK-SCC-002 verifies=REQ-SCC-TEST
 pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummary, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let corpus_path = fixtures

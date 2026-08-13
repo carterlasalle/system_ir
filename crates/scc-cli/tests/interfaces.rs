@@ -5,6 +5,7 @@ mod golden;
 use golden::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
+// trace:v1 id=test.scc.interfaces verifies=REQ-SCC-API exercises=impl.scc.mcp,impl.scc.http,impl.scc.cli
 
 #[test]
 fn export_validates_against_json_schema() {

@@ -18,6 +18,7 @@ use crate::model::{
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
+// trace:v1 id=impl.scc.extract.rust work=WORK-SCC-004 satisfies=REQ-SCC-IR
 
 /// Rust extractor. Uses the tree-sitter-rust grammar.
 pub struct RustExtractor {

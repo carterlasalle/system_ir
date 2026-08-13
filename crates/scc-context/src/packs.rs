@@ -83,6 +83,7 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
     outcome.exceeded_soft_budget = estimate_tokens(&content) > budget;
     (content, outcome)
 }
+// trace:v1 id=impl.scc.packs work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 
 /// Render a pack and record honest budget accounting on it.
 pub(crate) fn finish(

@@ -1,4 +1,5 @@
 # System IR Schema Specification
+<!-- trace:v1 id=REQ-SCC-IR type=requirement derived_from=PRD-SCC-001 title="System IR schema and invariants" -->
 
 ## 1. Purpose
 

@@ -428,6 +428,7 @@ fn cli_package_dirs(graph: &RealityGraph) -> BTreeSet<String> {
     }
     dirs
 }
+// trace:v1 id=impl.scc.components work=WORK-SCC-001 satisfies=REQ-SCC-IR
 
 pub fn compile_components(
     graph: &RealityGraph,

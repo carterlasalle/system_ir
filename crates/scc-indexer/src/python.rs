@@ -10,6 +10,7 @@ use crate::model::{
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
+// trace:v1 id=impl.scc.extract.python work=WORK-SCC-004 satisfies=REQ-SCC-IR
 
 /// Python extractor. Uses the tree-sitter-python grammar.
 pub struct PythonExtractor {

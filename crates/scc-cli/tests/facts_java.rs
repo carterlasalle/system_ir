@@ -7,6 +7,7 @@ mod golden;
 use golden::*;
 
 const CONFIG: &str = "languages:\n  java: true\n";
+// trace:v1 id=test.scc.facts.java verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.java
 
 /// Index the java-facts-service fixture with java enabled.
 fn indexed() -> tempfile::TempDir {

@@ -60,6 +60,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<serde_json::Value, String>
         serde_json::from_str(first).map_err(|e| format!("bad JSONL frame: {e}"))
     }
 }
+// trace:v1 id=impl.scc.context7 work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 pub struct Context7Client {
     child: Child,

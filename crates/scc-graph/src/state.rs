@@ -245,6 +245,7 @@ pub struct StateClaim {
 /// STATE / REGISTRY owners, CONFIGURED_BY configuration targets, topics
 /// (PUBLISHES/SUBSCRIBES/CONSUMES), and middleware/registry REGISTERS.
 /// Deterministic: sorted by (component, target, provenance).
+// trace:v1 id=impl.scc.state work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn compile_state_claims(
     graph: &RealityGraph,
     symbol_comp: &HashMap<String, String>,

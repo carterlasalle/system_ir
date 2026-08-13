@@ -1,4 +1,5 @@
 # Security Specification
+<!-- trace:v1 id=REQ-SCC-SEC type=requirement derived_from=PRD-SCC-001 title="Security model: local-first, sandbox, provenance" -->
 
 ## 1. Threat model
 

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const MAX_CALL_SITES: usize = 500;
+// trace:v1 id=impl.scc.resolver work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 /// Semantic backend contract.
 pub trait SemanticResolver {

@@ -292,6 +292,7 @@ fn score_task(
         missed,
     })
 }
+// trace:v1 id=impl.scc.bench.context work=WORK-SCC-001 verifies=REQ-SCC-TEST
 
 /// Run the full context benchmark against `benchmarks/tasks.json`.
 pub fn run_context_benchmark(min_recall: f64) -> Result<BenchSummary, String> {

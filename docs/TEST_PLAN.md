@@ -1,4 +1,5 @@
 # Test Suite and Quality Assurance
+<!-- trace:v1 id=REQ-SCC-TEST type=requirement derived_from=PRD-SCC-001 title="Test plan: benchmarks, gates, quality floors" -->
 
 ## 1. Philosophy
 

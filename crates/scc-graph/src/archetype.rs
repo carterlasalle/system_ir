@@ -33,6 +33,7 @@ const PHASE_VERBS: &[&str] = &[
     "generate", "generator", "lexer", "lex", "tokenize", "tokeniser", "emit", "optimize",
     "lower", "ast",
 ];
+// trace:v1 id=impl.scc.archetype work=WORK-SCC-005 satisfies=REQ-SCC-IR
 
 /// Deterministic evidence scores per archetype. Pure function of graph +
 /// import-table shape; every signal is an integer count comparison.

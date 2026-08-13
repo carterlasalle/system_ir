@@ -48,6 +48,7 @@ pub struct FailureHit {
 /// `typescript`, `javascript`, `go`, or `rust`; anything else yields
 /// nothing). Pure and deterministic: identical input produces identical
 /// output.
+// trace:v1 id=impl.scc.failures work=WORK-SCC-001 satisfies=REQ-SCC-FLOW
 pub fn scan_failures(content: &str, language: &str) -> Vec<FailureHit> {
     match language {
         "go" => return scan_go(content),

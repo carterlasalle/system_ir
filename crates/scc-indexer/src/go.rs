@@ -12,6 +12,7 @@ use crate::model::{
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
+// trace:v1 id=impl.scc.extract.go work=WORK-SCC-004 satisfies=REQ-SCC-IR
 
 /// Go extractor. Uses the tree-sitter-go grammar.
 pub struct GoExtractor {

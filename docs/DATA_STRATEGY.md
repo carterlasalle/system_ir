@@ -1,4 +1,5 @@
 # Data Strategy
+<!-- trace:v1 id=REQ-SCC-DATA type=requirement derived_from=PRD-SCC-001 title="Data strategy: storage, freshness, epochs" -->
 
 ## 1. Principles
 

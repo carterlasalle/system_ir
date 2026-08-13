@@ -348,6 +348,7 @@ impl ModelEpoch {
         format!("epoch:{}", &h.finalize().to_hex()[..24])
     }
 }
+// trace:v1 id=impl.scc.store work=WORK-SCC-001 satisfies=REQ-SCC-DATA implements=PLAN-SCC-001
 
 pub struct Store {
     pub conn: Connection,

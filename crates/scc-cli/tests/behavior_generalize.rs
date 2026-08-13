@@ -7,6 +7,7 @@
 use std::path::Path;
 
 mod golden;
+// trace:v1 id=test.scc.behavior verifies=REQ-SCC-FLOW exercises=impl.scc.flows,impl.scc.flowgraph
 
 /// Parse the `scc export flow-graphs.json` output for the given fixture
 /// (indexed natively — no `resolve` pass ever runs in these tests).

@@ -19,6 +19,7 @@ struct Tool {
     input_schema: serde_json::Value,
 }
 
+// trace:v1 id=impl.scc.mcp work=WORK-SCC-001 satisfies=REQ-SCC-API
 fn tools() -> Vec<Tool> {
     vec![
         Tool {

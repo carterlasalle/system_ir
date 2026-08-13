@@ -121,6 +121,7 @@ except Exception:
 print(json.dumps({"files": {"scc-rehydrate.md": content}}))
 PYEOF
 "#;
+// trace:v1 id=impl.scc.plugin work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 pub fn install(root: &Path) -> crate::Result<()> {
     let claude_dir = root.join(".claude");

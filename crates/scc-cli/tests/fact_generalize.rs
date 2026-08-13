@@ -9,6 +9,7 @@
 mod golden;
 
 use golden::{copy_fixture, run_ok, workdir};
+// trace:v1 id=test.scc.fact-generalize verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.python
 
 fn builder_factory_service() -> tempfile::TempDir {
     let repo = copy_fixture("builder-factory-service");

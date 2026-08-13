@@ -33,6 +33,7 @@ fn copy_tree(src: &Path, dst: &Path) {
         }
     }
 }
+// trace:v1 id=test.scc.bench.atlas verifies=REQ-SCC-TEST exercises=impl.scc.bench.atlas
 
 #[test]
 fn bench_atlas_fixtures_fallback_prints_table() {

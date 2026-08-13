@@ -62,6 +62,7 @@ impl TrustPolicy {
         }
     }
 }
+// trace:v1 id=impl.scc.trust work=WORK-SCC-001 satisfies=REQ-SCC-IR
 
 /// Filtered, policy-governed view over the reality graph.
 pub struct TrustedGraphView<'a> {
