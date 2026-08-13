@@ -12,8 +12,8 @@
 //! (resolve.rs splits on '.' — `Type::method` names would never resolve).
 
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SourceFile,
-    StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -289,6 +289,21 @@ fn first_string_arg(call: Node, src: &[u8]) -> Option<String> {
     None
 }
 
+/// First string-literal value anywhere under `node` (macro invocation
+/// args, token trees, …), quotes stripped.
+fn first_string_literal(node: Node, src: &[u8]) -> Option<String> {
+    if matches!(node.kind(), "string_literal" | "raw_string_literal") {
+        return rust_string_value(node, src);
+    }
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        if let Some(v) = first_string_literal(c, src) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// First paragraph of a docstring (blank-line terminated), like python.rs.
 fn first_paragraph(s: &str) -> String {
     let t = s.trim();
@@ -395,6 +410,11 @@ struct Ctx {
     /// CLI flags per owning symbol (clap `#[arg(...)]`), `-`/`--`
     /// prefixed, sorted + deduped.
     cli_flags: BTreeMap<String, BTreeSet<String>>,
+    /// Wave 9 semantic facts collected during the walk.
+    facts: Vec<SemanticFact>,
+    /// axum Router registrations: emitted only when the file imports axum
+    /// (verified in `into_extracted`, once imports are complete).
+    reg_candidates: Vec<SemanticFact>,
     scopes: Vec<Scope>,
 }
 
@@ -414,6 +434,17 @@ impl Ctx {
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
+        // Framework verification: axum registrations are facts only when
+        // the file imports axum (imports are complete after the full walk);
+        // the Router receiver check already ran during the walk.
+        let has_axum = self
+            .imports
+            .iter()
+            .any(|i| i.module == "axum" || i.module.starts_with("axum::"));
+        let mut facts = self.facts;
+        facts.extend(self.reg_candidates.into_iter().filter(|_| has_axum));
+        facts.sort_by_key(fact_key);
+        facts.dedup();
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -424,7 +455,7 @@ impl Ctx {
             retries: self.retries,
             entrypoints: self.entrypoints,
             cli_flags,
-            facts: Vec::new(),
+            facts,
         }
         }
 }
@@ -446,6 +477,7 @@ impl RustExtractor {
             "const_item" | "static_item" => self.walk_const(node, ctx, src),
             "use_declaration" => self.record_use(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
+            "macro_invocation" => self.record_macro_invocation(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -565,6 +597,14 @@ impl RustExtractor {
                 line: start_line,
             });
         }
+        // Public API surface: `pub fn` at module level, `pub fn` methods.
+        if exported {
+            let kind = if in_impl { "method" } else { "function" };
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: sym_name.clone(),
+                kind: kind.to_string(),
+            });
+        }
         ctx.scopes.push(Scope {
             name: sym_name,
             is_impl: false,
@@ -644,6 +684,28 @@ impl RustExtractor {
                 }
             }
         }
+        // Wave 9 facts: public type surface, derive annotations, fields.
+        if exported {
+            let ek = match kind {
+                SymbolKind::Class => "class",
+                SymbolKind::Enum => "enum",
+                SymbolKind::Interface => "trait",
+                _ => "type",
+            };
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: ek.to_string(),
+            });
+        }
+        for d in &derives {
+            ctx.facts.push(SemanticFact::Annotation {
+                name: d.clone(),
+                target: name.clone(),
+            });
+        }
+        if kind == SymbolKind::Class {
+            self.record_struct_fields(node, &name, ctx, src);
+        }
         // Trait bodies contain function declarations (contracts, default
         // impls); struct/enum bodies have none. Walk everything uniformly.
         self.walk_children(node, ctx, src);
@@ -689,6 +751,12 @@ impl RustExtractor {
             docstring: doc,
             parent: None,
         });
+        if exported {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: "module".to_string(),
+            });
+        }
         // Module bodies are walked WITHOUT a scope push: nested items keep
         // plain names (symbols are per-file, so cross-module collisions in
         // one file are the only risk — rare, and deterministic).
@@ -715,6 +783,12 @@ impl RustExtractor {
             docstring: doc,
             parent: None,
         });
+        if exported {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: "const".to_string(),
+            });
+        }
         self.walk_children(node, ctx, src);
     }
 
@@ -725,13 +799,17 @@ impl RustExtractor {
         let Some(arg) = node.child_by_field_name("argument") else {
             return;
         };
-        self.emit_use(arg, "", ctx, src, line);
+        // `pub use` binds a name into the crate's public API surface.
+        let reexport = self.is_exported(node);
+        self.emit_use(arg, "", reexport, ctx, src, line);
     }
 
     /// Emit one `use` binding as an Import. `prefix` accumulates enclosing
     /// `use a::b::{...}` paths. The module string is the full path as
     /// written (`a::b::c`); the bound name is the last path segment.
-    fn emit_use(&self, node: Node, prefix: &str, ctx: &mut Ctx, src: &[u8], line: u32) {
+    /// `reexport` is true for `pub use` — the bound name is also a
+    /// PublicExport.
+    fn emit_use(&self, node: Node, prefix: &str, reexport: bool, ctx: &mut Ctx, src: &[u8], line: u32) {
         let join = |p: &str, s: &str| {
             if p.is_empty() {
                 s.to_string()
@@ -753,10 +831,11 @@ impl RustExtractor {
                 let last = path.rsplit("::").next().unwrap_or(&path).to_string();
                 ctx.imports.push(Import {
                     module,
-                    names: vec![(alias, last)],
+                    names: vec![(alias.clone(), last)],
                     line,
                     r#type: ImportType::Member,
                 });
+                self.push_reexport(ctx, &alias, reexport);
             }
             "use_wildcard" => {
                 let t = clean(node_text(Some(node), src)); // `a::b::*` or `*`
@@ -778,7 +857,7 @@ impl RustExtractor {
             "use_list" => {
                 let mut cursor = node.walk();
                 for c in node.named_children(&mut cursor) {
-                    self.emit_use(c, prefix, ctx, src, line);
+                    self.emit_use(c, prefix, reexport, ctx, src, line);
                 }
             }
             "scoped_use_list" => {
@@ -793,7 +872,7 @@ impl RustExtractor {
                 };
                 let mut cursor = list.walk();
                 for c in list.named_children(&mut cursor) {
-                    self.emit_use(c, &new_prefix, ctx, src, line);
+                    self.emit_use(c, &new_prefix, reexport, ctx, src, line);
                 }
             }
             "self" | "super" | "crate" => {
@@ -801,13 +880,14 @@ impl RustExtractor {
                 // path segment `a::self`; `use crate;` binds `crate`.
                 let t = clean(node_text(Some(node), src));
                 let module = if prefix.is_empty() { t } else { prefix.to_string() };
-                let last = module.rsplit("::").next().unwrap_or(&module).to_string();
+                let bound = module.rsplit("::").next().unwrap_or(&module).to_string();
                 ctx.imports.push(Import {
                     module,
-                    names: vec![(last.clone(), last)],
+                    names: vec![(bound.clone(), bound.clone())],
                     line,
                     r#type: ImportType::Member,
                 });
+                self.push_reexport(ctx, &bound, reexport);
             }
             _ => {
                 // identifier / scoped_identifier: the full path binds the
@@ -817,14 +897,27 @@ impl RustExtractor {
                     return;
                 }
                 let module = join(prefix, &t);
-                let last = t.rsplit("::").next().unwrap_or(&t).to_string();
+                let bound = t.rsplit("::").next().unwrap_or(&t).to_string();
                 ctx.imports.push(Import {
                     module,
-                    names: vec![(last.clone(), last)],
+                    names: vec![(bound.clone(), bound.clone())],
                     line,
                     r#type: ImportType::Member,
                 });
+                self.push_reexport(ctx, &bound, reexport);
             }
+        }
+    }
+
+    /// `pub use` binds `name` into the crate's public API surface; the
+    /// re-exported item's kind is unknown syntactically, so it is
+    /// recorded as a generic `type`.
+    fn push_reexport(&self, ctx: &mut Ctx, name: &str, reexport: bool) {
+        if reexport && !name.is_empty() {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.to_string(),
+                kind: "type".to_string(),
+            });
         }
     }
 
@@ -837,6 +930,7 @@ impl RustExtractor {
         // the same outer node).
         if chain_outer(node).id() == node.id() {
             self.record_clap_builder(node, ctx, src);
+            self.record_axum_registration(node, ctx, src);
         }
         if let Some(fn_node) = node.child_by_field_name("function") {
             // Skip chained-call receivers (`a()()`, `a.b()()`): the inner
@@ -865,6 +959,21 @@ impl RustExtractor {
                     }
                 }
                 if !callee.is_empty() {
+                    // Configuration reads: std::env::var("KEY") /
+                    // std::env::var_os("KEY").
+                    if matches!(callee.as_str(), "std::env::var" | "std::env::var_os")
+                        || callee.ends_with("::env::var")
+                        || callee.ends_with("::env::var_os")
+                    {
+                        if let Some(key) = first_string_arg(node, src) {
+                            if let Some(owner) = ctx.caller() {
+                                ctx.facts.push(SemanticFact::Configuration {
+                                    owner,
+                                    key,
+                                });
+                            }
+                        }
+                    }
                     ctx.calls.push(Call {
                         caller: ctx.caller(),
                         callee,
@@ -1003,6 +1112,108 @@ impl RustExtractor {
             target,
             line: call.start_position().row as u32 + 1,
         });
+    }
+
+    /// axum route/middleware registrations:
+    /// `Router::new().route(path, get(handler)).layer(mw)`. The receiver
+    /// must be a `Router` constructor (`Router::new`, `Router::with_state`,
+    /// `axum::Router::…`); the axum import gate is applied in
+    /// `into_extracted` once imports are complete, so a plain method named
+    /// `route` on another receiver is never a fact.
+    fn record_axum_registration(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some((root, _root_args, segs)) = clap_chain(node, src) else {
+            return;
+        };
+        let router_receiver = root == "Router"
+            || root.starts_with("Router::")
+            || root.starts_with("axum::Router::");
+        if !router_receiver {
+            return;
+        }
+        let Some(owner) = ctx.caller() else {
+            return;
+        };
+        for (m, args) in &segs {
+            let kind = match m.as_str() {
+                "route" => "route",
+                "layer" => "middleware",
+                _ => continue,
+            };
+            let target = if kind == "route" {
+                // the path literal names the registered contract
+                match string_arg(*args, src) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                let t = args
+                    .and_then(|a| a.named_child(0))
+                    .map(|c| clean(node_text(Some(c), src)))
+                    .unwrap_or_default();
+                if t.is_empty() {
+                    continue;
+                }
+                truncate_chars(&t, 120)
+            };
+            ctx.reg_candidates.push(SemanticFact::Registration {
+                owner: owner.clone(),
+                kind: kind.to_string(),
+                target,
+            });
+        }
+    }
+
+    /// Struct fields (state surface). A field is mutable when its type
+    /// uses an interior-mutability/atomic wrapper; plain fields are
+    /// immutable under Rust's ownership rules.
+    fn record_struct_fields(&self, node: Node, owner: &str, ctx: &mut Ctx, src: &[u8]) {
+        const MUTABLE_TYPES: &[&str] = &[
+            "Cell<",
+            "RefCell<",
+            "Mutex<",
+            "RwLock<",
+            "Atomic",
+            "UnsafeCell<",
+        ];
+        let mut cursor = node.walk();
+        for c in node.named_children(&mut cursor) {
+            if c.kind() != "field_declaration_list" {
+                continue;
+            }
+            let mut c2 = c.walk();
+            for f in c.named_children(&mut c2) {
+                if f.kind() != "field_declaration" {
+                    continue;
+                }
+                let fname = clean(node_text(f.child_by_field_name("name"), src));
+                if fname.is_empty() {
+                    continue;
+                }
+                let ftype = node_text(f.child_by_field_name("type"), src);
+                let mutable = MUTABLE_TYPES.iter().any(|t| ftype.contains(t));
+                ctx.facts.push(SemanticFact::Field {
+                    owner: owner.to_string(),
+                    name: fname,
+                    mutable,
+                });
+            }
+        }
+    }
+
+    /// `env!("KEY")` / `option_env!("KEY")` configuration reads (macro
+    /// invocation form; the `std::env::var` function form is handled in
+    /// `record_call`). Body children are walked like before so calls
+    /// inside macro arguments are still recorded.
+    fn record_macro_invocation(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mac = clean(node_text(node.child_by_field_name("macro"), src));
+        if mac == "env" || mac == "option_env" {
+            if let Some(key) = first_string_literal(node, src) {
+                if let Some(owner) = ctx.caller() {
+                    ctx.facts.push(SemanticFact::Configuration { owner, key });
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
     }
 }
 
@@ -1301,6 +1512,20 @@ fn clap_arg_flags(lists: &[Node], src: &[u8]) -> Vec<String> {
         }
     }
     flags
+}
+
+/// Deterministic fact sort key: (owning symbol, kind/name). PublicExport
+/// sorts by (symbol, kind); the other families by their owner-ish field
+/// and name, so facts group by owner and are stable across runs.
+fn fact_key(f: &SemanticFact) -> (String, String) {
+    match f {
+        SemanticFact::PublicExport { symbol, kind } => (symbol.clone(), kind.clone()),
+        SemanticFact::Annotation { name, target } => (target.clone(), name.clone()),
+        SemanticFact::Field { owner, name, .. } => (owner.clone(), name.clone()),
+        SemanticFact::Registration { owner, kind, .. } => (owner.clone(), kind.clone()),
+        SemanticFact::Configuration { owner, key } => (owner.clone(), key.clone()),
+        SemanticFact::Callback { owner, callback } => (owner.clone(), callback.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -1815,10 +2040,238 @@ fn g() {}
             "fn main( {\n",
             "use a::{b, c as\n",
             "/// doc\n",
+            "fn f() { Router::new().route(; }\n",
+            "fn f() { Router::new().route(\"a\", get(h)).layer( }\n",
+            "fn f() { env!( }\n",
+            "pub use a::{b as\n",
         ];
         for c in cases {
             let _ = extract(c);
         }
+    }
+
+    #[test]
+    fn facts_public_exports_annotations_fields() {
+        let ef = extract(
+            r#"use std::time::Duration;
+
+/// Re-exported duration type.
+pub use std::time::Duration as StdDuration;
+
+pub const MAX: usize = 10;
+
+/// A job service.
+#[derive(Debug, Serialize)]
+pub struct Service {
+    pub name: String,
+    cache: std::sync::RwLock<Vec<String>>,
+}
+
+#[derive(Clone)]
+pub enum Mode {
+    Fast,
+}
+
+pub trait Store {
+    fn save(&self, x: &str);
+}
+
+impl Service {
+    pub fn new(name: &str) -> Service {
+        Service { name: name.into(), cache: std::sync::RwLock::new(Vec::new()) }
+    }
+    fn run(&self) {}
+}
+
+fn private_fn() {}
+"#,
+        );
+        // public API surface: pub items, pub use re-export, pub method
+        let exports: Vec<(&str, &str)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::PublicExport { symbol, kind } => {
+                    Some((symbol.as_str(), kind.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        for want in ["StdDuration", "MAX", "Service", "Mode", "Store", "Service.new"] {
+            assert!(
+                exports.iter().any(|(s, _)| *s == want),
+                "missing export {want}: {exports:?}"
+            );
+        }
+        // re-exports are recorded with a generic `type` kind
+        assert!(exports.contains(&("StdDuration", "type")));
+        assert!(exports.contains(&("Service", "class")));
+        assert!(exports.contains(&("Service.new", "method")));
+        assert!(!exports.iter().any(|(s, _)| *s == "run"));
+        assert!(!exports.iter().any(|(s, _)| *s == "private_fn"));
+
+        // derive macros annotate their target
+        let anns: Vec<(&str, &str)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Annotation { name, target } => {
+                    Some((name.as_str(), target.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(anns.contains(&("Debug", "Service")), "anns: {anns:?}");
+        assert!(anns.contains(&("Serialize", "Service")));
+        assert!(anns.contains(&("Clone", "Mode")));
+
+        // fields with the interior-mutability flag
+        let fields: Vec<(&str, &str, bool)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some((owner.as_str(), name.as_str(), *mutable))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fields.contains(&("Service", "name", false)),
+            "fields: {fields:?}"
+        );
+        assert!(fields.contains(&("Service", "cache", true)));
+    }
+
+    #[test]
+    fn facts_axum_registrations_require_framework() {
+        // axum import + Router::new receiver -> registrations
+        let ef = extract(
+            r#"use axum::Router;
+
+fn build_router() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/users", get(list_users))
+        .layer(tower_http::trace::TraceLayer::new())
+}
+
+fn health() {}
+fn list_users() {}
+"#,
+        );
+        let regs: Vec<(&str, &str, &str)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some((owner.as_str(), kind.as_str(), target.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(regs.len(), 3, "regs: {regs:?}");
+        assert!(regs.contains(&("build_router", "route", "/health")));
+        assert!(regs.contains(&("build_router", "route", "/users")));
+        assert!(regs.contains(&(
+            "build_router",
+            "middleware",
+            "tower_http::trace::TraceLayer::new()"
+        )));
+
+        // no axum import -> registrations are not facts
+        let ef2 = extract(
+            r#"fn build_router() {
+    Router::new().route("/health", get(health));
+}
+"#,
+        );
+        assert!(
+            !ef2.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::Registration { .. })),
+            "no axum import must suppress registrations"
+        );
+
+        // a plain receiver that is not a Router constructor -> nothing,
+        // even with the axum import
+        let ef3 = extract(
+            r#"use axum::Router;
+fn f(app: Router) {
+    app.route("/x", get(handler));
+}
+"#,
+        );
+        assert!(
+            !ef3.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::Registration { .. })),
+            "non-Router receiver must not register"
+        );
+    }
+
+    #[test]
+    fn facts_configuration_env_reads() {
+        let ef = extract(
+            r#"fn service_port() -> String {
+    std::env::var("PORT").unwrap_or_else(|_| "8080".to_string())
+}
+
+fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn opt() -> Option<&'static str> {
+    option_env!("SCC_FEATURE")
+}
+"#,
+        );
+        let cfgs: Vec<(&str, &str)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Configuration { owner, key } => {
+                    Some((owner.as_str(), key.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            cfgs.contains(&("service_port", "PORT")),
+            "cfgs: {cfgs:?}"
+        );
+        assert!(
+            cfgs.contains(&("version", "CARGO_PKG_VERSION")),
+            "cfgs: {cfgs:?}"
+        );
+        assert!(cfgs.contains(&("opt", "SCC_FEATURE")), "cfgs: {cfgs:?}");
+    }
+
+    #[test]
+    fn facts_sorted_and_deduped() {
+        let ef = extract(
+            r#"use axum::Router;
+pub struct A;
+pub fn z() {}
+pub fn a() {}
+#[derive(Debug)]
+pub struct B { x: i32 }
+fn cfg() { env!("K"); std::env::var("K"); }
+fn router() { Router::new().route("/a", get(a)).route("/b", get(b)); }
+"#,
+        );
+        let keys: Vec<(String, String)> = ef.facts.iter().map(fact_key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "facts must be sorted");
+
+        // identical configuration reads from the same owner dedupe
+        let cfgs = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Configuration { .. }))
+            .count();
+        assert_eq!(cfgs, 1, "deduped config reads: {cfgs}");
     }
 
     #[test]

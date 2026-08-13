@@ -5,7 +5,7 @@
 
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -422,6 +422,21 @@ struct Ctx {
     /// `@click.option`), `-`/`--` prefixed, sorted + deduped.
     cli_flags: BTreeMap<String, BTreeSet<String>>,
     scopes: Vec<Scope>,
+    /// Wave 9 semantic facts (annotations, registrations, configuration,
+    /// callbacks). Deterministic order is applied in `into_extracted`.
+    facts: Vec<SemanticFact>,
+    /// Class fields: (owner, name) -> mutable. `true` wins on re-assignment.
+    fields: BTreeMap<(String, String), bool>,
+    /// `__all__` entries (module-level public surface).
+    all_exports: Vec<String>,
+    /// Root module names imported in this file (framework verification).
+    imported_modules: BTreeSet<String>,
+}
+
+impl Ctx {
+    fn has_framework(&self, root: &str) -> bool {
+        self.imported_modules.contains(root)
+    }
 }
 
 impl Ctx {
@@ -440,6 +455,31 @@ impl Ctx {
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
+        let mut facts = self.facts;
+        // Resolve `__all__` entries against module-level symbols so the
+        // export kind is function/class where we can prove it.
+        let module_symbols: BTreeMap<&str, SymbolKind> = self
+            .symbols
+            .iter()
+            .filter(|s| s.parent.is_none())
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect();
+        for name in &self.all_exports {
+            let kind = match module_symbols.get(name.as_str()) {
+                Some(SymbolKind::Function) => "function",
+                Some(SymbolKind::Class) => "class",
+                _ => "module",
+            };
+            facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: kind.to_string(),
+            });
+        }
+        for ((owner, name), mutable) in self.fields {
+            facts.push(SemanticFact::Field { owner, name, mutable });
+        }
+        facts.sort_by_key(fact_sort_key);
+        facts.dedup_by(|a, b| a == b);
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -450,9 +490,35 @@ impl Ctx {
             retries: self.retries,
             entrypoints: self.entrypoints,
             cli_flags,
-            facts: Vec::new(),
+            facts,
         }
         }
+}
+
+/// Deterministic sort key for semantic facts: (owning symbol, family).
+fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
+    match f {
+        SemanticFact::PublicExport { symbol, kind } => {
+            (symbol.clone(), format!("export:{kind}"), String::new())
+        }
+        SemanticFact::Annotation { name, target } => {
+            (target.clone(), format!("annotation:{name}"), String::new())
+        }
+        SemanticFact::Field { owner, name, mutable } => {
+            (owner.clone(), format!("field:{name}:{mutable}"), String::new())
+        }
+        SemanticFact::Registration { owner, kind, target } => (
+            owner.clone(),
+            format!("registration:{kind}:{target}"),
+            String::new(),
+        ),
+        SemanticFact::Configuration { owner, key } => {
+            (owner.clone(), format!("configuration:{key}"), String::new())
+        }
+        SemanticFact::Callback { owner, callback } => {
+            (owner.clone(), format!("callback:{callback}"), String::new())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +532,18 @@ impl PythonExtractor {
             "class_definition" => self.walk_class(node, ctx, src),
             "decorated_definition" => self.walk_decorated(node, ctx, src),
             "call" => self.record_call(node, ctx, src),
+            "assignment" => {
+                self.record_assignment(node, ctx, src);
+                self.walk_children(node, ctx, src);
+            }
+            "attribute" => {
+                self.record_config_attr(node, ctx, src);
+                self.walk_children(node, ctx, src);
+            }
+            "subscript" => {
+                self.record_config_subscript(node, ctx, src);
+                self.walk_children(node, ctx, src);
+            }
             "import_statement" => self.record_import(node, ctx, src),
             "import_from_statement" => self.record_from_import(node, ctx, src),
             "if_statement" => {
@@ -517,6 +595,13 @@ impl PythonExtractor {
             docstring: doc,
             parent,
         });
+        // public API surface: module-level defs not starting with `_`
+        if exported && !name.starts_with('_') {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: sym_name.clone(),
+                kind: "function".to_string(),
+            });
+        }
         // module-level pytest-style tests
         if !in_class && exported && name.starts_with("test_") {
             ctx.tests.push(Test {
@@ -556,6 +641,13 @@ impl PythonExtractor {
                 symbol: Some(name.clone()),
                 kind: TestKind::Unit,
                 line: start_line,
+            });
+        }
+        // public API surface: module-level classes not starting with `_`
+        if exported && !name.starts_with('_') {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: "class".to_string(),
             });
         }
         ctx.scopes.push(Scope {
@@ -610,6 +702,29 @@ impl PythonExtractor {
                 .unwrap_or_default(),
             _ => collapse(node_text(Some(expr), src)),
         };
+        let method = dotted.rsplit('.').next().unwrap_or("").to_string();
+        // Wave 9 facts: annotations, framework callbacks, celery tasks.
+        if let Some(sym) = def_symbol {
+            if !dotted.is_empty() && self.annotation_allowed(ctx, &dotted) {
+                ctx.facts.push(SemanticFact::Annotation {
+                    name: dotted.clone(),
+                    target: sym.to_string(),
+                });
+            }
+            if let Some(cb) = self.callback_for(ctx, &dotted, &method, expr, src) {
+                ctx.facts.push(SemanticFact::Callback {
+                    owner: sym.to_string(),
+                    callback: cb,
+                });
+            }
+            if method == "task" && ctx.has_framework("celery") {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: ctx.caller().unwrap_or_else(|| sym.to_string()),
+                    kind: "task".to_string(),
+                    target: sym.to_string(),
+                });
+            }
+        }
         // retry/backoff decoration
         let lower = dotted.to_ascii_lowercase();
         if !dotted.is_empty() && (lower.contains("retry") || lower.contains("backoff")) {
@@ -700,6 +815,8 @@ impl PythonExtractor {
                     conditional: call_is_conditional(node),
                 });
                 self.record_store_ref(node, fn_node, &root, ctx, src);
+                self.record_config_call(node, fn_node, ctx, src);
+                self.record_framework_registration(node, fn_node, ctx, src);
             }
         }
         self.walk_children(node, ctx, src);
@@ -795,6 +912,292 @@ impl PythonExtractor {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Wave 9 semantic facts
+    // -------------------------------------------------------------------
+
+    /// Class fields (class-level assignments, `self.x` in `__init__`) and
+    /// module-level `__all__` public surface.
+    fn record_assignment(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        if ctx.top_is_class() {
+            if let Some(l) = left {
+                if l.kind() == "identifier" {
+                    let owner = ctx.top_name();
+                    let name = clean(node_text(Some(l), src));
+                    if !name.is_empty() {
+                        let mutable = value_is_mutable(right);
+                        ctx.fields
+                            .entry((owner, name))
+                            .and_modify(|m| *m = *m || mutable)
+                            .or_insert(mutable);
+                    }
+                }
+            }
+        } else if ctx.top_name().ends_with(".__init__") {
+            if let Some(l) = left {
+                if l.kind() == "attribute" {
+                    let mut segs: Vec<String> = Vec::new();
+                    attribute_segments(l, &mut segs, src);
+                    if segs.len() == 2 && segs[0] == "self" {
+                        let owner = ctx.top_name().trim_end_matches(".__init__").to_string();
+                        let mutable = value_is_mutable(right);
+                        ctx.fields
+                            .entry((owner, segs[1].clone()))
+                            .and_modify(|m| *m = *m || mutable)
+                            .or_insert(mutable);
+                    }
+                }
+            }
+        }
+        // `__all__ = [...]` at module level
+        if ctx.scopes.is_empty() {
+            if let Some(l) = left {
+                if l.kind() == "identifier" && node_text(Some(l), src) == "__all__" {
+                    if let Some(r) = right {
+                        if r.kind() == "list" {
+                            let mut cursor = r.walk();
+                            for s in r.named_children(&mut cursor) {
+                                if let Some(v) = string_literal_value(s, src) {
+                                    ctx.all_exports.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Configuration reads via attribute chains: `settings.X`, `config.X`,
+    /// `app.config.X`, `django.conf.settings.X`. Skips the inner segments of
+    /// a chain and call functions (those are handled as calls).
+    fn record_config_attr(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(p) = node.parent() {
+            if p.kind() == "attribute" {
+                return; // outer attribute of the chain handles it
+            }
+            if p.kind() == "call"
+                && p.child_by_field_name("function")
+                    .map(|f| f.id() == node.id())
+                    .unwrap_or(false)
+            {
+                return; // a config *call* (e.g. settings.get(...)) — handled in record_config_call
+            }
+        }
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(node, &mut segs, src);
+        let n = segs.len();
+        if n < 2 {
+            return;
+        }
+        let is_config = segs[0] == "settings"
+            || segs[0] == "config"
+            || (n >= 3 && segs[n - 2] == "config")
+            || (n >= 3 && segs[n - 2] == "settings");
+        if !is_config {
+            return;
+        }
+        let Some(caller) = ctx.caller() else { return; };
+        ctx.facts.push(SemanticFact::Configuration {
+            owner: caller,
+            key: segs[n - 1].clone(),
+        });
+    }
+
+    /// Configuration reads via subscripts: `os.environ["KEY"]`,
+    /// `app.config["KEY"]`.
+    fn record_config_subscript(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if node.parent().map(|p| p.kind() == "subscript").unwrap_or(false) {
+            return;
+        }
+        let Some(value) = node.child_by_field_name("value") else {
+            return;
+        };
+        let Some(sub) = node.child_by_field_name("subscript") else {
+            return;
+        };
+        let Some(key) = string_literal_value(sub, src) else {
+            return;
+        };
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(value, &mut segs, src);
+        let is_config = (segs.len() == 2 && segs[0] == "os" && segs[1] == "environ")
+            || segs.last().map(|s| s == "config").unwrap_or(false);
+        if !is_config {
+            return;
+        }
+        let Some(caller) = ctx.caller() else { return; };
+        ctx.facts.push(SemanticFact::Configuration {
+            owner: caller,
+            key,
+        });
+    }
+
+    /// Configuration reads through calls: `os.getenv("K")`,
+    /// `os.environ.get("K")`, `settings.get("K")`, `config.get("K")`,
+    /// `app.config.get("K")`.
+    fn record_config_call(&self, node: Node, fn_node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(fn_node, &mut segs, src);
+        if segs.len() < 2 {
+            return;
+        }
+        let method = segs.last().unwrap().clone();
+        if method != "get" && method != "getenv" {
+            return;
+        }
+        let is_env = segs[0] == "os"
+            && (segs[1] == "getenv" || (segs.len() >= 3 && segs[1] == "environ"));
+        let is_settings = ((segs[0] == "settings" || segs[0] == "config")
+            || (segs.len() >= 3
+                && (segs[segs.len() - 2] == "config" || segs[segs.len() - 2] == "settings")))
+            && method == "get";
+        if !is_env && !is_settings {
+            return;
+        }
+        let Some(key) = first_string_arg(node, src) else { return; };
+        let Some(caller) = ctx.caller() else { return; };
+        ctx.facts.push(SemanticFact::Configuration {
+            owner: caller,
+            key,
+        });
+    }
+
+    /// Framework registrations: fastapi `include_router`/`add_middleware`/
+    /// `add_exception_handler`, flask `register_blueprint` and the
+    /// `Blueprint("name", ...)` constructor. Owners are the enclosing symbol
+    /// (so the writer can attach the fact); framework imports gate emission.
+    fn record_framework_registration(&self, node: Node, fn_node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(fn_node, &mut segs, src);
+        if segs.is_empty() {
+            return;
+        }
+        let method = segs.last().unwrap().clone();
+        let receiver = segs[0].clone();
+        let caller = ctx.caller();
+        if method == "Blueprint"
+            && (segs.len() == 1 || receiver == "flask")
+            && ctx.has_framework("flask")
+        {
+            if let Some(name) = first_string_arg(node, src) {
+                let owner = caller.unwrap_or_else(|| {
+                    self.assignment_target(node, src)
+                        .unwrap_or_else(|| "Blueprint".to_string())
+                });
+                ctx.facts.push(SemanticFact::Registration {
+                    owner,
+                    kind: "blueprint".to_string(),
+                    target: name,
+                });
+            }
+            return;
+        }
+        let kind = match method.as_str() {
+            "include_router" | "add_middleware" | "add_exception_handler"
+                if ctx.has_framework("fastapi") =>
+            {
+                Some(method.clone())
+            }
+            "register_blueprint" if ctx.has_framework("flask") => Some(method.clone()),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if let Some(t) = first_positional_arg_text(node, src) {
+                if !t.is_empty() {
+                    ctx.facts.push(SemanticFact::Registration {
+                        owner: caller.unwrap_or(receiver),
+                        kind,
+                        target: t,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Left-hand identifier of an enclosing `x = ...` assignment.
+    fn assignment_target(&self, node: Node, src: &[u8]) -> Option<String> {
+        let parent = node.parent()?;
+        if parent.kind() != "assignment" {
+            return None;
+        }
+        let left = parent.child_by_field_name("left")?;
+        if left.kind() != "identifier" {
+            return None;
+        }
+        Some(clean(node_text(Some(left), src)))
+    }
+
+    /// Whether a decorator's Annotation fact may be emitted: framework
+    /// decorators (routes, celery tasks, lifecycle hooks, flask request
+    /// hooks) require the corresponding framework import.
+    fn annotation_allowed(&self, ctx: &Ctx, dotted: &str) -> bool {
+        let method = dotted.rsplit('.').next().unwrap_or("");
+        if ROUTE_VERBS.contains(&method) {
+            return ctx.has_framework("fastapi") || ctx.has_framework("flask");
+        }
+        if method == "task" {
+            return ctx.has_framework("celery");
+        }
+        if matches!(method, "on_event" | "on_startup" | "on_shutdown") {
+            return ctx.has_framework("fastapi");
+        }
+        if matches!(
+            method,
+            "before_request"
+                | "after_request"
+                | "teardown_request"
+                | "errorhandler"
+                | "before_app_request"
+                | "after_app_request"
+                | "teardown_app_request"
+                | "teardown_appcontext"
+        ) {
+            return ctx.has_framework("flask");
+        }
+        if method == "connect" {
+            return ctx.has_framework("celery") && is_celery_signal(dotted);
+        }
+        true
+    }
+
+    /// Callback/hook name when a decorator registers a framework-invoked
+    /// callback: fastapi `@app.on_event("startup")`, flask
+    /// `@app.before_request`, celery signal `@sig.connect`.
+    fn callback_for(
+        &self,
+        ctx: &Ctx,
+        dotted: &str,
+        method: &str,
+        expr: Node,
+        src: &[u8],
+    ) -> Option<String> {
+        match method {
+            "on_event" if ctx.has_framework("fastapi") => first_string_arg(expr, src),
+            "on_startup" | "on_shutdown" if ctx.has_framework("fastapi") => {
+                Some(method.to_string())
+            }
+            "before_request"
+            | "after_request"
+            | "teardown_request"
+            | "errorhandler"
+            | "before_app_request"
+            | "after_app_request"
+            | "teardown_app_request"
+            | "teardown_appcontext"
+                if ctx.has_framework("flask") =>
+            {
+                Some(method.to_string())
+            }
+            "connect" if ctx.has_framework("celery") && is_celery_signal(dotted) => {
+                dotted.rsplit('.').nth(1).map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+
     fn record_import(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let line = node.start_position().row as u32 + 1;
         let mut cursor = node.walk();
@@ -821,6 +1224,11 @@ impl PythonExtractor {
         };
         if dotted.is_empty() {
             return;
+        }
+        if let Some(root) = dotted.split('.').next() {
+            if root.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) {
+                ctx.imported_modules.insert(root.to_string());
+            }
         }
         let names = match alias {
             Some(a) => vec![(a, dotted.clone())],
@@ -875,6 +1283,11 @@ impl PythonExtractor {
         let module = module_node
             .map(|m| collapse(node_text(Some(m), src)))
             .unwrap_or_default();
+        if let Some(root) = module.split('.').next() {
+            if root.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) {
+                ctx.imported_modules.insert(root.to_string());
+            }
+        }
         let mut names: Vec<(String, String)> = Vec::new();
         let mut wildcard = false;
         let mut cursor = node.walk();
@@ -1149,6 +1562,59 @@ fn methods_kwarg(call: Node, src: &[u8]) -> Vec<String> {
         return out;
     }
     Vec::new()
+}
+
+/// First positional (non-keyword) argument of a call as source text.
+fn first_positional_arg_text(call: Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            continue;
+        }
+        let t = collapse(node_text(Some(child), src));
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Heuristic mutability of a field initializer: mutable containers and call
+/// results are treated as mutable state; literals (str/int/bool/None) are not.
+fn value_is_mutable(right: Option<Node>) -> bool {
+    let Some(r) = right else {
+        return false;
+    };
+    matches!(
+        r.kind(),
+        "list"
+            | "dictionary"
+            | "set"
+            | "call"
+            | "await"
+            | "list_comprehension"
+            | "dictionary_comprehension"
+            | "set_comprehension"
+            | "generator_expression"
+    )
+}
+
+/// True when a dotted decorator name looks like a celery signal handler
+/// (`@task_postrun.connect`, `@celery.signals.task_success.connect`, ...).
+fn is_celery_signal(dotted: &str) -> bool {
+    let root = dotted.rsplit('.').nth(1).unwrap_or(dotted);
+    root.contains("celery")
+        || root.starts_with("task_")
+        || root.starts_with("worker_")
+        || root.contains("_signal")
+        || root.ends_with("_prerun")
+        || root.ends_with("_postrun")
+        || root.ends_with("_success")
+        || root.ends_with("_failure")
+        || root.ends_with("_retry")
+        || root.ends_with("_revoked")
+        || root.ends_with("_received")
 }
 
 #[cfg(test)]
@@ -1569,5 +2035,273 @@ mod tests {
         let ja = serde_json::to_string(&a).unwrap();
         let jb = serde_json::to_string(&b).unwrap();
         assert_eq!(ja, jb);
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 9 semantic facts
+    // -------------------------------------------------------------------
+
+    fn facts_of<'a>(ef: &'a ExtractedFile, want: &SemanticFact) -> Vec<&'a SemanticFact> {
+        ef.facts.iter().filter(|f| *f == want).collect()
+    }
+
+    #[test]
+    fn facts_public_exports() {
+        let ef = extract(
+            "from fastapi import FastAPI\n\n__all__ = [\"create_app\", \"ping\", \"Item\", \"external\"]\n\ndef create_app():\n    pass\n\ndef ping():\n    pass\n\nclass Item:\n    pass\n\ndef _private():\n    pass\n",
+        );
+        let exports: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::PublicExport { .. }))
+            .collect();
+        // defs create_app/ping/Item + __all__-only "external" (create_app,
+        // ping, Item dedup with the def facts)
+        assert_eq!(exports.len(), 4, "exports: {exports:?}");
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::PublicExport { symbol: "create_app".into(), kind: "function".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::PublicExport { symbol: "ping".into(), kind: "function".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::PublicExport { symbol: "Item".into(), kind: "class".into() }).len(),
+            1
+        );
+        // __all__ entry with no matching symbol resolves to module kind
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::PublicExport { symbol: "external".into(), kind: "module".into() }).len(),
+            1
+        );
+        // private defs are not public exports
+        assert!(!ef
+            .facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::PublicExport { symbol, .. } if symbol == "_private")));
+        // facts are sorted by (symbol, kind)
+        let keys: Vec<String> = exports.iter().map(|f| match f {
+            SemanticFact::PublicExport { symbol, kind } => format!("{symbol}:{kind}"),
+            _ => unreachable!(),
+        }).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn facts_annotations_framework_gated() {
+        // route decorator without a fastapi/flask import → no annotation
+        let ef = extract("@app.get(\"/x\")\ndef x():\n    pass\n\n@staticmethod\ndef y():\n    pass\n");
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Annotation { name: "staticmethod".into(), target: "y".into() }).len(),
+            1
+        );
+        assert!(!ef
+            .facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::Annotation { name, .. } if name == "app.get")));
+
+        // with fastapi import the route decorator IS annotated
+        let ef2 = extract(
+            "from fastapi import FastAPI\n\n@app.get(\"/x\")\ndef x():\n    pass\n\n@dataclass\nclass C:\n    pass\n",
+        );
+        assert_eq!(
+            facts_of(&ef2, &SemanticFact::Annotation { name: "app.get".into(), target: "x".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef2, &SemanticFact::Annotation { name: "dataclass".into(), target: "C".into() }).len(),
+            1
+        );
+
+        // celery.task annotation needs a celery import
+        let ef3 = extract("@celery.task\ndef send():\n    pass\n");
+        assert!(!ef3
+            .facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::Annotation { name, .. } if name == "celery.task")));
+        let ef4 = extract("from celery import Celery\n\n@celery.task\ndef send():\n    pass\n");
+        assert_eq!(
+            facts_of(&ef4, &SemanticFact::Annotation { name: "celery.task".into(), target: "send".into() }).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn facts_fields() {
+        let ef = extract(
+            "class Cart:\n    capacity = 5\n    default_items = []\n\n    def __init__(self, owner):\n        self.owner = owner\n        self.items = []\n        self.tags = {}\n\nclass Item:\n    name: str\n    tags: list = field(default_factory=list)\n",
+        );
+        let fields: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Field { .. }))
+            .collect();
+        assert_eq!(fields.len(), 7, "fields: {fields:?}");
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Cart".into(), name: "capacity".into(), mutable: false }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Cart".into(), name: "default_items".into(), mutable: true }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Cart".into(), name: "owner".into(), mutable: false }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Cart".into(), name: "items".into(), mutable: true }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Cart".into(), name: "tags".into(), mutable: true }).len(),
+            1
+        );
+        // dataclass-style call initializer counts as mutable
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Item".into(), name: "tags".into(), mutable: true }).len(),
+            1
+        );
+        // typed annotation without a value is still a declared field
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Field { owner: "Item".into(), name: "name".into(), mutable: false }).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn facts_registration_fastapi_flask_celery() {
+        let ef = extract(
+            "from fastapi import FastAPI, APIRouter\nfrom flask import Flask, Blueprint\n\nrouter = APIRouter()\n\nclass RequestLogger:\n    pass\n\ndef create_app():\n    app = FastAPI()\n    app.include_router(router)\n    app.add_middleware(RequestLogger)\n    app.add_exception_handler(ValueError, handler)\n    return app\n\ndef make_web():\n    bp = Blueprint(\"admin\", __name__)\n    web = Flask(__name__)\n    web.register_blueprint(bp)\n    return web\n",
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Registration { owner: "create_app".into(), kind: "include_router".into(), target: "router".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Registration { owner: "create_app".into(), kind: "add_middleware".into(), target: "RequestLogger".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Registration { owner: "create_app".into(), kind: "add_exception_handler".into(), target: "ValueError".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Registration { owner: "make_web".into(), kind: "blueprint".into(), target: "admin".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Registration { owner: "make_web".into(), kind: "register_blueprint".into(), target: "bp".into() }).len(),
+            1
+        );
+
+        // no framework import → registrations suppressed
+        let bare = extract("def create_app():\n    app.include_router(router)\n    return app\n");
+        assert!(bare
+            .facts
+            .iter()
+            .all(|f| !matches!(f, SemanticFact::Registration { .. })));
+
+        // celery task registration targets the decorated function
+        let celery = extract("from celery import Celery\n\ncelery = Celery(\"facts\")\n\n@celery.task\ndef send_email(address):\n    return None\n");
+        assert_eq!(
+            facts_of(&celery, &SemanticFact::Registration { owner: "send_email".into(), kind: "task".into(), target: "send_email".into() }).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn facts_configuration() {
+        let ef = extract(
+            "import os\n\ndef boot():\n    port = os.getenv(\"PORT\", \"8080\")\n    url = os.environ[\"DATABASE_URL\"]\n    debug = settings.DEBUG\n    api = config.api_key\n    return port, url, debug, api\n",
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Configuration { owner: "boot".into(), key: "PORT".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Configuration { owner: "boot".into(), key: "DATABASE_URL".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Configuration { owner: "boot".into(), key: "DEBUG".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Configuration { owner: "boot".into(), key: "api_key".into() }).len(),
+            1
+        );
+        // app.config["KEY"] (flask) and django.conf.settings reads
+        let ef2 = extract(
+            "def make_web():\n    app.config[\"DEBUG\"] = True\n    return app\n\ndef setup():\n    from django.conf import settings\n    return settings.DATABASES\n",
+        );
+        assert_eq!(
+            facts_of(&ef2, &SemanticFact::Configuration { owner: "make_web".into(), key: "DEBUG".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef2, &SemanticFact::Configuration { owner: "setup".into(), key: "DATABASES".into() }).len(),
+            1
+        );
+        // module-level reads have no owning symbol → skipped
+        let ef3 = extract("import os\n\nURL = os.environ[\"URL\"]\n");
+        assert!(ef3.facts.is_empty() || !ef3
+            .facts
+            .iter()
+            .any(|f| matches!(f, SemanticFact::Configuration { .. })));
+    }
+
+    #[test]
+    fn facts_callback() {
+        let ef = extract(
+            "from fastapi import FastAPI\nfrom flask import Flask\n\ndef create_app():\n    app = FastAPI()\n\n    @app.on_event(\"startup\")\n    def on_start():\n        pass\n\n    @app.on_event(\"shutdown\")\n    def on_stop():\n        pass\n\n    return app\n\ndef make_web():\n    web = Flask(__name__)\n\n    @web.before_request\n    def log_req():\n        pass\n\n    return web\n",
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Callback { owner: "on_start".into(), callback: "startup".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Callback { owner: "on_stop".into(), callback: "shutdown".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Callback { owner: "log_req".into(), callback: "before_request".into() }).len(),
+            1
+        );
+        // the hooks are annotated too, framework-gated
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Annotation { name: "app.on_event".into(), target: "on_start".into() }).len(),
+            1
+        );
+        assert_eq!(
+            facts_of(&ef, &SemanticFact::Annotation { name: "web.before_request".into(), target: "log_req".into() }).len(),
+            1
+        );
+        // without the fastapi import, on_event yields no callback
+        let bare = extract("@app.on_event(\"startup\")\ndef s():\n    pass\n");
+        assert!(bare
+            .facts
+            .iter()
+            .all(|f| !matches!(f, SemanticFact::Callback { .. })));
+    }
+
+    #[test]
+    fn facts_sorted_and_deduplicated() {
+        let src = "from fastapi import FastAPI\n\n@app.get(\"/x\")\ndef x():\n    pass\n\n@app.get(\"/x\")\ndef x2():\n    pass\n\nclass Cart:\n    items = []\n\n__all__ = [\"x\", \"x\", \"Cart\"]\n";
+        let ef = extract(src);
+        // stable across runs
+        let again = extract(src);
+        assert_eq!(
+            serde_json::to_string(&ef).unwrap(),
+            serde_json::to_string(&again).unwrap()
+        );
+        // no duplicate facts
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &ef.facts {
+            assert!(seen.insert(format!("{f:?}")), "duplicate fact: {f:?}");
+        }
     }
 }

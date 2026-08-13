@@ -344,14 +344,34 @@ impl<'a> Writer<'a> {
                     if let Some((_, owner_id)) =
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
-                        let target_id = written
+                        let target_id = match written
                             .symbol_ids
                             .iter()
                             .find(|(n, _)| n == target)
                             .map(|(_, id)| id.clone())
-                            .unwrap_or_else(|| {
-                                entity_id(self.repo_id, scc_core::kinds::CONTRACT, target)
-                            });
+                        {
+                            Some(id) => id,
+                            None => {
+                                // registered surfaces are contract entities
+                                // themselves (route/middleware/event targets);
+                                // insert them so no dangling object survives
+                                let id = entity_id(
+                                    self.repo_id,
+                                    scc_core::kinds::CONTRACT,
+                                    target,
+                                );
+                                let mut ce = scc_core::Entity::new(
+                                    id.clone(),
+                                    scc_core::kinds::CONTRACT,
+                                    target.clone(),
+                                );
+                                ce.attr("kind", serde_json::json!(kind));
+                                ce.attr("file", serde_json::json!(path));
+                                ce.evidence = sym_evidence(owner);
+                                self.store.insert_entity(&ce, &[path.to_string()])?;
+                                id
+                            }
+                        };
                         let rel = Relationship::new(
                             rel_id(&["registers", owner_id, &target_id]),
                             owner_id.clone(),
@@ -359,11 +379,6 @@ impl<'a> Writer<'a> {
                             target_id,
                             Provenance::Extracted,
                         );
-                        let mut rel = rel;
-                        if kind == "route" || kind == "middleware" || kind == "event" {
-                            // registered surfaces are contracts themselves
-                            let _ = &mut rel;
-                        }
                         self.store.insert_relationship(&rel, path)?;
                     }
                 }
@@ -792,6 +807,12 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "serve.port");
 
+        let contracts = store.entities_by_kind(scc_core::kinds::CONTRACT).unwrap();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "registration target inserts a contract entity: {contracts:?}"
+        );
         let rels = store.all_relationships().unwrap();
         assert!(
             rels.iter()

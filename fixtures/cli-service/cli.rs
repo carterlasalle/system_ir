@@ -1,6 +1,39 @@
 //! cli-service: demo CLI with two subcommands, flags, and store writes.
 
+use axum::Router;
 use clap::{Arg, Command, Parser, Subcommand};
+
+/// Re-exported type for the public API surface.
+pub use std::time::Duration;
+
+/// Greet a user by name.
+pub fn greet(name: &str) -> String {
+    format!("Hello, {name}!")
+}
+
+/// Server state shared across request handlers.
+#[derive(Clone)]
+pub struct ServerState {
+    pub port: u16,
+    cache: std::sync::RwLock<Vec<String>>,
+}
+
+/// Read the service port from the environment.
+fn service_port() -> String {
+    std::env::var("PORT").unwrap_or_else(|_| "8080".to_string())
+}
+
+/// Build the axum HTTP router.
+pub fn build_router() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/users", get(list_users))
+        .layer(tower_http::trace::TraceLayer::new())
+}
+
+fn health() {}
+
+fn list_users() {}
 
 /// cli-service: demo CLI service.
 #[derive(Parser)]

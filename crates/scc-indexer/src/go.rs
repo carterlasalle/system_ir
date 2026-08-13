@@ -6,8 +6,8 @@
 //! unwraps_or everywhere — hostile input never panics.
 
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SourceFile, StoreOp,
-    StoreRef, Symbol, SymbolKind,
+    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SemanticFact,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +43,12 @@ impl LanguageExtractor for GoExtractor {
         // prepass: `var cmd = ...cobra.Command{Use: "x"}` bindings, used to
         // name `rootCmd.AddCommand(cmd)` subcommands.
         scan_cobra_commands(tree.root_node(), src, &mut ctx.command_uses);
+        // prepass: router variable → framework receiver bindings
+        // (`r := gin.Default()` → *gin.Engine, `api := r.Group("/api")` →
+        // *gin.RouterGroup, `r := mux.NewRouter()` → *mux.Router).
+        let mut router_scan = RouterScanner::default();
+        scan_router_bindings(tree.root_node(), src, &mut router_scan);
+        ctx.router_bindings = router_scan.bindings;
         self.walk(tree.root_node(), &mut ctx, src);
         ctx.into_extracted()
         }
@@ -115,13 +121,27 @@ fn string_literal_value(node: Node, src: &[u8]) -> Option<String> {
 /// First string-literal argument of a call.
 fn first_string_arg(call: Node, src: &[u8]) -> Option<String> {
     let args = call.child_by_field_name("arguments")?;
+    args_string_literals(args, src).into_iter().next()
+}
+
+/// String-literal arguments of a call, in argument order.
+fn string_literal_args(call: Node, src: &[u8]) -> Vec<String> {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    args_string_literals(args, src)
+}
+
+/// String-literal children of an `arguments` node, in order.
+fn args_string_literals(args: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
     let mut cursor = args.walk();
     for child in args.named_children(&mut cursor) {
         if let Some(s) = string_literal_value(child, src) {
-            return Some(s);
+            out.push(s);
         }
     }
-    None
+    out
 }
 
 /// Case-insensitive byte search; returns index into the original string.
@@ -358,6 +378,12 @@ struct Ctx {
     scopes: Vec<String>,
     /// `var name = ...cobra.Command{Use: "x"}` map (prepass).
     command_uses: BTreeMap<String, String>,
+    /// Router variable → framework receiver type + group path prefix
+    /// (prepass), e.g. `r := gin.Default()` → `engine`, `api := r.Group(
+    /// "/api")` → `routergroup` with prefix `/api`.
+    router_bindings: BTreeMap<String, GinBinding>,
+    /// Wave 9 semantic facts (exports, fields, registrations, callbacks).
+    facts: Vec<SemanticFact>,
     /// CLI flags per owning symbol (cobra `Flags().StringP(...)`),
     /// `--` prefixed, sorted + deduped.
     cli_flags: BTreeMap<String, BTreeSet<String>>,
@@ -369,12 +395,40 @@ impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().cloned()
     }
+    /// Local name of the gin import (`gin` / `github.com/gin-gonic/gin` or
+    /// any module ending in `/gin`), honoring aliases.
+    fn gin_local(&self) -> Option<&str> {
+        self.imports
+            .iter()
+            .find(|i| is_gin_module(&i.module))
+            .and_then(|i| i.names.first())
+            .map(|(n, _)| n.as_str())
+    }
+    /// Local name of the gorilla mux import, honoring aliases.
+    fn mux_local(&self) -> Option<&str> {
+        self.imports
+            .iter()
+            .find(|i| i.module == "github.com/gorilla/mux")
+            .and_then(|i| i.names.first())
+            .map(|(n, _)| n.as_str())
+    }
+    /// Local name of the `net/http` import, honoring aliases.
+    fn http_local(&self) -> Option<&str> {
+        self.imports
+            .iter()
+            .find(|i| i.module == "net/http")
+            .and_then(|i| i.names.first())
+            .map(|(n, _)| n.as_str())
+    }
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect();
+        // deterministic fact order: (owning symbol, family, detail)
+        let mut facts = self.facts;
+        facts.sort_by_key(fact_sort_key);
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -382,6 +436,7 @@ impl Ctx {
             store_refs: self.store_refs,
             entrypoints: self.entrypoints,
             cli_flags,
+            facts,
             ..ExtractedFile::default()
         }
         }
@@ -446,6 +501,12 @@ impl GoExtractor {
                 line: start_line,
             });
         }
+        if is_exported(&name) {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: "function".to_string(),
+            });
+        }
         ctx.scopes.push(name);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
@@ -474,6 +535,12 @@ impl GoExtractor {
             docstring: leading_doc(node, src),
             parent,
         });
+        if is_exported(&name) {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: sym_name.clone(),
+                kind: "method".to_string(),
+            });
+        }
         ctx.scopes.push(sym_name);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
@@ -512,6 +579,56 @@ impl GoExtractor {
                 docstring: leading_doc(spec, src),
                 parent: None,
             });
+            if is_exported(&name) {
+                ctx.facts.push(SemanticFact::PublicExport {
+                    symbol: name.clone(),
+                    kind: "type".to_string(),
+                });
+            }
+            // struct fields → Field facts (Go fields are always mutable)
+            let ty = spec.child_by_field_name("type");
+            if let Some(ty) = ty {
+                if ty.kind() == "struct_type" {
+                    let mut c3 = ty.walk();
+                    for child in ty.named_children(&mut c3) {
+                        if child.kind() != "field_declaration_list" {
+                            continue;
+                        }
+                        let mut c4 = child.walk();
+                        for fd in child.named_children(&mut c4) {
+                            if fd.kind() != "field_declaration" {
+                                continue;
+                            }
+                            let mut field_names: Vec<String> = Vec::new();
+                            let mut c5 = fd.walk();
+                            for n in fd.children_by_field_name("name", &mut c5) {
+                                let t = clean(node_text(Some(n), src));
+                                if !t.is_empty() {
+                                    field_names.push(t);
+                                }
+                            }
+                            if field_names.is_empty() {
+                                // embedded field: named by its type
+                                if let Some(et) = fd.child_by_field_name("type") {
+                                    if et.kind() == "type_identifier" {
+                                        let t = clean(node_text(Some(et), src));
+                                        if !t.is_empty() {
+                                            field_names.push(t);
+                                        }
+                                    }
+                                }
+                            }
+                            for fname in field_names {
+                                ctx.facts.push(SemanticFact::Field {
+                                    owner: name.clone(),
+                                    name: fname,
+                                    mutable: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -560,6 +677,12 @@ impl GoExtractor {
                     docstring: None,
                     parent: None,
                 });
+                if is_exported(&name) {
+                    ctx.facts.push(SemanticFact::PublicExport {
+                        symbol: name,
+                        kind: "const".to_string(),
+                    });
+                }
             }
         }
     }
@@ -634,6 +757,7 @@ impl GoExtractor {
                     conditional: false,
                 });
                 self.record_store_ref(node, &fn_node, &root, ctx, src);
+                self.record_framework_facts(node, ctx, src);
             }
         }
         self.walk_children(node, ctx, src);
@@ -762,6 +886,476 @@ impl GoExtractor {
             line: node.start_position().row as u32 + 1,
         });
     }
+
+    /// Wave 9 framework facts. Framework verification rules:
+    /// - gin routes/middleware need the gin import AND a receiver bound to
+    ///   `*gin.Engine` / `*gin.RouterGroup` (from `gin.New()`/`gin.Default()`
+    ///   / `Group(...)` chains or a gin-typed parameter);
+    /// - gorilla `r.HandleFunc` needs the gorilla/mux import AND a receiver
+    ///   bound to `*mux.Router`;
+    /// - `http.HandleFunc` needs a `net/http` import whose local name heads
+    ///   the call. Plain methods named `get()` are never routes.
+    fn record_framework_facts(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(fn_node) = node.child_by_field_name("function") else {
+            return;
+        };
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(fn_node, &mut segs, src);
+        if segs.len() < 2 {
+            return;
+        }
+        let recv = segs[0].clone();
+        let method = segs.last().unwrap().clone();
+        let Some(owner) = ctx.caller() else {
+            return;
+        };
+
+        // net/http: `http.HandleFunc("/path", handler)` → callback
+        if method == "HandleFunc" && ctx.http_local() == Some(recv.as_str()) {
+            if let Some(handler) = handler_arg(node, 2, src) {
+                ctx.facts.push(SemanticFact::Callback {
+                    owner,
+                    callback: handler,
+                });
+            }
+            return;
+        }
+
+        let Some(binding) = ctx.router_bindings.get(&recv).cloned() else {
+            return;
+        };
+
+        // gin routes + middleware chains
+        if (binding.receiver == "engine" || binding.receiver == "routergroup")
+            && ctx.gin_local().is_some()
+        {
+            if GIN_ROUTE_METHODS.contains(&method.as_str()) {
+                let strings = string_literal_args(node, src);
+                let (m, p) = if method == "Handle" {
+                    (
+                        strings.first().cloned().unwrap_or_default().to_uppercase(),
+                        strings.get(1).cloned().unwrap_or_default(),
+                    )
+                } else {
+                    (method.to_uppercase(), strings.first().cloned().unwrap_or_default())
+                };
+                if binding.prefix.is_empty() && p.is_empty() {
+                    return;
+                }
+                let target = join_path(&binding.prefix, &p);
+                ctx.facts.push(SemanticFact::Registration {
+                    owner,
+                    kind: "route".to_string(),
+                    target: format!("{m} {target}"),
+                });
+            } else if method == "Use" {
+                for handler in handler_args(node, src) {
+                    ctx.facts.push(SemanticFact::Callback {
+                        owner: owner.clone(),
+                        callback: handler,
+                    });
+                }
+            }
+            return;
+        }
+
+        // gorilla mux: `r.HandleFunc("/path", handler)` on *mux.Router
+        if binding.receiver == "muxrouter" && method == "HandleFunc" && ctx.mux_local().is_some() {
+            let p = first_string_arg(node, src).unwrap_or_default();
+            if p.is_empty() {
+                return;
+            }
+            ctx.facts.push(SemanticFact::Registration {
+                owner,
+                kind: "route".to_string(),
+                target: p,
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 9 semantic fact helpers (router bindings, route/middleware facts)
+// ---------------------------------------------------------------------------
+
+/// gin HTTP-verb methods that register a route. `Handle` takes the method as
+/// its first string argument; the rest take the path first.
+const GIN_ROUTE_METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "Any", "Handle",
+];
+
+fn is_gin_module(module: &str) -> bool {
+    module == "gin" || module.ends_with("/gin")
+}
+
+/// A router variable's framework receiver, with any `Group` path prefix.
+#[derive(Clone, Debug)]
+struct GinBinding {
+    /// `engine` (*gin.Engine) | `routergroup` (*gin.RouterGroup) |
+    /// `muxrouter` (*mux.Router).
+    receiver: String,
+    /// Path prefix accumulated through `r.Group("/api")` chains.
+    prefix: String,
+}
+
+/// Prepass state for router bindings: framework import local names (aliases
+/// honored) plus the variable → binding map.
+#[derive(Default)]
+struct RouterScanner {
+    gin_local: Option<String>,
+    mux_local: Option<String>,
+    bindings: BTreeMap<String, GinBinding>,
+}
+
+/// Join a group prefix and a route path: `"/api"` + `"/users"` →
+/// `"/api/users"`.
+fn join_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        return path.to_string();
+    }
+    if path.is_empty() {
+        return prefix.to_string();
+    }
+    let a = prefix.trim_end_matches('/');
+    let b = path.trim_start_matches('/');
+    if a.is_empty() {
+        return b.to_string();
+    }
+    format!("{a}/{b}")
+}
+
+/// nth (1-indexed) argument of a call as a handler name: an identifier's
+/// text, `(anonymous)` for a function literal, else the collapsed text.
+fn handler_arg(node: Node, index: usize, src: &[u8]) -> Option<String> {
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut i = 0;
+    for arg in args.named_children(&mut cursor) {
+        i += 1;
+        if i != index {
+            continue;
+        }
+        let name = match arg.kind() {
+            "identifier" => clean(node_text(Some(arg), src)),
+            "func_literal" => "(anonymous)".to_string(),
+            _ => collapse(node_text(Some(arg), src)),
+        };
+        let name = truncate_chars(&name, 80);
+        return if name.is_empty() { None } else { Some(name) };
+    }
+    None
+}
+
+/// All handler arguments of a call (for `r.Use(...)` chains): identifiers by
+/// name, calls by their function text, literals as `(anonymous)`.
+fn handler_args(node: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return out;
+    };
+    let mut cursor = args.walk();
+    for arg in args.named_children(&mut cursor) {
+        let name = match arg.kind() {
+            "func_literal" => "(anonymous)".to_string(),
+            "call_expression" => arg
+                .child_by_field_name("function")
+                .map(|f| collapse(node_text(Some(f), src)))
+                .unwrap_or_default(),
+            _ => collapse(node_text(Some(arg), src)),
+        };
+        let name = truncate_chars(&name, 80);
+        if !name.is_empty() {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Deterministic ordering for facts: (owning symbol, family, detail).
+fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
+    match f {
+        SemanticFact::PublicExport { symbol, kind } => {
+            (symbol.clone(), "export".to_string(), kind.clone())
+        }
+        SemanticFact::Annotation { name, target } => {
+            (target.clone(), "annotation".to_string(), name.clone())
+        }
+        SemanticFact::Field { owner, name, .. } => {
+            (owner.clone(), "field".to_string(), name.clone())
+        }
+        SemanticFact::Registration { owner, kind, target } => (
+            owner.clone(),
+            "registration".to_string(),
+            format!("{kind}\u{0}{target}"),
+        ),
+        SemanticFact::Configuration { owner, key } => {
+            (owner.clone(), "configuration".to_string(), key.clone())
+        }
+        SemanticFact::Callback { owner, callback } => {
+            (owner.clone(), "callback".to_string(), callback.clone())
+        }
+    }
+}
+
+/// Prepass: collect framework import local names and map router variables to
+/// their receiver bindings (`r := gin.Default()`, `api := r.Group("/api")`,
+/// `r := mux.NewRouter()`, plus gin/mux-typed function parameters).
+fn scan_router_bindings(node: Node, src: &[u8], s: &mut RouterScanner) {
+    match node.kind() {
+        "import_declaration" => {
+            let mut cursor = node.walk();
+            for c in node.named_children(&mut cursor) {
+                match c.kind() {
+                    "import_spec" => record_router_import(c, src, s),
+                    "import_spec_list" => {
+                        let mut c2 = c.walk();
+                        for spec in c.named_children(&mut c2) {
+                            if spec.kind() == "import_spec" {
+                                record_router_import(spec, src, s);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "var_declaration" => {
+            let mut cursor = node.walk();
+            for spec in node.named_children(&mut cursor) {
+                if spec.kind() != "var_spec" {
+                    continue;
+                }
+                let mut names: Vec<String> = Vec::new();
+                let mut c2 = spec.walk();
+                for n in spec.children_by_field_name("name", &mut c2) {
+                    let t = clean(node_text(Some(n), src));
+                    if !t.is_empty() {
+                        names.push(t);
+                    }
+                }
+                let mut exprs: Vec<Node> = Vec::new();
+                if let Some(value) = spec.child_by_field_name("value") {
+                    let mut c3 = value.walk();
+                    for e in value.named_children(&mut c3) {
+                        exprs.push(e);
+                    }
+                }
+                bind_names(names, exprs, src, s);
+            }
+        }
+        "short_var_declaration" => {
+            let mut names: Vec<String> = Vec::new();
+            let mut lc = node.walk();
+            for left in node.children_by_field_name("left", &mut lc) {
+                // the field is an expression_list wrapper; the identifiers
+                // are its named children
+                let mut c2 = left.walk();
+                for n in left.named_children(&mut c2) {
+                    if matches!(n.kind(), "identifier" | "type_identifier") {
+                        let t = clean(node_text(Some(n), src));
+                        if !t.is_empty() {
+                            names.push(t);
+                        }
+                    }
+                }
+            }
+            let mut exprs: Vec<Node> = Vec::new();
+            let mut rc = node.walk();
+            for right in node.children_by_field_name("right", &mut rc) {
+                let mut c2 = right.walk();
+                for e in right.named_children(&mut c2) {
+                    exprs.push(e);
+                }
+            }
+            bind_names(names, exprs, src, s);
+        }
+        "function_declaration" | "method_declaration" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                let mut cursor = params.walk();
+                for p in params.named_children(&mut cursor) {
+                    if p.kind() != "parameter_declaration" {
+                        continue;
+                    }
+                    let ty = clean(node_text(p.child_by_field_name("type"), src));
+                    let Some(binding) = binding_for_type(&ty, s) else {
+                        continue;
+                    };
+                    let mut c2 = p.walk();
+                    for n in p.children_by_field_name("name", &mut c2) {
+                        let name = clean(node_text(Some(n), src));
+                        if !name.is_empty() {
+                            s.bindings.insert(name, binding.clone());
+                        }
+                    }
+                }
+            }
+            // recurse into the body: `r := gin.Default()` / `api := r.Group(...)`
+            let mut cursor = node.walk();
+            for c in node.named_children(&mut cursor) {
+                scan_router_bindings(c, src, s);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for c in node.named_children(&mut cursor) {
+                scan_router_bindings(c, src, s);
+            }
+        }
+    }
+}
+
+fn record_router_import(spec: Node, src: &[u8], s: &mut RouterScanner) {
+    let Some(path) = spec
+        .child_by_field_name("path")
+        .and_then(|p| string_literal_value(p, src))
+    else {
+        return;
+    };
+    let alias = clean(node_text(spec.child_by_field_name("name"), src));
+    if alias == "." || alias == "_" {
+        return;
+    }
+    let local = if alias.is_empty() {
+        path.rsplit('/').next().unwrap_or("").to_string()
+    } else {
+        alias.clone()
+    };
+    if local.is_empty() || local == "_" {
+        return;
+    }
+    if is_gin_module(&path) && s.gin_local.is_none() {
+        s.gin_local = Some(local);
+    } else if path == "github.com/gorilla/mux" && s.mux_local.is_none() {
+        s.mux_local = Some(local);
+    }
+}
+
+/// Bind `names` to router receivers from the positional `exprs`.
+fn bind_names(names: Vec<String>, exprs: Vec<Node>, src: &[u8], s: &mut RouterScanner) {
+    for (name, expr) in names.iter().zip(exprs.iter()) {
+        if let Some(b) = eval_router_binding(*expr, s, src) {
+            s.bindings.insert(name.clone(), b);
+        }
+    }
+}
+
+/// Receiver binding for a parameter type text like `*gin.Engine`,
+/// `*gin.RouterGroup`, or `*mux.Router` (aliases honored).
+fn binding_for_type(ty: &str, s: &RouterScanner) -> Option<GinBinding> {
+    let t = ty.trim().trim_start_matches('*').trim();
+    let (pkg, name) = t.split_once('.')?;
+    if s.gin_local.as_deref() == Some(pkg) {
+        match name {
+            "Engine" => Some(GinBinding {
+                receiver: "engine".to_string(),
+                prefix: String::new(),
+            }),
+            "RouterGroup" => Some(GinBinding {
+                receiver: "routergroup".to_string(),
+                prefix: String::new(),
+            }),
+            _ => None,
+        }
+    } else if s.mux_local.as_deref() == Some(pkg) && name == "Router" {
+        Some(GinBinding {
+            receiver: "muxrouter".to_string(),
+            prefix: String::new(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Evaluate a right-hand side expression to a router binding:
+/// `gin.New()`/`gin.Default()` → engine; `mux.NewRouter()` → muxrouter;
+/// `<engine>.Group("/api")` → routergroup (prefix joined); a plain
+/// identifier resolves through previously bound names. `None` for anything
+/// unverifiable.
+fn eval_router_binding(expr: Node, s: &RouterScanner, src: &[u8]) -> Option<GinBinding> {
+    let mut n = expr;
+    while matches!(n.kind(), "parenthesized_expression" | "unary_expression") {
+        n = n.named_child(0)?;
+    }
+    if n.kind() == "identifier" {
+        return s
+            .bindings
+            .get(&clean(node_text(Some(n), src)))
+            .cloned();
+    }
+    if n.kind() != "call_expression" {
+        return None;
+    }
+    let fn_node = n.child_by_field_name("function")?;
+    // collect the selector chain outer → inner; the innermost identifier is
+    // the root (package or variable), each field a method call.
+    let mut methods: Vec<(String, Option<Node>)> = Vec::new();
+    let mut cur = fn_node;
+    let root: Option<String>;
+    loop {
+        match cur.kind() {
+            "selector_expression" => {
+                let field = clean(node_text(cur.child_by_field_name("field"), src));
+                if field.is_empty() {
+                    return None;
+                }
+                let args = cur
+                    .parent()
+                    .filter(|p| p.kind() == "call_expression")
+                    .and_then(|p| p.child_by_field_name("arguments"));
+                methods.push((field, args));
+                cur = cur.child_by_field_name("operand")?;
+            }
+            "call_expression" => {
+                cur = cur.child_by_field_name("function")?;
+            }
+            "identifier" | "type_identifier" => {
+                root = Some(clean(node_text(Some(cur), src)));
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let root = root?;
+    let from_package = s.gin_local.as_deref() == Some(root.as_str())
+        || s.mux_local.as_deref() == Some(root.as_str());
+    let mut binding = if from_package {
+        None
+    } else {
+        s.bindings.get(&root).cloned()
+    };
+    for (method, args) in methods.iter().rev() {
+        let path = args
+            .map(|a| args_string_literals(a, src).into_iter().next())
+            .flatten();
+        match method.as_str() {
+            "New" | "Default" if s.gin_local.as_deref() == Some(root.as_str()) => {
+                binding = Some(GinBinding {
+                    receiver: "engine".to_string(),
+                    prefix: String::new(),
+                });
+            }
+            "NewRouter" if s.mux_local.as_deref() == Some(root.as_str()) => {
+                binding = Some(GinBinding {
+                    receiver: "muxrouter".to_string(),
+                    prefix: String::new(),
+                });
+            }
+            "Group" => {
+                let cur = binding?;
+                if cur.receiver == "engine" || cur.receiver == "routergroup" {
+                    let prefix = join_path(&cur.prefix, &path.unwrap_or_default());
+                    binding = Some(GinBinding {
+                        receiver: "routergroup".to_string(),
+                        prefix,
+                    });
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    binding
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,5 +1896,206 @@ mod tests {
         let ja = serde_json::to_string(&a).unwrap();
         let jb = serde_json::to_string(&b).unwrap();
         assert_eq!(ja, jb);
+    }
+
+    #[test]
+    fn facts_public_exports() {
+        let ef = extract(
+            "package app\n\nfunc Exported() {}\nfunc hidden() {}\ntype Store struct{}\nconst MaxRetries = 3\nvar Version = \"1.0\"\nfunc (s *Store) Save() {}\n",
+        );
+        let exports: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::PublicExport { symbol, kind } => {
+                    Some(format!("{symbol}:{kind}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exports,
+            [
+                "Exported:function",
+                "MaxRetries:const",
+                "Store:type",
+                "Store.Save:method",
+                "Version:const",
+            ]
+        );
+        // hidden() is not exported
+        assert!(
+            !exports.iter().any(|e| e.starts_with("hidden")),
+            "hidden must not be exported: {exports:?}"
+        );
+    }
+
+    #[test]
+    fn facts_struct_fields() {
+        let ef = extract(
+            "package app\n\ntype User struct {\n    ID   int64\n    Name string\n    Age, Email string\n}\n\ntype Inner struct{}\n\ntype Outer struct {\n    Inner\n    db *sql.DB\n}\n",
+        );
+        let fields: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some(format!("{owner}.{name}:{mutable}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "Outer.Inner:true",
+                "Outer.db:true",
+                "User.Age:true",
+                "User.Email:true",
+                "User.ID:true",
+                "User.Name:true",
+            ]
+        );
+    }
+
+    #[test]
+    fn facts_gin_routes_require_import_and_receiver() {
+        let ef = extract(
+            "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc Ping(c *gin.Context) {}\n\nfunc setup(r *gin.Engine) {\n    r.GET(\"/ping\", Ping)\n    r.POST(\"/users\", Ping)\n    r.Handle(\"DELETE\", \"/users/:id\", Ping)\n}\n",
+        );
+        let regs: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } => {
+                    Some(format!("{owner}:{kind}:{target}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            regs,
+            [
+                "setup:route:DELETE /users/:id",
+                "setup:route:GET /ping",
+                "setup:route:POST /users",
+            ]
+        );
+    }
+
+    #[test]
+    fn facts_gin_group_prefix_resolves_paths() {
+        let ef = extract(
+            "package main\n\nimport (\n    \"github.com/gin-gonic/gin\"\n)\n\nfunc H(c *gin.Context) {}\n\nfunc setup() {\n    r := gin.Default()\n    api := r.Group(\"/api\")\n    v1 := api.Group(\"/v1\")\n    r.GET(\"/health\", H)\n    api.GET(\"/users\", H)\n    v1.GET(\"/items\", H)\n}\n",
+        );
+        let targets: Vec<&str> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { target, .. } => Some(target.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["GET /api/users", "GET /api/v1/items", "GET /health"]);
+    }
+
+    #[test]
+    fn facts_gin_plain_methods_are_not_routes() {
+        // no gin import → no route facts, even with get()/post() calls
+        let ef = extract(
+            "package app\n\nfunc get() {}\n\nfunc run() {\n    r := router.New()\n    r.get(\"/x\")\n    r.GET(\"/x\")\n}\n",
+        );
+        assert!(
+            !ef.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::Registration { .. })),
+            "plain methods must not become routes: {:?}",
+            ef.facts
+                .iter()
+                .filter(|f| matches!(f, SemanticFact::Registration { .. }))
+                .collect::<Vec<_>>()
+        );
+        // gin imported but receiver never bound to a gin type → still no route
+        let ef = extract(
+            "package app\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc run() {\n    var r other.Router\n    r.GET(\"/x\")\n}\n",
+        );
+        assert!(
+            !ef.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::Registration { .. })),
+            "unbound receiver must not become routes: {:?}",
+            ef.facts
+        );
+    }
+
+    #[test]
+    fn facts_gorilla_mux_routes() {
+        let ef = extract(
+            "package main\n\nimport \"github.com/gorilla/mux\"\n\nfunc H(w http.ResponseWriter, r *http.Request) {}\n\nfunc setup() *mux.Router {\n    r := mux.NewRouter()\n    r.HandleFunc(\"/items\", H)\n    r.HandleFunc(\"/items/{id}\", H)\n    return r\n}\n",
+        );
+        let regs: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { kind, target, .. } => {
+                    Some(format!("{kind}:{target}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(regs, ["route:/items", "route:/items/{id}"]);
+    }
+
+    #[test]
+    fn facts_http_handlefunc_and_gin_use_callbacks() {
+        let ef = extract(
+            "package main\n\nimport (\n    \"net/http\"\n\n    \"github.com/gin-gonic/gin\"\n)\n\nfunc Legacy(w http.ResponseWriter, r *http.Request) {}\nfunc Logger(c *gin.Context) {}\n\nfunc setup(r *gin.Engine) {\n    r.Use(Logger)\n    http.HandleFunc(\"/legacy\", Legacy)\n}\n",
+        );
+        let callbacks: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Callback { owner, callback } => {
+                    Some(format!("{owner}:{callback}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(callbacks, ["setup:Legacy", "setup:Logger"]);
+    }
+
+    #[test]
+    fn facts_gin_import_missing_blocks_http_and_gin_use() {
+        // http.HandleFunc with no net/http import local named `http`
+        let ef = extract(
+            "package app\n\nfunc run() {\n    http.HandleFunc(\"/x\", h)\n}\n",
+        );
+        assert!(
+            !ef.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::Callback { .. })),
+            "no import → no callbacks: {:?}",
+            ef.facts
+        );
+    }
+
+    #[test]
+    fn facts_deterministic_order() {
+        let src = "package main\n\nimport \"github.com/gin-gonic/gin\"\n\ntype User struct {\n    ID int64\n}\n\nfunc Ping(c *gin.Context) {}\n\nfunc setup(r *gin.Engine) {\n    r.GET(\"/ping\", Ping)\n    r.POST(\"/users\", Ping)\n}\n";
+        let a = extract(src);
+        let b = extract(src);
+        assert_eq!(
+            serde_json::to_string(&a.facts).unwrap(),
+            serde_json::to_string(&b.facts).unwrap()
+        );
+        // sorted by (owner, family, detail)
+        let keys: Vec<(String, String, String)> = a
+            .facts
+            .iter()
+            .map(fact_sort_key)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "facts must be emitted in sorted order");
     }
 }

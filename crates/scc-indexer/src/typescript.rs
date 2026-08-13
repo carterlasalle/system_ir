@@ -9,7 +9,7 @@
 
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -384,6 +384,12 @@ impl LanguageExtractor for TypeScriptExtractor {
             }
         }
 
+        // Semantic facts (Wave 9): public exports, annotations, fields,
+        // registrations, configuration ownership, callbacks. Framework facts
+        // (nest decorators, express registrations, react/svelte callbacks)
+        // are gated on the matching import; see `collect_facts`.
+        out.facts = collect_facts(&root, src, &file.path, &out.imports);
+
         out
         }
 }
@@ -549,6 +555,807 @@ fn push_children_excluding<'a>(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Semantic facts (Wave 9)
+// ---------------------------------------------------------------------------
+//
+// A second, independent traversal collects `SemanticFact`s on top of the
+// classic extraction. Facts are pure syntax: public exports (export
+// statements), decorators (nest), class fields, framework registrations
+// (nest `@Module` arrays, express route/middleware calls, next.config),
+// `process.env` configuration reads, and framework callbacks
+// (`useEffect`/`onMount`/`addEventListener`). Framework facts are verified
+// against the file's imports so a plain method named `get()` is never a
+// route and a random `@Whatever()` is never a nest annotation.
+
+/// Enclosing-symbol context for fact attribution.
+#[derive(Clone, Default)]
+struct FactCtx {
+    /// Enclosing callable ("ClassName.method" for methods, arrow-const names).
+    caller: Option<String>,
+    /// Enclosing class name.
+    class: Option<String>,
+    /// Module-level const being initialized (e.g. `const PORT = process.env.PORT`).
+    const_owner: Option<String>,
+}
+
+fn is_next_config_file(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next().unwrap_or(path),
+        "next.config.js"
+            | "next.config.cjs"
+            | "next.config.mjs"
+            | "next.config.ts"
+            | "next.config.cts"
+            | "next.config.mts"
+    )
+}
+
+/// Deterministic total order over facts: (family, owner/symbol, secondary,
+/// tertiary). Identical facts sort adjacent so `dedup` collapses them.
+fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
+    match f {
+        SemanticFact::PublicExport { symbol, kind } => (0, symbol.clone(), kind.clone(), String::new()),
+        SemanticFact::Annotation { name, target } => (1, target.clone(), name.clone(), String::new()),
+        SemanticFact::Field { owner, name, mutable } => (
+            2,
+            owner.clone(),
+            name.clone(),
+            if *mutable { "mutable" } else { "readonly" }.to_string(),
+        ),
+        SemanticFact::Registration { owner, kind, target } => {
+            (3, owner.clone(), kind.clone(), target.clone())
+        }
+        SemanticFact::Configuration { owner, key } => (4, owner.clone(), key.clone(), String::new()),
+        SemanticFact::Callback { owner, callback } => (5, owner.clone(), callback.clone(), String::new()),
+    }
+}
+
+fn has_import(imports: &[Import], pred: impl Fn(&str) -> bool) -> bool {
+    imports.iter().any(|i| pred(&i.module))
+}
+
+/// `@Name` / `@Name(...)` / `@ns.Name(...)` -> `Name`.
+fn decorator_name(dec: &Node, src: &[u8]) -> Option<String> {
+    let first = dec.named_children(&mut dec.walk()).next()?;
+    match first.kind() {
+        "identifier" => {
+            let n = node_text(&first, src).to_string();
+            if n.is_empty() { None } else { Some(n) }
+        }
+        "call_expression" => {
+            let f = first.child_by_field_name("function")?;
+            match f.kind() {
+                "identifier" => Some(node_text(&f, src).to_string()),
+                "member_expression" => f
+                    .child_by_field_name("property")
+                    .map(|p| node_text(&p, src).to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Name of the declaration a decorator decorates (class name, or
+/// `Class.member` for body decorators).
+fn decorated_target(dec: &Node, src: &[u8], ctx: &FactCtx) -> Option<String> {
+    let parent = dec.parent()?;
+    match parent.kind() {
+        "class_declaration" | "abstract_class_declaration" => parent
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, src).to_string()),
+        "export_statement" => {
+            // `export @Controller(...) class X` — find the class/function.
+            let mut cur = parent.walk();
+            for c in parent.named_children(&mut cur) {
+                if matches!(c.kind(), "class_declaration" | "abstract_class_declaration" | "function_declaration" | "generator_function_declaration") {
+                    if let Some(n) = c.child_by_field_name("name") {
+                        return Some(node_text(&n, src).to_string());
+                    }
+                }
+            }
+            None
+        }
+        "class_body" => {
+            // Member decorator: the decorated member is the next sibling.
+            let member = dec.next_named_sibling()?;
+            let name = match member.kind() {
+                "method_definition" | "public_field_definition" => member
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, src).to_string()),
+                _ => None,
+            }?;
+            match &ctx.class {
+                Some(c) if !c.is_empty() => Some(format!("{c}.{name}")),
+                _ => Some(name),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Identifiers in a nest `@Module({ controllers: [...], ... })` object:
+/// `(kind, target)` per array element.
+fn nest_module_arrays(dec: &Node, src: &[u8], out: &mut Vec<SemanticFact>, owner: &str) {
+    let Some(expr) = dec.named_children(&mut dec.walk()).next() else {
+        return;
+    };
+    let Some(call) = expr.kind().eq("call_expression").then_some(expr) else {
+        return;
+    };
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return;
+    };
+    let Some(obj) = args
+        .named_children(&mut args.walk())
+        .find(|c| c.kind() == "object")
+    else {
+        return;
+    };
+    let mut cur = obj.walk();
+    for pair in obj.named_children(&mut cur) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let Some(key) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        let kind = node_text(&key, src);
+        if !matches!(kind, "controllers" | "providers" | "imports" | "exports") {
+            continue;
+        }
+        let Some(value) = pair.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "array" {
+            continue;
+        }
+        let mut cur2 = value.walk();
+        for el in value.named_children(&mut cur2) {
+            if el.kind() != "identifier" {
+                continue;
+            }
+            let target = node_text(&el, src);
+            if !target.is_empty() {
+                out.push(SemanticFact::Registration {
+                    owner: owner.to_string(),
+                    kind: kind.to_string(),
+                    target: target.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// `process.env.KEY` / `process.env["KEY"]` -> key string.
+fn env_key(node: &Node, src: &[u8]) -> Option<String> {
+    let is_env = |obj: &Node| -> bool {
+        obj.kind() == "member_expression"
+            && obj
+                .child_by_field_name("object")
+                .map(|o| o.kind() == "identifier" && node_text(&o, src) == "process")
+                .unwrap_or(false)
+            && obj
+                .child_by_field_name("property")
+                .map(|p| node_text(&p, src) == "env")
+                .unwrap_or(false)
+    };
+    match node.kind() {
+        "member_expression" => {
+            let obj = node.child_by_field_name("object")?;
+            if !is_env(&obj) {
+                return None;
+            }
+            let key = node.child_by_field_name("property")?;
+            let k = node_text(&key, src);
+            if k.is_empty() { None } else { Some(k.to_string()) }
+        }
+        "subscript_expression" => {
+            let obj = node.child_by_field_name("object")?;
+            if !is_env(&obj) {
+                return None;
+            }
+            let idx = node.child_by_field_name("index")?;
+            if idx.kind() != "string" {
+                return None;
+            }
+            let k = unquote(node_text(&idx, src));
+            if k.is_empty() { None } else { Some(k) }
+        }
+        _ => None,
+    }
+}
+
+/// Method name of a member call whose receiver is an identifier in `allowed`
+/// (`app.get` -> "get"). Returns None for other shapes.
+fn receiver_ident(function: &Node, src: &[u8], allowed: &[&str]) -> Option<String> {
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let obj = function.child_by_field_name("object")?;
+    if obj.kind() != "identifier" {
+        return None;
+    }
+    let receiver = node_text(&obj, src);
+    if !allowed.contains(&receiver) {
+        return None;
+    }
+    let prop = function.child_by_field_name("property")?;
+    let method = node_text(&prop, src);
+    if method.is_empty() {
+        None
+    } else {
+        Some(method.to_string())
+    }
+}
+
+/// Text of the last identifier/member argument (a named handler/middleware),
+/// else None.
+fn last_named_arg(call: &Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let children: Vec<Node> = args.named_children(&mut args.walk()).collect();
+    for c in children.iter().rev() {
+        if matches!(c.kind(), "identifier" | "member_expression") {
+            return Some(normalize_callee(node_text(c, src)));
+        }
+    }
+    None
+}
+
+/// Collect all semantic facts for one file. Iterative (no recursion), never
+/// panics: hostile input just yields fewer facts.
+/// panics: hostile input just yields fewer facts.
+fn collect_facts(root: &Node, src: &[u8], path: &str, imports: &[Import]) -> Vec<SemanticFact> {
+    let nest = has_import(imports, |m| m.starts_with("@nestjs/"));
+    let express = has_import(imports, |m| m == "express");
+    let react = has_import(imports, |m| m == "react");
+    let svelte = has_import(imports, |m| m == "svelte");
+    let next_config = is_next_config_file(path);
+
+    let mut facts: Vec<SemanticFact> = Vec::new();
+    let mut frames: Vec<(Node, FactCtx)> = vec![(*root, FactCtx::default())];
+
+    while let Some((node, ctx)) = frames.pop() {
+        if node.is_error() || node.is_missing() {
+            continue;
+        }
+        let module_level = ctx.caller.is_none() && ctx.class.is_none();
+        match node.kind() {
+            "export_statement" => {
+                // Re-exports: `export { a } from "m"`, `export * from "m"`,
+                // `export * as ns from "m"`.
+                if let Some(source) = node.child_by_field_name("source") {
+                    let module = unquote(node_text(&source, src));
+                    let mut any = false;
+                    let mut cur = node.walk();
+                    for c in node.named_children(&mut cur) {
+                        match c.kind() {
+                            "export_clause" => {
+                                let mut cur2 = c.walk();
+                                for spec in c.named_children(&mut cur2) {
+                                    if spec.kind() != "export_specifier" {
+                                        continue;
+                                    }
+                                    let name = field_text(&spec, "alias", src)
+                                        .or_else(|| field_text(&spec, "name", src));
+                                    if let Some(n) = name {
+                                        if !n.is_empty() {
+                                            facts.push(SemanticFact::PublicExport {
+                                                symbol: n,
+                                                kind: "module".into(),
+                                            });
+                                            any = true;
+                                        }
+                                    }
+                                }
+                            }
+                            "namespace_export" => {
+                                let mut cur2 = c.walk();
+                                for id in c.named_children(&mut cur2) {
+                                    if id.kind() == "identifier" {
+                                        let n = node_text(&id, src);
+                                        if !n.is_empty() {
+                                            facts.push(SemanticFact::PublicExport {
+                                                symbol: n.to_string(),
+                                                kind: "module".into(),
+                                            });
+                                            any = true;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // `export * from "m"`: the whole module is public surface.
+                    if !any && !module.is_empty() {
+                        facts.push(SemanticFact::PublicExport {
+                            symbol: module,
+                            kind: "module".into(),
+                        });
+                    }
+                } else {
+                    // Local re-export `export { a }` or `export default <id>`.
+                    // (`default` is an unnamed keyword token.)
+                    let mut cur = node.walk();
+                    let has_default = node.children(&mut cur).any(|c| c.kind() == "default");
+                    let children: Vec<Node> = node.named_children(&mut cur).collect();
+                    if has_default {
+                        for id in children.iter().filter(|c| c.kind() == "identifier") {
+                            let n = node_text(id, src);
+                            if !n.is_empty() {
+                                facts.push(SemanticFact::PublicExport {
+                                    symbol: n.to_string(),
+                                    kind: "module".into(),
+                                });
+                            }
+                        }
+                    }
+                    for c in children {
+                        if c.kind() != "export_clause" {
+                            continue;
+                        }
+                        let mut cur2 = c.walk();
+                        for spec in c.named_children(&mut cur2) {
+                            if spec.kind() != "export_specifier" {
+                                continue;
+                            }
+                            let name = field_text(&spec, "alias", src)
+                                .or_else(|| field_text(&spec, "name", src));
+                            if let Some(n) = name {
+                                if !n.is_empty() {
+                                    facts.push(SemanticFact::PublicExport {
+                                        symbol: n,
+                                        kind: "module".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Decorators on `export @Controller(...) class X`.
+                if nest {
+                    let mut cur = node.walk();
+                    for dec in node.named_children(&mut cur) {
+                        if dec.kind() != "decorator" {
+                            continue;
+                        }
+                        if let Some(target) = decorated_target(&dec, src, &ctx) {
+                            if let Some(name) = decorator_name(&dec, src) {
+                                facts.push(SemanticFact::Annotation {
+                                    name: name.clone(),
+                                    target: target.clone(),
+                                });
+                                if name == "Module" {
+                                    nest_module_arrays(&dec, src, &mut facts, &target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, src).to_string())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                if module_level && is_exported(&node) {
+                    facts.push(SemanticFact::PublicExport {
+                        symbol: name.clone(),
+                        kind: "class".into(),
+                    });
+                }
+                // Class fields: `readonly` modifier -> immutable.
+                if module_level {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        let mut cur = body.walk();
+                        for f in body.named_children(&mut cur) {
+                            if f.kind() != "public_field_definition" {
+                                continue;
+                            }
+                            let fname = f
+                                .child_by_field_name("name")
+                                .or_else(|| {
+                                    f.named_children(&mut f.walk())
+                                        .find(|c| c.kind() == "property_identifier")
+                                })
+                                .map(|n| node_text(&n, src).to_string())
+                                .unwrap_or_default();
+                            if fname.is_empty() {
+                                continue;
+                            }
+                            let mutable =
+                                !f.children(&mut f.walk()).any(|c| c.kind() == "readonly");
+                            facts.push(SemanticFact::Field {
+                                owner: name.clone(),
+                                name: fname,
+                                mutable,
+                            });
+                        }
+                    }
+                }
+                // Decorators on a plain (non-exported) decorated class.
+                if nest {
+                    let mut cur = node.walk();
+                    for dec in node.named_children(&mut cur) {
+                        if dec.kind() != "decorator" {
+                            continue;
+                        }
+                        if let Some(target) = decorated_target(&dec, src, &ctx) {
+                            if let Some(dname) = decorator_name(&dec, src) {
+                                facts.push(SemanticFact::Annotation {
+                                    name: dname.clone(),
+                                    target: target.clone(),
+                                });
+                                if dname == "Module" {
+                                    nest_module_arrays(&dec, src, &mut facts, &target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "class_body" => {
+                // Member decorators (`@Get()` above a method).
+                if nest {
+                    let mut cur = node.walk();
+                    for dec in node.named_children(&mut cur) {
+                        if dec.kind() != "decorator" {
+                            continue;
+                        }
+                        if let Some(target) = decorated_target(&dec, src, &ctx) {
+                            if let Some(dname) = decorator_name(&dec, src) {
+                                facts.push(SemanticFact::Annotation {
+                                    name: dname,
+                                    target,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "function_declaration" | "generator_function_declaration" => {
+                if module_level && is_exported(&node) {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        facts.push(SemanticFact::PublicExport {
+                            symbol: n,
+                            kind: "function".into(),
+                        });
+                    }
+                }
+            }
+            "interface_declaration" => {
+                if module_level && is_exported(&node) {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        facts.push(SemanticFact::PublicExport {
+                            symbol: n,
+                            kind: "interface".into(),
+                        });
+                    }
+                }
+            }
+            "type_alias_declaration" => {
+                if module_level && is_exported(&node) {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        facts.push(SemanticFact::PublicExport {
+                            symbol: n,
+                            kind: "type".into(),
+                        });
+                    }
+                }
+            }
+            "enum_declaration" => {
+                if module_level && is_exported(&node) {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        facts.push(SemanticFact::PublicExport {
+                            symbol: n,
+                            kind: "enum".into(),
+                        });
+                    }
+                }
+            }
+            "lexical_declaration" => {
+                if module_level {
+                    let exported = is_exported(&node);
+                    let mut cur = node.walk();
+                    for d in node.named_children(&mut cur) {
+                        if d.kind() != "variable_declarator" {
+                            continue;
+                        }
+                        let name = d
+                            .child_by_field_name("name")
+                            .map(|n| node_text(&n, src).to_string())
+                            .unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if exported {
+                            facts.push(SemanticFact::PublicExport {
+                                symbol: name.clone(),
+                                kind: "const".into(),
+                            });
+                        }
+                        // next.config: the exported config object registers
+                        // with the next framework (filename-verified).
+                        if next_config {
+                            if let Some(v) = d.child_by_field_name("value") {
+                                if v.kind() == "object" {
+                                    facts.push(SemanticFact::Registration {
+                                        owner: name.clone(),
+                                        kind: "next-config".into(),
+                                        target: "next".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "call_expression" => {
+                let Some(function) = node.child_by_field_name("function") else {
+                    continue;
+                };
+                // Express registrations (import-verified): app/router/server/
+                // api/route/express .get/.post/.../.use(...).
+                if express {
+                    if let Some(method) = receiver_ident(
+                        &function,
+                        src,
+                        &["app", "router", "server", "api", "route", "express"],
+                    ) {
+                        let owner = ctx
+                            .caller
+                            .clone()
+                            .unwrap_or_else(|| receiver_text(&function, src));
+                        if method == "use" {
+                            let target = last_named_arg(&node, src).or_else(|| {
+                                first_string_arg(&node, src).or_else(|| {
+                                    node.child_by_field_name("arguments")
+                                        .and_then(|a| {
+                                            a.named_children(&mut a.walk()).next()
+                                        })
+                                        .map(|a| match a.kind() {
+                                            "call_expression" => a
+                                                .child_by_field_name("function")
+                                                .map(|f| normalize_callee(node_text(&f, src)))
+                                                .unwrap_or_default(),
+                                            _ => normalize_callee(node_text(&a, src)),
+                                        })
+                                })
+                            });
+                            if let Some(t) = target {
+                                if !t.is_empty() {
+                                    facts.push(SemanticFact::Registration {
+                                        owner,
+                                        kind: "middleware".into(),
+                                        target: t,
+                                    });
+                                }
+                            }
+                        } else if matches!(
+                            method.as_str(),
+                            "get" | "post" | "put" | "delete" | "patch" | "all"
+                        ) {
+                            if let Some(p) = first_string_arg(&node, src) {
+                                facts.push(SemanticFact::Registration {
+                                    owner,
+                                    kind: "route".into(),
+                                    target: format!("{} {p}", method.to_uppercase()),
+                                });
+                            }
+                        }
+                    }
+                }
+                // React useEffect / Svelte onMount callbacks.
+                if function.kind() == "identifier" {
+                    let callee = node_text(&function, src);
+                    let framework_cb =
+                        (react && callee == "useEffect") || (svelte && callee == "onMount");
+                    if framework_cb {
+                        if let Some(owner) = ctx.caller.clone() {
+                            if let Some(cb) = last_named_arg(&node, src) {
+                                facts.push(SemanticFact::Callback { owner, callback: cb });
+                            }
+                        }
+                    }
+                }
+                // DOM addEventListener (receiver-verified: window/document/
+                // globalThis).
+                if let Some(method) =
+                    receiver_ident(&function, src, &["window", "document", "globalThis"])
+                {
+                    if method == "addEventListener" {
+                        if let Some(owner) = ctx.caller.clone() {
+                            if let Some(cb) = last_named_arg(&node, src) {
+                                facts.push(SemanticFact::Callback { owner, callback: cb });
+                            }
+                        }
+                    }
+                }
+            }
+            "member_expression" | "subscript_expression" => {
+                if let Some(key) = env_key(&node, src) {
+                    let owner = ctx
+                        .caller
+                        .clone()
+                        .or_else(|| ctx.const_owner.clone())
+                        .or_else(|| ctx.class.clone());
+                    if let Some(owner) = owner {
+                        facts.push(SemanticFact::Configuration { owner, key });
+                    }
+                }
+            }
+            "assignment_expression" if next_config => {
+                // next.config: `module.exports = nextConfig`.
+                {
+                    if let Some(left) = node.child_by_field_name("left") {
+                        if left.kind() == "member_expression" && node_text(&left, src) == "module.exports" {
+                            if let Some(right) = node.child_by_field_name("right") {
+                                if right.kind() == "identifier" {
+                                    let owner = node_text(&right, src);
+                                    if !owner.is_empty() {
+                                        facts.push(SemanticFact::Registration {
+                                            owner: owner.to_string(),
+                                            kind: "next-config".into(),
+                                            target: "next".into(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Push children with adjusted fact context. Decorator subtrees are
+        // consumed above; skipping them here avoids double-reporting.
+        let mut children: Vec<Node> = Vec::new();
+        {
+            let mut cur = node.walk();
+            for c in node.named_children(&mut cur) {
+                if c.kind() == "decorator" {
+                    continue;
+                }
+                children.push(c);
+            }
+        }
+        let child_ctx: FactCtx = match node.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if module_level {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        FactCtx {
+                            caller: Some(n),
+                            class: None,
+                            const_owner: ctx.const_owner.clone(),
+                        }
+                    } else {
+                        ctx.clone()
+                    }
+                } else {
+                    ctx.clone()
+                }
+            }
+            "method_definition" => {
+                let n = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, src).to_string())
+                    .unwrap_or_default();
+                if n.is_empty() {
+                    ctx.clone()
+                } else {
+                    let full = match &ctx.class {
+                        Some(c) if !c.is_empty() => format!("{c}.{n}"),
+                        Some(_) => n,
+                        None => n,
+                    };
+                    FactCtx {
+                        caller: Some(full),
+                        class: None,
+                        const_owner: ctx.const_owner.clone(),
+                    }
+                }
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                if module_level {
+                    let n = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if !n.is_empty() {
+                        FactCtx { caller: None, class: Some(n), const_owner: None }
+                    } else {
+                        ctx.clone()
+                    }
+                } else {
+                    ctx.clone()
+                }
+            }
+            "lexical_declaration" => {
+                // Module-level arrow/function consts become callers; every
+                // declarator value reads config under the const's name.
+                let mut cur = node.walk();
+                for d in node.named_children(&mut cur) {
+                    if d.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let name = d
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, src).to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let mut d_ctx = ctx.clone();
+                    if module_level {
+                        d_ctx.const_owner = Some(name.clone());
+                        if let Some(v) = d.child_by_field_name("value") {
+                            if matches!(
+                                v.kind(),
+                                "arrow_function" | "function_expression" | "generator_function"
+                            ) {
+                                d_ctx.caller = Some(name.clone());
+                            }
+                        }
+                    }
+                    let dchildren: Vec<Node> = d.named_children(&mut d.walk()).collect();
+                    for c in dchildren.iter().rev() {
+                        frames.push((*c, d_ctx.clone()));
+                    }
+                }
+                continue;
+            }
+            "public_field_definition" => {
+                // Field initializers read config under the class name.
+                FactCtx {
+                    caller: None,
+                    class: ctx.class.clone(),
+                    const_owner: ctx.class.clone(),
+                }
+            }
+            _ => ctx.clone(),
+        };
+        for c in children.iter().rev() {
+            frames.push((*c, child_ctx.clone()));
+        }
+    }
+
+    facts.sort_by_key(fact_sort_key);
+    facts.dedup();
+    facts
+}
+fn receiver_text(function: &Node, src: &[u8]) -> String {
+    function
+        .child_by_field_name("object")
+        .map(|o| node_text(&o, src).to_string())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,5 +3059,267 @@ describe("suite", () => { it("works", () => {}); });
         assert_eq!(sniff_sql_target("SELECT * FROM \"weird table\" x").as_deref(), Some("weird"));
         assert_eq!(sniff_sql_target("SELECT 1"), None);
         assert_eq!(sniff_sql_target("SELECT * FROM db.users").as_deref(), Some("db"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic facts (Wave 9)
+    // -----------------------------------------------------------------------
+
+    fn has_fact(facts: &[SemanticFact], want: &SemanticFact) -> bool {
+        facts.iter().any(|f| f == want)
+    }
+
+    #[test]
+    fn facts_public_exports() {
+        let ef = extract(
+            "src/lib.ts",
+            r#"export function add(a: number): number { return a; }
+function hidden() {}
+export class User { name: string = ""; }
+export interface Named { name: string; }
+export type Alias = string;
+export enum Color { Red }
+export const LIMIT = 10;
+export { add as plus } from "./util";
+export * from "./types";
+export default DEFAULT_VALUE;
+const DEFAULT_VALUE = 1;
+export { hidden };
+"#,
+        );
+        let want = |s: &str, k: &str| SemanticFact::PublicExport { symbol: s.into(), kind: k.into() };
+        // plain exports with their kinds
+        assert!(has_fact(&ef.facts, &want("add", "function")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("User", "class")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("Named", "interface")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("Alias", "type")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("Color", "enum")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("LIMIT", "const")), "{:?}", ef.facts);
+        // re-exports + default export + plain `export { a }`
+        assert!(has_fact(&ef.facts, &want("plus", "module")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("./types", "module")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("DEFAULT_VALUE", "module")), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &want("hidden", "module")), "{:?}", ef.facts);
+        // nothing for the non-exported helper
+        assert!(!has_fact(&ef.facts, &want("hidden", "function")), "{:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_nest_annotations_fields_and_module_registrations() {
+        let ef = extract(
+            "src/app.module.ts",
+            r#"import { Controller, Get, Module, Injectable } from "@nestjs/common";
+
+@Injectable()
+export class UsersService {
+  private readonly base: string = "/users";
+  retries = 0;
+  constructor(private readonly svc: string) {}
+}
+
+@Controller("users")
+export class UsersController {
+  constructor(private readonly svc: UsersService) {}
+  @Get()
+  async list(): Promise<string[]> { return []; }
+}
+
+@Module({
+  controllers: [UsersController],
+  providers: [UsersService],
+})
+export class AppModule {}
+"#,
+        );
+        // annotations
+        assert!(has_fact(&ef.facts, &SemanticFact::Annotation { name: "Injectable".into(), target: "UsersService".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Annotation { name: "Controller".into(), target: "UsersController".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Annotation { name: "Get".into(), target: "UsersController.list".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Annotation { name: "Module".into(), target: "AppModule".into() }), "{:?}", ef.facts);
+        // fields with mutability
+        assert!(has_fact(&ef.facts, &SemanticFact::Field { owner: "UsersService".into(), name: "base".into(), mutable: false }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Field { owner: "UsersService".into(), name: "retries".into(), mutable: true }), "{:?}", ef.facts);
+        // module registrations
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "AppModule".into(), kind: "controllers".into(), target: "UsersController".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "AppModule".into(), kind: "providers".into(), target: "UsersService".into() }), "{:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_annotations_gated_on_nest_import() {
+        // No @nestjs import: decorators are not framework facts.
+        let ef = extract(
+            "src/plain.ts",
+            r#"class Foo {
+  @Get()
+  list() {}
+}
+"#,
+        );
+        assert!(ef.facts.is_empty(), "{:?}", ef.facts);
+        // A plain method named get is never a route/registration either.
+        let ef2 = extract(
+            "src/plain2.ts",
+            r#"class Router {
+  get(path: string) { return path; }
+}
+"#,
+        );
+        assert!(ef2.facts.is_empty(), "{:?}", ef2.facts);
+    }
+
+    #[test]
+    fn facts_express_registrations() {
+        let ef = extract(
+            "src/server.ts",
+            r#"import express from "express";
+const app = express();
+app.use(express.json());
+app.use("/api", apiRouter);
+app.get("/health", healthHandler);
+function setup(server: any) {
+  server.get("/x", h);
+}
+"#,
+        );
+        // module-level: owner falls back to the app receiver (a written symbol)
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "app".into(), kind: "middleware".into(), target: "express.json".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "app".into(), kind: "middleware".into(), target: "apiRouter".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "app".into(), kind: "route".into(), target: "GET /health".into() }), "{:?}", ef.facts);
+        // inside a function the owner is the function
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "setup".into(), kind: "route".into(), target: "GET /x".into() }), "{:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_express_registrations_gated_on_import() {
+        // No express import: api.get is not an express registration.
+        let ef = extract(
+            "src/other.ts",
+            r#"const api = { get: (p: string, h: any) => {} };
+api.get("/thing", handler);
+"#,
+        );
+        assert!(ef.facts.is_empty(), "{:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_configuration_reads() {
+        let ef = extract(
+            "src/config.ts",
+            r#"import express from "express";
+const app = express();
+const PORT = process.env.PORT;
+const NAMED = process.env["API_KEY"];
+function read(): string { return process.env.DB_URL; }
+class Client {
+  static readonly endpoint = process.env.ENDPOINT;
+  readSecret() { return process.env.TOKEN; }
+}
+"#,
+        );
+        assert!(has_fact(&ef.facts, &SemanticFact::Configuration { owner: "PORT".into(), key: "PORT".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Configuration { owner: "NAMED".into(), key: "API_KEY".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Configuration { owner: "read".into(), key: "DB_URL".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Configuration { owner: "Client".into(), key: "ENDPOINT".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Configuration { owner: "Client.readSecret".into(), key: "TOKEN".into() }), "{:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_callbacks() {
+        let ef = extract(
+            "src/app.tsx",
+            r#"import { useEffect } from "react";
+import { onMount } from "svelte";
+function handleClick() {}
+function handleAuth() {}
+export const App = () => {
+  useEffect(handleAuth, []);
+  document.addEventListener("click", handleClick);
+  return null;
+};
+window.addEventListener("load", handleLoad);
+function handleLoad() {}
+"#,
+        );
+        assert!(has_fact(&ef.facts, &SemanticFact::Callback { owner: "App".into(), callback: "handleAuth".into() }), "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Callback { owner: "App".into(), callback: "handleClick".into() }), "{:?}", ef.facts);
+        // module-level window listener: no enclosing symbol -> no fact
+        assert!(!has_fact(&ef.facts, &SemanticFact::Callback { owner: "handleLoad".into(), callback: "handleLoad".into() }), "{:?}", ef.facts);
+        // svelte onMount (import-verified)
+        let ef2 = extract(
+            "src/comp.svelte.ts",
+            r#"import { onMount } from "svelte";
+export function init() {
+  onMount(refresh);
+}
+function refresh() {}
+"#,
+        );
+        assert!(has_fact(&ef2.facts, &SemanticFact::Callback { owner: "init".into(), callback: "refresh".into() }), "{:?}", ef2.facts);
+        // no react import -> useEffect is not a framework callback
+        let ef3 = extract(
+            "src/plain3.ts",
+            r#"function App() { useEffect(foo); }
+function foo() {}
+"#,
+        );
+        assert!(ef3.facts.is_empty(), "{:?}", ef3.facts);
+    }
+
+    #[test]
+    fn facts_next_config() {
+        let ef = extract(
+            "next.config.js",
+            r#"const nextConfig = { rewrites: () => [] };
+module.exports = nextConfig;
+"#,
+        );
+        // deduped: const object + module.exports assignment are one fact
+        let regs: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Registration { kind, .. } if kind == "next-config"))
+            .collect();
+        assert_eq!(regs.len(), 1, "{:?}", ef.facts);
+        assert!(has_fact(&ef.facts, &SemanticFact::Registration { owner: "nextConfig".into(), kind: "next-config".into(), target: "next".into() }), "{:?}", ef.facts);
+        // a non-next.config file never registers next
+        let ef2 = extract(
+            "src/other.ts",
+            r#"const cfg = { x: 1 };
+module.exports = cfg;
+"#,
+        );
+        assert!(ef2.facts.is_empty(), "{:?}", ef2.facts);
+    }
+
+    #[test]
+    fn facts_deterministic() {
+        let src = r#"import { Controller, Get, Module } from "@nestjs/common";
+import express from "express";
+const app = express();
+app.get("/health", h);
+export function h() {}
+@Controller("x")
+export class C {
+  @Get()
+  m() { return process.env.KEY; }
+}
+@Module({ controllers: [C] })
+export class M {}
+"#;
+        let a = extract("src/a.ts", src);
+        let b = extract("src/a.ts", src);
+        assert_eq!(a.facts, b.facts, "deterministic across runs");
+        assert!(!a.facts.is_empty());
+    }
+
+    #[test]
+    fn facts_hostile_input_never_panics() {
+        let nasty = "export {";
+        let ef = extract("src/broken.ts", nasty);
+        assert!(ef.facts.is_empty());
+        let ef2 = extract("src/broken2.ts", "@Module({ controllers: [");
+        assert!(ef2.facts.is_empty());
+        let ef3 = extract("src/broken3.ts", "app.get(\" / broken\nprocess.env.");
+        assert!(ef3.facts.is_empty());
     }
 }

@@ -276,11 +276,22 @@ pub fn collect_lexical_candidates_full(
         }
     }
 
+    // Routes are contracts — they must always surface when they match the
+    // goal, regardless of lexical crowding from the fact layer (exports/
+    // contracts/tests compete for the same candidate budget). Ground-truth
+    // recall for route items depends on these surviving truncation.
+    for r in view.entities_of_kind(kinds::ROUTE) {
+        let name_l = r.name.to_ascii_lowercase();
+        if goal_terms.iter().any(|t| name_l.contains(t)) {
+            push(r, 3.0, "route-contract", &mut out, &mut seen);
+        }
+    }
+
     out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     if let Some(rr) = reranker {
         rr.rerank(goal, &mut out);
     }
-    out.truncate(limit.max(20));
+    out.truncate((limit + 8).max(20));
     out
 }
 

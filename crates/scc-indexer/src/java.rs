@@ -6,8 +6,8 @@
 //! strings, matching the python.rs contract).
 
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SourceFile,
-    StoreOp, StoreRef, Symbol, SymbolKind,
+    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
 };
 use tree_sitter::{Node, Parser};
 
@@ -323,6 +323,8 @@ fn technology_for(root: &str) -> Option<String> {
 struct Scope {
     name: String,
     is_class: bool,
+    /// The enclosing type is an interface: members are implicitly public.
+    is_interface: bool,
 }
 
 #[derive(Default)]
@@ -334,6 +336,7 @@ struct Ctx {
     retries: Vec<Retry>,
     entrypoints: Vec<Entrypoint>,
     scopes: Vec<Scope>,
+    facts: Vec<SemanticFact>,
 }
 
 impl Ctx {
@@ -351,6 +354,9 @@ impl Ctx {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
     fn into_extracted(self) -> ExtractedFile {
+        let mut facts = self.facts;
+        // Deterministic order: (owning symbol, fact kind, tiebreaker).
+        facts.sort_by_key(fact_sort_key);
         ExtractedFile {
             symbols: self.symbols,
             imports: self.imports,
@@ -361,14 +367,123 @@ impl Ctx {
             retries: self.retries,
             entrypoints: self.entrypoints,
             cli_flags: std::collections::BTreeMap::new(),
-            facts: Vec::new(),
+            facts,
         }
-        }
+    }
+
+    /// Any import whose module string starts with `prefix`.
+    fn has_import(&self, prefix: &str) -> bool {
+        self.imports.iter().any(|i| i.module.starts_with(prefix))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Walker
 // ---------------------------------------------------------------------------
+
+/// Deterministic order for semantic facts: (owning symbol, fact kind,
+/// tiebreaker). `facts` are sorted before emission so exports never vary
+/// run-to-run regardless of walk order.
+fn fact_sort_key(f: &SemanticFact) -> (String, u8, String, String) {
+    match f {
+        SemanticFact::PublicExport { symbol, kind } => {
+            (symbol.clone(), 0, kind.clone(), String::new())
+        }
+        SemanticFact::Annotation { name, target } => {
+            (target.clone(), 1, name.clone(), String::new())
+        }
+        SemanticFact::Field {
+            owner,
+            name,
+            mutable,
+        } => (
+            owner.clone(),
+            2,
+            name.clone(),
+            if *mutable { "mutable" } else { "final" }.to_string(),
+        ),
+        SemanticFact::Registration { owner, kind, target } => {
+            (owner.clone(), 3, kind.clone(), target.clone())
+        }
+        SemanticFact::Callback { owner, callback } => {
+            (owner.clone(), 4, callback.clone(), String::new())
+        }
+        SemanticFact::Configuration { owner, key } => {
+            (owner.clone(), 5, key.clone(), String::new())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Semantic facts (Wave 9)
+// ---------------------------------------------------------------------------
+
+/// Framework import roots. A framework-named annotation is only recognized
+/// as a framework fact when the matching import is present — a plain method
+/// carrying a custom `@GetMapping` and no Spring import is never a route.
+const SPRING_ROOT: &str = "org.springframework";
+const JUNIT_ROOT: &str = "org.junit";
+const MOCKITO_ROOT: &str = "org.mockito";
+
+/// Spring MVC/context annotation names.
+fn is_spring_annotation(name: &str) -> bool {
+    matches!(
+        name,
+        "Controller"
+            | "RestController"
+            | "GetMapping"
+            | "PostMapping"
+            | "PutMapping"
+            | "DeleteMapping"
+            | "PatchMapping"
+            | "RequestMapping"
+            | "Bean"
+            | "Service"
+            | "Repository"
+            | "Component"
+            | "Autowired"
+            | "Configuration"
+            | "Value"
+            | "Scheduled"
+            | "PathVariable"
+            | "RequestBody"
+            | "RequestParam"
+            | "ResponseBody"
+            | "Transactional"
+            | "SpringBootApplication"
+    )
+}
+
+/// JUnit 4/5 annotation names.
+fn is_junit_annotation(name: &str) -> bool {
+    matches!(
+        name,
+        "Test"
+            | "Before"
+            | "After"
+            | "BeforeClass"
+            | "AfterClass"
+            | "BeforeAll"
+            | "AfterAll"
+            | "BeforeEach"
+            | "AfterEach"
+            | "Rule"
+            | "Ignore"
+            | "Disabled"
+            | "RunWith"
+            | "ExtendWith"
+            | "ParameterizedTest"
+            | "RepeatedTest"
+            | "Timeout"
+            | "TempDir"
+            | "DisplayName"
+    )
+}
+
+/// Mockito annotation names.
+fn is_mockito_annotation(name: &str) -> bool {
+    matches!(name, "Mock" | "InjectMocks" | "Spy" | "Captor" | "MockBean")
+}
 
 impl JavaExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
@@ -413,9 +528,24 @@ impl JavaExtractor {
             docstring: self.leading_javadoc(node, src),
             parent: None,
         });
+        let modifiers = self.modifiers_text(node, src);
+        let is_public = modifiers.split_whitespace().any(|w| w == "public");
+        if is_public {
+            let kind_str = match kind {
+                SymbolKind::Interface => "interface",
+                SymbolKind::Enum => "enum",
+                _ => "class",
+            };
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: name.clone(),
+                kind: kind_str.to_string(),
+            });
+        }
+        self.record_annotations(node, ctx, src, &name);
         ctx.scopes.push(Scope {
             name: name.clone(),
             is_class: true,
+            is_interface: kind == SymbolKind::Interface,
         });
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
@@ -458,9 +588,23 @@ impl JavaExtractor {
                 line: start_line,
             });
         }
+        // Wave 9 facts: public API surface, annotations, registrations,
+        // lifecycle callbacks.
+        let is_interface = ctx.scopes.last().map(|s| s.is_interface).unwrap_or(false);
+        let is_public = modifiers.split_whitespace().any(|w| w == "public") || is_interface;
+        if is_public {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: sym_name.clone(),
+                kind: "method".to_string(),
+            });
+        }
+        self.record_annotations(node, ctx, src, &sym_name);
+        self.record_spring_registrations(node, ctx, src, &class, &sym_name);
+        self.record_junit_lifecycle(node, ctx, src, &class, &sym_name);
         ctx.scopes.push(Scope {
             name: sym_name,
             is_class: false,
+            is_interface: false,
         });
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
@@ -487,15 +631,27 @@ impl JavaExtractor {
             parent: Some(class.clone()),
         });
         self.maybe_retry(node, ctx, src, &sym_name);
+        // Wave 9: a public constructor is API surface.
+        let modifiers = self.modifiers_text(node, src);
+        if modifiers.split_whitespace().any(|w| w == "public") {
+            ctx.facts.push(SemanticFact::PublicExport {
+                symbol: sym_name.clone(),
+                kind: "constructor".to_string(),
+            });
+        }
+        self.record_annotations(node, ctx, src, &sym_name);
         ctx.scopes.push(Scope {
             name: sym_name,
             is_class: false,
+            is_interface: false,
         });
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
 
-    /// Field declarations → const symbols named `Class.field`.
+    /// Field declarations → const symbols named `Class.field` plus Wave 9
+    /// Field facts (mutable unless `final` / interface constant) and JUnit
+    /// `@Rule` registrations.
     fn walk_field(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         if !ctx.top_is_class() {
             self.walk_children(node, ctx, src);
@@ -504,6 +660,14 @@ impl JavaExtractor {
         let class = ctx.top_name();
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
+        let modifiers = self.modifiers_text(node, src);
+        let is_final = modifiers.split_whitespace().any(|w| w == "final");
+        let in_interface = ctx.scopes.last().map(|s| s.is_interface).unwrap_or(false);
+        let mutable = !is_final && !in_interface;
+        let has_rule = ctx.has_import(JUNIT_ROOT)
+            && annotations_on(node, src)
+                .iter()
+                .any(|(n, _)| n == "Rule");
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() != "variable_declarator" {
@@ -516,8 +680,9 @@ impl JavaExtractor {
             if fname.is_empty() {
                 continue;
             }
+            let fq = format!("{class}.{fname}");
             ctx.symbols.push(Symbol {
-                name: format!("{class}.{fname}"),
+                name: fq.clone(),
                 kind: SymbolKind::Const,
                 signature: None,
                 start_line,
@@ -526,6 +691,114 @@ impl JavaExtractor {
                 docstring: None,
                 parent: Some(class.clone()),
             });
+            ctx.facts.push(SemanticFact::Field {
+                owner: class.clone(),
+                name: fname.clone(),
+                mutable,
+            });
+            self.record_annotations(node, ctx, src, &fq);
+            if has_rule {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: class.clone(),
+                    kind: "rule".to_string(),
+                    target: fq,
+                });
+            }
+        }
+    }
+
+    /// Wave 9: annotation facts on a declaration targeting `target`.
+    /// Framework-named annotations (Spring/JUnit/Mockito) are only recorded
+    /// when the matching framework import is present; JDK and custom
+    /// annotations are always recorded.
+    fn record_annotations(&self, node: Node, ctx: &mut Ctx, src: &[u8], target: &str) {
+        for (simple, _line) in annotations_on(node, src) {
+            let fw_root = if is_spring_annotation(&simple) {
+                Some(SPRING_ROOT)
+            } else if is_junit_annotation(&simple) {
+                Some(JUNIT_ROOT)
+            } else if is_mockito_annotation(&simple) {
+                Some(MOCKITO_ROOT)
+            } else {
+                None
+            };
+            if let Some(root) = fw_root {
+                if !ctx.has_import(root) {
+                    continue;
+                }
+            }
+            ctx.facts.push(SemanticFact::Annotation {
+                name: simple,
+                target: target.to_string(),
+            });
+        }
+    }
+
+    /// Wave 9: Spring mapping annotations (@GetMapping/@PostMapping/.../
+    /// @RequestMapping) and @Bean on a method → Registration. Only when the
+    /// Spring import is present — a plain method named `get` is never a
+    /// route.
+    fn record_spring_registrations(
+        &self,
+        node: Node,
+        ctx: &mut Ctx,
+        src: &[u8],
+        class: &str,
+        method: &str,
+    ) {
+        if !ctx.has_import(SPRING_ROOT) {
+            return;
+        }
+        for (simple, _line) in annotations_on(node, src) {
+            let kind = if matches!(
+                simple.as_str(),
+                "GetMapping"
+                    | "PostMapping"
+                    | "PutMapping"
+                    | "DeleteMapping"
+                    | "PatchMapping"
+                    | "RequestMapping"
+            ) {
+                Some("route")
+            } else if simple == "Bean" {
+                Some("bean")
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner: class.to_string(),
+                    kind: kind.to_string(),
+                    target: method.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Wave 9: JUnit lifecycle methods (@BeforeClass/@BeforeAll/@BeforeEach/
+    /// @Before/@After/...) → Callback. Only when the JUnit import is present.
+    fn record_junit_lifecycle(
+        &self,
+        node: Node,
+        ctx: &mut Ctx,
+        src: &[u8],
+        class: &str,
+        method: &str,
+    ) {
+        if !ctx.has_import(JUNIT_ROOT) {
+            return;
+        }
+        for (simple, _line) in annotations_on(node, src) {
+            if matches!(
+                simple.as_str(),
+                "Before" | "After" | "BeforeClass" | "AfterClass" | "BeforeAll" | "AfterAll"
+                    | "BeforeEach" | "AfterEach"
+            ) {
+                ctx.facts.push(SemanticFact::Callback {
+                    owner: class.to_string(),
+                    callback: method.to_string(),
+                });
+            }
         }
     }
 
@@ -859,6 +1132,34 @@ fn find_named_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     out
 }
 
+/// Every annotation on a declaration, as `(simple name, line)`. The simple
+/// name is the last segment of a possibly-qualified annotation
+/// (`@org.junit.Test` → `Test`). Both `annotation` (with arguments) and
+/// `marker_annotation` (argument-less, e.g. `@Test`/`@RestController`) are
+/// collected.
+fn annotations_on(node: Node, src: &[u8]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let Some(mods) = find_named_child(node, "modifiers") else {
+        return out;
+    };
+    let mut cursor = mods.walk();
+    for child in mods.named_children(&mut cursor) {
+        if child.kind() != "annotation" && child.kind() != "marker_annotation" {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .map(|n| clean(node_text(Some(n), src)))
+            .unwrap_or_default();
+        let simple = name.rsplit('.').next().unwrap_or(&name).to_string();
+        if simple.is_empty() {
+            continue;
+        }
+        out.push((simple, child.start_position().row as u32 + 1));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,4 +1395,239 @@ public class Service {
         let junk = String::from_utf8_lossy(&[0x00u8, 0x01, 0xff, 0xfe, b'a', 0x80]).to_string();
         let _ = extract(&junk);
     }
+
+    #[test]
+    fn facts_public_exports_annotations_fields() {
+        let ef = extract(
+            r#"
+package com.example;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/** Greeting surface. */
+@RestController
+public class GreetingController {
+
+    private final String prefix = "Hello";
+
+    public GreetingController() {
+    }
+
+    @GetMapping("/greet")
+    public String greet() {
+        return this.prefix;
+    }
+
+    void internal() {
+    }
 }
+
+public interface Listener {
+    void onEvent(String e);
+}
+"#,
+        );
+        use crate::model::SemanticFact;
+        let fact = |n: &str| ef.facts.iter().filter(move |f| matches!(f, SemanticFact::Annotation { name, .. } if name == n)).count();
+
+        // public types + public methods + public constructors
+        let exports: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::PublicExport { symbol, kind } => {
+                    Some(format!("{symbol}:{kind}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(exports.contains(&"GreetingController:class".to_string()), "{exports:?}");
+        assert!(exports.contains(&"GreetingController.GreetingController:constructor".to_string()), "{exports:?}");
+        assert!(exports.contains(&"GreetingController.greet:method".to_string()), "{exports:?}");
+        assert!(exports.contains(&"Listener:interface".to_string()), "{exports:?}");
+        // interface methods are implicitly public
+        assert!(exports.contains(&"Listener.onEvent:method".to_string()), "{exports:?}");
+        // package-private method is NOT an export
+        assert!(!exports.contains(&"GreetingController.internal:method".to_string()), "{exports:?}");
+
+        // framework annotations require the matching import
+        assert_eq!(fact("RestController"), 1, "facts: {:?}", ef.facts);
+        assert_eq!(fact("GetMapping"), 1, "facts: {:?}", ef.facts);
+
+        // fields with mutability
+        let fields: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some(format!("{owner}.{name}:{}", if *mutable { "mutable" } else { "final" }))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, vec!["GreetingController.prefix:final"], "{fields:?}");
+
+        // spring route registrations point at the handler methods
+        let routes: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { owner, kind, target } if kind == "route" => {
+                    Some(format!("{owner}->{target}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(routes, vec!["GreetingController->GreetingController.greet"], "{routes:?}");
+    }
+
+    #[test]
+    fn facts_framework_verification_requires_imports() {
+        // Same annotations WITHOUT the spring import: no route registration,
+        // and the framework-named annotation is not a fact at all.
+        let ef = extract(
+            r#"
+public class PlainController {
+    @GetMapping("/nope")
+    public String get() {
+        return "x";
+    }
+
+    @Bean
+    public String thing() {
+        return "x";
+    }
+}
+"#,
+        );
+        use crate::model::SemanticFact;
+        let routes = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Registration { kind, .. } if kind == "route" || kind == "bean"))
+            .count();
+        assert_eq!(routes, 0, "no framework import -> no registrations: {:?}", ef.facts);
+        let ann = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Annotation { .. }))
+            .count();
+        assert_eq!(ann, 0, "no framework import -> no framework annotations: {:?}", ef.facts);
+    }
+
+    #[test]
+    fn facts_junit_lifecycle_callbacks_and_rules() {
+        let ef = extract(
+            r#"
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+public class CalcTest {
+
+    @Rule
+    public TemporaryFolder tmp = new TemporaryFolder();
+
+    @BeforeClass
+    public static void setupAll() {
+    }
+
+    @Before
+    public void setUp() {
+    }
+
+    @Test
+    public void adds() {
+    }
+}
+"#,
+        );
+        use crate::model::SemanticFact;
+        let callbacks: Vec<String> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Callback { owner, callback } => Some(format!("{owner}->{callback}")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            callbacks.contains(&"CalcTest->CalcTest.setupAll".to_string()),
+            "{callbacks:?}"
+        );
+        assert!(callbacks.contains(&"CalcTest->CalcTest.setUp".to_string()), "{callbacks:?}");
+
+        // @Test is an annotation fact; @Rule registers the field
+        let tests = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Annotation { name, .. } if name == "Test"))
+            .count();
+        assert_eq!(tests, 1, "facts: {:?}", ef.facts);
+        let rules: Vec<&str> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Registration { kind, target, .. } if kind == "rule" => {
+                    Some(target.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules, vec!["CalcTest.tmp"], "{rules:?}");
+
+        // field facts: final fields immutable, non-final mutable
+        let mutable: Vec<((String, String), bool)> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::Field { owner, name, mutable } => {
+                    Some(((owner.clone(), name.clone()), *mutable))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            mutable
+                .iter()
+                .any(|(n, m)| n == &("CalcTest".to_string(), "tmp".to_string()) && *m),
+            "{mutable:?}"
+        );
+    }
+
+    #[test]
+    fn facts_deterministic_sorted_order() {
+        let src = r#"
+import org.junit.Test;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class SortedController {
+    private String a = "1";
+    private int z = 2;
+
+    @GetMapping("/a")
+    public String first() { return ""; }
+
+    @Test
+    public void second() {}
+}
+"#;
+        let ef1 = JavaExtractor::default().extract(&SourceFile::new("Sorted.java", src));
+        let ef2 = JavaExtractor::default().extract(&SourceFile::new("Sorted.java", src));
+        assert_eq!(ef1.facts, ef2.facts, "facts must be deterministic");
+        assert!(ef1.facts.len() >= 6, "facts: {:?}", ef1.facts);
+        // sorted by (owning symbol, fact kind): annotations before callbacks
+        // before fields before registrations per owner
+        for w in ef1.facts.windows(2) {
+            let k1 = fact_sort_key(&w[0]);
+            let k2 = fact_sort_key(&w[1]);
+            assert!(k1 <= k2, "facts not sorted: {:?} > {:?}", k1, k2);
+        }
+    }
+}
+
