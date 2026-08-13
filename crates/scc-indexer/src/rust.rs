@@ -387,6 +387,77 @@ fn technology_for(root: &str) -> Option<String> {
     }
 }
 
+/// CFG evidence for a call site: `(conditional, control_block, inside_loop,
+/// inside_try)`, walking ancestors up to the nearest function boundary.
+/// Rust has no syntactic try/catch (errors flow via `Result`), so the
+/// control blocks are if/else/for/while/loop/match. The nearest block
+/// wins; loop nesting accumulates (a call inside `if` within a `for` is
+/// still `inside_loop`).
+fn call_cfg(node: tree_sitter::Node) -> (bool, Option<&'static str>, bool, bool) {
+    let mut cur = node.parent();
+    let mut inside_loop = false;
+    let mut block: Option<&'static str> = None;
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_item" | "function_signature_item" | "closure_expression"
+            | "impl_item" | "trait_item" | "mod_item" | "source_file" => break,
+            "if_expression" => {
+                block.get_or_insert("if");
+            }
+            "else_clause" => {
+                block.get_or_insert("else");
+            }
+            "for_expression" | "while_expression" | "loop_expression" => {
+                inside_loop = true;
+                let kind = match anc.kind() {
+                    "for_expression" => "for",
+                    "while_expression" => "while",
+                    _ => "loop",
+                };
+                block.get_or_insert(kind);
+            }
+            "match_expression" => {
+                block.get_or_insert("match");
+            }
+            _ => {}
+        }
+        cur = anc.parent();
+    }
+    (block.is_some(), block, inside_loop, false)
+}
+
+/// True when the call is awaited: `expr.await` — the ancestor is an
+/// `await_expression` (tree-sitter-rust represents `x.await` as
+/// `await_expression` wrapping the expression).
+fn call_is_awaited(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_item" | "function_signature_item" | "closure_expression"
+            | "impl_item" | "trait_item" | "mod_item" | "source_file" => return false,
+            "await_expression" => return true,
+            _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
+/// True when the call's result is consumed (assigned/returned/compared/
+/// passed) rather than discarded as a bare expression statement.
+fn call_returns_value(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_item" | "function_signature_item" | "closure_expression"
+            | "impl_item" | "trait_item" | "mod_item" | "source_file"
+            | "expression_statement" => return false,
+            "await_expression" | "parenthesized_expression" => cur = anc.parent(),
+            _ => return true,
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -416,6 +487,8 @@ struct Ctx {
     /// (verified in `into_extracted`, once imports are complete).
     reg_candidates: Vec<SemanticFact>,
     scopes: Vec<Scope>,
+    /// Per-caller call-site counter (source order) — CFG lexical evidence.
+    call_seq: BTreeMap<Option<String>, u32>,
 }
 
 impl Ctx {
@@ -974,12 +1047,22 @@ impl RustExtractor {
                             }
                         }
                     }
+                    let caller = ctx.caller();
+                    let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
+                    *seq += 1;
+                    let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                     ctx.calls.push(Call {
-                        caller: ctx.caller(),
+                        caller,
                         callee,
                         line: node.start_position().row as u32 + 1,
                         known_receiver: known_receiver(fn_node, src),
-                        conditional: false,
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: call_is_awaited(node),
+                        returns_value: call_returns_value(node),
                     });
                     self.record_store_ref(node, fn_node, ctx, src);
                 }

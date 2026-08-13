@@ -106,7 +106,7 @@ pub enum ImportType {
 }
 
 /// A call site with its enclosing symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Call {
     /// Enclosing symbol name (function/method) or `None` for module level.
     pub caller: Option<String>,
@@ -122,6 +122,34 @@ pub struct Call {
     /// evidence that turns call fanout into control-flow branching.
     #[serde(default)]
     pub conditional: bool,
+    /// 0-based index of this call site within its enclosing function, in
+    /// source order (a per-function counter). Deterministic CFG evidence:
+    /// the FlowGraph compiler orders Next edges by this value within a
+    /// caller, so sequential causality matches the code as written.
+    #[serde(default)]
+    pub lexical_order: u32,
+    /// Nearest enclosing control-flow block kind: `if`/`else`/`for`/
+    /// `while`/`try`/`catch`/`match`/`switch`/`with`/`do`/`loop`/
+    /// `finally`/`select` (language-dependent). `None` when the call sits
+    /// in straight-line code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_block: Option<String>,
+    /// The call sits inside a loop body (for/while/do/loop), possibly
+    /// nested under other blocks.
+    #[serde(default)]
+    pub inside_loop: bool,
+    /// The call sits inside a try/except (catch) body, possibly nested.
+    #[serde(default)]
+    pub inside_try: bool,
+    /// The call is awaited/spawned at this site: python `await`, ts
+    /// `await` / `Promise.all`, rust `.await`, go `go` statement. Java has
+    /// no syntactic await — always false there.
+    #[serde(default)]
+    pub awaited: bool,
+    /// The call's result is consumed (assigned/returned/compared/passed)
+    /// rather than discarded as a bare expression statement.
+    #[serde(default)]
+    pub returns_value: bool,
 }
 
 /// An HTTP route declaration.

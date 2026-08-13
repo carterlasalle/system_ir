@@ -494,6 +494,7 @@ mod tests {
             line: 3,
             known_receiver: true,
             conditional: false,
+            ..Default::default()
         }];
         let resolved = resolve_calls("a.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved.len(), 1);
@@ -525,6 +526,7 @@ mod tests {
             line: 3,
             known_receiver: true,
             conditional: false,
+            ..Default::default()
         }];
         let resolved = resolve_calls("a.py", &calls, &[mk_symbol("main", SymbolKind::Function)], &resolved_imports, &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "b.py", "resolve")));
@@ -550,6 +552,7 @@ mod tests {
             line: 3,
             known_receiver: true,
             conditional: false,
+            ..Default::default()
         }];
         let resolved = resolve_calls("main.py", &calls, &[mk_symbol("run", SymbolKind::Function)], &[ri], &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "svc/asr.py", "transcribe")));
@@ -574,6 +577,7 @@ mod tests {
             line: 3,
             known_receiver: true,
             conditional: false,
+            ..Default::default()
         }];
         let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "w.py", "Worker.helper")));
@@ -596,6 +600,7 @@ mod tests {
             line: 3,
             known_receiver: false,
             conditional: false,
+            ..Default::default()
         }];
         let resolved = resolve_calls("a.ts", &calls, &[mk_symbol("main", SymbolKind::Function)], &[ri], &idx, "repo");
         assert_eq!(

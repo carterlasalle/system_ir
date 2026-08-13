@@ -143,7 +143,7 @@ pub fn compile_flow_graphs(
 
         // ---- edges from call paths ----
         // successors[sym] = distinct callees resolved from CALLS
-        let mut successors: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut successors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut call_rel: HashMap<(String, String), (Provenance, Vec<String>)> = HashMap::new();
         let mut syms: BTreeSet<String> = paths
             .iter()
@@ -151,8 +151,8 @@ pub fn compile_flow_graphs(
             .cloned()
             .collect();
         syms.insert(ep.symbol_id.clone());
-        for sym in syms {
-            for r in graph.out_pred(&sym, scc_core::predicates::CALLS) {
+        for sym in &syms {
+            for r in graph.out_pred(sym, scc_core::predicates::CALLS) {
                 if matches!(r.provenance, Provenance::Extracted | Provenance::Resolved) {
                     successors
                         .entry(sym.clone())
@@ -171,6 +171,20 @@ pub fn compile_flow_graphs(
         }
 
         let mut edges = EdgeTable::new();
+
+        // Materialize every reachable symbol as a node up front so node ids
+        // are deterministic (sorted symbol order) and every caller's
+        // from-lookup succeeds regardless of edge-creation order.
+        for sym in &syms {
+            let key = (
+                symbol_comp
+                    .get(sym)
+                    .cloned()
+                    .unwrap_or_else(|| "component:root".into()),
+                op_of(graph, sym),
+            );
+            table.get(&key);
+        }
 
         for (sym, targets) in &successors {
             let key = (
@@ -196,19 +210,46 @@ pub fn compile_flow_graphs(
             // P1 §19: call fanout is NOT control-flow branching. A call
             // graph says "A may call B and C", not "A chooses B or C".
             // Branch edges exist ONLY where the extractor recorded the call
-            // inside a conditional/loop/try body (conditional_calls attr).
-            let conditional_calls: std::collections::HashSet<String> = graph
-                .entities
-                .get(sym)
-                .and_then(|e| e.attributes.get("conditional_calls"))
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
+            // inside a conditional/loop/try body — `call_blocks` (CFG
+            // evidence, condition = block kind) with `conditional_calls`
+            // as fallback for older indexes.
+            let cond_attr = |name: &str| -> Option<serde_json::Value> {
+                graph.entities.get(sym).and_then(|e| e.attributes.get(name).cloned())
+            };
+            let conditional_calls: std::collections::HashSet<String> = cond_attr("conditional_calls")
+                .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
-            for t in targets {
+            let call_blocks: BTreeMap<String, String> = cond_attr("call_blocks")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let call_order: BTreeMap<String, u32> = cond_attr("call_order")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let awaited_calls: std::collections::BTreeSet<String> = cond_attr("awaited_calls")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let match_callee = |attr: &str, t_op: &str| -> bool {
+                attr == t_op || attr.ends_with(&format!(".{t_op}"))
+            };
+            // Deterministic order: CFG lexical order within the caller
+            // (min over matching call sites), then callee name. Straight-
+            // line calls keep their source sequence; unknown callees sort
+            // after known ones.
+            let mut ordered: Vec<(u32, &String)> = targets
+                .iter()
+                .map(|t| {
+                    let t_op = op_of(graph, t);
+                    let order = call_order
+                        .iter()
+                        .filter(|(c, _)| match_callee(c, &t_op))
+                        .map(|(_, o)| *o)
+                        .min()
+                        .unwrap_or(u32::MAX);
+                    (order, t)
+                })
+                .collect();
+            ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, t) in ordered {
                 let actor = symbol_comp
                     .get(t)
                     .cloned()
@@ -220,9 +261,14 @@ pub fn compile_flow_graphs(
                     .cloned()
                     .unwrap_or((Provenance::Resolved, Vec::new()));
                 let t_op = op_of(graph, t);
-                let is_branch = conditional_calls
+                let block = call_blocks
                     .iter()
-                    .any(|c| c == &t_op || c.ends_with(&format!(".{t_op}")));
+                    .find(|(c, _)| match_callee(c, &t_op))
+                    .map(|(_, b)| b.clone());
+                let fallback = conditional_calls
+                    .iter()
+                    .any(|c| match_callee(c, &t_op));
+                let is_branch = block.is_some() || fallback;
                 edges.push(
                     from,
                     to,
@@ -231,10 +277,28 @@ pub fn compile_flow_graphs(
                     } else {
                         FlowEdgeKind::Next
                     },
-                    if is_branch { Some(format!("conditional: {t_op}")) } else { None },
+                    if let Some(b) = &block {
+                        Some(b.clone())
+                    } else if is_branch {
+                        Some(format!("conditional: {t_op}"))
+                    } else {
+                        None
+                    },
                     prov,
                     evidence,
                 );
+                // Async edge for awaited/spawned call sites (CFG evidence):
+                // `await`, `.await`, `go` statement, `Promise.all`.
+                if awaited_calls.iter().any(|c| match_callee(c, &t_op)) {
+                    edges.push(
+                        from,
+                        to,
+                        FlowEdgeKind::Async,
+                        Some(format!("awaited: {t_op}")),
+                        prov,
+                        Vec::new(),
+                    );
+                }
             }
         }
 

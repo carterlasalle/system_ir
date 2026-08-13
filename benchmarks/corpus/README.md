@@ -75,3 +75,23 @@ git clone --depth 1 https://github.com/kubernetes-sigs/kind.git benchmarks/corpu
 ```
 
 Ground truth answer keys: `benchmarks/ground-truth/<name>.md` (one doc per repo).
+
+## Holdout corpus (v1)
+
+`benchmarks/holdout/` is the blind holdout set for overfit detection: 20 NEW
+repos (5 python / 5 ts / 3 rust / 3 go / 2 java / 2 infra-monorepo), cloned
+after the dev-corpus rules were tuned. The atlas has never been fitted
+against them. Full manifest + re-clone instructions live in
+`benchmarks/holdout/README.md`; answer keys are in
+`benchmarks/holdout-ground-truth/<name>.md`.
+
+Run the holdout protocol:
+
+```bash
+scc bench atlas --holdout
+```
+
+This scores BOTH corpora with the same pipeline, prints the dev-vs-holdout
+per-layer recall and the overfit verdict, and writes
+`benchmarks/results/holdout-v1.txt` (dev vs holdout per-layer recall, overall,
+and the gap). Dev-corpus scoring itself is unchanged by the flag.

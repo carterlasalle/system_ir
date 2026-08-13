@@ -13,10 +13,10 @@ use crate::packs::{entity_name, finish, Section};
 use scc_graph::TrustedGraphView;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
-    AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasInvariant, AtlasOwnershipClaim, FlowKind,
-    SystemAtlas,
+    Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode, AtlasInvariant,
+    AtlasOwnershipClaim, FlowKind, SystemAtlas,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Structured atlas compilation — pure data, no rendering.
 pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
@@ -136,6 +136,21 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         owns.retain(|o| seen.insert((o.target.clone(), o.provenance.clone())));
 
+        // Ontology phase: hierarchical layer + immediate container (set by
+        // the component compiler's clusterer; defaulted for pre-ontology
+        // components so grouping stays total and deterministic).
+        let layer = c
+            .attributes
+            .get("layer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("component")
+            .to_string();
+        let parent = c
+            .attributes
+            .get("parent")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         components.push(AtlasComponent {
             name: c.name.clone(),
             purpose: purpose_text,
@@ -146,6 +161,8 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             downstream: downstream.into_iter().collect(),
             failure_behavior,
             owns,
+            layer,
+            parent,
         });
     }
     components.sort_by(|a, b| a.name.cmp(&b.name));
@@ -405,6 +422,43 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         format!("STALE ({})", stale.len())
     };
 
+    // ---- Ontology phase: archetype + STATE & DATA AUTHORITY + hierarchy ----
+    let archetype = Some(scc_graph::archetype::detect_archetype(view.graph, store));
+
+    // symbol -> component name over the *stored* components (the state
+    // compiler attributes ownership per component from the fact layer)
+    let mut symbol_comp: HashMap<String, String> = HashMap::new();
+    for c in view.components() {
+        for r in view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
+            for sr in view.out_pred(&r.object, scc_core::predicates::CONTAINS) {
+                symbol_comp.insert(sr.object.clone(), c.name.clone());
+            }
+        }
+    }
+    let state_authority = scc_graph::state::compile_state_authority(view.graph, &symbol_comp);
+
+    // hierarchical containers: services first, then subsystems; members are
+    // direct member entity ids (component ids or nested subsystem ids)
+    let mut hierarchy: Vec<AtlasHierarchyNode> = Vec::new();
+    for kind in [scc_core::kinds::SERVICE, scc_core::kinds::SUBSYSTEM] {
+        for e in view.graph.entities_of_kind(kind) {
+            let mut members: Vec<String> = view
+                .graph
+                .out_pred(&e.id, scc_core::predicates::CONTAINS)
+                .into_iter()
+                .map(|r| r.object.clone())
+                .collect();
+            members.sort();
+            hierarchy.push(AtlasHierarchyNode {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                kind: kind.to_string(),
+                members,
+            });
+        }
+    }
+    hierarchy.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+
     SystemAtlas {
         repository: repo.name,
         revision: snapshot
@@ -427,6 +481,9 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         async_boundaries: async_boundaries.into_iter().collect(),
         implementation_map,
         data_stores: data_stores.into_iter().collect(),
+        archetype,
+        state_authority,
+        hierarchy,
         evidence_summary,
         warnings,
     }
@@ -437,8 +494,16 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     let mut pack = ContextPack::new("atlas", &atlas.revision);
     let mut sections: Vec<Section> = Vec::new();
 
-    // SYSTEM PURPOSE (never cut)
+    // SYSTEM PURPOSE (never cut); the ARCHETYPE header is the ontology
+    // phase's one-line classification of the repository.
     let mut purpose = String::new();
+    purpose.push_str(&format!(
+        "ARCHETYPE: {}\n",
+        atlas
+            .archetype
+            .map(|a| a.as_str())
+            .unwrap_or(Archetype::Unknown.as_str())
+    ));
     if !atlas.purpose.is_empty() {
         purpose.push_str(&format!(
             "[SYSTEM PURPOSE — from README, DOCUMENTATION not fact]\n{}\n",
@@ -457,27 +522,31 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     sections.push(Section::new("SYSTEM PURPOSE", purpose, 10));
 
-    // ARCHITECTURE (component blocks)
+    // ARCHITECTURE (component blocks), grouped by layer: services first,
+    // then subsystems, then unmerged components, code-regions last — with
+    // `parent` indentation under service/subsystem headers. The flat block
+    // format is preserved inside each group.
     let mut arch = String::new();
-    for c in &atlas.components {
-        arch.push_str(&format!("\n{}", c.name.to_uppercase()));
+    let mut rendered: BTreeSet<String> = BTreeSet::new(); // names under containers
+    let comp_block = |c: &AtlasComponent, indent: &str| -> String {
+        let mut out = format!("\n{}{}", indent, c.name.to_uppercase());
         if !c.purpose.is_empty() {
-            arch.push_str(&format!("\nPurpose: {}", c.purpose));
+            out.push_str(&format!("\n{}Purpose: {}", indent, c.purpose));
         }
         if !c.implementation.is_empty() {
-            arch.push_str(&format!("\nImplementation: {}", c.implementation.join(", ")));
+            out.push_str(&format!("\n{}Implementation: {}", indent, c.implementation.join(", ")));
         }
         if !c.consumes.is_empty() {
-            arch.push_str(&format!("\nConsumes: {}", c.consumes.join(", ")));
+            out.push_str(&format!("\n{}Consumes: {}", indent, c.consumes.join(", ")));
         }
         if !c.produces.is_empty() {
-            arch.push_str(&format!("\nProduces: {}", c.produces.join(", ")));
+            out.push_str(&format!("\n{}Produces: {}", indent, c.produces.join(", ")));
         }
         if !c.upstream.is_empty() {
-            arch.push_str(&format!("\nUpstream: {}", c.upstream.join(", ")));
+            out.push_str(&format!("\n{}Upstream: {}", indent, c.upstream.join(", ")));
         }
         if !c.downstream.is_empty() {
-            arch.push_str(&format!("\nDownstream: {}", c.downstream.join(", ")));
+            out.push_str(&format!("\n{}Downstream: {}", indent, c.downstream.join(", ")));
         }
         if !c.owns.is_empty() {
             let owned: Vec<String> = c
@@ -485,9 +554,80 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
                 .iter()
                 .map(|o| format!("{} ({})", o.target, o.provenance))
                 .collect();
-            arch.push_str(&format!("\nOwns: {}", owned.join(", ")));
+            out.push_str(&format!("\n{}Owns: {}", indent, owned.join(", ")));
+        }
+        out.push('\n');
+        out
+    };
+    let name_of = |id: &str| -> Option<String> {
+        ctx.view
+            .entity(id)
+            .map(|e| e.name.clone())
+    };
+    // services first: nested subsystems, then directly-contained components
+    for svc in atlas.hierarchy.iter().filter(|n| n.kind == "service") {
+        arch.push_str(&format!("\nSERVICE {}\n", svc.name.to_uppercase()));
+        for m in &svc.members {
+            let Some(sub) = atlas.hierarchy.iter().find(|n| &n.id == m) else {
+                continue;
+            };
+            if sub.kind != "subsystem" {
+                continue;
+            }
+            arch.push_str(&format!("  SUBSYSTEM {}\n", sub.name.to_uppercase()));
+            for cm in &sub.members {
+                if let Some(name) = name_of(cm) {
+                    rendered.insert(name.clone());
+                    if let Some(c) = atlas.components.iter().find(|c| c.name == name) {
+                        arch.push_str(&format!("    {}\n", comp_block(c, "    ").trim_end()));
+                    }
+                }
+            }
+            arch.push('\n');
+        }
+        for m in &svc.members {
+            if atlas.hierarchy.iter().any(|n| &n.id == m) {
+                continue; // subsystems rendered above
+            }
+            if let Some(name) = name_of(m) {
+                rendered.insert(name.clone());
+                if let Some(c) = atlas.components.iter().find(|c| c.name == name) {
+                    arch.push_str(&format!("  {}\n", comp_block(c, "  ").trim_end()));
+                }
+            }
+        }
+    }
+    // standalone subsystems (not nested inside a service)
+    for sub in atlas.hierarchy.iter().filter(|n| n.kind == "subsystem") {
+        if atlas
+            .hierarchy
+            .iter()
+            .any(|n| n.kind == "service" && n.members.contains(&sub.id))
+        {
+            continue;
+        }
+        arch.push_str(&format!("\nSUBSYSTEM {}\n", sub.name.to_uppercase()));
+        for cm in &sub.members {
+            if let Some(name) = name_of(cm) {
+                rendered.insert(name.clone());
+                if let Some(c) = atlas.components.iter().find(|c| c.name == name) {
+                    arch.push_str(&format!("  {}\n", comp_block(c, "  ").trim_end()));
+                }
+            }
         }
         arch.push('\n');
+    }
+    // unmerged components (evidence-backed), then bare code regions
+    for layer in ["component", "code_region"] {
+        for c in &atlas.components {
+            if rendered.contains(&c.name) {
+                continue;
+            }
+            if c.layer != layer {
+                continue;
+            }
+            arch.push_str(&comp_block(c, ""));
+        }
     }
     sections.push(Section::new("ARCHITECTURE", arch, 9));
 
@@ -514,23 +654,60 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     sections.push(Section::new("FLOWS", flows, 9));
 
-    // DATA OWNERSHIP (never cut)
-    let mut ownership = String::new();
+    // STATE & DATA AUTHORITY (never cut): five subsections — DATA
+    // OWNERSHIP (persistent: the write-derived + declared owns claims and
+    // the DATA STORES list), RUNTIME STATE, CONFIGURATION, CACHES,
+    // DERIVED / REGISTRIES. Falls back to the legacy DATA OWNERSHIP title
+    // when the state compiler found no state at all.
+    let has_state = atlas
+        .state_authority
+        .values()
+        .any(|v| !v.is_empty());
+    let mut state_body = String::new();
+    if has_state {
+        state_body.push_str("DATA OWNERSHIP\n");
+    }
     for c in &atlas.components {
         for o in &c.owns {
-            ownership.push_str(&format!(
+            state_body.push_str(&format!(
                 "{} owns {} ({})\n",
                 c.name, o.target, o.provenance
             ));
         }
     }
     if !atlas.data_stores.is_empty() {
-        ownership.push_str("\nDATA STORES\n");
+        state_body.push_str("\nDATA STORES\n");
         for s in &atlas.data_stores {
-            ownership.push_str(&format!("  {s}\n"));
+            state_body.push_str(&format!("  {s}\n"));
         }
     }
-    sections.push(Section::new("DATA OWNERSHIP", ownership, 10));
+    for section in [
+        scc_graph::state::S_RUNTIME,
+        scc_graph::state::S_CONFIGURATION,
+        scc_graph::state::S_CACHES,
+        scc_graph::state::S_DERIVED,
+    ] {
+        if let Some(lines) = atlas.state_authority.get(section) {
+            if !lines.is_empty() {
+                state_body.push_str(&format!(
+                    "\n{}\n",
+                    scc_graph::state::section_label(section)
+                ));
+                for l in lines {
+                    state_body.push_str(&format!("  {l}\n"));
+                }
+            }
+        }
+    }
+    sections.push(Section::new(
+        if has_state {
+            "STATE & DATA AUTHORITY"
+        } else {
+            "DATA OWNERSHIP"
+        },
+        state_body,
+        10,
+    ));
 
     // CONTRACTS (never cut)
     sections.push(Section::new(

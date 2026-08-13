@@ -64,6 +64,11 @@ impl LanguageExtractor for TypeScriptExtractor {
         // subtree. Children are pushed in reverse so pops happen in document
         // order; state is never mutated across sibling subtrees.
         let mut frames: Vec<(Node, Ctx)> = vec![(root, Ctx::default())];
+        // Per-caller call-site counter (source order) — CFG lexical
+        // evidence; frames are processed in document order, so the counter
+        // advances deterministically per enclosing callable.
+        let mut call_seq: std::collections::BTreeMap<Option<String>, u32> =
+            std::collections::BTreeMap::new();
         while let Some((node, ctx)) = frames.pop() {
             if node.is_error() || node.is_missing() {
                 continue;
@@ -349,12 +354,22 @@ impl LanguageExtractor for TypeScriptExtractor {
                         out.tests.push(t);
                     }
                 }
+                let callee = normalize_callee(node_text(&function, src));
+                let seq = call_seq.entry(ctx.caller.clone()).or_insert(0);
+                *seq += 1;
+                let (conditional, control_block, inside_loop, inside_try) = ts_call_cfg(node);
                 out.calls.push(Call {
                     caller: ctx.caller.clone(),
-                    callee: normalize_callee(node_text(&function, src)),
+                    callee: callee.clone(),
                     line,
                     known_receiver: known_receiver(&function),
-                    conditional: ts_call_is_conditional(node),
+                    conditional,
+                    lexical_order: *seq - 1,
+                    control_block: control_block.map(str::to_string),
+                    inside_loop,
+                    inside_try,
+                    awaited: ts_call_is_awaited(node, &callee),
+                    returns_value: ts_call_returns_value(node),
                 });
             }
             _ => {}
@@ -1859,23 +1874,102 @@ fn push_retry(dec: &Node, src: &[u8], out: &mut Vec<(String, u32)>) {
 // Calls
 // ---------------------------------------------------------------------------
 
-/// Whether the callee root is an identifier (or member chain rooted in one).
-/// True when the call sits inside a conditional/loop/try/catch/switch body
-/// within its enclosing function — the ONLY evidence that turns call fanout
-/// into control-flow branching. Stops at the nearest function boundary so
-/// calls inside conditionally-defined closures are not marked.
-fn ts_call_is_conditional(node: Node) -> bool {
+/// CFG evidence for a call site: `(conditional, control_block, inside_loop,
+/// inside_try)`. True when the call sits inside a conditional/loop/try/
+/// catch/switch body within its enclosing function — the ONLY evidence that
+/// turns call fanout into control-flow branching. Stops at the nearest
+/// function boundary so calls inside conditionally-defined closures are not
+/// marked. The nearest control block wins; loop/try nesting accumulates
+/// independently of it.
+fn ts_call_cfg(node: Node) -> (bool, Option<&'static str>, bool, bool) {
+    let mut cur = node.parent();
+    let mut inside_loop = false;
+    let mut inside_try = false;
+    let mut block: Option<&'static str> = None;
+    // A `finally` body runs on every path — guaranteed, not an alternative —
+    // so it contributes no branch evidence; skip the try_statement it
+    // belongs to (the walk continues to any *outer* construct).
+    let mut skip_next_try = false;
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "function_expression" | "arrow_function"
+            | "method_definition" | "class_declaration" | "program" | "module" => break,
+            "if_statement" => {
+                block.get_or_insert("if");
+            }
+            "else_clause" => {
+                block.get_or_insert("else");
+            }
+            "for_statement" | "for_in_statement" | "for_of_statement" => {
+                inside_loop = true;
+                block.get_or_insert("for");
+            }
+            "while_statement" => {
+                inside_loop = true;
+                block.get_or_insert("while");
+            }
+            "do_statement" => {
+                inside_loop = true;
+                block.get_or_insert("do");
+            }
+            "try_statement" => {
+                inside_try = true;
+                if skip_next_try {
+                    skip_next_try = false;
+                } else {
+                    block.get_or_insert("try");
+                }
+            }
+            "catch_clause" => {
+                inside_try = true;
+                block.get_or_insert("catch");
+            }
+            "finally_clause" => {
+                inside_try = true;
+                skip_next_try = true;
+            }
+            "switch_statement" => {
+                block.get_or_insert("switch");
+            }
+            "ternary_expression" => {
+                block.get_or_insert("if");
+            }
+            _ => {}
+        }
+        cur = anc.parent();
+    }
+    (block.is_some(), block, inside_loop, inside_try)
+}
+
+/// True when the call is awaited (`await expr`) or is a `Promise.all(...)`
+/// call — the flow edge is Async. `callee` is the normalized callee text.
+fn ts_call_is_awaited(node: Node, callee: &str) -> bool {
+    if callee == "Promise.all" {
+        return true;
+    }
     let mut cur = node.parent();
     while let Some(anc) = cur {
         match anc.kind() {
             "function_declaration" | "function_expression" | "arrow_function"
-            | "method_definition" | "class_declaration" | "program" | "module" => {
-                return false
-            }
-            "if_statement" | "for_statement" | "for_in_statement" | "for_of_statement"
-            | "while_statement" | "do_statement" | "try_statement" | "catch_clause"
-            | "switch_statement" | "ternary_expression" => return true,
+            | "method_definition" | "class_declaration" | "program" | "module" => return false,
+            "await_expression" => return true,
             _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
+/// True when the call's result is consumed (assigned/returned/compared/
+/// passed/awaited) rather than discarded as a bare expression statement.
+fn ts_call_returns_value(node: Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "function_expression" | "arrow_function"
+            | "method_definition" | "class_declaration" | "program" | "module"
+            | "expression_statement" => return false,
+            "await_expression" | "parenthesized_expression" => cur = anc.parent(),
+            _ => return true,
         }
     }
     false
@@ -2618,6 +2712,110 @@ const up = "abc".toUpperCase();
         assert_eq!(up[0].caller, None);
         let gc = c("getClient");
         assert_eq!(gc[0].caller, None);
+    }
+
+    #[test]
+    fn cfg_evidence_blocks_await_and_order() {
+        let ef = extract(
+            "src/app.ts",
+            r#"async function process(payload: any) {
+  try {
+    const valid = validate(payload);
+    if (valid) {
+      save(payload);
+    } else {
+      reject(payload);
+    }
+  } catch (e) {
+    log(e);
+  }
+  await persist(payload);
+  await Promise.all([first(), second()]);
+  fanout();
+}
+"#,
+        );
+        let calls = &ef.calls;
+        // validate, save, reject, log, persist, Promise.all, first, second,
+        // fanout
+        assert_eq!(calls.len(), 9, "{calls:?}");
+        let orders: Vec<u32> = calls.iter().map(|c| c.lexical_order).collect();
+        assert_eq!(orders, vec![0, 1, 2, 3, 4, 5, 6, 7, 8], "{orders:?}");
+        let by_callee = |name: &str| -> &Call {
+            calls
+                .iter()
+                .find(|c| c.callee == name)
+                .unwrap_or_else(|| panic!("call {name}"))
+        };
+        let validate = by_callee("validate");
+        assert_eq!(validate.control_block.as_deref(), Some("try"));
+        assert!(validate.inside_try);
+        let save = by_callee("save");
+        assert_eq!(save.control_block.as_deref(), Some("if"));
+        assert!(save.inside_try, "if nested in try is still inside_try");
+        let reject = by_callee("reject");
+        assert_eq!(reject.control_block.as_deref(), Some("else"));
+        let log = by_callee("log");
+        assert_eq!(log.control_block.as_deref(), Some("catch"));
+        assert!(log.inside_try);
+
+        // awaited calls: `await persist(...)` and `Promise.all([...])`.
+        let persist = by_callee("persist");
+        assert!(persist.awaited);
+        let promise_all = by_callee("Promise.all");
+        assert!(promise_all.awaited);
+        let first = by_callee("first");
+        assert!(first.awaited, "first() inside awaited Promise.all is awaited with the batch");
+        let second = by_callee("second");
+        assert!(second.awaited, "second() inside awaited Promise.all is awaited with the batch");
+        let fanout = by_callee("fanout");
+        assert!(!fanout.conditional);
+        assert_eq!(fanout.control_block, None);
+        assert_eq!(fanout.lexical_order, 8);
+
+        // returns_value: assigned result used; bare statements discarded.
+        assert!(validate.returns_value);
+        assert!(!save.returns_value);
+        assert!(!persist.returns_value, "bare `await persist(...)` discards the result");
+        assert!(!fanout.returns_value);
+    }
+
+    #[test]
+    fn cfg_evidence_switch_and_loops() {
+        let ef = extract(
+            "src/app.ts",
+            r#"function route(kind: string) {
+  switch (kind) {
+    case "a": alpha(); break;
+    case "b": beta(); break;
+  }
+  for (const x of items) {
+    if (x.ok) probe(x); else drop(x);
+  }
+  while (running) poll();
+}
+"#,
+        );
+        let calls = &ef.calls;
+        let by_callee = |name: &str| -> &Call {
+            calls
+                .iter()
+                .find(|c| c.callee == name)
+                .unwrap_or_else(|| panic!("call {name}"))
+        };
+        let alpha = by_callee("alpha");
+        assert_eq!(alpha.control_block.as_deref(), Some("switch"));
+        assert!(alpha.conditional);
+        let probe = by_callee("probe");
+        assert_eq!(probe.control_block.as_deref(), Some("if"));
+        assert!(probe.inside_loop);
+        let drop = by_callee("drop");
+        assert_eq!(drop.control_block.as_deref(), Some("else"));
+        assert!(drop.inside_loop);
+        let poll = by_callee("poll");
+        assert_eq!(poll.control_block.as_deref(), Some("while"));
+        assert!(poll.inside_loop);
+        assert_eq!(poll.lexical_order, 4, "switch x2, for-if, for-else, while");
     }
 
     #[test]

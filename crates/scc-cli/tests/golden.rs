@@ -67,6 +67,17 @@ pub fn run_ok(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// A valid CFG branch condition: a control-block kind (if/else/for/while/
+/// try/catch/match/switch/with/do/loop/finally/select) or the legacy
+/// `conditional: <op>` format from pre-CFG indexes.
+pub fn is_cfg_condition(c: &str) -> bool {
+    matches!(
+        c,
+        "if" | "else" | "for" | "while" | "try" | "catch" | "match" | "switch"
+            | "with" | "do" | "loop" | "select"
+    ) || c.starts_with("conditional:")
+}
+
 #[test]
 fn http_service_produces_expected_ir() {
     let repo = copy_fixture("http-service-python");
@@ -190,11 +201,8 @@ fn canonical_flow_graph_preserves_topology() {
         "exactly one conditional call becomes a branch: {kinds:?}"
     );
     assert!(
-        branch_edges[0]["condition"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("conditional:"),
-        "branch condition names the conditional evidence: {branch_edges:?}"
+        is_cfg_condition(branch_edges[0]["condition"].as_str().unwrap_or("")),
+        "branch condition names the control-block evidence: {branch_edges:?}"
     );
     assert!(
         kinds.iter().filter(|k| *k == &"next").count() >= 2,
@@ -202,14 +210,15 @@ fn canonical_flow_graph_preserves_topology() {
     );
     // no false convergence either: this fixture has no join point, so no
     // Join edge is invented (the old branch-artifact join is gone)
-    // branch edges carry evidence conditions ("conditional: <op>"), never
-    // comma-split operation lists from generated text
+    // branch edges carry evidence conditions (block kind or the legacy
+    // "conditional: <op>" format), never comma-split operation lists from
+    // generated text
     for e in graph["edges"].as_array().unwrap() {
         if e["kind"] == "branch" {
             if let Some(c) = e["condition"].as_str() {
                 assert!(
-                    c.starts_with("conditional:"),
-                    "branch conditions name the conditional evidence: {c}"
+                    is_cfg_condition(c),
+                    "branch conditions name the CFG evidence: {c}"
                 );
             }
         }

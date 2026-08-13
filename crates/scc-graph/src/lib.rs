@@ -3,6 +3,7 @@
 //!
 //! Docs mapping: scc-graph + scc-system-ir + scc-flow.
 
+pub mod archetype;
 pub mod boundaries;
 pub mod cochange;
 pub mod components;
@@ -11,6 +12,7 @@ pub mod flows;
 pub mod impact;
 pub mod invariants;
 pub mod lifecycle;
+pub mod state;
 pub mod trust;
 pub mod workflow;
 

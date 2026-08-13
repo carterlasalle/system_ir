@@ -291,6 +291,12 @@ enum BenchSub {
         /// source for benchmarks/results/ground-truth-gaps.md)
         #[arg(long)]
         diagnose: bool,
+        /// Blind holdout protocol: score the dev corpus AND the holdout
+        /// corpus (benchmarks/holdout + benchmarks/holdout-ground-truth),
+        /// compare per-layer recall, write benchmarks/results/holdout-v1.txt
+        /// and print the overfit verdict
+        #[arg(long)]
+        holdout: bool,
     },
 }
 
@@ -616,24 +622,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ground_truth,
                 json,
                 diagnose,
-            } => match scc_cli::benchatlas::run_atlas_bench(
-                corpus.as_deref(),
-                ground_truth.as_deref(),
-                diagnose,
-            ) {
-                Ok(report) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&report)
-                                .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
-                        );
-                    } else {
-                        scc_cli::benchatlas::print_report(&report, diagnose);
+                holdout,
+            } => {
+                if holdout {
+                    match scc_cli::benchatlas::run_atlas_holdout(
+                        corpus.as_deref(),
+                        ground_truth.as_deref(),
+                        diagnose,
+                    ) {
+                        Ok(comparison) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&comparison)
+                                        .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
+                                );
+                            } else {
+                                scc_cli::benchatlas::print_holdout_report(&comparison, diagnose);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(scc_cli::CliError::Other(e)),
                     }
-                    Ok(())
+                } else {
+                    match scc_cli::benchatlas::run_atlas_bench(
+                        corpus.as_deref(),
+                        ground_truth.as_deref(),
+                        diagnose,
+                    ) {
+                        Ok(report) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report)
+                                        .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
+                                );
+                            } else {
+                                scc_cli::benchatlas::print_report(&report, diagnose);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(scc_cli::CliError::Other(e)),
+                    }
                 }
-                Err(e) => Err(scc_cli::CliError::Other(e)),
             },
         },
         Commands::StatePath => {

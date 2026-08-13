@@ -363,6 +363,72 @@ fn technology_for(root: &str) -> Option<String> {
     }
 }
 
+/// CFG evidence for a call site: `(conditional, control_block, inside_loop)`,
+/// walking ancestors up to the nearest function boundary. Go has no
+/// try/catch; control blocks are if/else/for/switch/select. The nearest
+/// block wins; loop nesting accumulates (a call inside `if` within a `for`
+/// is still `inside_loop`).
+fn call_cfg(node: tree_sitter::Node) -> (bool, Option<&'static str>, bool) {
+    let mut cur = node.parent();
+    let mut inside_loop = false;
+    let mut block: Option<&'static str> = None;
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "method_declaration" | "func_literal"
+            | "source_file" => break,
+            "if_statement" => {
+                block.get_or_insert("if");
+            }
+            "else_clause" => {
+                block.get_or_insert("else");
+            }
+            "for_statement" => {
+                inside_loop = true;
+                block.get_or_insert("for");
+            }
+            "switch_statement" | "type_switch_statement" => {
+                block.get_or_insert("switch");
+            }
+            "select_statement" => {
+                block.get_or_insert("select");
+            }
+            _ => {}
+        }
+        cur = anc.parent();
+    }
+    (block.is_some(), block, inside_loop)
+}
+
+/// True when the call is spawned: it sits inside a `go` statement (go-stmt),
+/// which fires the goroutine asynchronously — the flow edge is Async.
+fn call_is_awaited(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "method_declaration" | "func_literal"
+            | "source_file" => return false,
+            "go_statement" => return true,
+            _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
+/// True when the call's result is consumed (assigned/returned/compared/
+/// passed) rather than discarded as a bare expression statement.
+fn call_returns_value(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_declaration" | "method_declaration" | "func_literal"
+            | "source_file" | "expression_statement" => return false,
+            "parenthesized_expression" => cur = anc.parent(),
+            _ => return true,
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -389,6 +455,8 @@ struct Ctx {
     cli_flags: BTreeMap<String, BTreeSet<String>>,
     /// Subcommand names already emitted as entrypoints.
     seen_subcommands: BTreeSet<String>,
+    /// Per-caller call-site counter (source order) — CFG lexical evidence.
+    call_seq: BTreeMap<Option<String>, u32>,
 }
 
 impl Ctx {
@@ -748,13 +816,26 @@ impl GoExtractor {
                 let root = callee_root(fn_node);
                 let known_receiver =
                     matches!(root.kind(), "identifier" | "type_identifier" | "field_identifier");
+                let caller = ctx.caller();
+                let lexical_order = {
+                    let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
+                    *seq += 1;
+                    *seq - 1
+                };
+                let (conditional, control_block, inside_loop) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
                 ctx.calls.push(Call {
-                    caller: ctx.caller(),
+                    caller,
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
-                    conditional: false,
+                    conditional,
+                    lexical_order,
+                    control_block: control_block.map(str::to_string),
+                    inside_loop,
+                    inside_try: false,
+                    awaited: call_is_awaited(node),
+                    returns_value: call_returns_value(node),
                 });
                 self.record_store_ref(node, &fn_node, &root, ctx, src);
                 self.record_framework_facts(node, ctx, src);

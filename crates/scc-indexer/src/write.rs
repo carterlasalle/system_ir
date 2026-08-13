@@ -13,6 +13,7 @@ use crate::resolve::{ResolvedCall, ResolvedImport, SymbolIndex};
 use scc_core::kinds;
 use scc_core::{entity_id, Evidence, Provenance, Relationship};
 use scc_store::Store;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn rel_id(parts: &[&str]) -> String {
     let mut h = blake3::Hasher::new();
@@ -171,6 +172,52 @@ impl<'a> Writer<'a> {
                 cond.sort();
                 cond.dedup();
                 se.attr("conditional_calls", serde_json::json!(cond));
+            }
+            // CFG evidence (Wave 3, causal FlowGraph): per-callee lexical
+            // order, nearest control block kind, awaited calls, and calls
+            // whose result is used. The FlowGraph compiler orders Next
+            // edges by `call_order`, turns `call_blocks` entries into
+            // Branch edges (condition = block kind), and emits Async edges
+            // for `awaited_calls`. `conditional_calls` stays as the
+            // fallback when `call_blocks` is absent.
+            let own: Vec<&crate::model::Call> = ef
+                .calls
+                .iter()
+                .filter(|c| c.caller.as_deref() == Some(sym.name.as_str()))
+                .collect();
+            if !own.is_empty() {
+                let mut order: BTreeMap<String, u32> = BTreeMap::new();
+                let mut blocks: BTreeMap<String, String> = BTreeMap::new();
+                let mut awaited: BTreeSet<String> = BTreeSet::new();
+                let mut returns: BTreeSet<String> = BTreeSet::new();
+                for c in &own {
+                    // first site wins for order/block (min lexical order).
+                    order
+                        .entry(c.callee.clone())
+                        .and_modify(|o| *o = (*o).min(c.lexical_order))
+                        .or_insert(c.lexical_order);
+                    if let Some(b) = &c.control_block {
+                        blocks.entry(c.callee.clone()).or_insert_with(|| b.clone());
+                    }
+                    if c.awaited {
+                        awaited.insert(c.callee.clone());
+                    }
+                    if c.returns_value {
+                        returns.insert(c.callee.clone());
+                    }
+                }
+                if !order.is_empty() {
+                    se.attr("call_order", serde_json::json!(order));
+                }
+                if !blocks.is_empty() {
+                    se.attr("call_blocks", serde_json::json!(blocks));
+                }
+                if !awaited.is_empty() {
+                    se.attr("awaited_calls", serde_json::json!(awaited));
+                }
+                if !returns.is_empty() {
+                    se.attr("call_returns", serde_json::json!(returns));
+                }
             }
             // cli_flags: `--flag` list owned by the symbol (sorted, deduped
             // by the extractor).

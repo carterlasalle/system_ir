@@ -346,19 +346,92 @@ const STRING_TARGET_ROOTS: &[&str] = &[
 
 const ROUTE_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "options", "head", "route"];
 
-/// True when the call sits inside a conditional/loop/try body within its
-/// enclosing function — walking ancestors from the call node up to (but
-/// excluding) the nearest function/class/module boundary. A call inside a
-/// nested function definition is NOT conditional (it is conditionally
-/// *defined*, not conditionally *called*).
-fn call_is_conditional(node: tree_sitter::Node) -> bool {
+/// CFG evidence for a call site: `(conditional, control_block, inside_loop,
+/// inside_try)`, walking ancestors from the call node up to (but excluding)
+/// the nearest function/class/module boundary. A call inside a nested
+/// function definition is NOT conditional (it is conditionally *defined*,
+/// not conditionally *called*). The nearest control-flow block wins for
+/// `control_block`; loop/try nesting accumulates independently, so a call
+/// inside `if` within a `for` is still `inside_loop`.
+fn call_cfg(node: tree_sitter::Node) -> (bool, Option<&'static str>, bool, bool) {
+    let mut cur = node.parent();
+    let mut inside_loop = false;
+    let mut inside_try = false;
+    let mut block: Option<&'static str> = None;
+    // A `finally` body runs on every path — guaranteed, not an alternative —
+    // so it contributes no branch evidence; skip the try_statement it
+    // belongs to (the walk continues to any *outer* construct).
+    let mut skip_next_try = false;
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_definition" | "class_definition" | "module" => break,
+            "if_statement" => {
+                block.get_or_insert("if");
+            }
+            "else_clause" => {
+                block.get_or_insert("else");
+            }
+            "for_statement" | "while_statement" => {
+                inside_loop = true;
+                block
+                    .get_or_insert(if anc.kind() == "for_statement" { "for" } else { "while" });
+            }
+            "try_statement" => {
+                inside_try = true;
+                if skip_next_try {
+                    skip_next_try = false;
+                } else {
+                    block.get_or_insert("try");
+                }
+            }
+            "except_clause" => {
+                inside_try = true;
+                block.get_or_insert("catch");
+            }
+            "finally_clause" => {
+                inside_try = true;
+                skip_next_try = true;
+            }
+            "with_statement" => {
+                block.get_or_insert("with");
+            }
+            "match_statement" => {
+                block.get_or_insert("match");
+            }
+            _ => {}
+        }
+        cur = anc.parent();
+    }
+    (block.is_some(), block, inside_loop, inside_try)
+}
+
+/// True when the call sits under an `await` expression (python) within its
+/// enclosing function — the call is awaited, so its flow edge is Async.
+fn call_is_awaited(node: tree_sitter::Node) -> bool {
     let mut cur = node.parent();
     while let Some(anc) = cur {
         match anc.kind() {
             "function_definition" | "class_definition" | "module" => return false,
-            "if_statement" | "for_statement" | "while_statement" | "try_statement"
-            | "with_statement" | "match_statement" => return true,
+            "await" => return true,
             _ => cur = anc.parent(),
+        }
+    }
+    false
+}
+
+/// True when the call's result is consumed (assigned/returned/compared/
+/// passed/awaited) rather than discarded as a bare statement. `await` and
+/// parenthesized wrappers are skipped: `await foo()` as a statement
+/// discards the value, `x = await foo()` uses it.
+fn call_returns_value(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "function_definition" | "class_definition" | "module" | "expression_statement" => {
+                return false
+            }
+            "await" | "parenthesized_expression" => cur = anc.parent(),
+            _ => return true,
         }
     }
     false
@@ -431,6 +504,8 @@ struct Ctx {
     all_exports: Vec<String>,
     /// Root module names imported in this file (framework verification).
     imported_modules: BTreeSet<String>,
+    /// Per-caller call-site counter (source order) — CFG lexical evidence.
+    call_seq: BTreeMap<Option<String>, u32>,
 }
 
 impl Ctx {
@@ -806,13 +881,26 @@ impl PythonExtractor {
             if !callee.is_empty() {
                 let root = callee_root(fn_node);
                 let known_receiver = root.kind() == "identifier";
+                let caller = ctx.caller();
+                let lexical_order = {
+                    let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
+                    *seq += 1;
+                    *seq - 1
+                };
+                let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
                 ctx.calls.push(Call {
-                    caller: ctx.caller(),
+                    caller,
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
-                    conditional: call_is_conditional(node),
+                    conditional,
+                    lexical_order,
+                    control_block: control_block.map(str::to_string),
+                    inside_loop,
+                    inside_try,
+                    awaited: call_is_awaited(node),
+                    returns_value: call_returns_value(node),
                 });
                 self.record_store_ref(node, fn_node, &root, ctx, src);
                 self.record_config_call(node, fn_node, ctx, src);
@@ -1768,6 +1856,94 @@ mod tests {
         assert!(calls[2].known_receiver);
         assert_eq!(calls[3].callee, "(factory)");
         assert!(calls[3].known_receiver);
+    }
+
+    #[test]
+    fn cfg_evidence_lexical_order_blocks_await() {
+        let ef = extract(
+            "import asyncio\n\n\
+             def process(payload):\n\
+             \x20   try:\n\
+             \x20       valid = validate(payload)\n\
+             \x20       if valid:\n\
+             \x20           save(payload)\n\
+             \x20       else:\n\
+             \x20           reject(payload)\n\
+             \x20   finally:\n\
+             \x20       cleanup()\n\
+             \x20   second_try(payload)\n\
+             \x20   third_try(payload)\n\
+             \nasync def persist():\n\
+             \x20   await tick()\n\
+             \x20   await asyncio.sleep(0)\n",
+        );
+        let calls = &ef.calls;
+        // validate, save, reject, cleanup, second_try, third_try, tick, sleep
+        assert_eq!(calls.len(), 8, "{calls:?}");
+
+        // per-function lexical counter in source order
+        let orders: Vec<u32> = calls.iter().map(|c| c.lexical_order).collect();
+        assert_eq!(orders, vec![0, 1, 2, 3, 4, 5, 0, 1], "{orders:?}");
+
+        let by_callee = |name: &str| -> &Call {
+            calls.iter().find(|c| c.callee == name).unwrap_or_else(|| panic!("call {name}"))
+        };
+
+        // control blocks: try body -> try, if -> if, else -> else; finally
+        // and straight-line calls are NOT branch evidence.
+        let validate = by_callee("validate");
+        assert!(validate.conditional);
+        assert_eq!(validate.control_block.as_deref(), Some("try"));
+        assert!(validate.inside_try);
+        assert!(!validate.inside_loop);
+
+        let save = by_callee("save");
+        assert_eq!(save.control_block.as_deref(), Some("if"));
+        let reject = by_callee("reject");
+        assert_eq!(reject.control_block.as_deref(), Some("else"));
+
+        let cleanup = by_callee("cleanup");
+        assert!(!cleanup.conditional, "finally body is guaranteed, not a branch");
+        assert_eq!(cleanup.control_block, None);
+        assert!(cleanup.inside_try, "finally still belongs to the try construct");
+
+        // straight-line calls after the try/finally: no block, sequential.
+        let second = by_callee("second_try");
+        assert!(!second.conditional);
+        assert_eq!(second.control_block, None);
+
+        // awaited: `await` ancestors flag the call; lexical order resets per
+        // function.
+        let tick = by_callee("tick");
+        assert!(tick.awaited);
+        assert_eq!(tick.lexical_order, 0);
+        let sleep = by_callee("asyncio.sleep");
+        assert!(sleep.awaited);
+        assert_eq!(sleep.lexical_order, 1);
+
+        // returns_value: assigned result used, bare statements discarded.
+        assert!(validate.returns_value, "valid = validate(...) uses the result");
+        assert!(!save.returns_value, "bare statement discards the result");
+        assert!(!sleep.returns_value, "bare `await asyncio.sleep(0)` discards the result");
+    }
+
+    #[test]
+    fn cfg_evidence_loops_and_nesting() {
+        let ef = extract(
+            "def scan(items):\n    for item in items:\n        if item.ok:\n            probe(item)\n        else:\n            drop(item)\n    while running:\n        poll()\n",
+        );
+        let calls = &ef.calls;
+        let probe = calls.iter().find(|c| c.callee == "probe").unwrap();
+        assert_eq!(probe.control_block.as_deref(), Some("if"));
+        assert!(probe.inside_loop, "if nested inside for is still in a loop");
+        assert!(probe.conditional);
+        let drop = calls.iter().find(|c| c.callee == "drop").unwrap();
+        assert_eq!(drop.control_block.as_deref(), Some("else"));
+        assert!(drop.inside_loop);
+        let poll = calls.iter().find(|c| c.callee == "poll").unwrap();
+        assert_eq!(poll.control_block.as_deref(), Some("while"));
+        assert!(poll.inside_loop);
+        assert_eq!(poll.lexical_order, 2, "for/if/else/while sites: 0,1,2");
     }
 
     #[test]

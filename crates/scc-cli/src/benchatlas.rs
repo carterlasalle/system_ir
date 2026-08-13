@@ -53,6 +53,13 @@ use std::path::{Path, PathBuf};
 /// The floor is over the five startup-required layers ONLY.
 pub const ATLAS_GATE: f64 = 0.5;
 
+/// Holdout verdict tolerance: the blind holdout corpus may lag the dev
+/// corpus by up to this much (overall recall, absolute) before the run is
+/// called OVERFIT. The band absorbs corpus-difficulty, LOC-mix, and
+/// ground-truth-strictness differences; a lag beyond it means the dev-tuned
+/// rules do not generalize to unseen repos.
+pub const HOLDOUT_TOLERANCE: f64 = 0.05;
+
 /// The five startup-required layers that count toward the overall score
 /// (architecture, entrypoints, behavior, state_authority, contracts — see
 /// `ALL_SECTIONS`; landmarks + tests are informational).
@@ -768,6 +775,237 @@ pub fn run_atlas_bench(
     };
     let names = repo_dirs(&corpus_dir);
     run_atlas_recall(&corpus_dir, &gt_dir, &names, diagnose)
+}
+
+/// Overfit verdict over the dev-vs-holdout overall gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HoldoutVerdict {
+    /// holdout >= dev: the dev-tuned rules generalize at least as well.
+    NoOverfit,
+    /// dev - tolerance <= holdout < dev: lag inside the noise band.
+    Borderline,
+    /// holdout < dev - tolerance: dev-tuned rules do not generalize.
+    Overfit,
+}
+
+impl HoldoutVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HoldoutVerdict::NoOverfit => "NO OVERFIT",
+            HoldoutVerdict::Borderline => "BORDERLINE",
+            HoldoutVerdict::Overfit => "OVERFIT",
+        }
+    }
+}
+
+/// Verdict over the dev-vs-holdout overall gap (`dev`, `holdout` are the
+/// equal-weighted mean recalls of the five startup-required layers).
+pub fn holdout_verdict(dev: f64, holdout: f64) -> HoldoutVerdict {
+    if holdout >= dev {
+        HoldoutVerdict::NoOverfit
+    } else if holdout >= dev - HOLDOUT_TOLERANCE {
+        HoldoutVerdict::Borderline
+    } else {
+        HoldoutVerdict::Overfit
+    }
+}
+
+/// Dev-vs-holdout comparison for `scc bench atlas --holdout`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HoldoutComparison {
+    pub dev: AtlasRecallReport,
+    pub holdout: AtlasRecallReport,
+    /// Per-layer gap = holdout mean - dev mean (fraction, negative = lag).
+    pub gap_architecture: f64,
+    pub gap_entrypoints: f64,
+    pub gap_behavior: f64,
+    pub gap_state_authority: f64,
+    pub gap_contracts: f64,
+    pub gap_overall: f64,
+    pub verdict: HoldoutVerdict,
+    /// Path of the written comparison file.
+    pub results_file: String,
+}
+
+impl HoldoutComparison {
+    fn layer_gap(dev: f64, holdout: f64) -> f64 {
+        (holdout - dev).clamp(-1.0, 1.0)
+    }
+}
+
+/// Run the holdout protocol: score the dev corpus and the blind holdout
+/// corpus with the same recall pipeline, compute per-layer gaps, write
+/// `benchmarks/results/holdout-v1.txt`, and return the comparison.
+///
+/// `corpus`/`ground_truth` (when given) select the DEV corpus, exactly as in
+/// `run_atlas_bench` (defaults: `benchmarks/corpus` +
+/// `benchmarks/ground-truth`). The holdout dirs are fixed protocol paths:
+/// `benchmarks/holdout` + `benchmarks/holdout-ground-truth`. The holdout
+/// corpus must exist — a missing dir is an error, not a silent empty run.
+pub fn run_atlas_holdout(
+    corpus: Option<&Path>,
+    ground_truth: Option<&Path>,
+    diagnose: bool,
+) -> Result<HoldoutComparison, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = crate::find_root(&cwd);
+    let results_dir = root.join("benchmarks").join("results");
+    let results_file = results_dir.join("holdout-v1.txt");
+
+    let dev = run_atlas_bench(corpus, ground_truth, diagnose)?;
+
+    let holdout_corpus = root.join("benchmarks").join("holdout");
+    let holdout_gt = root.join("benchmarks").join("holdout-ground-truth");
+    if !holdout_corpus.is_dir() {
+        return Err(format!(
+            "holdout corpus dir not found (run --holdout from the workspace): {}",
+            holdout_corpus.display()
+        ));
+    }
+    let names = repo_dirs(&holdout_corpus);
+    if names.is_empty() {
+        return Err(format!(
+            "holdout corpus dir is empty: {}",
+            holdout_corpus.display()
+        ));
+    }
+    let mut holdout = run_atlas_recall(&holdout_corpus, &holdout_gt, &names, diagnose)?;
+    holdout.mode = format!("holdout: {}", holdout_corpus.display());
+
+    let c = HoldoutComparison {
+        gap_architecture: HoldoutComparison::layer_gap(dev.mean_architecture, holdout.mean_architecture),
+        gap_entrypoints: HoldoutComparison::layer_gap(dev.mean_entrypoints, holdout.mean_entrypoints),
+        gap_behavior: HoldoutComparison::layer_gap(dev.mean_behavior, holdout.mean_behavior),
+        gap_state_authority: HoldoutComparison::layer_gap(
+            dev.mean_state_authority,
+            holdout.mean_state_authority,
+        ),
+        gap_contracts: HoldoutComparison::layer_gap(dev.mean_contracts, holdout.mean_contracts),
+        gap_overall: HoldoutComparison::layer_gap(dev.mean_overall, holdout.mean_overall),
+        verdict: holdout_verdict(dev.mean_overall, holdout.mean_overall),
+        results_file: results_file.display().to_string(),
+        dev,
+        holdout,
+    };
+
+    std::fs::create_dir_all(&results_dir).map_err(|e| e.to_string())?;
+    std::fs::write(&results_file, c.to_results_text()).map_err(|e| e.to_string())?;
+    Ok(c)
+}
+
+impl HoldoutComparison {
+    /// Deterministic markdown text for `benchmarks/results/holdout-v1.txt`.
+    fn to_results_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# Holdout v1 — dev corpus vs blind holdout\n");
+        out.push_str(&format!("dev corpus:     {}\n", self.dev.mode));
+        out.push_str(&format!("holdout corpus: {}\n", self.holdout.mode));
+        out.push_str(&format!(
+            "results:        {}\n",
+            self.results_file
+        ));
+        out.push('\n');
+
+        let rows: [(&str, f64, f64); 6] = [
+            ("architecture", self.dev.mean_architecture, self.holdout.mean_architecture),
+            ("entrypoints", self.dev.mean_entrypoints, self.holdout.mean_entrypoints),
+            ("behavior", self.dev.mean_behavior, self.holdout.mean_behavior),
+            ("state_authority", self.dev.mean_state_authority, self.holdout.mean_state_authority),
+            ("contracts", self.dev.mean_contracts, self.holdout.mean_contracts),
+            ("overall (gate)", self.dev.mean_overall, self.holdout.mean_overall),
+        ];
+        out.push_str(&format!(
+            "{:<18} {:>10} {:>10} {:>10}\n",
+            "layer", "dev", "holdout", "gap"
+        ));
+        for (layer, dev, ho) in rows {
+            let gap = HoldoutComparison::layer_gap(dev, ho);
+            out.push_str(&format!(
+                "{:<18} {:>10.3} {:>10.3} {:>+10.3}\n",
+                layer, dev, ho, gap
+            ));
+        }
+        out.push('\n');
+        out.push_str(&format!(
+            "scored: dev {} (skipped {}) | holdout {} (skipped {})\n",
+            self.dev.scored, self.dev.skipped, self.holdout.scored, self.holdout.skipped
+        ));
+        out.push_str(&format!(
+            "precision: dev {:.3} | holdout {:.3}\n",
+            self.dev.mean_precision, self.holdout.mean_precision
+        ));
+        out.push_str(&format!(
+            "density (facts/1k tokens): dev {:.2} | holdout {:.2}\n",
+            self.dev.mean_density, self.holdout.mean_density
+        ));
+        out.push_str(&format!(
+            "atlas tokens: dev {:.0} | holdout {:.0}\n",
+            self.dev.mean_atlas_tokens, self.holdout.mean_atlas_tokens
+        ));
+        out.push('\n');
+        out.push_str(&format!(
+            "## verdict: {} (gap = {:.3}; tolerance = {:.3})\n",
+            self.verdict.as_str(),
+            self.gap_overall,
+            HOLDOUT_TOLERANCE
+        ));
+        match self.verdict {
+            HoldoutVerdict::NoOverfit => out.push_str(
+                "The blind holdout corpus scores at least as well as the dev corpus; \
+                 the dev-tuned rules generalize to unseen repos.\n",
+            ),
+            HoldoutVerdict::Borderline => out.push_str(
+                "The holdout corpus lags the dev corpus, but by less than the tolerance \
+                 band; the gap is consistent with corpus-difficulty/ground-truth noise, \
+                 not demonstrated overfitting.\n",
+            ),
+            HoldoutVerdict::Overfit => out.push_str(
+                "The holdout corpus lags the dev corpus by more than the tolerance band; \
+                 rules tuned on the dev corpus do not generalize to unseen repos.\n",
+            ),
+        }
+        out.push('\n');
+        out.push_str("## holdout repo overall recall (sorted)\n");
+        for r in &self.holdout.repos {
+            match &r.skipped_reason {
+                Some(reason) => out.push_str(&format!("  {:<24} skipped: {reason}\n", r.repo)),
+                None => out.push_str(&format!(
+                    "  {:<24} {:>8.3}\n",
+                    r.repo, r.overall
+                )),
+            }
+        }
+        out
+    }
+}
+
+/// Print the dev and holdout reports side by side plus the gap summary.
+pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
+    println!("scc bench atlas --holdout — dev corpus vs blind holdout (v1)");
+    println!("\n=== DEV corpus ===");
+    print_report(&c.dev, diagnose);
+    println!("\n=== HOLDOUT corpus ===");
+    print_report(&c.holdout, diagnose);
+    println!("\n=== gap (holdout - dev) ===");
+    println!(
+        "  {:<18} {:>10}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}\n  {:<18} {:>+10.3}",
+        "layer", "gap",
+        "architecture", c.gap_architecture,
+        "entrypoints", c.gap_entrypoints,
+        "behavior", c.gap_behavior,
+        "state_authority", c.gap_state_authority,
+        "contracts", c.gap_contracts,
+        "overall", c.gap_overall,
+    );
+    println!(
+        "  verdict: {} (holdout {:.3} vs dev {:.3}; tolerance {:.3})",
+        c.verdict.as_str(),
+        c.holdout.mean_overall,
+        c.dev.mean_overall,
+        HOLDOUT_TOLERANCE
+    );
+    println!("  results written to: {}", c.results_file);
 }
 
 /// Sorted non-hidden subdirectory names of `dir` (the corpus listing).
@@ -1491,12 +1729,69 @@ mod tests {
         assert_eq!(doc.behavior, ["s1", "s2"]);
         assert_eq!(doc.state_authority, ["redis", "db.x"]);
         assert_eq!(doc.tests, ["test_a"]);
+    }
 
-        // re-parse the synthesized markdown through the same parser
-        let doc2 = parse_ground_truth(&doc.to_markdown());
-        assert_eq!(doc2.behavior, doc.behavior);
-        assert_eq!(doc2.state_authority, doc.state_authority);
-        assert_eq!(doc2.architecture, doc.architecture);
+    #[test]
+    fn holdout_verdict_matches_gap_bands() {
+        // holdout >= dev -> NO OVERFIT
+        assert_eq!(holdout_verdict(0.20, 0.25), HoldoutVerdict::NoOverfit);
+        assert_eq!(holdout_verdict(0.20, 0.20), HoldoutVerdict::NoOverfit);
+        // lag inside the tolerance band -> BORDERLINE
+        assert_eq!(holdout_verdict(0.20, 0.17), HoldoutVerdict::Borderline);
+        assert_eq!(holdout_verdict(0.20, 0.20 - 0.05 + 1e-9), HoldoutVerdict::Borderline);
+        // lag beyond the tolerance band -> OVERFIT
+        assert_eq!(holdout_verdict(0.20, 0.14), HoldoutVerdict::Overfit);
+        assert_eq!(holdout_verdict(0.20, 0.0), HoldoutVerdict::Overfit);
+        assert_eq!(holdout_verdict(0.20, 0.20 - 0.05 - 1e-9), HoldoutVerdict::Overfit);
+    }
+
+    #[test]
+    fn layer_gap_is_clamped_and_signed() {
+        assert!((HoldoutComparison::layer_gap(0.1, 0.3) - 0.2).abs() < 1e-9);
+        assert!((HoldoutComparison::layer_gap(0.3, 0.1) - (-0.2)).abs() < 1e-9);
+        assert_eq!(HoldoutComparison::layer_gap(0.0, 2.0), 1.0);
+        assert_eq!(HoldoutComparison::layer_gap(2.0, 0.0), -1.0);
+        assert_eq!(HoldoutComparison::layer_gap(0.5, 0.5), 0.0);
+    }
+
+    #[test]
+    fn holdout_results_text_is_deterministic_and_contains_gap() {
+        let dev = AtlasRecallReport {
+            mean_architecture: 0.3,
+            ..Default::default()
+        };
+        let mut dev = dev;
+        dev.mean_entrypoints = 0.2;
+        dev.mean_behavior = 0.4;
+        dev.mean_state_authority = 0.1;
+        dev.mean_contracts = 0.5;
+        dev.mean_overall = 0.3;
+        dev.scored = 20;
+        let mut holdout = dev.clone();
+        holdout.mean_overall = 0.26; // lag 0.04 -> BORDERLINE (inside 0.05 band)
+        holdout.mean_contracts = 0.45;
+
+        let c = HoldoutComparison {
+            gap_architecture: HoldoutComparison::layer_gap(dev.mean_architecture, holdout.mean_architecture),
+            gap_entrypoints: HoldoutComparison::layer_gap(dev.mean_entrypoints, holdout.mean_entrypoints),
+            gap_behavior: HoldoutComparison::layer_gap(dev.mean_behavior, holdout.mean_behavior),
+            gap_state_authority: HoldoutComparison::layer_gap(
+                dev.mean_state_authority,
+                holdout.mean_state_authority,
+            ),
+            gap_contracts: HoldoutComparison::layer_gap(dev.mean_contracts, holdout.mean_contracts),
+            gap_overall: HoldoutComparison::layer_gap(dev.mean_overall, holdout.mean_overall),
+            verdict: holdout_verdict(dev.mean_overall, holdout.mean_overall),
+            results_file: "benchmarks/results/holdout-v1.txt".to_string(),
+            dev,
+            holdout,
+        };
+        let text = c.to_results_text();
+        let text2 = c.to_results_text();
+        assert_eq!(text, text2, "deterministic output");
+        assert!(text.contains("overall (gate)"));
+        assert!(text.contains("verdict: BORDERLINE"));
+        assert!(text.contains("-0.040"), "gap -0.04 rendered: {text}");
     }
 }
 

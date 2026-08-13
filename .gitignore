@@ -8,3 +8,5 @@ sdk/typescript/dist/
 sdk/python/__pycache__/
 benchmarks/corpus/*
 !benchmarks/corpus/README.md
+benchmarks/holdout/*
+!benchmarks/holdout/README.md

@@ -126,6 +126,81 @@ pub enum EvidenceType {
 }
 
 // ---------------------------------------------------------------------------
+// Archetype (Ontology phase — deterministic repo classification)
+// ---------------------------------------------------------------------------
+
+/// Repository archetype, detected deterministically from graph evidence
+/// (routes, exports, cli/framework signals, deployment/workspace shape) by
+/// `scc_graph::archetype::detect_archetype`. `Unknown` is the honest
+/// fallback when no signal fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Archetype {
+    /// HTTP routes + deployment units, no library-scale export ratio.
+    ServiceApplication,
+    /// cli-subcommand entrypoints or main fns with clap/cobra/argparse.
+    Cli,
+    /// Exported-symbol ratio over total symbols > 0.5, few/no routes.
+    LibrarySdk,
+    /// Routes + framework registrations + middleware facts.
+    WebFramework,
+    /// parse/analyze/transform/generate-style phase symbols.
+    CompilerLanguageTool,
+    /// plugin/middleware/DI registrations dominating.
+    PluginFramework,
+    /// docker/k8s/terraform manifests + deployment units, few app symbols.
+    InfrastructureProject,
+    /// workspace packages >= 3 + multiple deployment units.
+    MonorepoPlatform,
+    /// No signal fired.
+    Unknown,
+}
+
+impl Archetype {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Archetype::ServiceApplication => "service_application",
+            Archetype::Cli => "cli",
+            Archetype::LibrarySdk => "library_sdk",
+            Archetype::WebFramework => "web_framework",
+            Archetype::CompilerLanguageTool => "compiler_language_tool",
+            Archetype::PluginFramework => "plugin_framework",
+            Archetype::InfrastructureProject => "infrastructure_project",
+            Archetype::MonorepoPlatform => "monorepo_platform",
+            Archetype::Unknown => "unknown",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Archetype::ServiceApplication => "service application",
+            Archetype::Cli => "cli",
+            Archetype::LibrarySdk => "library/sdk",
+            Archetype::WebFramework => "web framework",
+            Archetype::CompilerLanguageTool => "compiler/language tool",
+            Archetype::PluginFramework => "plugin framework",
+            Archetype::InfrastructureProject => "infrastructure project",
+            Archetype::MonorepoPlatform => "monorepo platform",
+            Archetype::Unknown => "unknown",
+        }
+    }
+
+    /// All archetypes in the deterministic tie-break precedence order
+    /// (first entry wins a score tie).
+    pub const PRECEDENCE: [Archetype; 9] = [
+        Archetype::MonorepoPlatform,
+        Archetype::InfrastructureProject,
+        Archetype::WebFramework,
+        Archetype::ServiceApplication,
+        Archetype::Cli,
+        Archetype::LibrarySdk,
+        Archetype::CompilerLanguageTool,
+        Archetype::PluginFramework,
+        Archetype::Unknown,
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Core records
 // ---------------------------------------------------------------------------
 
@@ -422,6 +497,28 @@ pub struct AtlasComponent {
     pub failure_behavior: Vec<String>,
     #[serde(default)]
     pub owns: Vec<AtlasOwnershipClaim>,
+    /// Architectural layer assigned by the hierarchy clusterer:
+    /// `code_region | component | subsystem | service`.
+    #[serde(default)]
+    pub layer: String,
+    /// Immediate container entity id (subsystem/service) for merged
+    /// members; `None` for unmerged leaves.
+    #[serde(default)]
+    pub parent: Option<String>,
+}
+
+/// One hierarchical container (service or subsystem) with its direct member
+/// entity ids (component ids, or subsystem ids nested inside a service).
+/// Deterministic: `members` sorted by entity id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasHierarchyNode {
+    /// Container entity id (`repo://…/service/…` or `repo://…/subsystem/…`).
+    pub id: String,
+    pub name: String,
+    /// `"service"` | `"subsystem"`
+    pub kind: String,
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 /// A typed ownership claim (provenance preserved — DECLARED intent never
@@ -493,6 +590,18 @@ pub struct SystemAtlas {
     /// rendered as a DATA STORES list under DATA OWNERSHIP.
     #[serde(default)]
     pub data_stores: Vec<String>,
+    /// Detected repository archetype (deterministic evidence scoring).
+    #[serde(default)]
+    pub archetype: Option<Archetype>,
+    /// STATE & DATA AUTHORITY (ontology phase): section key
+    /// (persistent|runtime|configuration|caches|derived) -> deterministic
+    /// `COMPONENT owns/reads TARGET (PROV)`-style lines.
+    #[serde(default)]
+    pub state_authority: BTreeMap<String, Vec<String>>,
+    /// Hierarchical architecture containers (services first, then
+    /// subsystems) with their direct member entity ids.
+    #[serde(default)]
+    pub hierarchy: Vec<AtlasHierarchyNode>,
     #[serde(default)]
     pub evidence_summary: BTreeMap<String, usize>,
     #[serde(default)]

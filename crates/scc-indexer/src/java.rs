@@ -9,6 +9,7 @@ use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
 };
+use std::collections::BTreeMap;
 use tree_sitter::{Node, Parser};
 
 /// Java extractor. Uses the tree-sitter-java grammar.
@@ -315,6 +316,87 @@ fn technology_for(root: &str) -> Option<String> {
     }
 }
 
+/// CFG evidence for a call site: `(conditional, control_block, inside_loop,
+/// inside_try)`, walking ancestors up to the nearest class/method boundary.
+/// tree-sitter-java has no `else_clause` node (the alternative is a plain
+/// block), so else-branch calls report the enclosing `if_statement` — the
+/// branch evidence is still correct. The nearest block wins; loop/try
+/// nesting accumulates independently of it.
+fn call_cfg(node: tree_sitter::Node) -> (bool, Option<&'static str>, bool, bool) {
+    let mut cur = node.parent();
+    let mut inside_loop = false;
+    let mut inside_try = false;
+    let mut block: Option<&'static str> = None;
+    // A `finally` body runs on every path — guaranteed, not an alternative —
+    // so it contributes no branch evidence; skip the try_statement it
+    // belongs to (the walk continues to any *outer* construct).
+    let mut skip_next_try = false;
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+            | "method_declaration" | "constructor_declaration" | "lambda_expression"
+            | "program" | "compilation_unit" => break,
+            "if_statement" => {
+                block.get_or_insert("if");
+            }
+            "for_statement" | "enhanced_for_statement" => {
+                inside_loop = true;
+                block.get_or_insert("for");
+            }
+            "while_statement" => {
+                inside_loop = true;
+                block.get_or_insert("while");
+            }
+            "do_statement" => {
+                inside_loop = true;
+                block.get_or_insert("do");
+            }
+            "try_statement" => {
+                inside_try = true;
+                if skip_next_try {
+                    skip_next_try = false;
+                } else {
+                    block.get_or_insert("try");
+                }
+            }
+            "catch_clause" => {
+                inside_try = true;
+                block.get_or_insert("catch");
+            }
+            "finally_clause" => {
+                inside_try = true;
+                skip_next_try = true;
+            }
+            "switch_expression" | "switch_statement" => {
+                block.get_or_insert("switch");
+            }
+            "ternary_expression" => {
+                block.get_or_insert("if");
+            }
+            _ => {}
+        }
+        cur = anc.parent();
+    }
+    (block.is_some(), block, inside_loop, inside_try)
+}
+
+/// True when the call's result is consumed (assigned/returned/compared/
+/// passed) rather than discarded as a bare expression statement. Java has
+/// no syntactic await — `awaited` is always false for java call sites.
+fn call_returns_value(node: tree_sitter::Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        match anc.kind() {
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+            | "method_declaration" | "constructor_declaration" | "lambda_expression"
+            | "program" | "compilation_unit" | "expression_statement" => return false,
+            "parenthesized_expression" => cur = anc.parent(),
+            _ => return true,
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -337,6 +419,8 @@ struct Ctx {
     entrypoints: Vec<Entrypoint>,
     scopes: Vec<Scope>,
     facts: Vec<SemanticFact>,
+    /// Per-caller call-site counter (source order) — CFG lexical evidence.
+    call_seq: BTreeMap<Option<String>, u32>,
 }
 
 impl Ctx {
@@ -826,12 +910,22 @@ impl JavaExtractor {
                     }
                     None => false,
                 };
+                let caller = ctx.caller();
+                let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
+                *seq += 1;
+                let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 ctx.calls.push(Call {
-                    caller: ctx.caller(),
+                    caller,
                     callee,
                     line: node.start_position().row as u32 + 1,
                     known_receiver,
-                    conditional: false,
+                    conditional,
+                    lexical_order: *seq - 1,
+                    control_block: control_block.map(str::to_string),
+                    inside_loop,
+                    inside_try,
+                    awaited: false, // java has no syntactic await
+                    returns_value: call_returns_value(node),
                 });
                 self.record_store_ref(node, ctx, src);
             }
@@ -844,12 +938,22 @@ impl JavaExtractor {
         if let Some(type_node) = node.child_by_field_name("type") {
             let type_name = clean(node_text(Some(type_node), src));
             if !type_name.is_empty() && !type_name.contains('[') {
+                let caller = ctx.caller();
+                let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
+                *seq += 1;
+                let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 ctx.calls.push(Call {
-                    caller: ctx.caller(),
+                    caller,
                     callee: type_name,
                     line: node.start_position().row as u32 + 1,
                     known_receiver: false,
-                    conditional: false,
+                    conditional,
+                    lexical_order: *seq - 1,
+                    control_block: control_block.map(str::to_string),
+                    inside_loop,
+                    inside_try,
+                    awaited: false, // java has no syntactic await
+                    returns_value: call_returns_value(node),
                 });
             }
         }
