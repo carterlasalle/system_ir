@@ -483,8 +483,19 @@ pub struct FlowGraph {
 pub struct AtlasComponent {
     pub name: String,
     pub purpose: String,
+    /// Implementation facts: directory paths AND member symbol names (the
+    /// component compiler's `implementation` attribute carries both). The
+    /// structured model exposes the full fact layer; the rendered atlas
+    /// shows only [`AtlasComponent::implementation_paths`] to stay compact.
     #[serde(default)]
     pub implementation: Vec<String>,
+    /// The directory-path subset of `implementation` — the compact view the
+    /// rendered ARCHITECTURE block and IMPLEMENTATION MAP use.
+    #[serde(default)]
+    pub implementation_paths: Vec<String>,
+    /// Member symbols attributed to the component (compile-time fact).
+    #[serde(default)]
+    pub symbols: Vec<String>,
     #[serde(default)]
     pub consumes: Vec<String>,
     #[serde(default)]
@@ -702,6 +713,25 @@ pub struct SystemAtlas {
     pub evidence_summary: BTreeMap<String, usize>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// PUBLIC API (Wave 10 COMPILER-gap attack): component name ->
+    /// sorted public-export names (EXPORT entities + exported module-level
+    /// symbols). Rendered as `component: exports...` compact lines.
+    #[serde(default)]
+    pub public_api: BTreeMap<String, Vec<String>>,
+    /// FRAMEWORK SEMANTICS (Wave 10): component name -> sorted semantic
+    /// lines (`annotates X`, `registers Y (kind)`, `handles callback Z`)
+    /// from ANNOTATES/REGISTERS/HANDLES_CALLBACK facts.
+    #[serde(default)]
+    pub framework_semantics: BTreeMap<String, Vec<String>>,
+    /// PIPELINE (Wave 10, CompilerLanguageTool archetype): phase-named
+    /// symbols/files grouped by stage (`parse`/`analyze`/`transform`/
+    /// `generate`/`emit`/`other`), rendered as `[stage] symbol` lines.
+    #[serde(default)]
+    pub pipeline: Vec<String>,
+    /// LANDMARKS (Wave 10): notable exports + annotated targets, bounded
+    /// (~40) — the informational one-zoom-deeper symbol list.
+    #[serde(default)]
+    pub landmarks: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

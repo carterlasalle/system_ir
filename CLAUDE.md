@@ -137,3 +137,6 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 
 Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
+
+
+This repository uses mandatory semantic traceability. Trace integrity is part of the Definition of Done. Follow the repository traceability skill and any trace instructions injected by hooks. Do not invent trace fields, replace stable IDs during refactors, or remove markers to silence validation. Before completing implementation work, `trace verify --changed` must pass under the active policy.

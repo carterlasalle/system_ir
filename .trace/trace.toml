@@ -1,0 +1,47 @@
+# TraceLayer configuration (spec Section 49).
+schema_version = 1
+repo_id = "system_ir"
+cache_dir = ".trace/cache"
+
+[index]
+respect_gitignore = true
+incremental = true
+fts = true
+
+[index.languages]
+python = true
+typescript = true
+javascript = true
+go = true
+rust = true
+java = true
+cpp = false
+
+[discovery]
+include = ["**/*"]
+exclude = [
+  ".git/**",
+  ".trace/cache/**",
+  "node_modules/**",
+  ".venv/**",
+  "dist/**",
+  "build/**"
+]
+generated = ["src/generated/**"]
+
+[markers]
+prefix = "trace:v1"
+unknown_keys = "error"
+
+[hooks]
+max_context_chars = 1500
+pre_edit_require_context = true
+pre_edit_block_once = true
+prompt_search_limit = 5
+
+[evidence]
+require_revision = true
+preferred_coverage_proof = "suite"
+
+[external]
+resolve_by_default = false

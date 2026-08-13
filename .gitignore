@@ -10,3 +10,4 @@ benchmarks/corpus/*
 !benchmarks/corpus/README.md
 benchmarks/holdout/*
 !benchmarks/holdout/README.md
+.trace/cache/

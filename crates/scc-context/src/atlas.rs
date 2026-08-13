@@ -42,10 +42,13 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .unwrap_or("")
             .to_string();
 
-        let implementation: Vec<String> = c
+        let implementation_attr = c
             .attributes
             .get("implementation")
-            .and_then(|i| i.get("paths"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let implementation_paths: Vec<String> = implementation_attr
+            .get("paths")
             .and_then(|p| p.as_array())
             .map(|a| {
                 a.iter()
@@ -53,6 +56,23 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                     .collect()
             })
             .unwrap_or_default();
+        // the full implementation fact: directory paths AND member symbol
+        // names (the component compiler attributes every contained symbol).
+        // The structured model carries both; the render shows only the
+        // paths (`implementation_paths`) to stay compact.
+        let mut implementation: Vec<String> = implementation_paths.clone();
+        let mut symbols: Vec<String> = implementation_attr
+            .get("symbols")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        symbols.sort();
+        symbols.dedup();
+        implementation.extend(symbols.iter().cloned());
 
         let mut upstream: BTreeSet<String> = BTreeSet::new();
         let mut downstream: BTreeSet<String> = BTreeSet::new();
@@ -155,6 +175,8 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             name: c.name.clone(),
             purpose: purpose_text,
             implementation,
+            implementation_paths,
+            symbols,
             consumes: consumes.into_iter().collect(),
             produces: produces.into_iter().collect(),
             upstream: upstream.into_iter().collect(),
@@ -529,7 +551,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // ---- implementation map ----
     let mut implementation_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in &components {
-        implementation_map.insert(c.name.clone(), c.implementation.clone());
+        implementation_map.insert(c.name.clone(), c.implementation_paths.clone());
     }
 
     // ---- evidence + warnings + freshness ----
@@ -601,6 +623,126 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     }
     hierarchy.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
 
+    // ---- STATE & DATA AUTHORITY: structured bridge ----
+    // The state compiler's per-component claims (mutable fields, STATE/
+    // REGISTRY entities, configuration targets, topics, middleware/registry
+    // registrations, store writes) become component `owns` claims too, so
+    // the state fact layer is part of the machine model — not just rendered
+    // text. Provenance preserved; deduped by (target, provenance).
+    let state_claims = scc_graph::state::compile_state_claims(view.graph, &symbol_comp);
+    for claim in state_claims {
+        let Some(c) = components
+            .iter_mut()
+            .find(|c| c.name == claim.component)
+        else {
+            continue;
+        };
+        let seen_claim = (claim.target.clone(), claim.provenance.clone());
+        if !c.owns.iter().any(|o| {
+            o.target == seen_claim.0 && o.provenance == seen_claim.1
+        }) {
+            c.owns.push(AtlasOwnershipClaim {
+                target: claim.target,
+                provenance: claim.provenance,
+            });
+        }
+    }
+    for c in &mut components {
+        c.owns.sort_by(|a, b| a.target.cmp(&b.target).then(a.provenance.cmp(&b.provenance)));
+    }
+
+    // ---- PUBLIC API (Wave 10): exports grouped by component ----
+    // EXPORT entities (extractor-emitted public-export facts) plus symbols
+    // the extractor statically marked `exported: true` at module level.
+    // Grouped by the exporting symbol's component.
+    let mut public_api: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // EXPORT entities: the exporting symbol is the EXPORTS relationship
+    // subject; its name matches the export entity name.
+    for r in view.all_rels() {
+        if r.predicate != scc_core::predicates::EXPORTS {
+            continue;
+        }
+        let Some(comp) = symbol_comp.get(&r.subject) else { continue };
+        if let Some(name) = view.entity(&r.object).map(|e| e.name.clone()) {
+            if !name.is_empty() {
+                public_api.entry(comp.clone()).or_default().insert(name);
+            }
+        }
+    }
+    // exported module-level symbols (`exported: true`, no `.` in the name)
+    for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
+        if e.name.is_empty() || e.name.starts_with('_') || e.name.contains('.') {
+            continue;
+        }
+        if e.attributes.get("exported").and_then(|v| v.as_bool()) != Some(true) {
+            continue;
+        }
+        let Some(comp) = symbol_comp.get(&e.id) else { continue };
+        public_api.entry(comp.clone()).or_default().insert(e.name.clone());
+    }
+    let public_api: BTreeMap<String, Vec<String>> = public_api
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect();
+
+    // ---- FRAMEWORK SEMANTICS (Wave 10): annotations / registrations /
+    // callbacks grouped by component ----
+    let mut framework_semantics: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // annotations: ANNOTATION entity ANNOTATES target symbol
+    for a in view.entities_of_kind(scc_core::kinds::ANNOTATION) {
+        let mut rels = view.out_pred(&a.id, scc_core::predicates::ANNOTATES);
+        rels.sort_by(|x, y| x.object.cmp(&y.object));
+        for r in rels {
+            if let Some(comp) = symbol_comp.get(&r.object) {
+                let target = entity_name(view, &r.object);
+                framework_semantics
+                    .entry(comp.clone())
+                    .or_default()
+                    .insert(format!("annotates {target} ({})", a.name));
+            }
+        }
+    }
+    // REGISTERS + HANDLES_CALLBACK: symbol -> target
+    for pred in [
+        scc_core::predicates::REGISTERS,
+        scc_core::predicates::HANDLES_CALLBACK,
+    ] {
+        let mut rels = view.all_rels().to_vec();
+        rels.sort_by(|x, y| {
+            x.subject
+                .cmp(&y.subject)
+                .then(x.object.cmp(&y.object))
+                .then(x.id.cmp(&y.id))
+        });
+        for r in rels {
+            if r.predicate != pred {
+                continue;
+            }
+            let Some(comp) = symbol_comp.get(&r.subject) else { continue };
+            let target = entity_name(view, &r.object);
+            let line = if pred == scc_core::predicates::REGISTERS {
+                format!("registers {target}")
+            } else {
+                format!("handles callback {target}")
+            };
+            framework_semantics.entry(comp.clone()).or_default().insert(line);
+        }
+    }
+    let framework_semantics: BTreeMap<String, Vec<String>> = framework_semantics
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect();
+
+    // ---- PIPELINE (Wave 10): phase-named symbols grouped by stage ----
+    // Rendered only for the CompilerLanguageTool archetype: symbols whose
+    // name contains a phase verb, plus phase-named files (`1-parse`-style
+    // stage directories). Grouped by stage; bounded.
+    let pipeline = build_pipeline(view, archetype);
+
+    // ---- LANDMARKS (Wave 10): notable exports + annotated targets,
+    // bounded (~40) ----
+    let landmarks = build_landmarks(view, &public_api, &symbol_comp);
+
     SystemAtlas {
         repository: repo.name,
         revision: snapshot
@@ -629,7 +771,159 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         hierarchy,
         evidence_summary,
         warnings,
+        public_api,
+        framework_semantics,
+        pipeline,
+        landmarks,
     }
+}
+
+/// Phase-stage verbs for the PIPELINE section (CompilerLanguageTool
+/// archetype): a symbol whose name contains a stage verb is a phase symbol.
+const PIPELINE_STAGES: [(&str, &[&str]); 5] = [
+    ("parse", &["parse", "parser", "lexer", "lex", "tokenize", "tokeniser", "ast"]),
+    ("analyze", &["analyze", "analyse", "analysis"]),
+    ("transform", &["transform", "lower", "resolve", "resolveconfig"]),
+    ("generate", &["generate", "generator", "codegen", "compile", "compiler"]),
+    ("emit", &["emit", "print", "format", "formatdoc", "serialize"]),
+];
+
+/// PIPELINE (Wave 10): phase-named symbols grouped by stage, plus
+/// phase-named file paths (`1-parse`-style stage dirs). Only rendered for
+/// the CompilerLanguageTool archetype. Deterministic: sorted by
+/// (stage-rank, name); bounded to keep the section compact.
+fn build_pipeline(view: &TrustedGraphView, archetype: Option<scc_core::Archetype>) -> Vec<String> {
+    if archetype != Some(scc_core::Archetype::CompilerLanguageTool) {
+        return Vec::new();
+    }
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let stage_of = |name: &str| -> Option<usize> {
+        let lower = name.to_ascii_lowercase();
+        PIPELINE_STAGES
+            .iter()
+            .position(|(_, verbs)| verbs.iter().any(|v| lower.contains(v)))
+    };
+    // phase-named symbols (module-level and method symbols)
+    for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
+        if e.name.is_empty() {
+            continue;
+        }
+        let Some(rank) = stage_of(&e.name) else { continue };
+        if !seen.insert(e.name.clone()) {
+            continue;
+        }
+        lines.push((rank, e.name.clone()));
+    }
+    // phase-named files: `phases/1-parse/index.js` or a `1-parse`-style
+    // directory segment, or a path segment containing a stage verb
+    for f in view.entities_of_kind(scc_core::kinds::FILE) {
+        let name = f.name.clone();
+        let lower = name.to_ascii_lowercase();
+        let mut rank: Option<usize> = None;
+        for (i, (_, verbs)) in PIPELINE_STAGES.iter().enumerate() {
+            // digit-prefixed stage dirs: `1-parse`, `2-analyze`, `3-transform`
+            let numbered = verbs.iter().any(|v| {
+                lower.contains(&format!("/{v}"))
+                    || lower
+                        .split('/')
+                        .any(|seg| {
+                            let seg = seg.trim_start_matches(|c: char| c.is_ascii_digit());
+                            seg.trim_start_matches(['-', '_']).starts_with(v)
+                        })
+            });
+            if numbered {
+                rank = Some(i);
+                break;
+            }
+        }
+        if rank.is_none() && lower.contains("/phases/") {
+            rank = Some(0); // compiler phase tree without a matched verb
+        }
+        if let Some(r) = rank {
+            if seen.insert(name.clone()) {
+                lines.push((r, name));
+            }
+        }
+    }
+    lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut out: Vec<String> = Vec::new();
+    let mut current_stage: Option<&str> = None;
+    for (rank, name) in lines.into_iter().take(96) {
+        let stage = PIPELINE_STAGES[rank].0;
+        if current_stage != Some(stage) {
+            out.push(format!("[{}]", stage));
+            current_stage = Some(stage);
+        }
+        out.push(format!("  {name}"));
+    }
+    out
+}
+
+/// LANDMARKS (Wave 10): notable exports + annotated targets, bounded (~40).
+/// Exports: the component-sorted public API, preferring classes then
+/// functions, capped. Annotated targets: symbols an ANNOTATION/REGISTERS
+/// fact targets (framework-decorated code). Deterministic: sorted.
+fn build_landmarks(
+    view: &TrustedGraphView,
+    public_api: &BTreeMap<String, Vec<String>>,
+    symbol_comp: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // notable exports: exported classes first, then other exports, capped
+    let mut classes: Vec<String> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
+    for names in public_api.values() {
+        for n in names {
+            let kind = view
+                .entities_of_kind(scc_core::kinds::SYMBOL)
+                .into_iter()
+                .find(|e| e.name == *n)
+                .and_then(|e| e.attributes.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_class = matches!(
+                kind,
+                "class" | "struct" | "trait" | "interface" | "enum" | "type" | "module" | "model"
+            );
+            if is_class {
+                classes.push(n.clone());
+            } else {
+                others.push(n.clone());
+            }
+        }
+    }
+    classes.sort();
+    others.sort();
+    let mut pool: Vec<String> = classes;
+    pool.extend(others);
+    for n in pool.into_iter().take(24) {
+        if seen.insert(n.clone()) {
+            out.push(format!("export {}", n));
+        }
+    }
+    // annotated targets (framework-decorated symbols), capped
+    let mut targets: Vec<String> = Vec::new();
+    for a in view.entities_of_kind(scc_core::kinds::ANNOTATION) {
+        for r in view.out_pred(&a.id, scc_core::predicates::ANNOTATES) {
+            if let Some(comp) = symbol_comp.get(&r.object) {
+                let name = entity_name(view, &r.object);
+                if !name.is_empty() && !name.starts_with('_') {
+                    targets.push(format!("{name} (@{})", a.name));
+                }
+                let _ = comp;
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    for t in targets.into_iter().take(16) {
+        if seen.insert(t.clone()) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// Push one contract, merging consumers/evidence when the same
@@ -856,12 +1150,22 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     if !atlas.entrypoints.is_empty() {
         purpose.push_str("ENTRYPOINTS\n");
-        for e in &atlas.entrypoints {
+        // bounded render: the full structured list stays in the machine
+        // model; the agent-facing artifact caps the listing (a framework
+        // repo can have thousands of export surfaces).
+        const EP_RENDER_CAP: usize = 200;
+        for e in atlas.entrypoints.iter().take(EP_RENDER_CAP) {
             if e.trigger == e.name {
                 purpose.push_str(&format!("  {} [{}]\n", e.name, e.kind));
             } else {
                 purpose.push_str(&format!("  {} [{}] — {}\n", e.name, e.kind, e.trigger));
             }
+        }
+        if atlas.entrypoints.len() > EP_RENDER_CAP {
+            purpose.push_str(&format!(
+                "  ... +{} more (full list in the machine model)\n",
+                atlas.entrypoints.len() - EP_RENDER_CAP
+            ));
         }
     }
     sections.push(Section::new("SYSTEM PURPOSE", purpose, 10));
@@ -877,8 +1181,15 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         if !c.purpose.is_empty() {
             out.push_str(&format!("\n{}Purpose: {}", indent, c.purpose));
         }
-        if !c.implementation.is_empty() {
-            out.push_str(&format!("\n{}Implementation: {}", indent, c.implementation.join(", ")));
+        if !c.implementation_paths.is_empty() {
+            out.push_str(&format!(
+                "\n{}Implementation: {}",
+                indent,
+                c.implementation_paths.join(", ")
+            ));
+            if !c.symbols.is_empty() {
+                out.push_str(&format!(" ({} member symbols)", c.symbols.len()));
+            }
         }
         if !c.consumes.is_empty() {
             out.push_str(&format!("\n{}Consumes: {}", indent, c.consumes.join(", ")));
@@ -1072,6 +1383,85 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
             lines.join("\n")
         },
         9,
+    ));
+
+    // PUBLIC API (Wave 10): exports grouped by component — compact
+    // `component: exports A, B, C` lines from the semantic fact layer
+    // (EXPORT entities + exported module-level symbols). Per-component
+    // render is bounded (the structured model carries the full list).
+    sections.push(Section::new(
+        "PUBLIC API",
+        if atlas.public_api.is_empty() {
+            "(none)".into()
+        } else {
+            const API_RENDER_CAP: usize = 64;
+            let mut lines: Vec<String> = Vec::new();
+            for (comp, exports) in &atlas.public_api {
+                if exports.is_empty() {
+                    continue;
+                }
+                let shown: Vec<&str> = exports.iter().take(API_RENDER_CAP).map(|s| s.as_str()).collect();
+                let mut line = format!("{}: exports {}", comp, shown.join(", "));
+                if exports.len() > API_RENDER_CAP {
+                    line.push_str(&format!(" (+{} more)", exports.len() - API_RENDER_CAP));
+                }
+                lines.push(line);
+            }
+            lines.join("\n")
+        },
+        6,
+    ));
+
+    // FRAMEWORK SEMANTICS (Wave 10): annotations on targets,
+    // route/bean/middleware registrations, lifecycle callbacks — grouped
+    // by component. Per-component render is bounded.
+    sections.push(Section::new(
+        "FRAMEWORK SEMANTICS",
+        if atlas.framework_semantics.is_empty() {
+            "(none)".into()
+        } else {
+            const SEM_RENDER_CAP: usize = 48;
+            let mut lines: Vec<String> = Vec::new();
+            for (comp, facts) in &atlas.framework_semantics {
+                for f in facts.iter().take(SEM_RENDER_CAP) {
+                    lines.push(format!("{comp}: {f}"));
+                }
+                if facts.len() > SEM_RENDER_CAP {
+                    lines.push(format!(
+                        "{comp}: (+{} more)",
+                        facts.len() - SEM_RENDER_CAP
+                    ));
+                }
+            }
+            lines.join("\n")
+        },
+        6,
+    ));
+
+    // PIPELINE (Wave 10, CompilerLanguageTool archetype): phase-named
+    // symbols grouped by stage.
+    sections.push(Section::new(
+        "PIPELINE",
+        if atlas.pipeline.is_empty() {
+            "(none)".into()
+        } else {
+            atlas.pipeline.join("\n")
+        },
+        6,
+    ));
+
+    // LANDMARKS (Wave 10, priority 5 — bounded ~40): notable exports and
+    // annotated targets, one zoom level deeper than the component list.
+    sections.push(Section::new(
+        "LANDMARKS",
+        if atlas.landmarks.is_empty() {
+            "(none)".into()
+        } else {
+            let mut lines = atlas.landmarks.clone();
+            lines.sort();
+            lines.join("\n")
+        },
+        5,
     ));
 
     // CRITICAL INVARIANTS (never cut)
@@ -1575,5 +1965,367 @@ mod tests {
         let ep_kinds: BTreeSet<&str> = atlas.entrypoints.iter().map(|e| e.kind.as_str()).collect();
         assert!(ep_kinds.contains("public_api"), "{ep_kinds:?}");
         assert!(ep_kinds.contains("queue"), "{ep_kinds:?}");
+    }
+
+    /// A repo with component-attributed symbols exercising the Wave 10
+    /// fact-layer sections: exported classes/methods, module exports,
+    /// annotations, registrations, callbacks, and state facts.
+    fn fact_layer_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+
+        // components api (api/app.py) and web (web/app.py)
+        let mk_comp = |store: &Store, name: &str, file: &str| -> String {
+            let id = entity_id(&repo, kinds::COMPONENT, name);
+            store
+                .insert_entity(
+                    &scc_core::Entity::new(id.clone(), kinds::COMPONENT, name),
+                    &[file.to_string()],
+                )
+                .unwrap();
+            let fid = entity_id(&repo, kinds::FILE, file);
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:c:{name}"),
+                        id.clone(),
+                        predicates::CONTAINS,
+                        fid,
+                        Provenance::Extracted,
+                    ),
+                    file,
+                )
+                .unwrap();
+            id
+        };
+        mk_comp(&store, "api", "api/app.py");
+        mk_comp(&store, "web", "web/app.py");
+        // components live in the `components` table (RealityGraph::load
+        // reads store.components()) — replace with the full list, carrying
+        // the component compiler's `implementation` fact (paths + member
+        // symbols).
+        let mut api_comp = scc_core::Entity::new(
+            entity_id(&repo, kinds::COMPONENT, "api"),
+            kinds::COMPONENT,
+            "api",
+        );
+        api_comp.attr(
+            "implementation",
+            serde_json::json!({
+                "paths": ["api"],
+                "symbols": ["App", "App.get", "include_router", "_secret"],
+            }),
+        );
+        let mut web_comp = scc_core::Entity::new(
+            entity_id(&repo, kinds::COMPONENT, "web"),
+            kinds::COMPONENT,
+            "web",
+        );
+        web_comp.attr(
+            "implementation",
+            serde_json::json!({
+                "paths": ["web"],
+                "symbols": ["handle_page", "on_message"],
+            }),
+        );
+        store.replace_components(&[api_comp, web_comp]).unwrap();
+        store
+            .insert_entity(
+                &Entity::new(entity_id(&repo, kinds::FILE, "api/app.py"), kinds::FILE, "api/app.py"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_entity(
+                &Entity::new(entity_id(&repo, kinds::FILE, "web/app.py"), kinds::FILE, "web/app.py"),
+                &["web/app.py".into()],
+            )
+            .unwrap();
+
+        let mk_sym = |path: &str, name: &str, attrs: serde_json::Value| -> String {
+            let id = symbol_id(&repo, path, name);
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, name);
+            if let Some(obj) = attrs.as_object() {
+                for (k, v) in obj {
+                    e.attr(k, v.clone());
+                }
+            }
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+            let fid = entity_id(&repo, kinds::FILE, path);
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:f:{path}:{name}"),
+                        fid,
+                        predicates::CONTAINS,
+                        id.clone(),
+                        Provenance::Extracted,
+                    ),
+                    path,
+                )
+                .unwrap();
+            id
+        };
+
+        // exported class `App` with public method `App.get` (framework class)
+        let app_id = mk_sym(
+            "api/app.py",
+            "App",
+            serde_json::json!({"kind": "class", "exported": true}),
+        );
+        let app_get = mk_sym(
+            "api/app.py",
+            "App.get",
+            serde_json::json!({"kind": "method", "parent": "App", "exported": false}),
+        );
+        // exported module-level function + underscore-private one
+        mk_sym(
+            "api/app.py",
+            "include_router",
+            serde_json::json!({"kind": "function", "exported": true}),
+        );
+        mk_sym(
+            "api/app.py",
+            "_secret",
+            serde_json::json!({"kind": "function", "exported": true}),
+        );
+        // web component symbol
+        let web_handle = mk_sym(
+            "web/app.py",
+            "handle_page",
+            serde_json::json!({"kind": "function", "exported": true}),
+        );
+
+        // EXPORT entity for include_router (EXPORTS edge)
+        let exp_id = entity_id(&repo, kinds::EXPORT, "include_router");
+        store
+            .insert_entity(
+                &Entity::new(exp_id.clone(), kinds::EXPORT, "include_router"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        let include_id = symbol_id(&repo, "api/app.py", "include_router");
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(100),
+                    include_id,
+                    predicates::EXPORTS,
+                    exp_id,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // annotation: @Get on App.get
+        let ann_id = entity_id(&repo, kinds::ANNOTATION, "Get");
+        store
+            .insert_entity(
+                &Entity::new(ann_id.clone(), kinds::ANNOTATION, "Get"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(101),
+                    ann_id,
+                    predicates::ANNOTATES,
+                    app_get.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // registration: App registers middleware
+        let mw_id = entity_id(&repo, kinds::MIDDLEWARE, "RequestLogger");
+        store
+            .insert_entity(
+                &Entity::new(mw_id.clone(), kinds::MIDDLEWARE, "RequestLogger"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(102),
+                    app_id.clone(),
+                    predicates::REGISTERS,
+                    mw_id,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // callback: web_handle HANDLES_CALLBACK on_message (a SYMBOL target)
+        let cb_sym = mk_sym(
+            "web/app.py",
+            "on_message",
+            serde_json::json!({"kind": "function", "exported": false}),
+        );
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(103),
+                    web_handle.clone(),
+                    predicates::HANDLES_CALLBACK,
+                    cb_sym,
+                    Provenance::Extracted,
+                ),
+                "web/app.py",
+            )
+            .unwrap();
+
+        // state facts: mutable field CONTAINS-ed by App + config
+        let field_id = entity_id(&repo, kinds::FIELD, "App.cache");
+        store
+            .insert_entity(
+                Entity::new(field_id.clone(), kinds::FIELD, "App.cache")
+                    .attr("mutable", serde_json::json!(true))
+                    .attr("owner", serde_json::json!("App")),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(104),
+                    app_id.clone(),
+                    predicates::CONTAINS,
+                    field_id,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+        let cfg_id = entity_id(&repo, kinds::CONFIGURATION, "DEBUG");
+        store
+            .insert_entity(
+                &Entity::new(cfg_id.clone(), kinds::CONFIGURATION, "DEBUG"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    relationship_id(105),
+                    cfg_id,
+                    predicates::CONFIGURED_BY,
+                    app_id,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        let _graph = scc_graph::RealityGraph::load(&store).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn fact_layer_sections_grouped_by_component() {
+        let (_dir, store) = fact_layer_store();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let atlas = build_atlas(&ctx);
+
+        // PUBLIC API grouped by component: api has App (exported class) +
+        // include_router (export entity + module export); web has
+        // handle_page. `_secret` is excluded (leading underscore).
+        let api_exports = atlas.public_api.get("api").expect("api exports");
+        assert!(api_exports.contains(&"App".to_string()), "{api_exports:?}");
+        assert!(api_exports.contains(&"include_router".to_string()), "{api_exports:?}");
+        assert!(!api_exports.iter().any(|e| e == "_secret"), "{api_exports:?}");
+        let web_exports = atlas.public_api.get("web").expect("web exports");
+        assert!(web_exports.contains(&"handle_page".to_string()), "{web_exports:?}");
+
+        // FRAMEWORK SEMANTICS: annotation, registration, callback per comp
+        let api_facts = atlas.framework_semantics.get("api").expect("api facts");
+        assert!(
+            api_facts.iter().any(|f| f.contains("annotates App.get (Get)")),
+            "{api_facts:?}"
+        );
+        assert!(
+            api_facts.iter().any(|f| f.contains("registers RequestLogger")),
+            "{api_facts:?}"
+        );
+        let web_facts = atlas.framework_semantics.get("web").expect("web facts");
+        assert!(
+            web_facts.iter().any(|f| f.contains("handles callback on_message")),
+            "{web_facts:?}"
+        );
+
+        // component implementation carries member symbols; paths stay pure
+        let api = atlas.components.iter().find(|c| c.name == "api").unwrap();
+        assert!(api.symbols.contains(&"App".to_string()), "{:?}", api.symbols);
+        assert!(api.symbols.contains(&"App.get".to_string()), "{:?}", api.symbols);
+        assert!(api.implementation.contains(&"App".to_string()), "{:?}", api.implementation);
+        assert_eq!(api.implementation_paths, vec!["api".to_string()]);
+        // paths-only in the implementation map (compact render)
+        assert_eq!(
+            atlas.implementation_map.get("api").unwrap(),
+            &vec!["api".to_string()]
+        );
+
+        // STATE & DATA AUTHORITY structured bridge: mutable field + config
+        // targets surface as component owns claims
+        let api_owns: Vec<&str> = api.owns.iter().map(|o| o.target.as_str()).collect();
+        assert!(
+            api_owns.contains(&"App.cache"),
+            "mutable field owns claim: {api_owns:?}"
+        );
+        assert!(api_owns.contains(&"DEBUG"), "config owns claim: {api_owns:?}");
+
+        // LANDMARKS bounded: exports (App, include_router, handle_page)
+        assert!(atlas.landmarks.len() <= 40, "landmarks bounded: {:?}", atlas.landmarks.len());
+        assert!(atlas.landmarks.iter().any(|l| l.contains("App")), "{:?}", atlas.landmarks);
+
+        // rendered atlas carries the new section headers
+        let pack = render_atlas(&ctx, &atlas, usize::MAX);
+        assert!(pack.content.contains("# PUBLIC API"), "{}", pack.content);
+        assert!(pack.content.contains("# FRAMEWORK SEMANTICS"), "{}", pack.content);
+        assert!(pack.content.contains("# LANDMARKS"), "{}", pack.content);
+        assert!(pack.content.contains("api: exports App, include_router"), "{}", pack.content);
+    }
+
+    #[test]
+    fn pipeline_only_for_compiler_language_tool() {
+        let (_dir, store) = fact_layer_store();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let atlas = build_atlas(&ctx);
+        // not a compiler repo → no pipeline lines
+        assert!(atlas.pipeline.is_empty(), "{:?}", atlas.pipeline);
+
+        // phase-named symbols group by stage when the archetype fires
+        let parse_id = symbol_id(&store.repo_id, "api/app.py", "parse");
+        let mut e = store
+            .get_entity(&parse_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                let ent = Entity::new(parse_id.clone(), kinds::SYMBOL, "parse");
+                store.insert_entity(&ent, &["api/app.py".into()]).unwrap();
+                ent
+            });
+        e.attr("exported", serde_json::json!(true));
+        store.insert_entity(&e, &["api/app.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let pipeline = build_pipeline(&ctx.view, Some(scc_core::Archetype::CompilerLanguageTool));
+        assert!(
+            pipeline.iter().any(|l| l.trim() == "parse"),
+            "parse symbol in pipeline: {pipeline:?}"
+        );
+        assert!(
+            pipeline.iter().any(|l| l == "[parse]"),
+            "stage header: {pipeline:?}"
+        );
     }
 }

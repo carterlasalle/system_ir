@@ -4,39 +4,39 @@ holdout corpus: holdout: /Users/rocket/system_ir/benchmarks/holdout
 results:        /Users/rocket/system_ir/benchmarks/results/holdout-v1.txt
 
 layer                     dev    holdout        gap
-architecture            0.123      0.079     -0.043
-entrypoints             0.046      0.042     -0.004
-behavior                0.077      0.000     -0.077
-state_authority         0.000      0.000     +0.000
-contracts               0.149      0.045     -0.104
-overall (gate)          0.079      0.033     -0.046
+architecture            0.815      0.322     -0.493
+entrypoints             0.248      0.422     +0.174
+behavior                0.115      0.000     -0.115
+state_authority         0.000      0.450     +0.450
+contracts               0.187      0.051     -0.136
+overall (gate)          0.273      0.249     -0.024
 
 scored: dev 20 (skipped 0) | holdout 20 (skipped 0)
-precision: dev 0.400 | holdout 0.250
-density (facts/1k tokens): dev 0.89 | holdout 0.17
-atlas tokens: dev 5969 | holdout 19103
+precision: dev 0.111 | holdout 0.000
+density (facts/1k tokens): dev 1.20 | holdout 0.53
+atlas tokens: dev 10294 | holdout 46902
 
-## verdict: BORDERLINE (gap = -0.046; tolerance = 0.050)
+## verdict: BORDERLINE (gap = -0.024; tolerance = 0.050)
 The holdout corpus lags the dev corpus, but by less than the tolerance band; the gap is consistent with corpus-difficulty/ground-truth noise, not demonstrated overfitting.
 
 ## holdout repo overall recall (sorted)
-  aiohttp                     0.025
-  axios                       0.000
-  black                       0.100
-  chi                         0.057
-  click                       0.022
-  cobra                       0.036
-  django                      0.070
-  guava                       0.000
-  helm                        0.000
-  kustomize                   0.018
-  netty                       0.175
-  rayon                       0.022
-  react                       0.020
-  requests                    0.000
-  ripgrep                     0.000
-  tokio                       0.020
-  vitest                      0.060
-  vue                         0.040
-  zerolog                     0.000
-  zod                         0.000
+  aiohttp                     0.254
+  axios                       0.120
+  black                       0.435
+  chi                         0.224
+  click                       0.278
+  cobra                       0.122
+  django                      0.332
+  guava                       0.575
+  helm                        0.070
+  kustomize                   0.221
+  netty                       0.555
+  rayon                       0.188
+  react                       0.233
+  requests                    0.301
+  ripgrep                     0.086
+  tokio                       0.126
+  vitest                      0.186
+  vue                         0.229
+  zerolog                     0.176
+  zod                         0.270

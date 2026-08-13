@@ -16,7 +16,7 @@ use scc_core::{
 };
 use scc_store::Store;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const MAX_DEPTH: usize = 10;
 const MAX_BREADTH: usize = 64;
@@ -51,6 +51,8 @@ fn last_segment(id: &str) -> String {
 /// Seed invocation surfaces from the Wave 9 semantic-fact layer
 /// (deterministic — sorted by (kind, symbol, trigger)):
 /// - public exports: `symbol EXPORTS export` relationships → PublicApi
+/// - exported module-level symbols + methods of exported classes (the
+///   `exported: true` fact attribute / class-parent attribution) → PublicApi
 /// - queue consumers: `symbol SUBSCRIBES topic` relationships → Queue
 /// - framework callbacks: `owner HANDLES_CALLBACK callback` → FrameworkCallback
 /// - lifecycle callbacks: JUnit @Before*/@After* annotation facts → Lifecycle
@@ -93,6 +95,60 @@ pub fn invocation_surfaces(graph: &RealityGraph) -> Vec<InvocationSurface> {
                     format!("export:{}", sym.name)
                 } else {
                     format!("export:{} ({kind_attr})", sym.name)
+                },
+            });
+        }
+    }
+
+    // exported module-level symbols + methods of exported classes → PublicApi.
+    // The extractors record visibility statically (`exported: true`) and
+    // attribute methods to their parent class; a method of an exported class
+    // is part of the class's public surface. Deterministic: symbols are
+    // iterated by id.
+    let exported_classes = exported_class_names(graph);
+    let mut exported_syms: Vec<&scc_core::Entity> = graph
+        .entities_of_kind(kinds::SYMBOL)
+        .into_iter()
+        .filter(|e| {
+            let name = e.name.as_str();
+            if name.is_empty() || name.starts_with('_') {
+                return false;
+            }
+            let exported = e
+                .attributes
+                .get("exported")
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            if exported {
+                return !name.contains('.');
+            }
+            // method of an exported class
+            let parent = e
+                .attributes
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            !parent.is_empty()
+                && exported_classes.contains(parent)
+                && e.attributes.get("kind").and_then(|v| v.as_str()) == Some("method")
+        })
+        .collect();
+    exported_syms.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in exported_syms {
+        let key = (InvocationSurfaceKind::PublicApi, e.id.clone());
+        if seen.insert(key.clone()) {
+            let kind = e
+                .attributes
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            out.push(InvocationSurface {
+                symbol: e.id.clone(),
+                kind: InvocationSurfaceKind::PublicApi,
+                trigger: if kind.is_empty() {
+                    format!("export:{}", e.name)
+                } else {
+                    format!("export:{} ({kind})", e.name)
                 },
             });
         }
@@ -195,6 +251,55 @@ pub fn invocation_surfaces(graph: &RealityGraph) -> Vec<InvocationSurface> {
     out
 }
 
+/// Module-level symbol kinds that count as an exported *class* (a method
+/// parent attribution target). The extractor's `exported: true` fact on a
+/// top-level class/struct/trait/interface/type marks the class as public API.
+const CLASS_KINDS: [&str; 13] = [
+    "class",
+    "struct",
+    "trait",
+    "interface",
+    "enum",
+    "type",
+    "module",
+    "protocol",
+    "dataclass",
+    "object",
+    "decorator",
+    "exception",
+    "model",
+];
+
+/// Names of exported classes (deterministic: sorted by id over symbol
+/// entities). Methods of these classes are public-api surfaces.
+fn exported_class_names(graph: &RealityGraph) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for e in graph.entities_of_kind(kinds::SYMBOL) {
+        let name = e.name.as_str();
+        if name.is_empty() || name.contains('.') {
+            continue;
+        }
+        let kind = e
+            .attributes
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !CLASS_KINDS.contains(&kind) {
+            continue;
+        }
+        if e.attributes.get("exported").and_then(|v| v.as_bool()) == Some(true) {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// How many public-api surfaces a flow pass is willing to seed (the full
+/// surface list stays in the atlas entrypoints; the FLOWS view stays
+/// bounded). Deterministic: the first N surfaces in invocation_surfaces'
+/// (kind, symbol, trigger) order.
+const PUBLIC_API_FLOW_SEED_CAP: usize = 24;
+
 /// Collect entrypoints: routes (handlers), declared intent flows, symbols
 /// marked as entrypoints (main-guard / bin / module-entry).
 pub fn collect_entrypoints(
@@ -203,12 +308,12 @@ pub fn collect_entrypoints(
     intent: &[(String, serde_json::Value)],
 ) -> Vec<FlowEntrypoint> {
     let mut out: Vec<FlowEntrypoint> = Vec::new();
-    // Flow ids key on the entrypoint name, so names must stay unique across
-    // kinds: a symbol that is several invocation surfaces at once seeds the
-    // first surface kind (deterministic enum order) and is skipped for the
-    // rest. `invocation_surfaces()` keeps the full multi-kind list for the
-    // atlas entrypoints and coverage counts.
+    // Flow ids key on the entrypoint name via `entity_id`, which sanitizes
+    // names to lowercase; names that differ only by case (`main` / `Main`)
+    // collide on the store's UNIQUE flows.id. Dedup on the canonical flow
+    // id so the id constraint is the invariant, never the raw spelling.
     let mut seen: HashSet<String> = HashSet::new();
+    let flow_key = |name: &str| entity_id(&store.repo_id, kinds::FLOW, name);
 
     // routes
     for route in graph.entities_of_kind(kinds::ROUTE) {
@@ -216,7 +321,7 @@ pub fn collect_entrypoints(
             let method = route.attributes.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let path = route.attributes.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let name = format!("{}-{}", method.to_ascii_lowercase(), path);
-            if seen.insert(name.clone()) {
+            if seen.insert(flow_key(&name)) {
                 out.push(FlowEntrypoint {
                     name,
                     trigger: format!("{method} {path}"),
@@ -242,7 +347,7 @@ pub fn collect_entrypoints(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| entrypoint.clone());
-            if seen.insert(name.clone()) {
+            if seen.insert(flow_key(&name)) {
                 out.push(FlowEntrypoint {
                     name,
                     trigger,
@@ -259,7 +364,7 @@ pub fn collect_entrypoints(
         if !has_ep {
             continue;
         }
-        if seen.insert(e.name.clone()) {
+        if seen.insert(flow_key(&e.name)) {
             out.push(FlowEntrypoint {
                 name: e.name.clone(),
                 trigger: format!("entrypoint:{}", e.name),
@@ -269,17 +374,27 @@ pub fn collect_entrypoints(
         }
     }
 
-    // Wave 9: invocation-surface seeds (public exports, queue consumers,
-    // framework callbacks, lifecycle callbacks, event handlers) — additive
-    // and deterministic (invocation_surfaces sorts its output). Name-dedup
+    // Wave 9/10: invocation-surface seeds (public exports, exported-module
+    // and exported-class-method surfaces, queue consumers, framework
+    // callbacks, lifecycle callbacks, event handlers) — additive and
+    // deterministic (invocation_surfaces sorts its output). Name-dedup
     // keeps flow ids unique (a symbol already seeded as an entrypoint does
-    // not seed a second flow).
+    // not seed a second flow). The public-api bulk (every exported symbol
+    // in a framework repo) is bounded here so the FLOWS view stays compact;
+    // the full surface list still reaches the atlas entrypoints.
+    let mut public_api_seeded = 0usize;
     for s in invocation_surfaces(graph) {
         let Some(e) = graph.entity(&s.symbol) else { continue };
         if e.name.is_empty() {
             continue;
         }
-        if seen.insert(e.name.clone()) {
+        if s.kind == InvocationSurfaceKind::PublicApi {
+            if public_api_seeded >= PUBLIC_API_FLOW_SEED_CAP {
+                continue;
+            }
+            public_api_seeded += 1;
+        }
+        if seen.insert(flow_key(&e.name)) {
             out.push(FlowEntrypoint {
                 name: e.name.clone(),
                 trigger: s.trigger.clone(),

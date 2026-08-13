@@ -229,10 +229,131 @@ pub fn compile_state_authority(
         .collect()
 }
 
+/// One structured state-ownership claim: `component` owns/reads/registers
+/// `target` (evidence `provenance`). The structured bridge from the STATE &
+/// DATA AUTHORITY compiler into the atlas component `owns` claims, so the
+/// state fact layer is part of the machine model (not just rendered text).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StateClaim {
+    pub component: String,
+    pub target: String,
+    pub provenance: String,
+}
+
+/// Emit per-component state claims over the same fact sets as
+/// [`compile_state_authority`]: WRITES to stores/caches, mutable FIELD /
+/// STATE / REGISTRY owners, CONFIGURED_BY configuration targets, topics
+/// (PUBLISHES/SUBSCRIBES/CONSUMES), and middleware/registry REGISTERS.
+/// Deterministic: sorted by (component, target, provenance).
+pub fn compile_state_claims(
+    graph: &RealityGraph,
+    symbol_comp: &HashMap<String, String>,
+) -> Vec<StateClaim> {
+    let mut claims: BTreeSet<StateClaim> = BTreeSet::new();
+    let comp_of = |sym_id: &str| symbol_comp.get(sym_id).cloned();
+    let prov_str = |p: &Provenance| p.as_str().to_string();
+
+    // per-symbol edges (writes/reads/publishes/subscribes/consumes/registers)
+    let mut symbol_ids: Vec<&String> = symbol_comp.keys().collect();
+    symbol_ids.sort();
+    for sym_id in symbol_ids {
+        let Some(comp) = comp_of(sym_id) else { continue };
+        let mut rels: Vec<&scc_core::Relationship> = graph.out_edges(sym_id);
+        rels.sort_by(|a, b| {
+            a.predicate
+                .cmp(&b.predicate)
+                .then_with(|| a.object.cmp(&b.object))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for r in rels {
+            let Some(target) = graph.entities.get(&r.object) else { continue };
+            let tgt = match r.predicate.as_str() {
+                predicates::WRITES => {
+                    if target.kind == kinds::DATA_STORE || target.kind == kinds::DATA_ENTITY {
+                        Some(store_ref(graph, &r.object))
+                    } else {
+                        Some(target.name.clone())
+                    }
+                }
+                predicates::PUBLISHES
+                | predicates::SUBSCRIBES
+                | predicates::CONSUMES
+                | predicates::READS => Some(target.name.clone()),
+                predicates::REGISTERS => {
+                    let is_mw_registry = target.kind == kinds::MIDDLEWARE
+                        || target.kind == kinds::REGISTRY
+                        || (target.kind == kinds::CONTRACT
+                            && target
+                                .attributes
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                .map(|k| matches!(k, "middleware" | "registry"))
+                                .unwrap_or(false));
+                    if is_mw_registry {
+                        Some(target.name.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(t) = tgt {
+                claims.insert(StateClaim {
+                    component: comp.clone(),
+                    target: t,
+                    provenance: prov_str(&r.provenance),
+                });
+            }
+        }
+    }
+
+    // runtime state: mutable FIELD facts + STATE/REGISTRY entities
+    let mut runtime_entities: Vec<&scc_core::Entity> = graph
+        .entities_of_kind(kinds::FIELD)
+        .into_iter()
+        .filter(|f| f.attributes.get("mutable").and_then(|v| v.as_bool()) == Some(true))
+        .collect();
+    runtime_entities.extend(graph.entities_of_kind(kinds::STATE));
+    runtime_entities.extend(graph.entities_of_kind(kinds::REGISTRY));
+    runtime_entities.sort_by(|a, b| a.id.cmp(&b.id));
+    for e in runtime_entities {
+        let mut rels = graph.in_pred(&e.id, predicates::CONTAINS);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            if let Some(comp) = comp_of(&r.subject) {
+                claims.insert(StateClaim {
+                    component: comp,
+                    target: e.name.clone(),
+                    provenance: prov_str(&r.provenance),
+                });
+                break;
+            }
+        }
+    }
+
+    // configuration: CONFIGURED_BY (config -> owner symbol)
+    for cfg in graph.entities_of_kind(kinds::CONFIGURATION) {
+        let mut rels = graph.out_pred(&cfg.id, predicates::CONFIGURED_BY);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            if let Some(comp) = comp_of(&r.object) {
+                claims.insert(StateClaim {
+                    component: comp,
+                    target: cfg.name.clone(),
+                    provenance: prov_str(&r.provenance),
+                });
+            }
+        }
+    }
+
+    let mut out: Vec<StateClaim> = claims.into_iter().collect();
+    out.sort();
+    out
+}
+
 /// Resolve a write target to a human store reference: data entities render
 /// as `store.entity`, stores as their name.
-fn store_ref(graph: &RealityGraph, id: &str) -> String {
-    match graph.entities.get(id) {
+fn store_ref(graph: &RealityGraph, id: &str) -> String {    match graph.entities.get(id) {
         Some(e) if e.kind == kinds::DATA_ENTITY => e
             .attributes
             .get("store")

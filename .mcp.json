@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tracelayer": {
+      "command": "tracelayer",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

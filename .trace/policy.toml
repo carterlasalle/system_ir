@@ -1,0 +1,21 @@
+# TraceLayer policy (spec Section 24.4).
+profile = "standard"
+
+[lifecycle]
+default = "wip"
+ci = "merge"
+
+[requirements.merge]
+require_work_ancestry = true
+require_requirement_for_changed_behavior = true
+require_verifying_test = true
+require_test_pass = true
+require_coverage_confirmation = false
+block_stale = true
+
+[requirements.release]
+require_coverage_confirmation = true
+require_semantic_audit = true
+
+[exclusions]
+paths = ["vendor/**", "generated/**", "docs/vendor/**"]

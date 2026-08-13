@@ -35,7 +35,7 @@
 - Context — per-invocation state: params, meta, command stack (src/click/core.py)
 - ParameterSource — enum recording where a param value came from (src/click/core.py)
 - _OptionParser — parsing state machine (src/click/parser.py)
-- Context.meta — arbitrary per-invocation metadata dict
+- Context._meta — arbitrary per-invocation metadata dict
 - current_context — thread-local active context (src/click/globals.py)
 - Context.params — resolved parameter values
 
