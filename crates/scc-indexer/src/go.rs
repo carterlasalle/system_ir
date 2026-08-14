@@ -804,23 +804,20 @@ impl GoExtractor {
                         }
                     }
                     if has_tags_fw && has_json_tag {
-                        ctx.facts.push(SemanticFact::SchemaDefinition {
+                        ctx.facts.push(SemanticFact::SchemaDefinition {  
                             owner: name.clone(),
-                            name: name.clone(),
-                        });
+                            name: name.clone(), expr: String::new() });
                         if let Some(parent) = embedded {
-                            ctx.facts.push(SemanticFact::SchemaComposition {
+                            ctx.facts.push(SemanticFact::SchemaComposition {  
                                 owner: name.clone(),
                                 name: name.clone(),
-                                parent,
-                            });
+                                parent, expr: String::new() });
                         }
                     }
                     if has_validate_tag {
-                        ctx.facts.push(SemanticFact::SchemaValidation {
+                        ctx.facts.push(SemanticFact::SchemaValidation {  
                             owner: name.clone(),
-                            target: name.clone(),
-                        });
+                            target: name.clone(), expr: String::new() });
                     }
                 }
             }
@@ -1200,10 +1197,9 @@ impl GoExtractor {
         let has_json = ctx.imports.iter().any(|i| i.module == "encoding/json");
         if has_json && method == "Unmarshal" && recv == "json" {
             if let Some(target) = unmarshal_target(node, src) {
-                ctx.facts.push(SemanticFact::SchemaValidation {
+                ctx.facts.push(SemanticFact::SchemaValidation {  
                     owner: owner.clone(),
-                    target,
-                });
+                    target, expr: String::new() });
             }
             return;
         }
@@ -1430,16 +1426,16 @@ fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
         SemanticFact::Callback { owner, callback } => {
             (owner.clone(), "callback".to_string(), callback.clone())
         }
-        SemanticFact::SchemaDefinition { owner, name } => {
+        SemanticFact::SchemaDefinition {   owner, name, .. }=> {
             (owner.clone(), "schema".to_string(), name.clone())
         }
-        SemanticFact::SchemaComposition { owner, name, parent } => {
+        SemanticFact::SchemaComposition {   owner, name, parent, .. }=> {
             (owner.clone(), "schema".to_string(), format!("{name}\u{0}composes:{parent}"))
         }
-        SemanticFact::SchemaValidation { owner, target } => {
+        SemanticFact::SchemaValidation {   owner, target, .. }=> {
             (owner.clone(), "schema-validation".to_string(), target.clone())
         }
-        SemanticFact::ReactiveState { owner, name, access } => {
+        SemanticFact::ReactiveState {   owner, name, access, .. }=> {
             (owner.clone(), "reactive".to_string(), format!("{name}\u{0}{access}"))
         }
     }
@@ -2592,28 +2588,28 @@ mod tests {
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+                SemanticFact::SchemaDefinition {   owner, name, .. }if owner == "User" && name == "User"
             )),
             "json-tagged struct must be a SchemaDefinition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaComposition { owner, name, parent } if owner == "User" && name == "User" && parent == "Parent"
+                SemanticFact::SchemaComposition {   owner, name, parent, .. }if owner == "User" && name == "User" && parent == "Parent"
             )),
             "embedded struct must be a SchemaComposition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaValidation { owner, target } if owner == "User" && target == "User"
+                SemanticFact::SchemaValidation {   owner, target, .. }if owner == "User" && target == "User"
             )),
             "validate tag must emit SchemaValidation: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaValidation { owner, target } if owner == "load" && target == "u"
+                SemanticFact::SchemaValidation {   owner, target, .. }if owner == "load" && target == "u"
             )),
             "json.Unmarshal must emit SchemaValidation: {schemas:?}"
         );

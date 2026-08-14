@@ -574,16 +574,16 @@ fn fact_sort_key(f: &SemanticFact) -> (String, u8, String, String) {
         SemanticFact::Configuration { owner, key } => {
             (owner.clone(), 5, key.clone(), String::new())
         }
-        SemanticFact::SchemaDefinition { owner, name } => {
+        SemanticFact::SchemaDefinition {   owner, name, .. }=> {
             (owner.clone(), 6, name.clone(), String::new())
         }
-        SemanticFact::SchemaComposition { owner, name, parent } => {
+        SemanticFact::SchemaComposition {   owner, name, parent, .. }=> {
             (owner.clone(), 6, name.clone(), parent.clone())
         }
-        SemanticFact::SchemaValidation { owner, target } => {
+        SemanticFact::SchemaValidation {   owner, target, .. }=> {
             (owner.clone(), 6, target.clone(), String::new())
         }
-        SemanticFact::ReactiveState { owner, name, access } => {
+        SemanticFact::ReactiveState {   owner, name, access, .. }=> {
             (owner.clone(), 7, name.clone(), access.clone())
         }
     }
@@ -723,14 +723,12 @@ impl JavaExtractor {
         let has_validation =
             ctx.has_import("jakarta.validation") || ctx.has_import("javax.validation");
         if has_validation && type_has_validation_annotations(node, src) {
-            ctx.facts.push(SemanticFact::SchemaDefinition {
+            ctx.facts.push(SemanticFact::SchemaDefinition {  
                 owner: name.clone(),
-                name: name.clone(),
-            });
-            ctx.facts.push(SemanticFact::SchemaValidation {
+                name: name.clone(), expr: String::new() });
+            ctx.facts.push(SemanticFact::SchemaValidation {  
                 owner: name.clone(),
-                target: name.clone(),
-            });
+                target: name.clone(), expr: String::new() });
         }
         // Wave 11: `class Foo extends LocalModel` (with validation imports)
         // is schema composition.
@@ -741,11 +739,10 @@ impl JavaExtractor {
                     .iter()
                     .any(|s| s.name == parent && s.kind == SymbolKind::Class)
                 {
-                    ctx.facts.push(SemanticFact::SchemaComposition {
+                    ctx.facts.push(SemanticFact::SchemaComposition {  
                         owner: name.clone(),
                         name: name.clone(),
-                        parent,
-                    });
+                        parent, expr: String::new() });
                 }
             }
         }
@@ -2310,14 +2307,14 @@ public class Impl implements Local { public void run() {} }
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaDefinition { owner, name } if owner == "UserDto" && name == "UserDto"
+                SemanticFact::SchemaDefinition {   owner, name, .. }if owner == "UserDto" && name == "UserDto"
             )),
             "validation-annotated record must be a SchemaDefinition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaValidation { owner, target } if owner == "UserDto" && target == "UserDto"
+                SemanticFact::SchemaValidation {   owner, target, .. }if owner == "UserDto" && target == "UserDto"
             )),
             "validation annotations must emit SchemaValidation: {schemas:?}"
         );
@@ -2333,7 +2330,7 @@ public class Impl implements Local { public void run() {} }
         assert!(
             schemas2.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaComposition { owner, name, parent } if owner == "Admin" && name == "Admin" && parent == "Base"
+                SemanticFact::SchemaComposition {   owner, name, parent, .. }if owner == "Admin" && name == "Admin" && parent == "Base"
             )),
             "model inheritance must be a SchemaComposition: {schemas2:?}"
         );

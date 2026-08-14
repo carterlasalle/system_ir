@@ -702,21 +702,19 @@ impl Ctx {
                 if !pydantic_models.contains(class) {
                     continue;
                 }
-                facts.push(SemanticFact::SchemaDefinition {
+                facts.push(SemanticFact::SchemaDefinition {  
                     owner: class.clone(),
-                    name: class.clone(),
-                });
+                    name: class.clone(), expr: String::new() });
                 // Composition: the base is another model declared in this
                 // file (first local base wins, deterministic).
                 if let Some(parent) = bases
                     .iter()
                     .find(|b| local_classes.contains(*b) && pydantic_models.contains(*b))
                 {
-                    facts.push(SemanticFact::SchemaComposition {
+                    facts.push(SemanticFact::SchemaComposition {  
                         owner: class.clone(),
                         name: class.clone(),
-                        parent: parent.clone(),
-                    });
+                        parent: parent.clone(), expr: String::new() });
                 }
             }
         }
@@ -760,16 +758,16 @@ fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
         SemanticFact::Callback { owner, callback } => {
             (owner.clone(), format!("callback:{callback}"), String::new())
         }
-        SemanticFact::SchemaDefinition { owner, name } => {
+        SemanticFact::SchemaDefinition {   owner, name, .. }=> {
             (owner.clone(), format!("schema:{name}"), String::new())
         }
-        SemanticFact::SchemaComposition { owner, name, parent } => {
+        SemanticFact::SchemaComposition {   owner, name, parent, .. }=> {
             (owner.clone(), format!("schema:{name}:composes:{parent}"), String::new())
         }
-        SemanticFact::SchemaValidation { owner, target } => {
+        SemanticFact::SchemaValidation {   owner, target, .. }=> {
             (owner.clone(), format!("schema-validation:{target}"), String::new())
         }
-        SemanticFact::ReactiveState { owner, name, access } => {
+        SemanticFact::ReactiveState {   owner, name, access, .. }=> {
             (owner.clone(), format!("reactive:{name}:{access}"), String::new())
         }
     }
@@ -1044,10 +1042,9 @@ impl PythonExtractor {
             {
                 let class = sym.rsplit_once('.').map(|(c, _)| c).unwrap_or("");
                 if !class.is_empty() {
-                    ctx.facts.push(SemanticFact::SchemaValidation {
+                    ctx.facts.push(SemanticFact::SchemaValidation {  
                         owner: sym.to_string(),
-                        target: class.to_string(),
-                    });
+                        target: class.to_string(), expr: String::new() });
                 }
             }
             // Wave 11: apscheduler `@scheduler.scheduled_job(...)` marks the
@@ -1066,10 +1063,9 @@ impl PythonExtractor {
             {
                 let is_class = defs_contains_class(def);
                 if is_class && class_defines_method(def, "__post_init__", src) {
-                    ctx.facts.push(SemanticFact::SchemaDefinition {
+                    ctx.facts.push(SemanticFact::SchemaDefinition {  
                         owner: sym.to_string(),
-                        name: sym.to_string(),
-                    });
+                        name: sym.to_string(), expr: String::new() });
                 }
             }
             // Wave 11: a `@consumer` decorator registers the function as a
@@ -1617,10 +1613,9 @@ impl PythonExtractor {
             && !matches!(segs[0].as_str(), "self" | "cls")
         {
             if let Some(owner) = caller {
-                ctx.facts.push(SemanticFact::SchemaValidation {
+                ctx.facts.push(SemanticFact::SchemaValidation {  
                     owner,
-                    target: segs[0].clone(),
-                });
+                    target: segs[0].clone(), expr: String::new() });
             }
         }
     }
@@ -3113,13 +3108,13 @@ mod tests {
         ef.facts
             .iter()
             .filter_map(|f| match f {
-                SemanticFact::SchemaDefinition { owner, name } => {
+                SemanticFact::SchemaDefinition {   owner, name, .. }=> {
                     Some(("def".to_string(), owner.clone(), name.clone()))
                 }
-                SemanticFact::SchemaComposition { owner, name: _, parent } => {
+                SemanticFact::SchemaComposition {   owner, name: _, parent, .. }=> {
                     Some(("compose".to_string(), owner.clone(), parent.clone()))
                 }
-                SemanticFact::SchemaValidation { owner, target } => {
+                SemanticFact::SchemaValidation {   owner, target, .. }=> {
                     Some(("validate".to_string(), owner.clone(), target.clone()))
                 }
                 _ => None,
@@ -3175,7 +3170,7 @@ mod tests {
         assert!(
             ef2.facts.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+                SemanticFact::SchemaDefinition {   owner, name, .. }if owner == "User" && name == "User"
             )),
             "import pydantic attribute form must count: {:?}",
             ef2.facts

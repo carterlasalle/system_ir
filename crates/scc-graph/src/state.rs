@@ -244,20 +244,33 @@ pub fn compile_state_authority(
             .get("access")
             .and_then(|v| v.as_str())
             .unwrap_or("state");
+        let expr = e
+            .attributes
+            .get("expr")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let mut rels = graph.in_pred(&e.id, predicates::OWNS);
         rels.sort_by(|a, b| a.id.cmp(&b.id));
         for r in rels {
             if let Some(comp) = comp_of(&r.subject) {
-                push(
-                    S_REACTIVE,
-                    format!(
+                let line = match &expr {
+                    Some(exp) if !exp.is_empty() => format!(
+                        "{} owns reactive: {} [{}] = {} ({})",
+                        comp,
+                        e.name,
+                        access,
+                        exp,
+                        prov_str(&r.provenance)
+                    ),
+                    _ => format!(
                         "{} owns reactive: {} [{}] ({})",
                         comp,
                         e.name,
                         access,
                         prov_str(&r.provenance)
                     ),
-                );
+                };
+                push(S_REACTIVE, line);
             }
         }
     }

@@ -534,6 +534,19 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .next()
             .map(|r| r.subject.clone());
         let mut ops: Vec<String> = vec![s.name.clone()];
+        // the defining expression (`z.object({ name: z.string() })`)
+        // renders as `schema: <name> = <expr>` when the extractor
+        // captured one — the concrete code form a human would quote.
+        if let Some(expr) = s
+            .attributes
+            .get("expr")
+            .and_then(|v| v.as_str())
+            .map(|e| e.to_string())
+        {
+            if !expr.is_empty() {
+                ops.push(format!("{} = {}", s.name, expr));
+            }
+        }
         let mut composed: Vec<String> = view
             .out_pred(&s.id, scc_core::predicates::COMPOSES)
             .into_iter()

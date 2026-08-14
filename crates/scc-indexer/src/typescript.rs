@@ -713,16 +713,16 @@ fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
         }
         SemanticFact::Configuration { owner, key } => (4, owner.clone(), key.clone(), String::new()),
         SemanticFact::Callback { owner, callback } => (5, owner.clone(), callback.clone(), String::new()),
-        SemanticFact::SchemaDefinition { owner, name } => {
+        SemanticFact::SchemaDefinition {   owner, name, .. }=> {
             (6, owner.clone(), name.clone(), String::new())
         }
-        SemanticFact::SchemaComposition { owner, name, parent } => {
+        SemanticFact::SchemaComposition {   owner, name, parent, .. }=> {
             (6, owner.clone(), name.clone(), parent.clone())
         }
-        SemanticFact::SchemaValidation { owner, target } => {
+        SemanticFact::SchemaValidation {   owner, target, .. }=> {
             (6, owner.clone(), target.clone(), String::new())
         }
-        SemanticFact::ReactiveState { owner, name, access } => {
+        SemanticFact::ReactiveState {   owner, name, access, .. }=> {
             (7, owner.clone(), name.clone(), access.clone())
         }
     }
@@ -1518,6 +1518,7 @@ fn collect_facts(
                             owner: owner.clone(),
                             name: name.clone(),
                             access: access.to_string(),
+                            expr: bound_expr(&v, src),
                         });
                         reactive_names
                             .entry(owner)
@@ -1529,6 +1530,7 @@ fn collect_facts(
                         facts.push(SemanticFact::SchemaDefinition {
                             owner: name.clone(),
                             name: name.clone(),
+                            expr: bound_expr(&v, src),
                         });
                     }
                     // zod composition: `const X = Base.extend(...)` /
@@ -1540,6 +1542,7 @@ fn collect_facts(
                                     owner: name.clone(),
                                     name: name.clone(),
                                     parent,
+                                    expr: bound_expr(&v, src),
                                 });
                             }
                         }
@@ -1663,7 +1666,11 @@ fn collect_facts(
                             .or_else(|| ctx.const_owner.clone())
                             .or_else(|| ctx.class.clone());
                         if let Some(owner) = owner {
-                            facts.push(SemanticFact::SchemaValidation { owner, target });
+                            facts.push(SemanticFact::SchemaValidation {
+                                owner,
+                                target,
+                                expr: bound_expr(&node, src),
+                            });
                         }
                     }
                 }
@@ -1759,11 +1766,10 @@ fn collect_facts(
                             && !is_reactive_decl_position(&node)
                             && !t.starts_with('$')
                         {
-                            facts.push(SemanticFact::ReactiveState {
+                            facts.push(SemanticFact::ReactiveState {  
                                 owner,
                                 name: t.to_string(),
-                                access: "read".into(),
-                            });
+                                access: "read".into(), expr: String::new() });
                         }
                     }
                 }
@@ -1783,11 +1789,10 @@ fn collect_facts(
                                 .map(|s| s.contains(node_text(&left, src)))
                                 .unwrap_or(false)
                             {
-                                facts.push(SemanticFact::ReactiveState {
+                                facts.push(SemanticFact::ReactiveState {  
                                     owner,
                                     name: node_text(&left, src).to_string(),
-                                    access: "write".into(),
-                                });
+                                    access: "write".into(), expr: String::new() });
                             }
                         }
                     }
@@ -2078,12 +2083,25 @@ fn receiver_text(function: &Node, src: &[u8]) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {
-    node.utf8_text(src).unwrap_or("")
+fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {    node.utf8_text(src).unwrap_or("")
 }
 
 fn line_of(node: &Node) -> u32 {
     node.start_position().row as u32 + 1
+}
+
+/// The defining source expression of a node, bounded to 200 chars
+/// (single-line, whitespace-collapsed) — enough to carry the concrete
+/// code form (`z.object({ name: z.string() })`) into the atlas without
+/// flooding it with a whole multi-line schema literal.
+fn bound_expr(node: &Node, src: &[u8]) -> String {
+    let text = node_text(node, src);
+    let one_line = collapse_ws(text);
+    let mut out = one_line;
+    if out.chars().count() > 200 {
+        out = out.chars().take(197).collect::<String>() + "...";
+    }
+    out
 }
 
 fn end_line_of(node: &Node) -> u32 {
@@ -4357,13 +4375,13 @@ export class M {}
         ef.facts
             .iter()
             .filter_map(|f| match f {
-                SemanticFact::SchemaDefinition { owner, name } => {
+                SemanticFact::SchemaDefinition {   owner, name, .. }=> {
                     Some(("def", owner.as_str(), name.as_str()))
                 }
-                SemanticFact::SchemaComposition { owner, name: _, parent } => {
+                SemanticFact::SchemaComposition {   owner, name: _, parent, .. }=> {
                     Some(("compose", owner.as_str(), parent.as_str()))
                 }
-                SemanticFact::SchemaValidation { owner, target } => {
+                SemanticFact::SchemaValidation {   owner, target, .. }=> {
                     Some(("validate", owner.as_str(), target.as_str()))
                 }
                 _ => None,
@@ -4375,7 +4393,7 @@ export class M {}
         ef.facts
             .iter()
             .filter_map(|f| match f {
-                SemanticFact::ReactiveState { owner, name, access } => {
+                SemanticFact::ReactiveState {   owner, name, access, .. }=> {
                     Some((owner.as_str(), name.as_str(), access.as_str()))
                 }
                 _ => None,
@@ -4417,6 +4435,32 @@ export class M {}
             .filter(|f| matches!(f, SemanticFact::SchemaValidation { .. }))
             .collect();
         assert_eq!(validates.len(), 1, "duplicate validation facts: {validates:?}");
+        // Wave 12: facts carry the defining expression (the concrete code
+        // form), so the atlas can render `schema: S = z.object({ a: z.string() })`.
+        let def_expr: Vec<&str> = ef2
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaDefinition { expr, .. } => Some(expr.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            def_expr.contains(&"z.object({ a: z.string() })"),
+            "definition expr must be the z.object call: {def_expr:?}"
+        );
+        let val_expr: Vec<&str> = ef2
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaValidation { expr, .. } => Some(expr.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            val_expr.contains(&"S.parse(data)"),
+            "validation expr must be the parse call: {val_expr:?}"
+        );
     }
 
     #[test]

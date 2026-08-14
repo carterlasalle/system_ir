@@ -267,19 +267,37 @@ pub enum SemanticFact {
     /// A structured schema/model definition (zod z.object, pydantic
     /// BaseModel, JSON Schema, serde model, go struct tags, Java
     /// validation annotations): `owner` defines schema `name`.
-    SchemaDefinition { owner: String, name: String },
+    /// `expr` is the defining source expression when available
+    /// (e.g. `z.object({ name: z.string() })`), else empty.
+    SchemaDefinition { owner: String, name: String, expr: String },
     /// Schema composition: `owner` composes schema `name` from `parent`
     /// (zod .extend/.merge, pydantic inheritance, serde flatten).
-    SchemaComposition { owner: String, name: String, parent: String },
+    SchemaComposition {
+        owner: String,
+        name: String,
+        parent: String,
+        expr: String,
+    },
     /// Schema validation surface: `owner` validates `target` against a
     /// schema (zod .parse/.safeParse, pydantic validators, javax
-    /// validation annotations).
-    SchemaValidation { owner: String, target: String },
+    /// validation annotations). `expr` is the call expression when
+    /// available (e.g. `schema.parse(data)`), else empty.
+    SchemaValidation {
+        owner: String,
+        target: String,
+        expr: String,
+    },
     /// Reactive state ownership: `owner` declares reactive state `name`
     /// with access `state|read|write|derive` (svelte $state, vue
     /// ref/reactive, react useState/useReducer/context, mobx observable,
-    /// signals).
-    ReactiveState { owner: String, name: String, access: String },
+    /// signals). `expr` is the declaration expression when available
+    /// (e.g. `useState(0)`), else empty.
+    ReactiveState {
+        owner: String,
+        name: String,
+        access: String,
+        expr: String,
+    },
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtractedFile {

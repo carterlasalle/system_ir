@@ -863,10 +863,9 @@ impl RustExtractor {
                 && derives.iter().any(|d| d == "Serialize")
                 && derives.iter().any(|d| d == "Deserialize")
             {
-                ctx.facts.push(SemanticFact::SchemaDefinition {
+                ctx.facts.push(SemanticFact::SchemaDefinition {  
                     owner: name.clone(),
-                    name: name.clone(),
-                });
+                    name: name.clone(), expr: String::new() });
             }
         }
         // Trait bodies contain function declarations (contracts, default
@@ -1177,10 +1176,9 @@ impl RustExtractor {
                     {
                         if let Some(target) = turbofish_type(fn_node, src) {
                             if let Some(owner) = ctx.caller() {
-                                ctx.facts.push(SemanticFact::SchemaValidation {
+                                ctx.facts.push(SemanticFact::SchemaValidation {  
                                     owner,
-                                    target,
-                                });
+                                    target, expr: String::new() });
                             }
                         }
                     }
@@ -1428,11 +1426,10 @@ impl RustExtractor {
                                 .any(|a| attr_policy(*a, src).contains("flatten"))
                         {
                             if let Some(parent) = flatten_parent_type(f, src) {
-                                ctx.facts.push(SemanticFact::SchemaComposition {
+                                ctx.facts.push(SemanticFact::SchemaComposition {  
                                     owner: owner.to_string(),
                                     name: owner.to_string(),
-                                    parent,
-                                });
+                                    parent, expr: String::new() });
                             }
                         }
                         pending.clear();
@@ -1814,12 +1811,12 @@ fn fact_key(f: &SemanticFact) -> (String, String) {
         SemanticFact::Registration { owner, kind, .. } => (owner.clone(), kind.clone()),
         SemanticFact::Configuration { owner, key } => (owner.clone(), key.clone()),
         SemanticFact::Callback { owner, callback } => (owner.clone(), callback.clone()),
-        SemanticFact::SchemaDefinition { owner, name } => (owner.clone(), name.clone()),
-        SemanticFact::SchemaComposition { owner, name, parent } => {
+        SemanticFact::SchemaDefinition {   owner, name, .. }=> (owner.clone(), name.clone()),
+        SemanticFact::SchemaComposition {   owner, name, parent, .. }=> {
             (owner.clone(), format!("{name}<:{parent}"))
         }
-        SemanticFact::SchemaValidation { owner, target } => (owner.clone(), target.clone()),
-        SemanticFact::ReactiveState { owner, name, access } => {
+        SemanticFact::SchemaValidation {   owner, target, .. }=> (owner.clone(), target.clone()),
+        SemanticFact::ReactiveState {   owner, name, access, .. }=> {
             (owner.clone(), format!("{name}:{access}"))
         }
     }
@@ -2668,28 +2665,28 @@ impl Builder {
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+                SemanticFact::SchemaDefinition {   owner, name, .. }if owner == "User" && name == "User"
             )),
             "serde struct must be a SchemaDefinition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaDefinition { owner, name } if owner == "Base" && name == "Base"
+                SemanticFact::SchemaDefinition {   owner, name, .. }if owner == "Base" && name == "Base"
             )),
             "serde base struct must be a SchemaDefinition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaComposition { owner, name, parent } if owner == "User" && name == "User" && parent == "Base"
+                SemanticFact::SchemaComposition {   owner, name, parent, .. }if owner == "User" && name == "User" && parent == "Base"
             )),
             "serde flatten must be a SchemaComposition: {schemas:?}"
         );
         assert!(
             schemas.iter().any(|f| matches!(
                 f,
-                SemanticFact::SchemaValidation { owner, target } if owner == "load" && target == "User"
+                SemanticFact::SchemaValidation {   owner, target, .. }if owner == "load" && target == "User"
             )),
             "serde_json::from_str::<T> must emit SchemaValidation: {schemas:?}"
         );

@@ -476,7 +476,11 @@ impl<'a> Writer<'a> {
                         self.store.insert_relationship(&rel, path)?;
                     }
                 }
-                crate::model::SemanticFact::SchemaDefinition { owner, name } => {
+                crate::model::SemanticFact::SchemaDefinition {
+                    owner,
+                    name,
+                    expr,
+                } => {
                     if let Some((_, owner_id)) =
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
@@ -487,6 +491,9 @@ impl<'a> Writer<'a> {
                             name.clone(),
                         );
                         se.attr("file", serde_json::json!(path));
+                        if !expr.is_empty() {
+                            se.attr("expr", serde_json::json!(expr));
+                        }
                         se.evidence = sym_evidence(owner);
                         self.store.insert_entity(&se, &[path.to_string()])?;
                         let rel = Relationship::new(
@@ -499,11 +506,10 @@ impl<'a> Writer<'a> {
                         self.store.insert_relationship(&rel, path)?;
                     }
                 }
-                crate::model::SemanticFact::SchemaComposition {
+                crate::model::SemanticFact::SchemaComposition { 
                     owner,
                     name,
-                    parent,
-                } => {
+                    parent, .. } => {
                     if let Some((_, owner_id)) =
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
@@ -528,7 +534,7 @@ impl<'a> Writer<'a> {
                         self.store.insert_relationship(&rel2, path)?;
                     }
                 }
-                crate::model::SemanticFact::SchemaValidation { owner, target } => {
+                crate::model::SemanticFact::SchemaValidation {  owner, target, .. } => {
                     if let Some((_, owner_id)) =
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
@@ -550,7 +556,12 @@ impl<'a> Writer<'a> {
                         self.store.insert_relationship(&rel, path)?;
                     }
                 }
-                crate::model::SemanticFact::ReactiveState { owner, name, access } => {
+                crate::model::SemanticFact::ReactiveState {
+                    owner,
+                    name,
+                    access,
+                    expr,
+                } => {
                     if let Some((_, owner_id)) =
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
@@ -562,6 +573,9 @@ impl<'a> Writer<'a> {
                         );
                         re.attr("access", serde_json::json!(access));
                         re.attr("file", serde_json::json!(path));
+                        if !expr.is_empty() {
+                            re.attr("expr", serde_json::json!(expr));
+                        }
                         re.evidence = sym_evidence(owner);
                         self.store.insert_entity(&re, &[path.to_string()])?;
                         let rel = Relationship::new(
