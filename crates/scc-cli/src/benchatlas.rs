@@ -1622,11 +1622,15 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The manifest hash recorded in a previous blind results-file header
 /// (`blind manifest sha256: <hex>`), for the change-detection check.
+/// The header line also carries a human summary after the hex
+/// (`(20 ground-truth files, ...)`); only the first whitespace token is
+/// the hash.
 fn manifest_hash_from_header(header: &str) -> Option<String> {
     header.lines().find_map(|l| {
         l.trim()
             .strip_prefix("blind manifest sha256:")
             .map(str::trim)
+            .and_then(|h| h.split_whitespace().next())
             .filter(|h| !h.is_empty())
             .map(|h| h.to_string())
     })

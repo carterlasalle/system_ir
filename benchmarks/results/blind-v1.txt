@@ -8,36 +8,36 @@ results:           /Users/rocket/system_ir/benchmarks/results/blind-v1.txt
 layer                validation        blind        gap
 architecture              0.597        0.348     -0.249
 entrypoints               0.422        0.217     -0.205
-behavior                  0.057        0.028     -0.029
+behavior                  0.057        0.035     -0.022
 state_authority           0.450        0.743     +0.293
-contracts                 0.060        0.015     -0.045
+contracts                 0.075        0.015     -0.060
 landmarks                 0.910        0.980     +0.070
 tests                     0.081        0.018     -0.063
-overall (gate)            0.317        0.270     -0.047
+overall (gate)            0.320        0.272     -0.049
 
 scored: validation 20 (skipped 0) | blind 20 (skipped 0)
 precision: validation 0.044 | blind 0.072
 F2: validation 0.100 | blind 0.137
-density (facts/1k tokens): validation 0.42 | blind 0.46
-atlas tokens: validation 199009 | blind 54789
+density (facts/1k tokens): validation 0.43 | blind 0.46
+atlas tokens: validation 199060 | blind 54862
 
 ## blind transfer ratio (blind / validation) — how much of the validation recall transfers to the unseen blind corpus
   architecture            0.582
   entrypoints             0.513
-  behavior                0.487
+  behavior                0.611
   state_authority         1.652
-  contracts               0.255
+  contracts               0.204
   landmarks               1.077
   tests                   0.226
-  overall                 0.851
+  overall                 0.848
 
 ## generalization gap (blind - validation) — informational, not gating
   architecture           -0.249
   entrypoints            -0.205
-  behavior               -0.029
+  behavior               -0.022
   state_authority        +0.293
-  contracts              -0.045
+  contracts              -0.060
   landmarks              +0.070
   tests                  -0.063
-  overall                -0.047
+  overall                -0.049
   gate (recall >= 0.5): blind FAIL | validation FAIL
