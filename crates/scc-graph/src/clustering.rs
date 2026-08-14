@@ -14,6 +14,7 @@
 //! | public surface cohesion (exports under one interface / extension point) | +4 |
 //! | flow participation | +3 |
 //! | event ownership (shared topic) | +3 |
+//! | invocation-surface cohesion (same framework family) | +2 |
 //! | type hierarchy (shared base) | +2 |
 //! | co-change | +1 (capped at 5) |
 //! | deployment boundary | +5 (constraint, not decoration) |
@@ -58,6 +59,11 @@ pub const W_FLOW: i32 = 3;
 /// Event ownership: regions sharing a topic via PUBLISHES/SUBSCRIBES/
 /// CONSUMES (+3).
 pub const W_EVENT: i32 = 3;
+/// Invocation-surface cohesion: regions whose symbols expose invocation
+/// surfaces of the same framework family (queue consumers, schedulers,
+/// plugin registrations; framework_callback+lifecycle count as one
+/// family) (+2, capped per pair).
+pub const W_SURFACE_FAMILY: i32 = 2;
 /// Type hierarchy: regions implementing/inheriting the same base (+2).
 pub const W_TYPE_HIERARCHY: i32 = 2;
 /// Deployment boundary containment: same deployment unit (+5).
@@ -200,6 +206,7 @@ pub fn build_regions(
 
 /// Cluster the atomic regions into components (and record the pass-2
 /// service weights). See the module docs for the signal list.
+// trace:v1 id=impl.scc.clustering.merge work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn cluster_components(
     graph: &RealityGraph,
     store: &Store,
@@ -445,7 +452,39 @@ pub fn cluster_components(
         }
     }
 
-    // ---- signal (g): co-change (+1 per spanning pair, capped) ----
+    // ---- signal (g): invocation-surface cohesion (+2, capped per pair) ----
+    // Regions whose symbols own invocation surfaces of the SAME framework
+    // family cohere: queue consumers with queue consumers, schedulers with
+    // schedulers, plugin registrations with plugin registrations;
+    // framework_callback and lifecycle symbols count as one family. The
+    // family group is a set of region names, so a shared family adds +2
+    // once per pair — never stacked per surface.
+    let mut surface_families: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for s in crate::flows::invocation_surfaces(graph) {
+        if is_test_symbol(&s.symbol) {
+            continue;
+        }
+        let family: &'static str = match s.kind {
+            scc_core::InvocationSurfaceKind::Queue => "queue",
+            scc_core::InvocationSurfaceKind::Schedule => "schedule",
+            scc_core::InvocationSurfaceKind::Plugin => "plugin",
+            scc_core::InvocationSurfaceKind::FrameworkCallback
+            | scc_core::InvocationSurfaceKind::Lifecycle => "lifecycle",
+            _ => continue,
+        };
+        let Some(&ra) = symbol_region.get(&s.symbol) else { continue };
+        surface_families
+            .entry(family)
+            .or_default()
+            .insert(regions[ra].name.clone());
+    }
+    for set in surface_families.values() {
+        if set.len() >= 2 {
+            add_pair_weight(&mut w, &idx, set, W_SURFACE_FAMILY);
+        }
+    }
+
+    // ---- signal (h): co-change (+1 per spanning pair, capped) ----
     let mut cc: BTreeMap<(usize, usize), i32> = BTreeMap::new();
     for p in pairs {
         if let (Some(&ra), Some(&rb)) = (path_region.get(&p.a), path_region.get(&p.b)) {
@@ -461,7 +500,7 @@ pub fn cluster_components(
         w[y][x] += weight;
     }
 
-    // ---- signal (h): deployment boundary containment (+5) ----
+    // ---- signal (i): deployment boundary containment (+5) ----
     let mut du_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (i, du) in parent_per_region.iter().enumerate() {
         if let Some(du) = du {
@@ -477,7 +516,7 @@ pub fn cluster_components(
         }
     }
 
-    // ---- signal (i): archetype emphasis (+2, one region trait) ----
+    // ---- signal (j): archetype emphasis (+2, one region trait) ----
     if let Some(prior) = crate::archetype::cluster_prior(archetype) {
         let mut set: BTreeSet<String> = BTreeSet::new();
         for &(sym, ra) in &syms {
@@ -730,6 +769,7 @@ fn add_pair_weight(w: &mut [Vec<i32>], idx: &HashMap<&str, usize>, set: &BTreeSe
 }
 
 /// Disjoint-set union-find with path compression.
+// # trace:exempt — union-find helper, data container with no behavior
 pub(crate) struct Dsu {
     parent: Vec<usize>,
 }
@@ -1200,6 +1240,70 @@ mod tests {
         assert!(names.contains(&"root"), "root shell stays: {names:?}");
         let lib = comps.iter().find(|c| c.name == "lib").unwrap();
         assert_eq!(lib.attributes["layer"], serde_json::json!(LAYER_COMPONENT));
+    }
+
+    /// Wave 11: two regions whose symbols are BOTH queue consumers (of
+    /// DIFFERENT topics — no shared-topic event signal) cohere: cross-region
+    /// call (2) + flow participation (3) + the invocation-surface cohesion
+    /// signal (2) = 7 >= MERGE_THRESHOLD. The surface signal is decisive —
+    /// without it the pair sits at 5 < 6 and stays split.
+    #[test]
+    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    fn queue_consumer_regions_cohere_on_surface_family() {
+        let (store, _t) = store_for();
+        let repo = store.repo_id.clone();
+        let sa = insert_file_with_symbols(&store, "jobs-a/consumer.py", &["consume_a"]);
+        let sb = insert_file_with_symbols(&store, "jobs-b/consumer.py", &["consume_b"]);
+        for (i, (sym, topic)) in [
+            (sa[0].clone(), "orders".to_string()),
+            (sb[0].clone(), "shipments".to_string()),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let topic_id = entity_id(&repo, kinds::TOPIC, topic);
+            store
+                .insert_entity(
+                    &Entity::new(topic_id.clone(), kinds::TOPIC, topic),
+                    &["jobs-a/consumer.py".into()],
+                )
+                .unwrap();
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:sub:{i}"),
+                        sym.clone(),
+                        predicates::SUBSCRIBES,
+                        topic_id,
+                        Provenance::Extracted,
+                    ),
+                    "jobs-a/consumer.py",
+                )
+                .unwrap();
+        }
+        // one cross-region call: 2 (call) + 3 (flow — the queue surfaces
+        // seed flows) = 5; the surface-family signal (+2) pushes to 7
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:call",
+                    sa[0].clone(),
+                    predicates::CALLS,
+                    sb[0].clone(),
+                    Provenance::Extracted,
+                ),
+                "jobs-a/consumer.py",
+            )
+            .unwrap();
+
+        let comps = compile(&store);
+        let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"jobs-a+jobs-b"),
+            "queue-consumer regions cohere into one component: {names:?}"
+        );
+        assert!(!names.contains(&"jobs-a"), "no jobs-a shell: {names:?}");
+        assert!(!names.contains(&"jobs-b"), "no jobs-b shell: {names:?}");
     }
 
     #[test]

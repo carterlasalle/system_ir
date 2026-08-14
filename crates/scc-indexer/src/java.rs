@@ -574,6 +574,18 @@ fn fact_sort_key(f: &SemanticFact) -> (String, u8, String, String) {
         SemanticFact::Configuration { owner, key } => {
             (owner.clone(), 5, key.clone(), String::new())
         }
+        SemanticFact::SchemaDefinition { owner, name } => {
+            (owner.clone(), 6, name.clone(), String::new())
+        }
+        SemanticFact::SchemaComposition { owner, name, parent } => {
+            (owner.clone(), 6, name.clone(), parent.clone())
+        }
+        SemanticFact::SchemaValidation { owner, target } => {
+            (owner.clone(), 6, target.clone(), String::new())
+        }
+        SemanticFact::ReactiveState { owner, name, access } => {
+            (owner.clone(), 7, name.clone(), access.clone())
+        }
     }
 }
 
@@ -652,6 +664,7 @@ impl JavaExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             "class_declaration" => self.walk_type(node, ctx, src, SymbolKind::Class),
+            "record_declaration" => self.walk_type(node, ctx, src, SymbolKind::Class),
             "interface_declaration" => self.walk_type(node, ctx, src, SymbolKind::Interface),
             "enum_declaration" => self.walk_type(node, ctx, src, SymbolKind::Enum),
             "method_declaration" => self.walk_method(node, ctx, src),
@@ -705,6 +718,37 @@ impl JavaExtractor {
             });
         }
         self.record_annotations(node, ctx, src, &name);
+        // Wave 11: validation-annotated types (records/classes with
+        // jakarta/javax validation annotations) are schema contracts.
+        let has_validation =
+            ctx.has_import("jakarta.validation") || ctx.has_import("javax.validation");
+        if has_validation && type_has_validation_annotations(node, src) {
+            ctx.facts.push(SemanticFact::SchemaDefinition {
+                owner: name.clone(),
+                name: name.clone(),
+            });
+            ctx.facts.push(SemanticFact::SchemaValidation {
+                owner: name.clone(),
+                target: name.clone(),
+            });
+        }
+        // Wave 11: `class Foo extends LocalModel` (with validation imports)
+        // is schema composition.
+        if has_validation && kind == SymbolKind::Class {
+            if let Some(parent) = superclass_name(node, src) {
+                if ctx
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == parent && s.kind == SymbolKind::Class)
+                {
+                    ctx.facts.push(SemanticFact::SchemaComposition {
+                        owner: name.clone(),
+                        name: name.clone(),
+                        parent,
+                    });
+                }
+            }
+        }
         // Extension contracts: a class implementing an interface is an
         // implementation of that extension point. Emitted only when the
         // interface is not declared in this file (a same-file interface
@@ -802,6 +846,10 @@ impl JavaExtractor {
         self.record_annotations(node, ctx, src, &sym_name);
         self.record_spring_registrations(node, ctx, src, &class, &sym_name);
         self.record_junit_lifecycle(node, ctx, src, &class, &sym_name);
+        // Wave 11: @Scheduled → schedule entrypoint; @RabbitListener /
+        // @KafkaListener → queue consumers.
+        self.record_schedule(node, ctx, src, &sym_name);
+        self.record_queue_consumers(node, ctx, src, &class, &name);
         ctx.scopes.push(Scope {
             name: sym_name,
             is_class: false,
@@ -1003,6 +1051,60 @@ impl JavaExtractor {
         }
     }
 
+    /// Wave 11: Spring `@Scheduled` methods are scheduled jobs (Schedule
+    /// entrypoint). Only when the Spring import is present.
+    fn record_schedule(&self, node: Node, ctx: &mut Ctx, src: &[u8], method: &str) {
+        if !ctx.has_import(SPRING_ROOT) {
+            return;
+        }
+        for (simple, line) in annotations_on(node, src) {
+            if simple == "Scheduled" {
+                ctx.entrypoints.push(Entrypoint {
+                    symbol: method.to_string(),
+                    kind: "schedule".to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    /// Wave 11: Spring `@RabbitListener` / `@KafkaListener` methods are
+    /// queue consumers (SUBSCRIBES store refs), import-gated on the Spring
+    /// AMQP/Kafka modules. The annotation's queues/topics value names the
+    /// target.
+    fn record_queue_consumers(
+        &self,
+        node: Node,
+        ctx: &mut Ctx,
+        src: &[u8],
+        class: &str,
+        method: &str,
+    ) {
+        let has_amqp = ctx.has_import("org.springframework.amqp");
+        let has_kafka = ctx.has_import("org.springframework.kafka");
+        if !has_amqp && !has_kafka {
+            return;
+        }
+        for (simple, line) in annotations_on(node, src) {
+            let store = if simple == "RabbitListener" && has_amqp {
+                Some("rabbitmq")
+            } else if simple == "KafkaListener" && has_kafka {
+                Some("kafka")
+            } else {
+                None
+            };
+            let Some(store) = store else { continue };
+            ctx.store_refs.push(StoreRef {
+                caller: Some(format!("{class}.{method}")),
+                store: store.to_string(),
+                technology: Some(store.to_string()),
+                op: StoreOp::Subscribe,
+                target: annotation_string_arg(node, src, &simple),
+                line,
+            });
+        }
+    }
+
     fn record_call(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = clean(node_text(Some(name_node), src));
@@ -1045,6 +1147,27 @@ impl JavaExtractor {
                     returns_value: call_returns_value(node),
                 });
                 self.record_store_ref(node, ctx, src);
+                // Wave 11: SPI plugin loading — `ServiceLoader.load(X.class)`
+                // registers X as a plugin extension point (import-gated on
+                // java.util.ServiceLoader; the fully-qualified call form
+                // counts without the import).
+                if name == "load" {
+                    let call_text = collapse(node_text(Some(node), src));
+                    let is_loader = call_text.starts_with("ServiceLoader.load")
+                        && ctx.has_import("java.util.ServiceLoader")
+                        || call_text.starts_with("java.util.ServiceLoader.load");
+                    if is_loader {
+                        if let Some(target) = first_arg_type_class(node, src) {
+                            if let Some(caller) = ctx.caller() {
+                                ctx.facts.push(SemanticFact::Registration {
+                                    owner: caller,
+                                    kind: "plugin".to_string(),
+                                    target,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         self.walk_children(node, ctx, src);
@@ -1378,6 +1501,153 @@ fn find_named_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 /// name is the last segment of a possibly-qualified annotation
 /// (`@org.junit.Test` → `Test`). Both `annotation` (with arguments) and
 /// `marker_annotation` (argument-less, e.g. `@Test`/`@RestController`) are
+/// jakarta/javax validation annotation simple names — the evidence that a
+/// record/class is a schema contract.
+const VALIDATION_ANNOTATIONS: &[&str] = &[
+    "NotNull", "Null", "Email", "NotBlank", "NotEmpty", "Size", "Min", "Max", "Positive",
+    "PositiveOrZero", "Negative", "NegativeOrZero", "Past", "PastOrPresent", "Future",
+    "FutureOrPresent", "Digits", "Pattern", "DecimalMin", "DecimalMax", "AssertTrue",
+    "AssertFalse", "Valid", "Validated", "Length", "CreditCardNumber",
+];
+
+fn validation_ann((name, _): &(String, u32)) -> bool {
+    VALIDATION_ANNOTATIONS.contains(&name.as_str())
+}
+
+/// True when a type declaration (class/record/enum) carries validation
+/// annotations on itself, its fields, or its record components.
+fn type_has_validation_annotations(node: Node, src: &[u8]) -> bool {
+    if annotations_on(node, src).iter().any(validation_ann) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "class_body" => {
+                let mut c2 = child.walk();
+                for member in child.named_children(&mut c2) {
+                    if member.kind() == "field_declaration"
+                        && annotations_on(member, src).iter().any(validation_ann)
+                    {
+                        return true;
+                    }
+                }
+            }
+            "formal_parameters" => {
+                let mut c2 = child.walk();
+                for p in child.named_children(&mut c2) {
+                    if matches!(p.kind(), "formal_parameter" | "spread_parameter")
+                        && annotations_on(p, src).iter().any(validation_ann)
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Simple name of the superclass of a class declaration (`class Foo extends
+/// com.x.Base<T>` → `Base`).
+fn superclass_name(node: Node, src: &[u8]) -> Option<String> {
+    let sc = node.child_by_field_name("superclass")?;
+    let t = clean(node_text(Some(sc), src));
+    // the superclass node wraps the `extends` keyword + the type
+    let t = t.strip_prefix("extends").unwrap_or(&t).trim();
+    let t = t.split('<').next().unwrap_or(t).trim();
+    let simple = t.rsplit('.').next().unwrap_or(t).trim();
+    if simple.is_empty() {
+        None
+    } else {
+        Some(simple.to_string())
+    }
+}
+
+/// First string literal argument of the annotation named `want`
+/// (`@RabbitListener(queues = "q")` → `q`, `@KafkaListener("t")` → `t`).
+fn annotation_string_arg(node: Node, src: &[u8], want: &str) -> Option<String> {
+    let mods = find_named_child(node, "modifiers")?;
+    let mut cursor = mods.walk();
+    for child in mods.named_children(&mut cursor) {
+        if child.kind() != "annotation" {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .map(|n| clean(node_text(Some(n), src)))
+            .unwrap_or_default();
+        if name != want {
+            continue;
+        }
+        let mut c2 = child.walk();
+        for arg in child.named_children(&mut c2) {
+            match arg.kind() {
+                "annotation_argument_list" => {
+                    let mut c3 = arg.walk();
+                    for inner in arg.named_children(&mut c3) {
+                        if inner.kind() == "string_literal" {
+                            return string_literal_value(inner, src);
+                        }
+                        if inner.kind() == "element_value_pair" {
+                            let value = inner.child_by_field_name("value")?;
+                            if value.kind() == "string_literal" {
+                                return string_literal_value(value, src);
+                            }
+                        }
+                    }
+                }
+                "string_literal" => return string_literal_value(arg, src),
+                "assignment" => {
+                    let value = arg.child_by_field_name("value")?;
+                    if value.kind() == "string_literal" {
+                        return string_literal_value(value, src);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// First argument of a call when it is `X.class` (SPI interface reference).
+fn first_arg_type_class(call: Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let arg = args.named_child(0)?;
+    match arg.kind() {
+        "class_literal" => {
+            // `Widget.class` — the type is the first named child
+            let t = arg
+                .named_child(0)
+                .map(|o| clean(node_text(Some(o), src)))
+                .unwrap_or_default();
+            let t = t.split('<').next().unwrap_or(&t).trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        "member_expression" => {
+            let prop = arg
+                .child_by_field_name("property")
+                .map(|p| node_text(Some(p), src))
+                .unwrap_or("");
+            if prop == "class" {
+                let obj = arg
+                    .child_by_field_name("object")
+                    .map(|o| clean(node_text(Some(o), src)))
+                    .unwrap_or_default();
+                if !obj.is_empty() {
+                    return Some(obj);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// collected.
 fn annotations_on(node: Node, src: &[u8]) -> Vec<(String, u32)> {
     let mut out = Vec::new();
@@ -2015,6 +2285,124 @@ public class Impl implements Local { public void run() {} }
         assert!(
             fields.contains(&("Config".into(), "NAME".into(), false)),
             "final static must be immutable: {fields:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 11: schema contracts + queue/schedule/plugin surfaces
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn wave11_validation_annotated_record_schema() {
+        let ef = extract(
+            "package com.example;\n\nimport jakarta.validation.constraints.Email;\nimport jakarta.validation.constraints.NotNull;\n\npublic record UserDto(\n    @NotNull String name,\n    @Email String email\n) {}\n",
+        );
+        let schemas: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            ))
+            .collect();
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { owner, name } if owner == "UserDto" && name == "UserDto"
+            )),
+            "validation-annotated record must be a SchemaDefinition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaValidation { owner, target } if owner == "UserDto" && target == "UserDto"
+            )),
+            "validation annotations must emit SchemaValidation: {schemas:?}"
+        );
+        // class extends a local model + validation imports → composition.
+        let ef2 = extract(
+            "package com.example;\n\nimport jakarta.validation.constraints.NotNull;\n\npublic class Base {\n    @NotNull\n    private String id;\n}\n\npublic class Admin extends Base {\n    private String role;\n}\n",
+        );
+        let schemas2: Vec<&SemanticFact> = ef2
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::SchemaComposition { .. }))
+            .collect();
+        assert!(
+            schemas2.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaComposition { owner, name, parent } if owner == "Admin" && name == "Admin" && parent == "Base"
+            )),
+            "model inheritance must be a SchemaComposition: {schemas2:?}"
+        );
+        // no jakarta import → no schema facts.
+        let ef3 = extract(
+            "package com.example;\n\npublic class Plain {\n    private String name;\n}\n",
+        );
+        assert!(
+            !ef3.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            )),
+            "no validation import → no schema facts: {:?}",
+            ef3.facts
+        );
+    }
+
+    #[test]
+    fn wave11_spring_schedule_and_queue_consumers() {
+        let ef = extract(
+            "package com.example;\n\nimport org.springframework.scheduling.annotation.Scheduled;\nimport org.springframework.amqp.rabbit.annotation.RabbitListener;\nimport org.springframework.kafka.annotation.KafkaListener;\n\npublic class Jobs {\n    @Scheduled(cron = \"0 * * * * *\")\n    public void sweep() {}\n\n    @RabbitListener(queues = \"orders\")\n    public void onOrder(String msg) {}\n\n    @KafkaListener(topics = \"events\")\n    public void onEvent(String msg) {}\n}\n",
+        );
+        assert!(
+            ef.entrypoints
+                .iter()
+                .any(|e| e.kind == "schedule" && e.symbol == "Jobs.sweep"),
+            "@Scheduled entrypoint missing: {:?}",
+            ef.entrypoints
+        );
+        assert!(
+            ef.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "rabbitmq"
+                    && sr.caller.as_deref() == Some("Jobs.onOrder")
+                    && sr.target.as_deref() == Some("orders")
+            }),
+            "@RabbitListener consumer missing: {:?}",
+            ef.store_refs
+        );
+        assert!(
+            ef.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "kafka"
+                    && sr.caller.as_deref() == Some("Jobs.onEvent")
+                    && sr.target.as_deref() == Some("events")
+            }),
+            "@KafkaListener consumer missing: {:?}",
+            ef.store_refs
+        );
+    }
+
+    #[test]
+    fn wave11_spi_plugin_registration() {
+        let ef = extract(
+            "package com.example;\n\nimport java.util.ServiceLoader;\n\npublic class Loader {\n    public void load() {\n        ServiceLoader.load(Widget.class).forEach(w -> {});\n    }\n}\n",
+        );
+        let rs: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::Registration { kind, .. } if kind == "plugin"))
+            .collect();
+        assert!(
+            rs.iter().any(|f| matches!(
+                f,
+                SemanticFact::Registration { owner, kind, target } if owner == "Loader.load" && kind == "plugin" && target == "Widget"
+            )),
+            "ServiceLoader SPI plugin missing: {rs:?}"
         );
     }
 }

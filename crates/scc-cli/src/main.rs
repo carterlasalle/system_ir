@@ -325,6 +325,26 @@ enum BenchSub {
         /// for both the dev and holdout corpora.
         #[arg(long)]
         no_resolve: bool,
+        /// Wave-11 generalization gates over two saved holdout result files
+        /// (JSON `HoldoutComparison`s, e.g. `scc bench atlas --holdout
+        /// --json` output): loads OLD (the earlier run) and NEW (the current
+        /// run), prints the per-section deltas, the generalization
+        /// efficiency GE = validation_delta / development_delta, and the
+        /// per-section regression guard, then exits nonzero when a gate
+        /// fails (semantic waves must generalize)
+        #[arg(long, num_args = 2, value_names = ["OLD", "NEW"], conflicts_with_all = ["blind", "holdout"])]
+        compare: Option<Vec<PathBuf>>,
+        /// GE gate floor for `--compare`: fail when
+        /// GE = validation_delta / development_delta <= MIN (default 0.0 —
+        /// semantic waves must generalize to validation)
+        #[arg(long, default_value_t = 0.0)]
+        gate_ge: f64,
+        /// Per-section regression guard for `--compare`: fail when ANY
+        /// startup-required section (architecture/entrypoints/behavior/
+        /// state_authority/contracts) drops by more than MAX between the
+        /// two runs, in development or validation (default 0.05)
+        #[arg(long, default_value_t = 0.05)]
+        guard_section_delta: f64,
     },
 }
 
@@ -673,9 +693,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 holdout,
                 blind,
                 no_resolve,
+                compare,
+                gate_ge,
+                guard_section_delta,
             } => {
                 let resolve = !no_resolve;
-                if blind {
+                if let Some(pair) = compare {
+                    if pair.len() != 2 {
+                        return Err(scc_cli::CliError::Other(
+                            "--compare requires exactly two result files: OLD NEW".into(),
+                        )
+                        .into());
+                    }
+                    let old = scc_cli::benchatlas::load_holdout_result(&pair[0])?;
+                    let new = scc_cli::benchatlas::load_holdout_result(&pair[1])?;
+                    let mut report = scc_cli::benchatlas::compare_runs(
+                        &old,
+                        &new,
+                        gate_ge,
+                        guard_section_delta,
+                    );
+                    report.old_file = pair[0].display().to_string();
+                    report.new_file = pair[1].display().to_string();
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| scc_cli::CliError::Other(e.to_string()))?
+                        );
+                    } else {
+                        scc_cli::benchatlas::print_compare_report(&report);
+                    }
+                    if report.passed() {
+                        Ok(())
+                    } else {
+                        Err(scc_cli::CliError::Other(
+                            "Wave-11 generalization gates FAILED: the semantic wave does not generalize (see --compare report)".into(),
+                        ))
+                    }
+                } else if blind {
                     match scc_cli::benchatlas::run_atlas_blind(diagnose, resolve) {
                         Ok(comparison) => {
                             if json {

@@ -57,6 +57,12 @@ fn last_segment(id: &str) -> String {
 /// - framework callbacks: `owner HANDLES_CALLBACK callback` → FrameworkCallback
 /// - lifecycle callbacks: JUnit @Before*/@After* annotation facts → Lifecycle
 /// - event handlers: `symbol CONSUMES|PUBLISHES topic` relationships → Event
+/// - process entrypoints (`main-guard`/`bin` entrypoint attrs) → Process
+/// - http surfaces: ROUTE entities (handler symbol) → Http
+/// - cli surfaces: `cli_flags` attrs / `cli` entrypoint kind → Cli
+/// - scheduled jobs: @Scheduled annotation facts → Schedule
+/// - plugin registrations: REGISTERS to `plugin`-kind contracts → Plugin
+// trace:v1 id=impl.scc.flows.surfaces work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn invocation_surfaces(graph: &RealityGraph) -> Vec<InvocationSurface> {
     let mut out: Vec<InvocationSurface> = Vec::new();
     // dedup key: (kind, symbol id) — keep the first occurrence after a
@@ -239,6 +245,149 @@ pub fn invocation_surfaces(graph: &RealityGraph) -> Vec<InvocationSurface> {
                     trigger,
                 });
             }
+        }
+    }
+
+    // process entrypoints → Process: symbols whose `entrypoints` attribute
+    // names a process surface (main-guard / bin / process).
+    let mut process_syms: Vec<&scc_core::Entity> = graph
+        .entities_of_kind(kinds::SYMBOL)
+        .into_iter()
+        .filter(|e| {
+            e.attributes
+                .get("entrypoints")
+                .and_then(|v| v.as_array())
+                .map(|eps| {
+                    eps.iter().any(|k| {
+                        matches!(k.as_str(), Some("main-guard") | Some("bin") | Some("process"))
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    process_syms.sort_by(|a, b| a.id.cmp(&b.id));
+    for e in process_syms {
+        let key = (InvocationSurfaceKind::Process, e.id.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: e.id.clone(),
+                kind: InvocationSurfaceKind::Process,
+                trigger: format!("process:{}", e.name),
+            });
+        }
+    }
+
+    // http surfaces → Http: ROUTE entities (the handler symbol, method+path
+    // trigger). The ROUTE entity itself keeps its dedicated `route`
+    // entrypoint kind in the atlas; the handler symbol carries the http
+    // surface kind.
+    let mut routes: Vec<&scc_core::Entity> = graph.entities_of_kind(kinds::ROUTE);
+    routes.sort_by(|a, b| a.id.cmp(&b.id));
+    for r in routes {
+        let Some(handler) = r.attributes.get("handler").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if graph.entity(handler).is_none() {
+            continue;
+        }
+        let method = r.attributes.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let path = r.attributes.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let trigger = format!("{method} {path}").trim().to_string();
+        let key = (InvocationSurfaceKind::Http, handler.to_string());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: handler.to_string(),
+                kind: InvocationSurfaceKind::Http,
+                trigger,
+            });
+        }
+    }
+
+    // cli surfaces → Cli: symbols with `cli_flags` attributes or an
+    // explicit `cli` entrypoint kind. `cli-subcommand` entrypoints keep
+    // their dedicated kind (they already render as such in the atlas).
+    let mut cli_syms: Vec<&scc_core::Entity> = graph
+        .entities_of_kind(kinds::SYMBOL)
+        .into_iter()
+        .filter(|e| {
+            let flags = e
+                .attributes
+                .get("cli_flags")
+                .and_then(|v| v.as_array())
+                .map(|fl| !fl.is_empty())
+                .unwrap_or(false);
+            let cli_ep = e
+                .attributes
+                .get("entrypoints")
+                .and_then(|v| v.as_array())
+                .map(|eps| eps.iter().any(|k| k.as_str() == Some("cli")))
+                .unwrap_or(false);
+            flags || cli_ep
+        })
+        .collect();
+    cli_syms.sort_by(|a, b| a.id.cmp(&b.id));
+    for e in cli_syms {
+        let key = (InvocationSurfaceKind::Cli, e.id.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: e.id.clone(),
+                kind: InvocationSurfaceKind::Cli,
+                trigger: format!("cli:{}", e.name),
+            });
+        }
+    }
+
+    // scheduled jobs → Schedule: @Scheduled annotation facts (Spring)
+    // annotating the job method.
+    const SCHEDULE_ANNOTATIONS: [&str; 2] = ["Scheduled", "Schedules"];
+    for a in graph.entities_of_kind(kinds::ANNOTATION) {
+        if !SCHEDULE_ANNOTATIONS.contains(&a.name.as_str()) {
+            continue;
+        }
+        let mut rels = graph.out_pred(&a.id, scc_core::predicates::ANNOTATES);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            let key = (InvocationSurfaceKind::Schedule, r.object.clone());
+            if seen.insert(key.clone()) {
+                out.push(InvocationSurface {
+                    symbol: r.object.clone(),
+                    kind: InvocationSurfaceKind::Schedule,
+                    trigger: format!("schedule:{}", a.name),
+                });
+            }
+        }
+    }
+
+    // plugin registrations → Plugin: REGISTERS edges whose target is a
+    // CONTRACT entity carrying a `plugin` registration kind.
+    for r in rels.iter().copied() {
+        if r.predicate != scc_core::predicates::REGISTERS {
+            continue;
+        }
+        if graph.entity(&r.subject).is_none() {
+            continue;
+        }
+        let is_plugin = graph
+            .entity(&r.object)
+            .map(|e| {
+                e.kind == kinds::CONTRACT
+                    && e.attributes.get("kind").and_then(|v| v.as_str()) == Some("plugin")
+            })
+            .unwrap_or(false);
+        if !is_plugin {
+            continue;
+        }
+        let target = graph
+            .entity(&r.object)
+            .map(|e| e.name.clone())
+            .unwrap_or_default();
+        let key = (InvocationSurfaceKind::Plugin, r.subject.clone());
+        if seen.insert(key.clone()) {
+            out.push(InvocationSurface {
+                symbol: r.subject.clone(),
+                kind: InvocationSurfaceKind::Plugin,
+                trigger: format!("register:{target}"),
+            });
         }
     }
 
@@ -1111,6 +1260,126 @@ mod tests {
                 "entrypoints must include {want}: {surface_kinds:?}"
             );
         }
+    }
+
+    /// Wave 11: the remaining InvocationSurfaceKind values seed from store
+    /// facts — process (main-guard entrypoint attr), http (ROUTE handler),
+    /// cli (cli_flags attr), schedule (@Scheduled annotation), plugin
+    /// (REGISTERS to a `plugin`-kind contract).
+    #[test]
+    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    fn process_http_cli_schedule_plugin_surfaces_seed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = "repo";
+        let mk_sym = |n: &str| scc_core::symbol_id(repo, "app.py", n);
+
+        let mk = |n: &str, attrs: serde_json::Value| {
+            let id = mk_sym(n);
+            let mut e = scc_core::Entity::new(id.clone(), kinds::SYMBOL, n);
+            if let Some(obj) = attrs.as_object() {
+                for (k, v) in obj {
+                    e.attr(k, v.clone());
+                }
+            }
+            store.insert_entity(&e, &["app.py".to_string()]).unwrap();
+            id
+        };
+        let main_id = mk("main", serde_json::json!({"entrypoints": ["main-guard"]}));
+        let handler_id = mk("handle_req", serde_json::json!({}));
+        let cli_id = mk("run", serde_json::json!({"cli_flags": ["--port"]}));
+        let job_id = mk("daily_job", serde_json::json!({}));
+        let plugin_id = mk("register_plugin", serde_json::json!({}));
+
+        // http: route with handler
+        let route_id = scc_core::entity_id(repo, kinds::ROUTE, "GET /x");
+        let mut route = scc_core::Entity::new(route_id.clone(), kinds::ROUTE, "GET /x");
+        route.attr("method", serde_json::json!("GET"));
+        route.attr("path", serde_json::json!("/x"));
+        route.attr("handler", serde_json::json!(handler_id));
+        store.insert_entity(&route, &["app.py".to_string()]).unwrap();
+
+        // schedule: @Scheduled annotation on the job
+        let ann_id = scc_core::entity_id(repo, kinds::ANNOTATION, "Scheduled");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(ann_id.clone(), kinds::ANNOTATION, "Scheduled"),
+                &["app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(1),
+                    ann_id,
+                    scc_core::predicates::ANNOTATES,
+                    job_id.clone(),
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        // plugin: REGISTERS to a `plugin`-kind contract
+        let plug_contract = scc_core::entity_id(repo, kinds::CONTRACT, "webhook");
+        let mut ce = scc_core::Entity::new(plug_contract.clone(), kinds::CONTRACT, "webhook");
+        ce.attr("kind", serde_json::json!("plugin"));
+        store.insert_entity(&ce, &["app.py".to_string()]).unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    scc_core::relationship_id(2),
+                    plugin_id.clone(),
+                    scc_core::predicates::REGISTERS,
+                    plug_contract,
+                    Provenance::Extracted,
+                ),
+                "app.py",
+            )
+            .unwrap();
+
+        let g = RealityGraph::load(&store).unwrap();
+        let surfaces = invocation_surfaces(&g);
+        let find = |kind: InvocationSurfaceKind, sym: &str| -> Vec<String> {
+            surfaces
+                .iter()
+                .filter(|s| s.kind == kind && s.symbol == sym)
+                .map(|s| s.trigger.clone())
+                .collect()
+        };
+        assert_eq!(
+            find(InvocationSurfaceKind::Process, &main_id),
+            vec!["process:main".to_string()],
+            "{surfaces:?}"
+        );
+        assert_eq!(
+            find(InvocationSurfaceKind::Http, &handler_id),
+            vec!["GET /x".to_string()],
+            "{surfaces:?}"
+        );
+        assert_eq!(
+            find(InvocationSurfaceKind::Cli, &cli_id),
+            vec!["cli:run".to_string()],
+            "{surfaces:?}"
+        );
+        assert_eq!(
+            find(InvocationSurfaceKind::Schedule, &job_id),
+            vec!["schedule:Scheduled".to_string()],
+            "{surfaces:?}"
+        );
+        assert_eq!(
+            find(InvocationSurfaceKind::Plugin, &plugin_id),
+            vec!["register:webhook".to_string()],
+            "{surfaces:?}"
+        );
+        // a non-plugin registration (e.g. middleware) is NOT a plugin
+        // surface — no false positives from bare REGISTERS edges
+        assert_eq!(
+            surfaces.iter().filter(|s| s.kind == InvocationSurfaceKind::Plugin).count(),
+            1
+        );
     }
 
     #[test]

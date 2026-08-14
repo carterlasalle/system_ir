@@ -562,6 +562,7 @@ pub(crate) fn build_candidates(
     candidates
 }
 
+// trace:v1 id=impl.scc.components.compile work=WORK-SCC-001 satisfies=REQ-SCC-IR
 pub fn compile_components(
     graph: &RealityGraph,
     store: &Store,
@@ -1165,6 +1166,7 @@ pub fn compile_components(
         let mut mine: Vec<String> = Vec::new();
         for section in [
             crate::state::S_RUNTIME,
+            crate::state::S_REACTIVE,
             crate::state::S_CONFIGURATION,
             crate::state::S_CACHES,
             crate::state::S_DERIVED,

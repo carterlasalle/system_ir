@@ -1,11 +1,13 @@
 //! STATE & DATA AUTHORITY (Ontology phase): deterministic attribution of
 //! state ownership per component from the fact layer.
 //!
-//! Five subsections:
+//! Six subsections:
 //! - `persistent`: stores/data entities via WRITES edges (the existing
 //!   component `owns` claims).
 //! - `runtime`: FIELD facts with `mutable=true`, STATE entities, REGISTRY
 //!   entities.
+//! - `reactive`: REACTIVE entities (svelte/vue/react/mobx/signals state)
+//!   via OWNS edges.
 //! - `configuration`: CONFIGURED_BY relationships (Configuration facts).
 //! - `caches`: WRITES/READS to cache-technology stores.
 //! - `derived`: PUBLISHES/SUBSCRIBES/CONSUMES topics + middleware/registry
@@ -21,24 +23,28 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const S_PERSISTENT: &str = "persistent";
 pub const S_RUNTIME: &str = "runtime";
+pub const S_REACTIVE: &str = "reactive";
 pub const S_CONFIGURATION: &str = "configuration";
 pub const S_CACHES: &str = "caches";
 pub const S_DERIVED: &str = "derived";
 
 /// Deterministic render order of the STATE & DATA AUTHORITY subsections.
-pub const STATE_SECTIONS: [&str; 5] = [
+pub const STATE_SECTIONS: [&str; 6] = [
     S_PERSISTENT,
     S_RUNTIME,
+    S_REACTIVE,
     S_CONFIGURATION,
     S_CACHES,
     S_DERIVED,
 ];
 
 /// Human-readable subsection header for a section key.
+// # trace:exempt — subsection header label map, no behavior of its own
 pub fn section_label(section: &str) -> &'static str {
     match section {
         S_PERSISTENT => "DATA OWNERSHIP",
         S_RUNTIME => "RUNTIME STATE",
+        S_REACTIVE => "REACTIVE STATE",
         S_CONFIGURATION => "CONFIGURATION",
         S_CACHES => "CACHES",
         S_DERIVED => "DERIVED / REGISTRIES",
@@ -68,11 +74,17 @@ pub fn is_cache_store(name: &str, technology: Option<&str>) -> bool {
 /// Returns `section -> sorted "COMP verb TARGET (PROV)" lines`. Section
 /// keys are [`STATE_SECTIONS`]; the map is a `BTreeMap` and every line set
 /// is sorted — output is deterministic for identical input.
+// trace:v1 id=impl.scc.state.authority work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn compile_state_authority(
     graph: &RealityGraph,
     symbol_comp: &HashMap<String, String>,
 ) -> BTreeMap<String, Vec<String>> {
     let mut sections: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // every section key exists (empty sections stay empty) so callers can
+    // iterate STATE_SECTIONS unconditionally
+    for k in STATE_SECTIONS {
+        sections.entry(k.to_string()).or_default();
+    }
     let mut push = |section: &str, line: String| {
         sections
             .entry(section.to_string())
@@ -223,6 +235,33 @@ pub fn compile_state_authority(
         }
     }
 
+    // ---- reactive state: REACTIVE entities (Wave 11) owned via OWNS
+    // edges (svelte $state, vue ref/reactive, react useState, mobx,
+    // signals). The owner symbol's component carries the line.
+    for e in graph.entities_of_kind(kinds::REACTIVE) {
+        let access = e
+            .attributes
+            .get("access")
+            .and_then(|v| v.as_str())
+            .unwrap_or("state");
+        let mut rels = graph.in_pred(&e.id, predicates::OWNS);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            if let Some(comp) = comp_of(&r.subject) {
+                push(
+                    S_REACTIVE,
+                    format!(
+                        "{} owns reactive: {} [{}] ({})",
+                        comp,
+                        e.name,
+                        access,
+                        prov_str(&r.provenance)
+                    ),
+                );
+            }
+        }
+    }
+
     sections
         .into_iter()
         .map(|(k, v)| (k, v.into_iter().collect()))
@@ -231,13 +270,16 @@ pub fn compile_state_authority(
 
 /// Groups of symbol ids that SHARE state authority: distinct symbols
 /// writing the same store (data entities resolve to their owning store, so
-/// `db.users` and `db.orders` count as one target) or read by the same
-/// CONFIGURED_BY configuration target. This is the shared-state-authority
-/// signal for the semantic clustering graph (+4 per pair inside a group).
+/// `db.users` and `db.orders` count as one target), read by the same
+/// CONFIGURED_BY configuration target, or owning the same REACTIVE state
+/// entity (Wave 11 — symbols mutating the same reactive state cohere).
+/// This is the shared-state-authority signal for the semantic clustering
+/// graph (+4 per pair inside a group).
 ///
 /// Deterministic: groups are built over sorted symbol ids and each group is
 /// a sorted `BTreeSet`; groups with fewer than 2 symbols (no pair) are
 /// omitted. Pure function of the graph — nothing is stored or promoted.
+// trace:v1 id=impl.scc.state.groups work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
     // store target -> symbols writing it (data entities resolve to their
     // owning store so writes to db.users and db.orders share authority)
@@ -279,8 +321,24 @@ pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
                 .insert(r.object.clone());
         }
     }
+    // reactive entity -> symbols owning it (OWNS edges)
+    let mut reactive_syms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for rs in graph.entities_of_kind(kinds::REACTIVE) {
+        let mut rels = graph.in_pred(&rs.id, predicates::OWNS);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            reactive_syms
+                .entry(rs.id.clone())
+                .or_default()
+                .insert(r.subject.clone());
+        }
+    }
     let mut out: Vec<BTreeSet<String>> = Vec::new();
-    for group in store_syms.values().chain(cfg_syms.values()) {
+    for group in store_syms
+        .values()
+        .chain(cfg_syms.values())
+        .chain(reactive_syms.values())
+    {
         if group.len() >= 2 {
             out.push(group.clone());
         }
@@ -401,6 +459,27 @@ pub fn compile_state_claims(
                 claims.insert(StateClaim {
                     component: comp,
                     target: cfg.name.clone(),
+                    provenance: prov_str(&r.provenance),
+                });
+            }
+        }
+    }
+
+    // reactive state: REACTIVE entities owned via OWNS edges (the owner
+    // symbol's component carries the `reactive: name [access]` claim)
+    for e in graph.entities_of_kind(kinds::REACTIVE) {
+        let access = e
+            .attributes
+            .get("access")
+            .and_then(|v| v.as_str())
+            .unwrap_or("state");
+        let mut rels = graph.in_pred(&e.id, predicates::OWNS);
+        rels.sort_by(|a, b| a.id.cmp(&b.id));
+        for r in rels {
+            if let Some(comp) = comp_of(&r.subject) {
+                claims.insert(StateClaim {
+                    component: comp,
+                    target: format!("reactive: {} [{}]", e.name, access),
                     provenance: prov_str(&r.provenance),
                 });
             }
@@ -716,6 +795,77 @@ mod tests {
         assert!(is_cache_store("kv", Some("valkey")));
         assert!(!is_cache_store("db", Some("postgres")));
         assert!(!is_cache_store("orders", None));
+    }
+
+    /// Wave 11: symbols OWNS-ing the same REACTIVE entity form a
+    /// shared-state authority group (the +4 clustering signal), and the
+    /// REACTIVE STATE section attributes the state to the owner symbol's
+    /// component.
+    #[test]
+    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    fn reactive_state_owners_group_and_attribute() {
+        let (_dir, store) = open();
+        let repo = store.repo_id.clone();
+        component(&store, "api", &["api/app.py"]);
+        let a = sym(&store, "api/app.py", "store_a");
+        attach(&store, "api", &a, "api/app.py");
+        let b = sym(&store, "api/app.py", "store_b");
+        attach(&store, "api", &b, "api/app.py");
+
+        let rs = entity_id(&repo, kinds::REACTIVE, "count");
+        store
+            .insert_entity(
+                Entity::new(rs.clone(), kinds::REACTIVE, "count")
+                    .attr("access", serde_json::json!("state")),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        for (i, s) in [a.clone(), b.clone()].iter().enumerate() {
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:owns:{i}"),
+                        s.clone(),
+                        predicates::OWNS,
+                        rs.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "api/app.py",
+                )
+                .unwrap();
+        }
+
+        // shared-reactive-ownership group: both owners in one group
+        let groups = state_authority_groups(&RealityGraph::load(&store).unwrap());
+        assert!(
+            groups.iter().any(|g| g.contains(&a) && g.contains(&b) && g.len() == 2),
+            "reactive owners must group: {groups:?}"
+        );
+
+        // section attribution: both owners render under REACTIVE STATE
+        let graph = RealityGraph::load(&store).unwrap();
+        let mut symbol_comp: HashMap<String, String> = HashMap::new();
+        for c in &graph.components {
+            for r in graph.out_pred(&c.id, predicates::CONTAINS) {
+                for sr in graph.out_pred(&r.object, predicates::CONTAINS) {
+                    symbol_comp.insert(sr.object.clone(), c.name.clone());
+                }
+            }
+        }
+        let state = compile_state_authority(&graph, &symbol_comp);
+        assert_eq!(
+            state[S_REACTIVE],
+            vec!["api owns reactive: count [state] (EXTRACTED)".to_string()],
+            "{:?}",
+            state[S_REACTIVE]
+        );
+
+        // structured claims bridge carries the same attribution
+        let claims = compile_state_claims(&graph, &symbol_comp);
+        assert!(
+            claims.iter().any(|c| c.target == "reactive: count [state]"),
+            "claims missing reactive state: {claims:?}"
+        );
     }
 
     #[test]

@@ -476,6 +476,104 @@ impl<'a> Writer<'a> {
                         self.store.insert_relationship(&rel, path)?;
                     }
                 }
+                crate::model::SemanticFact::SchemaDefinition { owner, name } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let sch_id = entity_id(self.repo_id, scc_core::kinds::SCHEMA, name);
+                        let mut se = scc_core::Entity::new(
+                            sch_id.clone(),
+                            scc_core::kinds::SCHEMA,
+                            name.clone(),
+                        );
+                        se.attr("file", serde_json::json!(path));
+                        se.evidence = sym_evidence(owner);
+                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["defines_schema", owner_id, &sch_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::DEFINES,
+                            sch_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::SchemaComposition {
+                    owner,
+                    name,
+                    parent,
+                } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let sch_id = entity_id(self.repo_id, scc_core::kinds::SCHEMA, name);
+                        let parent_id =
+                            entity_id(self.repo_id, scc_core::kinds::SCHEMA, parent);
+                        let rel = Relationship::new(
+                            rel_id(&["composes_schema", owner_id, &parent_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::COMPOSES,
+                            parent_id.clone(),
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                        let rel2 = Relationship::new(
+                            rel_id(&["composes_schema", &sch_id, &parent_id]),
+                            sch_id.clone(),
+                            scc_core::predicates::COMPOSES,
+                            parent_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel2, path)?;
+                    }
+                }
+                crate::model::SemanticFact::SchemaValidation { owner, target } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let tgt_id = written
+                            .symbol_ids
+                            .iter()
+                            .find(|(n, _)| n == target)
+                            .map(|(_, id)| id.clone())
+                            .unwrap_or_else(|| {
+                                entity_id(self.repo_id, scc_core::kinds::SYMBOL, target)
+                            });
+                        let rel = Relationship::new(
+                            rel_id(&["validates_schema", owner_id, &tgt_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::VALIDATES,
+                            tgt_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
+                crate::model::SemanticFact::ReactiveState { owner, name, access } => {
+                    if let Some((_, owner_id)) =
+                        written.symbol_ids.iter().find(|(n, _)| n == owner)
+                    {
+                        let rs_id = entity_id(self.repo_id, scc_core::kinds::REACTIVE, name);
+                        let mut re = scc_core::Entity::new(
+                            rs_id.clone(),
+                            scc_core::kinds::REACTIVE,
+                            name.clone(),
+                        );
+                        re.attr("access", serde_json::json!(access));
+                        re.attr("file", serde_json::json!(path));
+                        re.evidence = sym_evidence(owner);
+                        self.store.insert_entity(&re, &[path.to_string()])?;
+                        let rel = Relationship::new(
+                            rel_id(&["owns_reactive", owner_id, &rs_id]),
+                            owner_id.clone(),
+                            scc_core::predicates::OWNS,
+                            rs_id,
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel, path)?;
+                    }
+                }
             }
         }
 

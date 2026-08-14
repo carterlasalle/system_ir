@@ -17,9 +17,9 @@ use scc_core::{
     AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-// trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 
 /// Structured atlas compilation — pure data, no rendering.
+// trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     let view = &ctx.view;
     let store = ctx.store;
@@ -518,6 +518,51 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                 consumers: consumers.into_iter().collect(),
                 operations: vec![ce.name.clone()],
                 evidence: ce.evidence.clone(),
+            },
+        );
+    }
+    // schema: SCHEMA entities (Wave 11) — the schema name, its composed
+    // parents (COMPOSES edges, schema→parent) and validation lines (the
+    // defining owner's VALIDATES edges) render per-subclass with the
+    // `schema:` prefix: `schema: User`, `schema: User extends Base`,
+    // `schema: User validates`. Producer = the DEFINES subject (the owner
+    // symbol that declared the schema).
+    for s in view.entities_of_kind(scc_core::kinds::SCHEMA) {
+        let owner = view
+            .in_pred(&s.id, scc_core::predicates::DEFINES)
+            .into_iter()
+            .next()
+            .map(|r| r.subject.clone());
+        let mut ops: Vec<String> = vec![s.name.clone()];
+        let mut composed: Vec<String> = view
+            .out_pred(&s.id, scc_core::predicates::COMPOSES)
+            .into_iter()
+            .map(|r| format!("{} extends {}", s.name, entity_name(view, &r.object)))
+            .collect();
+        composed.sort();
+        composed.dedup();
+        ops.extend(composed);
+        if let Some(owner_id) = &owner {
+            let mut validated: Vec<String> = view
+                .out_pred(owner_id, scc_core::predicates::VALIDATES)
+                .into_iter()
+                .map(|_| format!("{} validates", s.name))
+                .collect();
+            validated.sort();
+            validated.dedup();
+            ops.extend(validated);
+        }
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: s.id.clone(),
+                kind: "schema".into(),
+                subclass: ContractSubclass::Schema,
+                producer: owner.clone().unwrap_or_else(|| s.id.clone()),
+                consumers: Vec::new(),
+                operations: ops,
+                evidence: s.evidence.clone(),
             },
         );
     }
@@ -1215,6 +1260,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
 }
 
 /// Render the atlas as compact structured text (agent-facing).
+// trace:v1 id=impl.scc.atlas.render work=WORK-SCC-001 satisfies=REQ-SCC-CTX
 pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -> ContextPack {
     let mut pack = ContextPack::new("atlas", &atlas.revision);
     let mut sections: Vec<Section> = Vec::new();
@@ -1242,10 +1288,31 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         // repo can have thousands of export surfaces).
         const EP_RENDER_CAP: usize = 200;
         for e in atlas.entrypoints.iter().take(EP_RENDER_CAP) {
-            if e.trigger == e.name {
-                purpose.push_str(&format!("  {} [{}]\n", e.name, e.kind));
-            } else {
-                purpose.push_str(&format!("  {} [{}] — {}\n", e.name, e.kind, e.trigger));
+            // Framework-surface kinds render as compact `kind: name` lines
+            // (`queue: consume_order`, `schedule: daily_job`,
+            // `plugin: register_hook`, `lifecycle: @BeforeAll` — the
+            // lifecycle line names the hook annotation). Classic
+            // http/cli/public_api/route/entrypoint lines keep the
+            // `name [kind] — trigger` form.
+            match e.kind.as_str() {
+                "queue" | "schedule" | "plugin" | "lifecycle" => {
+                    let label = if e.kind == "lifecycle" {
+                        e.trigger
+                            .strip_prefix("lifecycle:")
+                            .map(|a| format!("@{a}"))
+                            .unwrap_or_else(|| e.name.clone())
+                    } else {
+                        e.name.clone()
+                    };
+                    purpose.push_str(&format!("  {}: {}\n", e.kind, label));
+                }
+                _ => {
+                    if e.trigger == e.name {
+                        purpose.push_str(&format!("  {} [{}]\n", e.name, e.kind));
+                    } else {
+                        purpose.push_str(&format!("  {} [{}] — {}\n", e.name, e.kind, e.trigger));
+                    }
+                }
             }
         }
         if atlas.entrypoints.len() > EP_RENDER_CAP {
@@ -1416,11 +1483,12 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     sections.push(Section::new("FLOWS", flows, 9));
 
-    // STATE & DATA AUTHORITY (never cut): five subsections — DATA
+    // STATE & DATA AUTHORITY (never cut): six subsections — DATA
     // OWNERSHIP (persistent: the write-derived + declared owns claims and
-    // the DATA STORES list), RUNTIME STATE, CONFIGURATION, CACHES,
-    // DERIVED / REGISTRIES. Falls back to the legacy DATA OWNERSHIP title
-    // when the state compiler found no state at all.
+    // the DATA STORES list), RUNTIME STATE, REACTIVE STATE,
+    // CONFIGURATION, CACHES, DERIVED / REGISTRIES. Falls back to the
+    // legacy DATA OWNERSHIP title when the state compiler found no state
+    // at all.
     let has_state = atlas
         .state_authority
         .values()
@@ -1445,6 +1513,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     }
     for section in [
         scc_graph::state::S_RUNTIME,
+        scc_graph::state::S_REACTIVE,
         scc_graph::state::S_CONFIGURATION,
         scc_graph::state::S_CACHES,
         scc_graph::state::S_DERIVED,
@@ -1990,6 +2059,7 @@ mod tests {
     }
 
     #[test]
+    // # trace:exempt — unit test (tests are not trace-worthy behavior)
     fn contracts_and_coverage_from_fact_layer() {
         let (_dir, store) = test_store();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
@@ -2084,9 +2154,11 @@ mod tests {
             atlas.coverage.get("dynamic_receivers_unresolved").unwrap(),
             "1 (calls whose target is not a local symbol; unknown-receiver calls are not persisted)"
         );
-        // invocation surfaces: public_api (handler) + queue (worker)
-        assert!(
-            atlas.coverage.get("invocation_surfaces").unwrap().starts_with("2 ("),
+        // invocation surfaces: public_api (handler) + queue (worker) +
+        // http (handler via route) + cli (worker cli_flags)
+        assert_eq!(
+            atlas.coverage.get("invocation_surfaces").unwrap(),
+            "4 (cli 1, http 1, public_api 1, queue 1)",
             "{:?}",
             atlas.coverage.get("invocation_surfaces")
         );
@@ -2098,6 +2170,191 @@ mod tests {
         let ep_kinds: BTreeSet<&str> = atlas.entrypoints.iter().map(|e| e.kind.as_str()).collect();
         assert!(ep_kinds.contains("public_api"), "{ep_kinds:?}");
         assert!(ep_kinds.contains("queue"), "{ep_kinds:?}");
+        assert!(ep_kinds.contains("http"), "http surface: {ep_kinds:?}");
+        assert!(ep_kinds.contains("cli"), "cli surface: {ep_kinds:?}");
+    }
+
+    /// Wave 11: schema contracts (SCHEMA entities + DEFINES/COMPOSES/
+    /// VALIDATES edges) render under CONTRACTS with the `schema:` prefix,
+    /// and reactive state (REACTIVE entities + OWNS edges) renders under
+    /// STATE & DATA AUTHORITY's REACTIVE STATE subsection, attributed to
+    /// the owning symbol's component.
+    #[test]
+    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    fn schema_and_reactive_render_in_atlas() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+
+        // component api (api/app.py) with symbol UserService — components
+        // live in the `components` table (RealityGraph::load reads
+        // store.components())
+        let comp_id = entity_id(&repo, kinds::COMPONENT, "api");
+        store
+            .replace_components(&[scc_core::Entity::new(comp_id.clone(), kinds::COMPONENT, "api")])
+            .unwrap();
+        let fid = entity_id(&repo, kinds::FILE, "api/app.py");
+        store
+            .insert_entity(
+                &Entity::new(fid.clone(), kinds::FILE, "api/app.py"),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:c:api",
+                    comp_id,
+                    predicates::CONTAINS,
+                    fid.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+        let svc = symbol_id(&repo, "api/app.py", "UserService");
+        store
+            .insert_entity(
+                &Entity::new(svc.clone(), kinds::SYMBOL, "UserService"),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:f:svc",
+                    fid,
+                    predicates::CONTAINS,
+                    svc.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // schema User (UserService DEFINES it, COMPOSES Base, VALIDATES
+        // CreateUser)
+        let base = entity_id(&repo, kinds::SCHEMA, "Base");
+        store
+            .insert_entity(
+                &Entity::new(base.clone(), kinds::SCHEMA, "Base"),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        let user = entity_id(&repo, kinds::SCHEMA, "User");
+        store
+            .insert_entity(
+                &Entity::new(user.clone(), kinds::SCHEMA, "User"),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:defines",
+                    svc.clone(),
+                    predicates::DEFINES,
+                    user.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:composes",
+                    user,
+                    predicates::COMPOSES,
+                    base,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+        let target = entity_id(&repo, kinds::SYMBOL, "CreateUser");
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:validates",
+                    svc.clone(),
+                    predicates::VALIDATES,
+                    target,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        // reactive state count owned by UserService
+        let count = entity_id(&repo, kinds::REACTIVE, "count");
+        store
+            .insert_entity(
+                Entity::new(count.clone(), kinds::REACTIVE, "count")
+                    .attr("access", serde_json::json!("state")),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:owns:count",
+                    svc,
+                    predicates::OWNS,
+                    count,
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let atlas = build_atlas(&ctx);
+
+        // schema contract: name + composition + validation operations
+        // (find the User schema — the Base schema is a plain name-only
+        // contract)
+        let schema = atlas
+            .contracts
+            .iter()
+            .find(|c| c.subclass == scc_core::ContractSubclass::Schema && c.operations.first() == Some(&"User".to_string()))
+            .expect("schema contract for User");
+        assert_eq!(schema.kind, "schema");
+        assert_eq!(
+            schema.operations,
+            vec![
+                "User".to_string(),
+                "User extends Base".to_string(),
+                "User validates".to_string()
+            ],
+            "{schema:?}"
+        );
+
+        // reactive state attributed to the owning symbol's component
+        assert!(
+            atlas
+                .state_authority
+                .get(scc_graph::state::S_REACTIVE)
+                .map(|lines| lines.iter().any(|l| l == "api owns reactive: count [state] (EXTRACTED)"))
+                .unwrap_or(false),
+            "{:?}",
+            atlas.state_authority
+        );
+
+        // rendered atlas lines
+        let pack = render_atlas(&ctx, &atlas, usize::MAX);
+        for want in [
+            "schema: User",
+            "schema: User extends Base",
+            "schema: User validates",
+            "REACTIVE STATE",
+            "api owns reactive: count [state] (EXTRACTED)",
+        ] {
+            assert!(pack.content.contains(want), "missing {want:?} in:\n{}", pack.content);
+        }
     }
 
     /// A repo with component-attributed symbols exercising the Wave 10

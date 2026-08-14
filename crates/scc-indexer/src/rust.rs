@@ -853,6 +853,21 @@ impl RustExtractor {
         }
         if kind == SymbolKind::Class {
             self.record_struct_fields(node, &name, ctx, src);
+            // Wave 11: `#[derive(Serialize, Deserialize)]` structs are
+            // schema contracts (serde-import-gated).
+            let has_serde = ctx
+                .imports
+                .iter()
+                .any(|i| i.module == "serde" || i.module.starts_with("serde::"));
+            if has_serde
+                && derives.iter().any(|d| d == "Serialize")
+                && derives.iter().any(|d| d == "Deserialize")
+            {
+                ctx.facts.push(SemanticFact::SchemaDefinition {
+                    owner: name.clone(),
+                    name: name.clone(),
+                });
+            }
         }
         // Trait bodies contain function declarations (contracts, default
         // impls); struct/enum bodies have none. Walk everything uniformly.
@@ -1149,6 +1164,26 @@ impl RustExtractor {
                             }
                         }
                     }
+                    // Wave 11: `serde_json::from_str::<T>(...)` validates a
+                    // schema — the turbofish type names the schema target
+                    // (serde_json-import-gated).
+                    let base_callee = callee.split("::<").next().unwrap_or(&callee);
+                    if (base_callee == "serde_json::from_str"
+                        || base_callee.ends_with("::serde_json::from_str"))
+                        && ctx
+                            .imports
+                            .iter()
+                            .any(|i| i.module == "serde_json" || i.module.starts_with("serde_json::"))
+                    {
+                        if let Some(target) = turbofish_type(fn_node, src) {
+                            if let Some(owner) = ctx.caller() {
+                                ctx.facts.push(SemanticFact::SchemaValidation {
+                                    owner,
+                                    target,
+                                });
+                            }
+                        }
+                    }
                     let caller = ctx.caller();
                     let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                     *seq += 1;
@@ -1360,27 +1395,50 @@ impl RustExtractor {
             "Atomic",
             "UnsafeCell<",
         ];
+        // Wave 11: `#[serde(flatten)]` fields compose the struct's schema
+        // from the flattened field type (serde-import-gated).
+        let has_serde = ctx
+            .imports
+            .iter()
+            .any(|i| i.module == "serde" || i.module.starts_with("serde::"));
         let mut cursor = node.walk();
         for c in node.named_children(&mut cursor) {
             if c.kind() != "field_declaration_list" {
                 continue;
             }
+            let mut pending: Vec<Node> = Vec::new();
             let mut c2 = c.walk();
             for f in c.named_children(&mut c2) {
-                if f.kind() != "field_declaration" {
-                    continue;
+                match f.kind() {
+                    "attribute_item" => pending.push(f),
+                    "field_declaration" => {
+                        let fname = clean(node_text(f.child_by_field_name("name"), src));
+                        if !fname.is_empty() {
+                            let ftype = node_text(f.child_by_field_name("type"), src);
+                            let mutable = MUTABLE_TYPES.iter().any(|t| ftype.contains(t));
+                            ctx.facts.push(SemanticFact::Field {
+                                owner: owner.to_string(),
+                                name: fname,
+                                mutable,
+                            });
+                        }
+                        if has_serde
+                            && pending
+                                .iter()
+                                .any(|a| attr_policy(*a, src).contains("flatten"))
+                        {
+                            if let Some(parent) = flatten_parent_type(f, src) {
+                                ctx.facts.push(SemanticFact::SchemaComposition {
+                                    owner: owner.to_string(),
+                                    name: owner.to_string(),
+                                    parent,
+                                });
+                            }
+                        }
+                        pending.clear();
+                    }
+                    _ => {}
                 }
-                let fname = clean(node_text(f.child_by_field_name("name"), src));
-                if fname.is_empty() {
-                    continue;
-                }
-                let ftype = node_text(f.child_by_field_name("type"), src);
-                let mutable = MUTABLE_TYPES.iter().any(|t| ftype.contains(t));
-                ctx.facts.push(SemanticFact::Field {
-                    owner: owner.to_string(),
-                    name: fname,
-                    mutable,
-                });
             }
         }
     }
@@ -1616,6 +1674,43 @@ fn attr_name(a: Node, src: &[u8]) -> String {
     p[..end].to_string()
 }
 
+/// First type name of a turbofish type argument list
+/// (`serde_json::from_str::<User>` → `User`; `Foo<T>` → `Foo`).
+fn turbofish_type(fn_node: Node, src: &[u8]) -> Option<String> {
+    let ta = fn_node.child_by_field_name("type_arguments")?;
+    let mut cursor = ta.walk();
+    for child in ta.named_children(&mut cursor) {
+        let t = clean(node_text(Some(child), src));
+        if t.is_empty() {
+            continue;
+        }
+        let base = t.split('<').next().unwrap_or(&t).trim();
+        if base.is_empty() {
+            continue;
+        }
+        let base = base.rsplit("::").next().unwrap_or(base).trim();
+        if base.is_empty() {
+            continue;
+        }
+        return Some(base.to_string());
+    }
+    None
+}
+
+/// Field type of a `#[serde(flatten)]` field as the composed parent schema
+/// name: strips an outer `Option<...>`, rejects qualified/generic types
+/// (only plain local type names are resolvable).
+fn flatten_parent_type(f: Node, src: &[u8]) -> Option<String> {
+    let mut t = clean(node_text(f.child_by_field_name("type"), src));
+    if t.starts_with("Option<") && t.ends_with('>') {
+        t = t["Option<".len()..t.len() - 1].trim().to_string();
+    }
+    if t.is_empty() || t.contains("::") || t.contains('<') || t.contains('>') {
+        return None;
+    }
+    Some(t)
+}
+
 /// Derive names of a `#[derive(...)]` attribute run, last path segment
 /// only (`#[derive(clap::Parser)]` -> `Parser`).
 fn derive_names(attrs: &[Node], src: &[u8]) -> Vec<String> {
@@ -1719,6 +1814,14 @@ fn fact_key(f: &SemanticFact) -> (String, String) {
         SemanticFact::Registration { owner, kind, .. } => (owner.clone(), kind.clone()),
         SemanticFact::Configuration { owner, key } => (owner.clone(), key.clone()),
         SemanticFact::Callback { owner, callback } => (owner.clone(), callback.clone()),
+        SemanticFact::SchemaDefinition { owner, name } => (owner.clone(), name.clone()),
+        SemanticFact::SchemaComposition { owner, name, parent } => {
+            (owner.clone(), format!("{name}<:{parent}"))
+        }
+        SemanticFact::SchemaValidation { owner, target } => (owner.clone(), target.clone()),
+        SemanticFact::ReactiveState { owner, name, access } => {
+            (owner.clone(), format!("{name}:{access}"))
+        }
     }
 }
 
@@ -2540,6 +2643,69 @@ impl Builder {
                 .any(|s| s.name == "test" && s.kind == SymbolKind::Module),
             "module symbol missing: {:?}",
             ef.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 11: serde schema contracts
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn wave11_serde_schema_definition_flatten_validation() {
+        let ef = extract(
+            "use serde::{Deserialize, Serialize};\nuse serde_json;\n\n#[derive(Serialize, Deserialize)]\npub struct Base {\n    pub id: u64,\n}\n\n#[derive(Serialize, Deserialize)]\npub struct User {\n    #[serde(flatten)]\n    pub base: Base,\n    pub name: String,\n}\n\npub fn load(raw: &str) -> Result<User, serde_json::Error> {\n    serde_json::from_str::<User>(raw)\n}\n",
+        );
+        let schemas: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            ))
+            .collect();
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+            )),
+            "serde struct must be a SchemaDefinition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { owner, name } if owner == "Base" && name == "Base"
+            )),
+            "serde base struct must be a SchemaDefinition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaComposition { owner, name, parent } if owner == "User" && name == "User" && parent == "Base"
+            )),
+            "serde flatten must be a SchemaComposition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaValidation { owner, target } if owner == "load" && target == "User"
+            )),
+            "serde_json::from_str::<T> must emit SchemaValidation: {schemas:?}"
+        );
+        // no serde import → no schema facts
+        let ef2 = extract(
+            "pub struct Plain {\n    pub id: u64,\n}\n",
+        );
+        assert!(
+            !ef2.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            )),
+            "no serde import → no schema facts: {:?}",
+            ef2.facts
         );
     }
 }

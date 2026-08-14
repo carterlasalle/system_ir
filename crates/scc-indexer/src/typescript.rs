@@ -408,6 +408,11 @@ impl LanguageExtractor for TypeScriptExtractor {
         // are gated on the matching import; see `collect_facts`.
         out.facts = collect_facts(&root, src, &file.path, &out.imports, &out.symbols);
 
+        // Wave 11: queue consumers (import-gated): bullmq `new Worker(...)`
+        // and amqplib `channel.consume(...)` — store refs with SUBSCRIBES
+        // semantics, so the atlas seeds Queue invocation surfaces.
+        out.store_refs.extend(queue_consumers(&root, src, &out.imports));
+
         // Module-level mutable globals (`let x = ...`) are STATE facts owned
         // by the module symbol (file stem). Ensure that symbol exists unless
         // a real same-named symbol is declared in this file (Field facts then
@@ -708,6 +713,18 @@ fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
         }
         SemanticFact::Configuration { owner, key } => (4, owner.clone(), key.clone(), String::new()),
         SemanticFact::Callback { owner, callback } => (5, owner.clone(), callback.clone(), String::new()),
+        SemanticFact::SchemaDefinition { owner, name } => {
+            (6, owner.clone(), name.clone(), String::new())
+        }
+        SemanticFact::SchemaComposition { owner, name, parent } => {
+            (6, owner.clone(), name.clone(), parent.clone())
+        }
+        SemanticFact::SchemaValidation { owner, target } => {
+            (6, owner.clone(), target.clone(), String::new())
+        }
+        SemanticFact::ReactiveState { owner, name, access } => {
+            (7, owner.clone(), name.clone(), access.clone())
+        }
     }
 }
 
@@ -903,6 +920,161 @@ fn last_named_arg(call: &Node, src: &[u8]) -> Option<String> {
     None
 }
 
+/// Reactive access kind for a declaration value: svelte `$state`/`$derived`/
+/// `$props`, vue `ref`/`reactive`/`computed`, react `useState`/`useReducer`/
+/// `useContext`, mobx `observable`/`action`/`computed`. Framework-import
+/// gates are applied by the caller (`react`/`vue`/`mobx`/`svelte` flags).
+fn reactive_access(
+    v: &Node,
+    src: &[u8],
+    react: bool,
+    vue: bool,
+    mobx: bool,
+    svelte: bool,
+) -> Option<&'static str> {
+    if v.kind() != "call_expression" {
+        return None;
+    }
+    let f = v.child_by_field_name("function")?;
+    if f.kind() != "identifier" {
+        return None;
+    }
+    let callee = node_text(&f, src);
+    if svelte {
+        match callee {
+            "$state" => return Some("state"),
+            "$derived" => return Some("derive"),
+            "$props" => return Some("read"),
+            _ => {}
+        }
+    }
+    if vue {
+        match callee {
+            "ref" | "reactive" => return Some("state"),
+            "computed" => return Some("derive"),
+            _ => {}
+        }
+    }
+    if react {
+        match callee {
+            "useState" | "useReducer" => return Some("state"),
+            "useContext" => return Some("read"),
+            _ => {}
+        }
+    }
+    if mobx {
+        match callee {
+            "observable" | "makeObservable" | "makeAutoObservable" => return Some("state"),
+            "action" => return Some("write"),
+            "computed" => return Some("derive"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when a value expression is `z.object({...})` (zod schema
+/// construction; `zod_locals` are the local bindings of the zod import).
+fn zod_object_expr(v: &Node, src: &[u8], zod_locals: &BTreeSet<String>) -> bool {
+    if v.kind() != "call_expression" {
+        return false;
+    }
+    let Some(f) = v.child_by_field_name("function") else {
+        return false;
+    };
+    if f.kind() != "member_expression" {
+        return false;
+    }
+    let Some(obj) = f.child_by_field_name("object") else {
+        return false;
+    };
+    if obj.kind() != "identifier" || !zod_locals.contains(node_text(&obj, src)) {
+        return false;
+    }
+    f.child_by_field_name("property")
+        .map(|p| node_text(&p, src) == "object")
+        .unwrap_or(false)
+}
+
+/// Parent schema name of a zod composition value: `Base.extend({...})` /
+/// `Base.merge(...)` → `Base`. Anonymous bases (`z.object({...}).extend(...)`)
+/// are not resolvable → None.
+fn zod_compose_parent(v: &Node, src: &[u8]) -> Option<String> {
+    if v.kind() != "call_expression" {
+        return None;
+    }
+    let f = v.child_by_field_name("function")?;
+    if f.kind() != "member_expression" {
+        return None;
+    }
+    let method = node_text(&f.child_by_field_name("property")?, src);
+    if method != "extend" && method != "merge" {
+        return None;
+    }
+    let obj = f.child_by_field_name("object")?;
+    if obj.kind() != "identifier" {
+        return None;
+    }
+    let t = node_text(&obj, src).to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Target schema name of a zod validation call: `UserSchema.parse(x)` /
+/// `UserSchema.safeParse(x)` → `UserSchema` (receiver must be an
+/// identifier — chained/member receivers are not resolvable locally).
+fn zod_parse_target(f: &Node, src: &[u8]) -> Option<String> {
+    if f.kind() != "member_expression" {
+        return None;
+    }
+    let method = node_text(&f.child_by_field_name("property")?, src);
+    if method != "parse" && method != "safeParse" {
+        return None;
+    }
+    let obj = f.child_by_field_name("object")?;
+    if obj.kind() != "identifier" {
+        return None;
+    }
+    let t = node_text(&obj, src).to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// True when an identifier node is a declaration/assignment target or a
+/// property key — never a reactive read access.
+fn is_reactive_decl_position(node: &Node) -> bool {
+    let Some(p) = node.parent() else {
+        return false;
+    };
+    match p.kind() {
+        "variable_declarator" => p
+            .child_by_field_name("name")
+            .map(|n| n.id() == node.id())
+            .unwrap_or(false),
+        "assignment_expression" | "augmented_assignment_expression" => p
+            .child_by_field_name("left")
+            .map(|l| l.id() == node.id())
+            .unwrap_or(false),
+        "pair" => p
+            .child_by_field_name("key")
+            .map(|k| k.id() == node.id())
+            .unwrap_or(false),
+        "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        | "generator_function_declaration" | "generator_function" => p
+            .child_by_field_name("name")
+            .map(|n| n.id() == node.id())
+            .unwrap_or(false),
+        "import_specifier" | "update_expression" | "labeled_statement" => true,
+        _ => false,
+    }
+}
+
 /// Collect all semantic facts for one file. Iterative (no recursion), never
 /// panics: hostile input just yields fewer facts.
 /// panics: hostile input just yields fewer facts.
@@ -919,9 +1091,33 @@ fn collect_facts(
     let express = has_import(imports, |m| m == "express");
     let react = has_import(imports, |m| m == "react");
     let svelte = has_import(imports, |m| m == "svelte");
+    let vue = has_import(imports, |m| m == "vue");
+    let mobx = has_import(imports, |m| m == "mobx" || m.starts_with("mobx/"));
+    let zod = has_import(imports, |m| m == "zod" || m.starts_with("zod/"));
     let next_config = is_next_config_file(path);
 
+    // Local bindings of the zod import (`import { z } from "zod"` →
+    // "z"; `import * as z from "zod"` → "z").
+    let mut zod_locals: BTreeSet<String> = BTreeSet::new();
+    for i in imports {
+        if i.module == "zod" || i.module.starts_with("zod/") {
+            for (local, _) in &i.names {
+                zod_locals.insert(local.clone());
+            }
+        }
+    }
+
     let mut facts: Vec<SemanticFact> = Vec::new();
+    // Wave 11: reactive declarations per owning symbol (declaration facts
+    // carry owner; read/write accesses match only the declaring owner).
+    let mut reactive_names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Module-level const symbols (zod composition parents must resolve to a
+    // locally declared schema).
+    let local_consts: BTreeSet<String> = symbols
+        .iter()
+        .filter(|s| s.parent.is_none() && s.kind == SymbolKind::Const)
+        .map(|s| s.name.clone())
+        .collect();
     // Contract subclass evidence (Contract ontology): exported module-level
     // function names and per-class method names for the serializer/
     // deserializer pair rule; declared-symbol names for the extension
@@ -1277,8 +1473,79 @@ fn collect_facts(
                 }
             }
             "lexical_declaration" => {
+                let exported = is_exported(&node);
+                let mut cur = node.walk();
+                let declarators: Vec<Node> = node
+                    .named_children(&mut cur)
+                    .filter(|d| d.kind() == "variable_declarator")
+                    .collect();
+                // Wave 11: reactive declarations (svelte $state/$derived/
+                // $props, vue ref/reactive/computed, react useState/
+                // useReducer/useContext, mobx observable/action/computed) and
+                // zod schema definitions/compositions — at any nesting level.
+                for d in &declarators {
+                    let Some(name_node) = d.child_by_field_name("name") else {
+                        continue;
+                    };
+                    // React `const [count, setCount] = useState(0)` — the
+                    // first destructured element names the state value.
+                    let name = match name_node.kind() {
+                        "identifier" => Some(node_text(&name_node, src).to_string()),
+                        "array_pattern" => {
+                            let mut c = name_node.walk();
+                            let els: Vec<Node> =
+                                name_node.named_children(&mut c).collect();
+                            els.into_iter().find_map(|el| {
+                                (el.kind() == "identifier")
+                                    .then(|| node_text(&el, src).to_string())
+                            })
+                        }
+                        _ => None,
+                    };
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let Some(v) = d.child_by_field_name("value") else {
+                        continue;
+                    };
+                    if let Some(access) = reactive_access(&v, src, react, vue, mobx, svelte) {
+                        let owner = ctx
+                            .caller
+                            .clone()
+                            .or_else(|| ctx.class.clone())
+                            .unwrap_or_else(|| module_name.clone());
+                        facts.push(SemanticFact::ReactiveState {
+                            owner: owner.clone(),
+                            name: name.clone(),
+                            access: access.to_string(),
+                        });
+                        reactive_names
+                            .entry(owner)
+                            .or_default()
+                            .insert(name.clone());
+                    }
+                    // zod schema definition: `export const X = z.object(...)`.
+                    if module_level && exported && zod && zod_object_expr(&v, src, &zod_locals) {
+                        facts.push(SemanticFact::SchemaDefinition {
+                            owner: name.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                    // zod composition: `const X = Base.extend(...)` /
+                    // `Base.merge(...)` with a locally declared base.
+                    if module_level && zod {
+                        if let Some(parent) = zod_compose_parent(&v, src) {
+                            if local_consts.contains(&parent) {
+                                facts.push(SemanticFact::SchemaComposition {
+                                    owner: name.clone(),
+                                    name: name.clone(),
+                                    parent,
+                                });
+                            }
+                        }
+                    }
+                }
                 if module_level {
-                    let exported = is_exported(&node);
                     // `let` bindings are mutable module state; `const` is
                     // intent-immutable (skip). The declaration keyword is the
                     // `kind` field (`let`/`const`/`var`).
@@ -1286,8 +1553,7 @@ fn collect_facts(
                         .child_by_field_name("kind")
                         .map(|k| node_text(&k, src) == "let")
                         .unwrap_or(false);
-                    let mut cur = node.walk();
-                    for d in node.named_children(&mut cur) {
+                    for d in &declarators {
                         if d.kind() != "variable_declarator" {
                             continue;
                         }
@@ -1387,6 +1653,20 @@ fn collect_facts(
                 let Some(function) = node.child_by_field_name("function") else {
                     continue;
                 };
+                // Wave 11: zod schema validation (`UserSchema.parse(x)` /
+                // `UserSchema.safeParse(x)`), import-gated on zod.
+                if zod {
+                    if let Some(target) = zod_parse_target(&function, src) {
+                        let owner = ctx
+                            .caller
+                            .clone()
+                            .or_else(|| ctx.const_owner.clone())
+                            .or_else(|| ctx.class.clone());
+                        if let Some(owner) = owner {
+                            facts.push(SemanticFact::SchemaValidation { owner, target });
+                        }
+                    }
+                }
                 // Express registrations (import-verified): app/router/server/
                 // api/route/express .get/.post/.../.use(...).
                 if express {
@@ -1465,21 +1745,55 @@ fn collect_facts(
                     }
                 }
             }
-            "member_expression" | "subscript_expression" => {
-                if let Some(key) = env_key(&node, src) {
+            "identifier" => {
+                // Wave 11: reactive read accesses — a reference to a
+                // declared reactive name owned by the current caller.
+                if !reactive_names.is_empty() {
                     let owner = ctx
                         .caller
                         .clone()
-                        .or_else(|| ctx.const_owner.clone())
-                        .or_else(|| ctx.class.clone());
-                    if let Some(owner) = owner {
-                        facts.push(SemanticFact::Configuration { owner, key });
+                        .unwrap_or_else(|| module_name.clone());
+                    if let Some(names) = reactive_names.get(&owner) {
+                        let t = node_text(&node, src);
+                        if names.contains(t)
+                            && !is_reactive_decl_position(&node)
+                            && !t.starts_with('$')
+                        {
+                            facts.push(SemanticFact::ReactiveState {
+                                owner,
+                                name: t.to_string(),
+                                access: "read".into(),
+                            });
+                        }
                     }
                 }
             }
-            "assignment_expression" if next_config => {
+            "assignment_expression" | "augmented_assignment_expression" => {
+                // Wave 11: reactive write accesses (`count = 5` on a
+                // declared reactive).
+                if !reactive_names.is_empty() {
+                    if let Some(left) = node.child_by_field_name("left") {
+                        if left.kind() == "identifier" {
+                            let owner = ctx
+                                .caller
+                                .clone()
+                                .unwrap_or_else(|| module_name.clone());
+                            if reactive_names
+                                .get(&owner)
+                                .map(|s| s.contains(node_text(&left, src)))
+                                .unwrap_or(false)
+                            {
+                                facts.push(SemanticFact::ReactiveState {
+                                    owner,
+                                    name: node_text(&left, src).to_string(),
+                                    access: "write".into(),
+                                });
+                            }
+                        }
+                    }
+                }
                 // next.config: `module.exports = nextConfig`.
-                {
+                if next_config {
                     if let Some(left) = node.child_by_field_name("left") {
                         if left.kind() == "member_expression" && node_text(&left, src) == "module.exports" {
                             if let Some(right) = node.child_by_field_name("right") {
@@ -1495,6 +1809,18 @@ fn collect_facts(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            "member_expression" | "subscript_expression" => {
+                if let Some(key) = env_key(&node, src) {
+                    let owner = ctx
+                        .caller
+                        .clone()
+                        .or_else(|| ctx.const_owner.clone())
+                        .or_else(|| ctx.class.clone());
+                    if let Some(owner) = owner {
+                        facts.push(SemanticFact::Configuration { owner, key });
                     }
                 }
             }
@@ -1650,6 +1976,97 @@ fn collect_facts(
     facts.dedup();
     facts
 }
+
+/// Wave 11 queue consumers (import-gated, deterministic document order):
+/// bullmq `new Worker("queue", handler)` and amqplib
+/// `channel.consume("queue", handler)` — both emit SUBSCRIBES store refs so
+/// the atlas seeds Queue invocation surfaces. kafkajs `consumer.subscribe`
+/// is already covered by the receiver-based store-ref path.
+fn queue_consumers(root: &Node, src: &[u8], imports: &[Import]) -> Vec<StoreRef> {
+    let bullmq = has_import(imports, |m| m == "bullmq");
+    let amqplib = has_import(imports, |m| m == "amqplib");
+    if !bullmq && !amqplib {
+        return Vec::new();
+    }
+    let mut out: Vec<StoreRef> = Vec::new();
+    let mut frames: Vec<(Node, Option<String>)> = vec![(*root, None)];
+    while let Some((node, caller)) = frames.pop() {
+        if node.is_error() || node.is_missing() {
+            continue;
+        }
+        let mut next_caller = caller.clone();
+        match node.kind() {
+            "new_expression" if bullmq => {
+                let is_worker = node
+                    .child_by_field_name("constructor")
+                    .map(|c| c.kind() == "identifier" && node_text(&c, src) == "Worker")
+                    .unwrap_or(false);
+                if is_worker {
+                    if let Some(target) = first_string_arg(&node, src) {
+                        out.push(StoreRef {
+                            caller: caller.clone(),
+                            store: "bullmq".into(),
+                            technology: Some("bullmq".into()),
+                            op: StoreOp::Subscribe,
+                            target: Some(target),
+                            line: line_of(&node),
+                        });
+                    }
+                }
+            }
+            "call_expression" if amqplib => {
+                if let Some(f) = node.child_by_field_name("function") {
+                    if f.kind() == "member_expression" {
+                        let method = f
+                            .child_by_field_name("property")
+                            .map(|p| node_text(&p, src))
+                            .unwrap_or("");
+                        if method == "consume" {
+                            if let Some(target) = first_string_arg(&node, src) {
+                                out.push(StoreRef {
+                                    caller: caller.clone(),
+                                    store: "amqp".into(),
+                                    technology: Some("rabbitmq".into()),
+                                    op: StoreOp::Subscribe,
+                                    target: Some(target),
+                                    line: line_of(&node),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "function_declaration" | "method_definition" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, src).to_string())
+                {
+                    if !name.is_empty() {
+                        next_caller = Some(match &caller {
+                            Some(c) if node.kind() == "method_definition" => {
+                                format!("{c}.{name}")
+                            }
+                            _ => name,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut children: Vec<Node> = Vec::new();
+        {
+            let mut cur = node.walk();
+            for c in node.named_children(&mut cur) {
+                children.push(c);
+            }
+        }
+        for c in children.iter().rev() {
+            frames.push((*c, next_caller.clone()));
+        }
+    }
+    out
+}
+
 fn receiver_text(function: &Node, src: &[u8]) -> String {
     function
         .child_by_field_name("object")
@@ -3929,6 +4346,215 @@ export class M {}
         assert!(
             !rs.iter().any(|(_, _, t)| *t == "name"),
             "non-function property must not be a factory: {rs:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 11: zod schema contracts + reactive state + queue consumers
+    // -------------------------------------------------------------------
+
+    fn schemas(ef: &ExtractedFile) -> Vec<(&str, &str, &str)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaDefinition { owner, name } => {
+                    Some(("def", owner.as_str(), name.as_str()))
+                }
+                SemanticFact::SchemaComposition { owner, name: _, parent } => {
+                    Some(("compose", owner.as_str(), parent.as_str()))
+                }
+                SemanticFact::SchemaValidation { owner, target } => {
+                    Some(("validate", owner.as_str(), target.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reactives(ef: &ExtractedFile) -> Vec<(&str, &str, &str)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::ReactiveState { owner, name, access } => {
+                    Some((owner.as_str(), name.as_str(), access.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wave11_zod_schema_definition_validation_composition() {
+        let ef = extract(
+            "src/schema.ts",
+            "import { z } from \"zod\";\n\nexport const UserSchema = z.object({\n  id: z.number(),\n  name: z.string(),\n});\n\nexport const AdminSchema = UserSchema.extend({ role: z.string() });\n\nfunction validate(data: unknown): void {\n  UserSchema.parse(data);\n  AdminSchema.safeParse(data);\n}\n",
+        );
+        let sc = schemas(&ef);
+        assert!(
+            sc.contains(&("def", "UserSchema", "UserSchema")),
+            "zod const must be a SchemaDefinition: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("compose", "AdminSchema", "UserSchema")),
+            "extend of a local schema must be a SchemaComposition: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("validate", "validate", "UserSchema")),
+            "parse call must emit SchemaValidation: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("validate", "validate", "AdminSchema")),
+            "safeParse call must emit SchemaValidation: {sc:?}"
+        );
+        // dedupe: two validation calls on the same schema → one fact
+        let ef2 = extract(
+            "src/schema2.ts",
+            "import { z } from \"zod\";\n\nexport const S = z.object({ a: z.string() });\n\nfunction f(data: unknown) {\n  S.parse(data);\n  S.parse(data);\n}\n",
+        );
+        let validates: Vec<&SemanticFact> = ef2
+            .facts
+            .iter()
+            .filter(|f| matches!(f, SemanticFact::SchemaValidation { .. }))
+            .collect();
+        assert_eq!(validates.len(), 1, "duplicate validation facts: {validates:?}");
+    }
+
+    #[test]
+    fn wave11_zod_requires_import() {
+        // `.object`/`.parse` without the zod import is not a schema.
+        let ef = extract(
+            "src/nozod.ts",
+            "export const S = z.object({ a: z.string() });\n\nfunction f(data: unknown) {\n  S.parse(data);\n}\n",
+        );
+        assert!(
+            !ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            )),
+            "no zod import → no schema facts: {:?}",
+            ef.facts
+        );
+    }
+
+    #[test]
+    fn wave11_reactive_state_react_vue_svelte_mobx() {
+        // React: useState declares state; assignments/reads within the
+        // component function.
+        let ef = extract(
+            "src/Count.tsx",
+            "import React, { useState } from \"react\";\n\nexport function Counter() {\n  const [count, setCount] = useState(0);\n  count + 1;\n  setCount(count + 1);\n  return count;\n}\n",
+        );
+        let rs = reactives(&ef);
+        assert!(
+            rs.contains(&("Counter", "count", "state")),
+            "useState declaration missing: {rs:?}"
+        );
+        assert!(
+            rs.contains(&("Counter", "count", "read")),
+            "useState read missing: {rs:?}"
+        );
+        // Vue: ref declares state; computed derives.
+        let ef2 = extract(
+            "src/store.ts",
+            "import { ref, computed } from \"vue\";\n\nexport const count = ref(0);\nexport const double = computed(() => count.value * 2);\n\nexport function bump() {\n  count.value += 1;\n}\n",
+        );
+        let rs2 = reactives(&ef2);
+        assert!(
+            rs2.contains(&("store", "count", "state")),
+            "vue ref declaration missing: {rs2:?}"
+        );
+        assert!(
+            rs2.contains(&("store", "double", "derive")),
+            "vue computed derivation missing: {rs2:?}"
+        );
+        // Svelte: $state declares; $derived derives; $props reads.
+        let ef3 = extract(
+            "src/state.svelte.ts",
+            "import { $state, $derived } from \"svelte\";\n\nexport function makeStore() {\n  let count = $state(0);\n  let double = $derived(count * 2);\n  count = 5;\n  return double;\n}\n",
+        );
+        let rs3 = reactives(&ef3);
+        assert!(
+            rs3.contains(&("makeStore", "count", "state")),
+            "svelte $state declaration missing: {rs3:?}"
+        );
+        assert!(
+            rs3.contains(&("makeStore", "double", "derive")),
+            "svelte $derived missing: {rs3:?}"
+        );
+        assert!(
+            rs3.contains(&("makeStore", "count", "write")),
+            "svelte assignment write missing: {rs3:?}"
+        );
+        // Mobx: observable declares; action writes; computed derives.
+        let ef4 = extract(
+            "src/mob.ts",
+            "import { observable, action, computed } from \"mobx\";\n\nconst store = observable({ n: 1 });\nconst double = computed(() => store.n * 2);\nfunction inc() {\n  action(() => { store.n += 1; })();\n}\n",
+        );
+        let rs4 = reactives(&ef4);
+        assert!(
+            rs4.contains(&("mob", "store", "state")),
+            "mobx observable missing: {rs4:?}"
+        );
+        assert!(
+            rs4.contains(&("mob", "double", "derive")),
+            "mobx computed missing: {rs4:?}"
+        );
+        // no framework import → no reactive facts
+        let ef5 = extract(
+            "src/plain.ts",
+            "export function f() {\n  const x = useState(0);\n  return x;\n}\n",
+        );
+        assert!(
+            !ef5
+                .facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::ReactiveState { .. })),
+            "no framework import → no reactive facts: {:?}",
+            ef5.facts
+        );
+    }
+
+    #[test]
+    fn wave11_queue_consumers() {
+        // bullmq Worker subscribes to a queue.
+        let ef = extract(
+            "src/worker.ts",
+            "import { Worker } from \"bullmq\";\n\nnew Worker(\"emails\", async (job) => {\n  return job.data;\n});\n",
+        );
+        assert!(
+            ef.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "bullmq"
+                    && sr.target.as_deref() == Some("emails")
+            }),
+            "bullmq worker missing: {:?}",
+            ef.store_refs
+        );
+        // amqplib channel.consume subscribes to a queue.
+        let ef2 = extract(
+            "src/amqp.ts",
+            "import amqp from \"amqplib\";\n\nasync function start() {\n  const conn = await amqp.connect(\"amqp://localhost\");\n  const ch = await conn.createChannel();\n  await ch.consume(\"jobs\", (msg) => {});\n}\n",
+        );
+        assert!(
+            ef2.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "amqp"
+                    && sr.target.as_deref() == Some("jobs")
+            }),
+            "amqplib consume missing: {:?}",
+            ef2.store_refs
+        );
+        // no queue import → nothing
+        let ef3 = extract(
+            "src/plain.ts",
+            "const w = new Worker(\"x\");\nch.consume(\"y\", () => {});\n",
+        );
+        assert!(
+            ef3.store_refs.is_empty(),
+            "no queue import → no consumers: {:?}",
+            ef3.store_refs
         );
     }
 }

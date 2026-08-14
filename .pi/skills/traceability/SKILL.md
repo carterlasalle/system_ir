@@ -175,6 +175,7 @@ trace context <id>                   # full context for one trace (pre-edit)
 trace why <id>                       # causal path back to a root
 trace impact <id>                    # what a change to <id> affects
 trace graph <id> --depth 2           # local subgraph
+trace web                            # 3D web UI of the marker graph (markers only)
 trace verify --changed               # required before completion
 trace status                         # repository health
 trace new <type> --name NAME         # mint a fresh stable ID

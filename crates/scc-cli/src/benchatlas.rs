@@ -58,9 +58,10 @@ use crate::Compiler;
 use scc_context::atlas;
 use scc_context::ContextCompiler;
 use scc_core::Entity;
+use scc_core::SystemAtlas;
 use scc_indexer::scan::Language;
 use scc_store::Store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,112 @@ const ALL_SECTIONS: [&str; 7] = [
     "landmarks",
     "tests",
 ];
+
+/// Default per-section regression guard (`--guard-section-delta`): any
+/// startup-required section dropping by more than this between two compared
+/// runs fails the Wave-11 guard.
+pub const DEFAULT_SECTION_GUARD: f64 = 0.05;
+
+/// Minimal pure-Rust SHA-256 (FIPS 180-4) for the blind-test manifest hash.
+/// Deterministic, dependency-free (scc-cli has no crypto dep), panic-free.
+/// Public only so the roundtrip unit test can exercise it directly.
+pub mod sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    /// SHA-256 digest of `data` as 32 raw bytes.
+    pub fn digest(data: &[u8]) -> [u8; 32] {
+        let mut h = H0;
+        let bit_len: u64 = (data.len() as u64).wrapping_mul(8);
+        // pad: 0x80, zeros to 56 mod 64, then the 64-bit big-endian bit length
+        let mut buf: Vec<u8> = Vec::with_capacity(((data.len() + 72) / 64) * 64);
+        buf.extend_from_slice(data);
+        buf.push(0x80);
+        while buf.len() % 64 != 56 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&bit_len.to_be_bytes());
+
+        let mut w = [0u32; 64];
+        for chunk in buf.chunks_exact(64) {
+            for (i, word) in w.iter_mut().enumerate().take(16) {
+                let o = i * 4;
+                *word = u32::from_be_bytes([
+                    chunk[o],
+                    chunk[o + 1],
+                    chunk[o + 2],
+                    chunk[o + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+        let mut out = [0u8; 32];
+        for (i, v) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+
+    /// Lowercase hex of the SHA-256 digest.
+    pub fn hex(data: &[u8]) -> String {
+        let mut out = String::with_capacity(64);
+        for b in digest(data) {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+}
 
 /// Ground-truth sections parsed from `benchmarks/ground-truth/<name>.md`
 /// (one `- <key string>` bullet per item). The v2 ontology; legacy section
@@ -151,7 +258,7 @@ impl GroundTruthDoc {
 
 /// Gap-kind classification for a missed ground-truth item (`--diagnose`):
 /// where the fact disappeared between source and the rendered atlas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GapKind {
     /// The symbol/string is not parseable by any enabled extractor
@@ -191,7 +298,7 @@ impl GapKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapFinding {
     pub section: String,
     pub item: String,
@@ -199,7 +306,7 @@ pub struct GapFinding {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoRecall {
     pub repo: String,
     pub architecture: f64,
@@ -281,7 +388,7 @@ impl Default for RepoRecall {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AtlasRecallReport {
     /// One row per requested repo, in sorted order; skipped repos carry
     /// `skipped_reason`.
@@ -457,9 +564,11 @@ struct AtlasLayers {
     components: String,
 }
 
-fn build_layers(ctx: &ContextCompiler<'_>, pack: &scc_context::ContextPack) -> AtlasLayers {
-    let atlas = atlas::build_atlas(ctx);
-
+fn build_layers(
+    ctx: &ContextCompiler<'_>,
+    pack: &scc_context::ContextPack,
+    atlas: &SystemAtlas,
+) -> AtlasLayers {
     let mut arch_parts: Vec<String> = Vec::new();
     let mut sa_parts: Vec<String> = Vec::new();
     let mut land_parts: Vec<String> = Vec::new();
@@ -704,8 +813,14 @@ pub fn score_repo(
     let config = crate::load_config(repo_dir).map_err(|e| format!("config: {e}"))?;
     let stale = crate::stale_paths(&store).map_err(|e| format!("stale: {e}"))?;
     let comp = crate::compiler(&store, &config, stale).map_err(|e| format!("compiler: {e}"))?;
-    let pack = comp.ctx().system_atlas(None);
-    let layers = build_layers(&comp.ctx(), &pack);
+    // Wave 11: build the machine atlas once, order its sections by
+    // evidence-backed confidence (highest first — precision via ordering,
+    // no entries dropped), and render the agent-facing pack from the ranked
+    // atlas so agents read the strongest facts first under the token budget.
+    let mut atlas = atlas::build_atlas(&comp.ctx());
+    scc_context::rank::rank_startup_atlas(&mut atlas);
+    let pack = atlas::render_atlas(&comp.ctx(), &atlas, comp.ctx().settings.atlas_tokens);
+    let layers = build_layers(&comp.ctx(), &pack, &atlas);
     let text_norm = &layers.text;
 
     let (architecture, arch_hit, _) = layer_recall(&gt.architecture, &layers.architecture);
@@ -935,7 +1050,7 @@ pub fn run_atlas_bench(
 }
 
 /// Overfit verdict over the dev-vs-holdout overall gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HoldoutVerdict {
     /// holdout >= dev: the dev-tuned rules generalize at least as well.
@@ -969,7 +1084,7 @@ pub fn holdout_verdict(dev: f64, holdout: f64) -> HoldoutVerdict {
 }
 
 /// Dev-vs-holdout comparison for `scc bench atlas --holdout`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoldoutComparison {
     pub dev: AtlasRecallReport,
     /// The validation corpus report (`benchmarks/holdout` — the inspected
@@ -1206,8 +1321,346 @@ pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
     println!("  results written to: {}", c.results_file);
 }
 
+// ---------------------------------------------------------------------------
+// Wave 11 — GENERALIZATION II gates (--compare OLD NEW)
+// ---------------------------------------------------------------------------
+
+/// Generalization efficiency (GE): how much of the development improvement
+/// between two runs transferred to validation.
+///
+/// `GE = validation_delta / development_delta` over the overall recall
+/// means. A positive GE means validation moved the same direction as
+/// development (semantic waves generalize); negative GE means validation
+/// regressed while development improved (overfit). When development did not
+/// move (`dev_delta == 0`) the ratio is degenerate: a validation-only
+/// improvement counts as pure generalization (`1.0`), anything else as
+/// `0.0` — never NaN/inf.
+pub fn generalization_efficiency(dev_delta: f64, validation_delta: f64) -> f64 {
+    if dev_delta == 0.0 {
+        return if validation_delta > 0.0 { 1.0 } else { 0.0 };
+    }
+    validation_delta / dev_delta
+}
+
+/// Wave-11 gate report over two saved holdout result files (JSON
+/// `HoldoutComparison`s): the GE gate (`--gate-ge MIN`, default 0.0 — fails
+/// when `GE <= MIN`; semantic waves must generalize) and the per-section
+/// validation regression guard (`--guard-section-delta MAX`, default 0.05 —
+/// fails when ANY startup-required section regresses by more than MAX
+/// between the two runs, in development or validation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareReport {
+    pub old_file: String,
+    pub new_file: String,
+    /// new.dev.mean_overall - old.dev.mean_overall.
+    pub dev_delta_overall: f64,
+    /// new.holdout.mean_overall - old.holdout.mean_overall.
+    pub validation_delta_overall: f64,
+    /// validation_delta_overall / dev_delta_overall (guarded).
+    pub generalization_efficiency: f64,
+    /// Per-section delta = new - old, development corpus.
+    pub dev_deltas: BTreeMap<String, f64>,
+    /// Per-section delta = new - old, validation corpus.
+    pub validation_deltas: BTreeMap<String, f64>,
+    /// Largest startup-required section drop (new - old) across both
+    /// corpora; 0.0 when nothing regressed.
+    pub max_section_regression: f64,
+    /// The section with the largest drop (`section@corpus`), e.g.
+    /// `contracts@validation`; deterministic (first at the max in
+    /// `STARTUP_SECTIONS` order, development before validation).
+    pub max_regression_section: String,
+    pub gate_ge: f64,
+    pub guard_section_delta: f64,
+    pub ge_passed: bool,
+    pub guard_passed: bool,
+    /// Human-readable failure reasons; empty when the report passes.
+    pub failures: Vec<String>,
+}
+
+/// The five startup-required sections the regression guard watches.
+pub const STARTUP_SECTIONS: [&str; 5] = [
+    "architecture",
+    "entrypoints",
+    "behavior",
+    "state_authority",
+    "contracts",
+];
+
+impl CompareReport {
+    pub fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Compare two saved holdout result files (JSON `HoldoutComparison`s, e.g.
+/// `scc bench atlas --holdout --json` output) and apply the Wave-11 gates.
+/// `old` is the earlier run (the pre-wave baseline), `new` the current one;
+/// deltas are new - old.
+pub fn compare_runs(
+    old: &HoldoutComparison,
+    new: &HoldoutComparison,
+    gate_ge: f64,
+    guard_section_delta: f64,
+) -> CompareReport {
+    let dev_delta_overall = new.dev.mean_overall - old.dev.mean_overall;
+    let validation_delta_overall = new.holdout.mean_overall - old.holdout.mean_overall;
+    let ge = generalization_efficiency(dev_delta_overall, validation_delta_overall);
+
+    let section = |r: &AtlasRecallReport, name: &str| -> f64 {
+        match name {
+            "architecture" => r.mean_architecture,
+            "entrypoints" => r.mean_entrypoints,
+            "behavior" => r.mean_behavior,
+            "state_authority" => r.mean_state_authority,
+            "contracts" => r.mean_contracts,
+            _ => 0.0,
+        }
+    };
+    let mut dev_deltas: BTreeMap<String, f64> = BTreeMap::new();
+    let mut validation_deltas: BTreeMap<String, f64> = BTreeMap::new();
+    let mut max_section_regression: f64 = 0.0;
+    let mut max_regression_section = String::new();
+    for name in STARTUP_SECTIONS {
+        let d_dev = section(&new.dev, name) - section(&old.dev, name);
+        let d_val = section(&new.holdout, name) - section(&old.holdout, name);
+        dev_deltas.insert(name.to_string(), d_dev);
+        validation_deltas.insert(name.to_string(), d_val);
+        for (d, corpus) in [(d_dev, "development"), (d_val, "validation")] {
+            if -d > max_section_regression {
+                max_section_regression = -d;
+                max_regression_section = format!("{name}@{corpus}");
+            }
+        }
+    }
+
+    let ge_passed = ge > gate_ge;
+    let guard_passed = max_section_regression <= guard_section_delta;
+    let mut failures: Vec<String> = Vec::new();
+    if !ge_passed {
+        failures.push(format!(
+            "generalization efficiency {ge:.3} <= gate {gate_ge:.3} \
+             (validation delta {validation_delta_overall:+.3} vs development delta {dev_delta_overall:+.3}): \
+             the semantic wave did not generalize"
+        ));
+    }
+    if !guard_passed {
+        failures.push(format!(
+            "startup-required section regressed by {max_section_regression:.3} > guard {guard_section_delta:.3} \
+             (worst: {max_regression_section}; new vs old run, development or validation)"
+        ));
+    }
+
+    CompareReport {
+        old_file: String::new(),
+        new_file: String::new(),
+        dev_delta_overall,
+        validation_delta_overall,
+        generalization_efficiency: ge,
+        dev_deltas,
+        validation_deltas,
+        max_section_regression,
+        max_regression_section,
+        gate_ge,
+        guard_section_delta,
+        ge_passed,
+        guard_passed,
+        failures,
+    }
+}
+
+/// Load a saved holdout JSON result file into a `HoldoutComparison`.
+pub fn load_holdout_result(path: &Path) -> Result<HoldoutComparison, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("cannot parse {} as a holdout JSON result: {e}", path.display()))
+}
+
+/// Print the Wave-11 compare report (deltas, GE, per-section guard).
+pub fn print_compare_report(r: &CompareReport) {
+    println!("scc bench atlas --compare — Wave-11 generalization gates");
+    println!("  old: {}", r.old_file);
+    println!("  new: {}", r.new_file);
+    println!(
+        "  development delta:  {:+.3} (new - old, overall)",
+        r.dev_delta_overall
+    );
+    println!(
+        "  validation delta:   {:+.3} (new - old, overall)",
+        r.validation_delta_overall
+    );
+    println!(
+        "  generalization efficiency: {:.3} (validation delta / development delta)",
+        r.generalization_efficiency
+    );
+    println!(
+        "  GE gate (--gate-ge {:.3}): {}",
+        r.gate_ge,
+        if r.ge_passed { "PASS" } else { "FAIL" }
+    );
+    println!("  per-section deltas (new - old):");
+    println!(
+        "  {:<18} {:>12} {:>12}",
+        "section", "development", "validation"
+    );
+    for name in STARTUP_SECTIONS {
+        println!(
+            "  {:<18} {:>+12.3} {:>+12.3}",
+            name,
+            r.dev_deltas.get(name).copied().unwrap_or(0.0),
+            r.validation_deltas.get(name).copied().unwrap_or(0.0)
+        );
+    }
+    println!(
+        "  max section regression: {:.3} (guard --guard-section-delta {:.3}): {}",
+        r.max_section_regression,
+        r.guard_section_delta,
+        if r.guard_passed { "PASS" } else { "FAIL" }
+    );
+    if !r.max_regression_section.is_empty() {
+        println!("    worst regression: {}", r.max_regression_section);
+    }
+    if r.passed() {
+        println!("  verdict: PASS (all Wave-11 generalization gates)");
+    } else {
+        println!("  verdict: FAIL");
+        for f in &r.failures {
+            println!("    - {f}");
+        }
+    }
+}
+
+/// Blind-test manifest (Wave 11 — GENERALIZATION II): a sha256 fingerprint
+/// of the frozen blind set — the ground-truth answer keys
+/// (`benchmarks/blind-test-ground-truth/**`) and the clone list
+/// (the committed `benchmarks/blind-test/README.md` manifest plus the
+/// on-disk repo dirs — the git-ls-files equivalent for the gitignored
+/// clones). Written into the blind results header; `--blind` verifies the
+/// hash matches the previous run before scoring and errors on mismatch, so
+/// a changed blind set can never silently re-score different keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlindManifest {
+    /// sha256 hex of the deterministic manifest text.
+    pub sha256: String,
+    /// Number of ground-truth key files hashed.
+    pub ground_truth_files: usize,
+    /// Number of blind-test repo dirs in the clone list.
+    pub repos: usize,
+    /// The deterministic manifest text (paths + per-file hashes + clone
+    /// list); the sha256 is over exactly this.
+    pub text: String,
+}
+
+/// Deterministic manifest text + sha256 over the blind set under `root`:
+/// every file in `benchmarks/blind-test-ground-truth/**` (path + content
+/// hash) and the clone list (the committed `benchmarks/blind-test/README.md`
+/// content hash + the sorted top-level repo dir names — the git-ls-files
+/// equivalent for the gitignored clones). Missing ground-truth dir is an
+/// error (the protocol requires it); a missing README is tolerated (the
+/// clone list then reduces to the repo dirs).
+pub fn blind_manifest(root: &Path) -> Result<BlindManifest, String> {
+    let gt_dir = root.join("benchmarks").join("blind-test-ground-truth");
+    if !gt_dir.is_dir() {
+        return Err(format!(
+            "blind-test ground-truth dir not found (run --blind from the workspace): {}",
+            gt_dir.display()
+        ));
+    }
+    let blind_dir = root.join("benchmarks").join("blind-test");
+    let mut out = String::from("# scc blind-test manifest (deterministic)\n");
+
+    let mut gt_files: Vec<PathBuf> = Vec::new();
+    collect_files(&gt_dir, &mut gt_files);
+    gt_files.sort();
+    for f in &gt_files {
+        let rel = f
+            .strip_prefix(&gt_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| f.display().to_string());
+        let content = std::fs::read(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+        out.push_str(&format!("ground-truth {rel} {}\n", sha256::hex(&content)));
+    }
+
+    // clone list: the committed README manifest + the on-disk repo dirs
+    // (git ls-files of benchmarks/blind-test is just README.md — the
+    // clones are gitignored — so the dir names are the machine-level
+    // clone-set fingerprint).
+    let readme = blind_dir.join("README.md");
+    if readme.is_file() {
+        let content =
+            std::fs::read(&readme).map_err(|e| format!("read {}: {e}", readme.display()))?;
+        out.push_str(&format!("README.md {}\n", sha256::hex(&content)));
+    }
+    let dirs = repo_dirs(&blind_dir);
+    for d in &dirs {
+        out.push_str(&format!("clone {d}\n"));
+    }
+
+    let digest = sha256::hex(out.as_bytes());
+    Ok(BlindManifest {
+        sha256: digest,
+        ground_truth_files: gt_files.len(),
+        repos: dirs.len(),
+        text: out,
+    })
+}
+
+/// Recursively collect regular files under `dir` into `out`.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+/// The manifest hash recorded in a previous blind results-file header
+/// (`blind manifest sha256: <hex>`), for the change-detection check.
+fn manifest_hash_from_header(header: &str) -> Option<String> {
+    header.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("blind manifest sha256:")
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(|h| h.to_string())
+    })
+}
+
+/// Guarded division for the blind transfer ratio: `numerator / denominator`,
+/// 0.0 when the denominator is 0 (nothing transferred onto nothing).
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+/// Per-section blind transfer ratios (blind mean / validation mean) over
+/// the seven layers plus overall — deterministic, 0.0-guarded.
+fn blind_transfer_ratios(c: &BlindComparison) -> Vec<(&'static str, f64)> {
+    let v = &c.validation;
+    let b = &c.blind;
+    vec![
+        ("architecture", safe_ratio(b.mean_architecture, v.mean_architecture)),
+        ("entrypoints", safe_ratio(b.mean_entrypoints, v.mean_entrypoints)),
+        ("behavior", safe_ratio(b.mean_behavior, v.mean_behavior)),
+        ("state_authority", safe_ratio(b.mean_state_authority, v.mean_state_authority)),
+        ("contracts", safe_ratio(b.mean_contracts, v.mean_contracts)),
+        ("landmarks", safe_ratio(b.mean_landmarks, v.mean_landmarks)),
+        ("tests", safe_ratio(b.mean_tests, v.mean_tests)),
+        ("overall", safe_ratio(b.mean_overall, v.mean_overall)),
+    ]
+}
+
 /// Blind-test protocol comparison: validation-vs-blind generalization.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlindComparison {
     /// Validation corpus aggregates (`benchmarks/holdout`) — per-repo
     /// detail stripped.
@@ -1224,6 +1677,10 @@ pub struct BlindComparison {
     pub gap_landmarks: f64,
     pub gap_tests: f64,
     pub gap_overall: f64,
+    /// The sha256 manifest fingerprint of the frozen blind set scored in
+    /// this run (ground-truth keys + clone list); verified against the
+    /// previous run before scoring.
+    pub manifest: BlindManifest,
     /// Path of the written results file.
     pub results_file: String,
 }
@@ -1269,6 +1726,23 @@ pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison,
     let results_dir = root.join("benchmarks").join("results");
     let results_file = results_dir.join("blind-v1.txt");
 
+    // Wave 11: verify the frozen blind set did not change since the last
+    // recorded run BEFORE scoring — a mismatched manifest is a protocol
+    // error, not a silent re-score of different keys.
+    let manifest = blind_manifest(&root)?;
+    if results_file.is_file() {
+        let previous = std::fs::read_to_string(&results_file).map_err(|e| e.to_string())?;
+        if let Some(prev_hash) = manifest_hash_from_header(&previous) {
+            if prev_hash != manifest.sha256 {
+                return Err(format!(
+                    "blind-test set changed: manifest sha256 {prev_hash} (previous run) != {} (current); \
+                     the blind ground truth or clone list was modified — refusing to score",
+                    manifest.sha256
+                ));
+            }
+        }
+    }
+
     let validation_corpus = root.join("benchmarks").join("holdout");
     let validation_gt = root.join("benchmarks").join("holdout-ground-truth");
     let blind_corpus = root.join("benchmarks").join("blind-test");
@@ -1302,6 +1776,7 @@ pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison,
         gap_landmarks: HoldoutComparison::layer_gap(validation.mean_landmarks, blind.mean_landmarks),
         gap_tests: HoldoutComparison::layer_gap(validation.mean_tests, blind.mean_tests),
         gap_overall: HoldoutComparison::layer_gap(validation.mean_overall, blind.mean_overall),
+        manifest,
         results_file: results_file.display().to_string(),
         validation,
         blind,
@@ -1318,6 +1793,10 @@ impl BlindComparison {
     fn to_blind_text(&self) -> String {
         let mut out = String::new();
         out.push_str("# Blind v1 — validation vs blind (aggregates only)\n");
+        out.push_str(&format!(
+            "blind manifest sha256: {} ({} ground-truth files, {} blind-test repos)\n",
+            self.manifest.sha256, self.manifest.ground_truth_files, self.manifest.repos
+        ));
         out.push_str(&format!("validation corpus: {}\n", self.validation.mode));
         out.push_str(&format!("blind corpus:      {}\n", self.blind.mode));
         out.push_str(&format!("results:           {}\n", self.results_file));
@@ -1372,6 +1851,11 @@ impl BlindComparison {
             self.validation.mean_atlas_tokens, self.blind.mean_atlas_tokens
         ));
         out.push('\n');
+        out.push_str("## blind transfer ratio (blind / validation) — how much of the validation recall transfers to the unseen blind corpus\n");
+        for (layer, ratio) in blind_transfer_ratios(self) {
+            out.push_str(&format!("  {:<18} {:>10.3}\n", layer, ratio));
+        }
+        out.push('\n');
         out.push_str("## generalization gap (blind - validation) — informational, not gating\n");
         for (layer, gap) in [
             ("architecture", self.gap_architecture),
@@ -1400,6 +1884,10 @@ pub fn print_blind_report(c: &BlindComparison) {
     println!("scc bench atlas --blind — validation vs blind (aggregates only)");
     println!("  validation corpus: {}", c.validation.mode);
     println!("  blind corpus:      {}", c.blind.mode);
+    println!(
+        "  blind manifest sha256: {} ({} ground-truth files, {} blind-test repos)",
+        c.manifest.sha256, c.manifest.ground_truth_files, c.manifest.repos
+    );
     println!("  blind-test failures are never shown to tuning agents.");
     println!("\n=== per-section means ===");
     println!(
@@ -1433,6 +1921,10 @@ pub fn print_blind_report(c: &BlindComparison) {
         c.validation.mean_density, c.blind.mean_density,
         c.validation.mean_atlas_tokens, c.blind.mean_atlas_tokens
     );
+    println!("\n=== blind transfer ratio (blind / validation) ===");
+    for (layer, ratio) in blind_transfer_ratios(c) {
+        println!("  {:<18} {:>10.3}", layer, ratio);
+    }
     println!("\n=== generalization gap (blind - validation) — informational, not gating ===");
     for (layer, gap) in [
         ("architecture", c.gap_architecture),
@@ -2100,6 +2592,12 @@ mod tests {
             gap_landmarks: HoldoutComparison::layer_gap(validation.mean_landmarks, blind.mean_landmarks),
             gap_tests: HoldoutComparison::layer_gap(validation.mean_tests, blind.mean_tests),
             gap_overall: HoldoutComparison::layer_gap(validation.mean_overall, blind.mean_overall),
+            manifest: BlindManifest {
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                ground_truth_files: 20,
+                repos: 20,
+                text: String::new(),
+            },
             results_file: "benchmarks/results/blind-v1.txt".to_string(),
             validation,
             blind,
@@ -2112,6 +2610,20 @@ mod tests {
         assert!(text.contains("overall (gate)"), "{text}");
         assert!(text.contains("generalization gap"), "{text}");
         assert!(text.contains("+0.040"), "gap +0.04 rendered: {text}");
+        // Wave 11: manifest header + blind transfer ratios are printed
+        assert!(
+            text.contains("blind manifest sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "manifest hash in header: {text}"
+        );
+        assert!(text.contains("blind transfer ratio"), "{text}");
+        assert!(
+            text.contains("overall"),
+            "overall row present: {text}"
+        );
+        assert!(
+            text.contains("     1.148"),
+            "overall transfer ratio 0.31/0.27 = 1.148 rendered: {text}"
+        );
         assert!(
             !text.contains("missed:"),
             "no per-repo miss lines in blind output: {text}"
@@ -2333,6 +2845,169 @@ mod tests {
         assert!(item_matches("parse_args", hay));
     }
 
+    // ---- Wave 11: generalization gates + blind manifest ----
+
+    #[test]
+    fn sha256_matches_standard_test_vectors() {
+        assert_eq!(
+            sha256::hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256::hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256::hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let million: Vec<u8> = vec![b'a'; 1_000_000];
+        assert_eq!(
+            sha256::hex(&million),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn generalization_efficiency_gate_fails_negative_passes_positive() {
+        // dev improved, validation regressed -> negative GE -> the default
+        // gate (MIN = 0.0) fails: the semantic wave overfit
+        let ge = generalization_efficiency(0.10, -0.05);
+        assert!((ge - (-0.5)).abs() < 1e-9);
+        assert!(ge <= 0.0, "negative GE must fail the default gate");
+        // both moved up -> positive GE -> passes
+        let ge2 = generalization_efficiency(0.10, 0.04);
+        assert!((ge2 - 0.4).abs() < 1e-9);
+        assert!(ge2 > 0.0, "positive GE passes the default gate");
+        // zero dev delta: validation-only improvement is pure generalization
+        // (1.0); anything else is 0.0 — never NaN/inf
+        assert_eq!(generalization_efficiency(0.0, 0.05), 1.0);
+        assert_eq!(generalization_efficiency(0.0, 0.0), 0.0);
+        assert_eq!(generalization_efficiency(0.0, -0.05), 0.0);
+        for d in [0.0, -0.0, 1e-9, -1e-9] {
+            assert!(generalization_efficiency(0.0, d).is_finite());
+        }
+    }
+
+    fn holdout_with(
+        dev_overall: f64,
+        dev_sections: [f64; 5],
+        val_overall: f64,
+        val_sections: [f64; 5],
+    ) -> HoldoutComparison {
+        let dev = AtlasRecallReport {
+            mean_overall: dev_overall,
+            mean_architecture: dev_sections[0],
+            mean_entrypoints: dev_sections[1],
+            mean_behavior: dev_sections[2],
+            mean_state_authority: dev_sections[3],
+            mean_contracts: dev_sections[4],
+            ..Default::default()
+        };
+        let holdout = AtlasRecallReport {
+            mean_overall: val_overall,
+            mean_architecture: val_sections[0],
+            mean_entrypoints: val_sections[1],
+            mean_behavior: val_sections[2],
+            mean_state_authority: val_sections[3],
+            mean_contracts: val_sections[4],
+            ..Default::default()
+        };
+        HoldoutComparison {
+            gap_architecture: 0.0,
+            gap_entrypoints: 0.0,
+            gap_behavior: 0.0,
+            gap_state_authority: 0.0,
+            gap_contracts: 0.0,
+            gap_overall: 0.0,
+            verdict: HoldoutVerdict::NoOverfit,
+            results_file: String::new(),
+            dev,
+            holdout,
+        }
+    }
+
+    #[test]
+    fn compare_runs_ge_gate_and_section_guard() {
+        let old = holdout_with(0.50, [0.5; 5], 0.50, [0.5; 5]);
+        // new run: dev improved everywhere; validation improved overall but
+        // contracts regressed 0.50 -> 0.30 (beyond the 0.05 guard)
+        let mut new = holdout_with(0.55, [0.55; 5], 0.51, [0.55, 0.55, 0.55, 0.55, 0.30]);
+        new.dev.mean_contracts = 0.56;
+        let r = compare_runs(&old, &new, 0.0, 0.05);
+        // GE = (0.51 - 0.50) / (0.55 - 0.50) = 0.2 > 0.0 -> passes
+        assert!((r.generalization_efficiency - 0.2).abs() < 1e-9);
+        assert!(r.ge_passed, "{:?}", r.failures);
+        // contracts validation delta = 0.30 - 0.50 = -0.20 -> guard fails
+        assert!((r.max_section_regression - 0.20).abs() < 1e-9);
+        assert!(!r.guard_passed);
+        assert!(!r.passed());
+        assert!(r.failures.iter().any(|f| f.contains("contracts")));
+        assert!((r.validation_deltas["contracts"] - (-0.20)).abs() < 1e-9);
+
+        // everything improved -> both gates pass
+        let good = holdout_with(0.56, [0.56; 5], 0.53, [0.53; 5]);
+        let r2 = compare_runs(&old, &good, 0.0, 0.05);
+        assert!((r2.generalization_efficiency - 0.5).abs() < 1e-9);
+        assert!(r2.ge_passed, "{:?}", r2.failures);
+        assert!(r2.guard_passed, "{:?}", r2.failures);
+        assert!(r2.passed());
+        assert!(r2.failures.is_empty());
+        assert_eq!(r2.max_section_regression, 0.0);
+
+        // a tight GE floor: ge 0.5 <= MIN 0.6 -> fails
+        let r3 = compare_runs(&old, &good, 0.6, 0.05);
+        assert!(!r3.ge_passed);
+        assert!(r3.failures.iter().any(|f| f.contains("generalization efficiency")));
+    }
+
+    #[test]
+    fn blind_manifest_hash_roundtrip_detects_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let gt = root.join("benchmarks/blind-test-ground-truth");
+        let blind = root.join("benchmarks/blind-test");
+        std::fs::create_dir_all(&gt).unwrap();
+        std::fs::create_dir_all(&blind).unwrap();
+        std::fs::write(gt.join("axum.md"), "## architecture\n- axum\n").unwrap();
+        std::fs::write(gt.join("echo.md"), "## architecture\n- echo\n").unwrap();
+        std::fs::write(blind.join("README.md"), "# manifest\n| axum | url |\n").unwrap();
+        std::fs::create_dir_all(blind.join("axum")).unwrap();
+        std::fs::create_dir_all(blind.join("echo")).unwrap();
+
+        let m1 = blind_manifest(root).unwrap();
+        assert_eq!(m1.ground_truth_files, 2);
+        assert_eq!(m1.repos, 2);
+        assert_eq!(m1.sha256.len(), 64);
+        assert!(m1.text.contains("ground-truth axum.md"), "{}", m1.text);
+        assert!(m1.text.contains("clone axum"), "{}", m1.text);
+        // deterministic roundtrip
+        let m2 = blind_manifest(root).unwrap();
+        assert_eq!(m1.sha256, m2.sha256);
+        // tamper with a ground-truth key -> hash changes
+        std::fs::write(gt.join("axum.md"), "## architecture\n- axum-changed\n").unwrap();
+        assert_ne!(m1.sha256, blind_manifest(root).unwrap().sha256);
+        // restore, then tamper with the clone list (drop a repo dir)
+        std::fs::write(gt.join("axum.md"), "## architecture\n- axum\n").unwrap();
+        std::fs::remove_dir_all(blind.join("echo")).unwrap();
+        let m4 = blind_manifest(root).unwrap();
+        assert_ne!(m1.sha256, m4.sha256);
+        assert_eq!(m4.repos, 1);
+        // header roundtrip: the recorded hash is exactly what verification reads
+        let header = format!("blind manifest sha256: {}\n", m1.sha256);
+        assert_eq!(manifest_hash_from_header(&header).as_deref(), Some(m1.sha256.as_str()));
+        assert_eq!(manifest_hash_from_header("no hash here"), None);
+        // missing ground-truth dir is an error, not a silent empty manifest
+        std::fs::remove_dir_all(&gt).unwrap();
+        assert!(blind_manifest(root).is_err());
+    }
+
+    #[test]
+    fn blind_transfer_ratio_guards_zero_denominator() {
+        assert_eq!(safe_ratio(1.0, 2.0), 0.5);
+        assert_eq!(safe_ratio(0.0, 0.0), 0.0);
+        assert_eq!(safe_ratio(5.0, 0.0), 0.0);
+    }
 }
 
 

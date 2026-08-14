@@ -519,6 +519,10 @@ struct Ctx {
     fields: BTreeMap<(String, String), bool>,
     /// `__all__` entries (module-level public surface).
     all_exports: Vec<String>,
+    /// Wave 11: class inheritance evidence `(class, superclass names)` —
+    /// pydantic model/schema detection is verified in `into_extracted`
+    /// once imports are complete.
+    class_bases: Vec<(String, Vec<String>)>,
     /// Root module names imported in this file (framework verification).
     imported_modules: BTreeSet<String>,
     /// Module-symbol name (file stem) owning module-level STATE facts.
@@ -652,6 +656,70 @@ impl Ctx {
         for ((owner, name), mutable) in self.fields {
             facts.push(SemanticFact::Field { owner, name, mutable });
         }
+        // Wave 11: schema contracts. Pydantic BaseModel subclasses are
+        // SchemaDefinition; a base that is another locally-declared class is
+        // SchemaComposition. Framework-import-gated on pydantic.
+        let has_pydantic = self.imported_modules.contains("pydantic");
+        if has_pydantic {
+            // Local names bound to pydantic's BaseModel (`from pydantic
+            // import BaseModel as BM` → "BM"; `import pydantic` → the
+            // attribute form `pydantic.BaseModel`).
+            let mut pydantic_base_names: BTreeSet<String> = BTreeSet::new();
+            for imp in &self.imports {
+                if imp.module == "pydantic" || imp.module.starts_with("pydantic.") {
+                    for (local, imported) in &imp.names {
+                        if imported == "BaseModel" {
+                            pydantic_base_names.insert(local.clone());
+                        }
+                    }
+                }
+            }
+            let is_pydantic_base = |b: &str| -> bool {
+                pydantic_base_names.contains(b)
+                    || b == "BaseModel"
+                    || b.ends_with(".BaseModel")
+            };
+            let local_classes: BTreeSet<String> = symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Class)
+                .map(|s| s.name.clone())
+                .collect();
+            // A class is a pydantic model when it inherits pydantic's
+            // BaseModel directly, or inherits another local model that is
+            // itself a pydantic model (transitive, resolved in document
+            // order over `class_bases`).
+            let mut pydantic_models: BTreeSet<String> = BTreeSet::new();
+            for (class, bases) in &self.class_bases {
+                let is_model = bases.iter().any(|b| is_pydantic_base(b))
+                    || bases
+                        .iter()
+                        .any(|b| local_classes.contains(b) && pydantic_models.contains(b));
+                if is_model {
+                    pydantic_models.insert(class.clone());
+                }
+            }
+            for (class, bases) in &self.class_bases {
+                if !pydantic_models.contains(class) {
+                    continue;
+                }
+                facts.push(SemanticFact::SchemaDefinition {
+                    owner: class.clone(),
+                    name: class.clone(),
+                });
+                // Composition: the base is another model declared in this
+                // file (first local base wins, deterministic).
+                if let Some(parent) = bases
+                    .iter()
+                    .find(|b| local_classes.contains(*b) && pydantic_models.contains(*b))
+                {
+                    facts.push(SemanticFact::SchemaComposition {
+                        owner: class.clone(),
+                        name: class.clone(),
+                        parent: parent.clone(),
+                    });
+                }
+            }
+        }
         facts.sort_by_key(fact_sort_key);
         facts.dedup_by(|a, b| a == b);
         ExtractedFile {
@@ -691,6 +759,18 @@ fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
         }
         SemanticFact::Callback { owner, callback } => {
             (owner.clone(), format!("callback:{callback}"), String::new())
+        }
+        SemanticFact::SchemaDefinition { owner, name } => {
+            (owner.clone(), format!("schema:{name}"), String::new())
+        }
+        SemanticFact::SchemaComposition { owner, name, parent } => {
+            (owner.clone(), format!("schema:{name}:composes:{parent}"), String::new())
+        }
+        SemanticFact::SchemaValidation { owner, target } => {
+            (owner.clone(), format!("schema-validation:{target}"), String::new())
+        }
+        SemanticFact::ReactiveState { owner, name, access } => {
+            (owner.clone(), format!("reactive:{name}:{access}"), String::new())
         }
     }
 }
@@ -843,6 +923,21 @@ impl PythonExtractor {
                 kind: "class".to_string(),
             });
         }
+        // Wave 11: inheritance evidence (pydantic models are resolved in
+        // `into_extracted` against the import surface).
+        if let Some(supers) = node.child_by_field_name("superclasses") {
+            let mut bases: Vec<String> = Vec::new();
+            let mut cursor = supers.walk();
+            for s in supers.named_children(&mut cursor) {
+                let t = collapse(node_text(Some(s), src));
+                if !t.is_empty() {
+                    bases.push(t);
+                }
+            }
+            if !bases.is_empty() {
+                ctx.class_bases.push((name.clone(), bases));
+            }
+        }
         ctx.scopes.push(Scope {
             name: name.clone(),
             is_class: true,
@@ -863,7 +958,14 @@ impl PythonExtractor {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "decorator" {
-                self.process_decorator(child, ctx, src, def_plain.as_deref(), def_symbol.as_deref());
+                self.process_decorator(
+                    child,
+                    ctx,
+                    src,
+                    def,
+                    def_plain.as_deref(),
+                    def_symbol.as_deref(),
+                );
             }
             self.walk(child, ctx, src);
         }
@@ -874,6 +976,7 @@ impl PythonExtractor {
         dec: Node,
         ctx: &mut Ctx,
         src: &[u8],
+        def: Option<Node>,
         def_plain: Option<&str>,
         def_symbol: Option<&str>,
     ) {
@@ -932,6 +1035,55 @@ impl PythonExtractor {
                         target: class.to_string(),
                     });
                 }
+            }
+            // Wave 11: pydantic field validators (`@validator(...)` /
+            // `@field_validator(...)`) are schema-validation surfaces on
+            // the owning model class.
+            if ctx.has_framework("pydantic")
+                && matches!(method.as_str(), "validator" | "field_validator" | "validates")
+            {
+                let class = sym.rsplit_once('.').map(|(c, _)| c).unwrap_or("");
+                if !class.is_empty() {
+                    ctx.facts.push(SemanticFact::SchemaValidation {
+                        owner: sym.to_string(),
+                        target: class.to_string(),
+                    });
+                }
+            }
+            // Wave 11: apscheduler `@scheduler.scheduled_job(...)` marks the
+            // decorated function as a scheduled job.
+            if ctx.has_framework("apscheduler") && method == "scheduled_job" {
+                ctx.entrypoints.push(Entrypoint {
+                    symbol: sym.to_string(),
+                    kind: "schedule".to_string(),
+                    line,
+                });
+            }
+            // Wave 11: `@dataclass` classes with a `__post_init__` validation
+            // hook are schema definitions (stdlib dataclasses or pydantic).
+            if method == "dataclass"
+                && (ctx.has_framework("dataclasses") || ctx.has_framework("pydantic"))
+            {
+                let is_class = defs_contains_class(def);
+                if is_class && class_defines_method(def, "__post_init__", src) {
+                    ctx.facts.push(SemanticFact::SchemaDefinition {
+                        owner: sym.to_string(),
+                        name: sym.to_string(),
+                    });
+                }
+            }
+            // Wave 11: a `@consumer` decorator registers the function as a
+            // queue consumer (the decorator name is the registration
+            // evidence).
+            if method == "consumer" {
+                ctx.store_refs.push(StoreRef {
+                    caller: Some(sym.to_string()),
+                    store: "queue".to_string(),
+                    technology: None,
+                    op: StoreOp::Subscribe,
+                    target: None,
+                    line,
+                });
             }
         }
         // retry/backoff decoration
@@ -1023,6 +1175,7 @@ impl PythonExtractor {
                 };
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
+                self.record_wave11_call(node, fn_node, &callee, ctx, src);
                 ctx.calls.push(Call {
                     caller,
                     callee,
@@ -1178,6 +1331,19 @@ impl PythonExtractor {
         // module binding is mutable state).
         if ctx.scopes.is_empty() {
             if let Some(l) = left {
+                // Wave 11: celery beat `beat_schedule = {...}` /
+                // `app.conf.beat_schedule = {...}` — the module schedules
+                // periodic tasks (celery-import-gated).
+                if ctx.has_framework("celery") && !ctx.module_name.is_empty() {
+                    let ltext = collapse(node_text(Some(l), src));
+                    if ltext.ends_with("beat_schedule") {
+                        ctx.entrypoints.push(Entrypoint {
+                            symbol: ctx.module_name.clone(),
+                            kind: "schedule".to_string(),
+                            line: node.start_position().row as u32 + 1,
+                        });
+                    }
+                }
                 if l.kind() == "identifier" && node_text(Some(l), src) == "__all__" {
                     if let Some(r) = right {
                         if r.kind() == "list" {
@@ -1346,6 +1512,115 @@ impl PythonExtractor {
                         target: t,
                     });
                 }
+            }
+        }
+    }
+
+    /// Wave 11 general evidence, all framework-import-gated:
+    /// - aiokafka `AIOKafkaConsumer("topic", ...)` → Queue consumer
+    ///   (SUBSCRIBES).
+    /// - pika `channel.basic_consume(queue="q", ...)` → Queue consumer.
+    /// - apscheduler `scheduler.add_job(fn, "cron", ...)` → Schedule.
+    /// - setuptools `setup(entry_points=...)` → Plugin registration point.
+    /// - pydantic `Model.model_validate(...)` → SchemaValidation.
+    fn record_wave11_call(
+        &self,
+        node: Node,
+        fn_node: Node,
+        callee: &str,
+        ctx: &mut Ctx,
+        src: &[u8],
+    ) {
+        let line = node.start_position().row as u32 + 1;
+        let caller = ctx.caller();
+        // aiokafka consumer construction (`AIOKafkaConsumer("topic")` or
+        // `aiokafka.AIOKafkaConsumer("topic")`).
+        if callee.rsplit('.').next() == Some("AIOKafkaConsumer")
+            && ctx.has_framework("aiokafka")
+        {
+            ctx.store_refs.push(StoreRef {
+                caller,
+                store: "kafka".to_string(),
+                technology: Some("kafka".to_string()),
+                op: StoreOp::Subscribe,
+                target: first_string_arg(node, src),
+                line,
+            });
+            return;
+        }
+        let mut segs: Vec<String> = Vec::new();
+        attribute_segments(fn_node, &mut segs, src);
+        let method = segs.last().cloned().unwrap_or_default();
+        // pika channel.basic_consume(queue="q", ...).
+        if method == "basic_consume" && ctx.has_framework("pika") {
+            let target = first_string_arg(node, src).or_else(|| {
+                let args = node.child_by_field_name("arguments")?;
+                let mut cursor = args.walk();
+                for c in args.named_children(&mut cursor) {
+                    if c.kind() == "keyword_argument"
+                        && node_text(c.child_by_field_name("name"), src) == "queue"
+                    {
+                        return string_literal_value(c.child_by_field_name("value")?, src);
+                    }
+                }
+                None
+            });
+            ctx.store_refs.push(StoreRef {
+                caller,
+                store: "queue".to_string(),
+                technology: Some("rabbit".to_string()),
+                op: StoreOp::Subscribe,
+                target,
+                line,
+            });
+            return;
+        }
+        // apscheduler scheduler.add_job(fn, ...): the first positional arg
+        // names the scheduled callable when it is a bare identifier.
+        if method == "add_job" && ctx.has_framework("apscheduler") {
+            if let Some(name) = first_positional_identifier(node, src) {
+                ctx.entrypoints.push(Entrypoint {
+                    symbol: name,
+                    kind: "schedule".to_string(),
+                    line,
+                });
+            }
+            return;
+        }
+        // setuptools setup(entry_points={...}) — an entry-points
+        // registration surface (plugin extension points).
+        if method == "setup"
+            && (segs.len() == 1 || segs[0] == "setuptools")
+            && ctx.has_framework("setuptools")
+            && has_kwarg(node, "entry_points", src)
+        {
+            let owner = caller
+                .clone()
+                .filter(|o| !o.is_empty())
+                .unwrap_or_else(|| ctx.module_name.clone());
+            if !owner.is_empty() {
+                ctx.facts.push(SemanticFact::Registration {
+                    owner,
+                    kind: "plugin".to_string(),
+                    target: "entry_points".to_string(),
+                });
+            }
+            return;
+        }
+        // pydantic model_validate / parse_obj calls validate a schema.
+        if ctx.has_framework("pydantic")
+            && matches!(
+                method.as_str(),
+                "model_validate" | "model_validate_json" | "parse_obj"
+            )
+            && segs.len() == 2
+            && !matches!(segs[0].as_str(), "self" | "cls")
+        {
+            if let Some(owner) = caller {
+                ctx.facts.push(SemanticFact::SchemaValidation {
+                    owner,
+                    target: segs[0].clone(),
+                });
             }
         }
     }
@@ -1744,6 +2019,35 @@ fn is_test_class(class: Node, class_name: &str, src: &[u8]) -> bool {
     false
 }
 
+/// True when a decorated definition node is a `class_definition` (vs a
+/// function) — used to scope class-only decorator rules (`@dataclass`).
+fn defs_contains_class(def: Option<Node>) -> bool {
+    matches!(def, Some(d) if d.kind() == "class_definition")
+}
+
+/// True when a class body defines a method named `method` (e.g.
+/// `__post_init__` — the stdlib dataclass validation hook).
+fn class_defines_method(class: Option<Node>, method: &str, src: &[u8]) -> bool {
+    let Some(class) = class else {
+        return false;
+    };
+    if class.kind() != "class_definition" {
+        return false;
+    }
+    let Some(body) = class.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    for stmt in body.named_children(&mut cursor) {
+        if stmt.kind() == "function_definition"
+            && node_text(stmt.child_by_field_name("name"), src) == method
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// First bare-identifier call in document order (for `__main__` guards).
 fn find_main_call(node: Node, src: &[u8]) -> Option<String> {
     if node.kind() == "call" {
@@ -1811,6 +2115,43 @@ fn first_positional_arg_text(call: Node, src: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// First positional (non-keyword) argument when it is a bare identifier
+/// (apscheduler `scheduler.add_job(myfunc, ...)` names the callable).
+fn first_positional_identifier(call: Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            continue;
+        }
+        if child.kind() == "identifier" {
+            let n = clean(node_text(Some(child), src));
+            if !n.is_empty() {
+                return Some(n);
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// True when a call has a keyword argument named `name`
+/// (setuptools `setup(entry_points={...})`).
+fn has_kwarg(call: Node, name: &str, src: &[u8]) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument"
+            && node_text(child.child_by_field_name("name"), src) == name
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Heuristic mutability of a field initializer: mutable containers and call
@@ -2761,6 +3102,199 @@ mod tests {
         assert!(
             rs.contains(&("create_session".into(), "factory".into(), "Session".into())),
             "module factory must resolve its class: {rs:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 11: schema contracts + invocation surfaces
+    // -------------------------------------------------------------------
+
+    fn schemas(ef: &ExtractedFile) -> Vec<(String, String, String)> {
+        ef.facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaDefinition { owner, name } => {
+                    Some(("def".to_string(), owner.clone(), name.clone()))
+                }
+                SemanticFact::SchemaComposition { owner, name: _, parent } => {
+                    Some(("compose".to_string(), owner.clone(), parent.clone()))
+                }
+                SemanticFact::SchemaValidation { owner, target } => {
+                    Some(("validate".to_string(), owner.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wave11_pydantic_schema_definition_and_validation() {
+        let ef = extract(
+            "from pydantic import BaseModel, field_validator\n\nclass User(BaseModel):\n    name: str\n\n    @field_validator(\"name\")\n    def check_name(cls, v):\n        return v\n\nclass Admin(User):\n    pass\n\ndef create_user(data):\n    return User.model_validate(data)\n",
+        );
+        let sc = schemas(&ef);
+        assert!(
+            sc.contains(&("def".into(), "User".into(), "User".into())),
+            "pydantic model must be a SchemaDefinition: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("def".into(), "Admin".into(), "Admin".into())),
+            "derived pydantic model must be a SchemaDefinition: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("compose".into(), "Admin".into(), "User".into())),
+            "local-model inheritance must be a SchemaComposition: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("validate".into(), "User.check_name".into(), "User".into())),
+            "@field_validator must emit SchemaValidation: {sc:?}"
+        );
+        assert!(
+            sc.contains(&("validate".into(), "create_user".into(), "User".into())),
+            "model_validate call must emit SchemaValidation: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn wave11_pydantic_requires_import() {
+        // A BaseModel-named superclass without the pydantic import is not a
+        // schema; `import pydantic` attribute form still counts.
+        let ef = extract(
+            "class User(BaseModel):\n    name: str\n",
+        );
+        assert!(
+            !ef.facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::SchemaDefinition { .. })),
+            "no pydantic import → no schema facts: {:?}",
+            ef.facts
+        );
+        let ef2 = extract(
+            "import pydantic\n\nclass User(pydantic.BaseModel):\n    name: str\n",
+        );
+        assert!(
+            ef2.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+            )),
+            "import pydantic attribute form must count: {:?}",
+            ef2.facts
+        );
+    }
+
+    #[test]
+    fn wave11_dataclass_with_validator_is_schema() {
+        let ef = extract(
+            "from dataclasses import dataclass\n\n@dataclass\nclass Point:\n    x: int\n    y: int\n\n    def __post_init__(self):\n        if self.x < 0:\n            raise ValueError(\"x\")\n",
+        );
+        let sc = schemas(&ef);
+        assert!(
+            sc.contains(&("def".into(), "Point".into(), "Point".into())),
+            "validated dataclass must be a SchemaDefinition: {sc:?}"
+        );
+        // a dataclass without the validation hook is not a schema
+        let ef2 = extract(
+            "from dataclasses import dataclass\n\n@dataclass\nclass Plain:\n    x: int\n",
+        );
+        assert!(
+            !ef2
+                .facts
+                .iter()
+                .any(|f| matches!(f, SemanticFact::SchemaDefinition { .. })),
+            "plain dataclass must not be a schema: {:?}",
+            ef2.facts
+        );
+    }
+
+    #[test]
+    fn wave11_queue_schedule_plugin_surfaces() {
+        // aiokafka consumer → SUBSCRIBES store ref.
+        let ef = extract(
+            "import aiokafka\n\nasync def consume():\n    consumer = aiokafka.AIOKafkaConsumer(\"orders\")\n    await consumer.start()\n",
+        );
+        assert!(
+            ef.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe && sr.store == "kafka" && sr.target.as_deref() == Some("orders")
+            }),
+            "aiokafka consumer missing: {:?}",
+            ef.store_refs
+        );
+        // pika basic_consume → SUBSCRIBES (import-gated).
+        let ef2 = extract(
+            "import pika\n\nchannel = pika.BlockingConnection(pika.ConnectionParameters(\"x\")).channel()\nchannel.basic_consume(queue=\"jobs\", on_message_callback=lambda c, m, p, b: None)\n",
+        );
+        assert!(
+            ef2.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe && sr.target.as_deref() == Some("jobs")
+            }),
+            "pika consumer missing: {:?}",
+            ef2.store_refs
+        );
+        // apscheduler add_job → schedule entrypoint.
+        let ef3 = extract(
+            "from apscheduler.schedulers.background import BackgroundScheduler\n\nscheduler = BackgroundScheduler()\ndef sweep():\n    pass\nscheduler.add_job(sweep, \"cron\", hour=3)\n",
+        );
+        assert!(
+            ef3.entrypoints
+                .iter()
+                .any(|e| e.kind == "schedule" && e.symbol == "sweep"),
+            "apscheduler schedule entrypoint missing: {:?}",
+            ef3.entrypoints
+        );
+        // setuptools entry_points → plugin registration.
+        let ef4 = extract(
+            "import setuptools\n\nsetuptools.setup(name=\"x\", entry_points={\"console_scripts\": [\"x=x.cli:main\"]})\n",
+        );
+        assert!(
+            regs(&ef4).iter().any(|(_o, k, t)| k == "plugin" && t == "entry_points"),
+            "setuptools plugin registration missing: {:?}",
+            regs(&ef4)
+        );
+        // celery beat_schedule → schedule entrypoint on the module symbol.
+        let ef5 = extract(
+            "from celery import Celery\n\napp = Celery(\"x\")\napp.conf.beat_schedule = {\"every-minute\": {\"task\": \"t\", \"schedule\": 60.0}}\n",
+        );
+        assert!(
+            ef5.entrypoints
+                .iter()
+                .any(|e| e.kind == "schedule" && e.symbol == "test"),
+            "celery beat schedule entrypoint missing: {:?}",
+            ef5.entrypoints
+        );
+        // a `@consumer` decorator marks a queue consumer.
+        let ef6 = extract(
+            "def consumer(fn):\n    return fn\n\n@consumer\ndef handle_event(event):\n    pass\n",
+        );
+        assert!(
+            ef6.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "queue"
+                    && sr.caller.as_deref() == Some("handle_event")
+            }),
+            "@consumer decorator missing: {:?}",
+            ef6.store_refs
+        );
+    }
+
+    #[test]
+    fn wave11_plain_files_emit_nothing() {
+        // No framework imports, no decorators, no queue/schema/schedule
+        // idioms → zero wave-11 facts.
+        let ef = extract(
+            "def add(a, b):\n    return a + b\n\nclass Calc:\n    def double(self, x):\n        return x * 2\n",
+        );
+        assert!(ef.store_refs.is_empty(), "no store refs: {:?}", ef.store_refs);
+        assert!(ef.entrypoints.is_empty(), "no entrypoints: {:?}", ef.entrypoints);
+        assert!(
+            !ef.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+                    | SemanticFact::ReactiveState { .. }
+            )),
+            "no schema/reactive facts: {:?}",
+            ef.facts
         );
     }
 }

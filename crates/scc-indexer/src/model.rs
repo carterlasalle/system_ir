@@ -264,6 +264,22 @@ pub enum SemanticFact {
     Configuration { owner: String, key: String },
     /// A callback/hook handled by `owner` (framework invokes it).
     Callback { owner: String, callback: String },
+    /// A structured schema/model definition (zod z.object, pydantic
+    /// BaseModel, JSON Schema, serde model, go struct tags, Java
+    /// validation annotations): `owner` defines schema `name`.
+    SchemaDefinition { owner: String, name: String },
+    /// Schema composition: `owner` composes schema `name` from `parent`
+    /// (zod .extend/.merge, pydantic inheritance, serde flatten).
+    SchemaComposition { owner: String, name: String, parent: String },
+    /// Schema validation surface: `owner` validates `target` against a
+    /// schema (zod .parse/.safeParse, pydantic validators, javax
+    /// validation annotations).
+    SchemaValidation { owner: String, target: String },
+    /// Reactive state ownership: `owner` declares reactive state `name`
+    /// with access `state|read|write|derive` (svelte $state, vue
+    /// ref/reactive, react useState/useReducer/context, mobx observable,
+    /// signals).
+    ReactiveState { owner: String, name: String, access: String },
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtractedFile {

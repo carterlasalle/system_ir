@@ -746,6 +746,17 @@ impl GoExtractor {
             let ty = spec.child_by_field_name("type");
             if let Some(ty) = ty {
                 if ty.kind() == "struct_type" {
+                    // Wave 11: json/xml-tagged structs are schema contracts
+                    // (encoding/json|xml or go-playground/validator imports
+                    // gate emission).
+                    let has_tags_fw = ctx.imports.iter().any(|i| {
+                        i.module == "encoding/json"
+                            || i.module == "encoding/xml"
+                            || i.module.contains("go-playground/validator")
+                    });
+                    let mut has_json_tag = false;
+                    let mut has_validate_tag = false;
+                    let mut embedded: Option<String> = None;
                     let mut c3 = ty.walk();
                     for child in ty.named_children(&mut c3) {
                         if child.kind() != "field_declaration_list" {
@@ -755,6 +766,13 @@ impl GoExtractor {
                         for fd in child.named_children(&mut c4) {
                             if fd.kind() != "field_declaration" {
                                 continue;
+                            }
+                            let tag = node_text(fd.child_by_field_name("tag"), src);
+                            if tag.contains("json:") || tag.contains("xml:") {
+                                has_json_tag = true;
+                            }
+                            if tag.contains("validate:") {
+                                has_validate_tag = true;
                             }
                             let mut field_names: Vec<String> = Vec::new();
                             let mut c5 = fd.walk();
@@ -770,7 +788,8 @@ impl GoExtractor {
                                     if et.kind() == "type_identifier" {
                                         let t = clean(node_text(Some(et), src));
                                         if !t.is_empty() {
-                                            field_names.push(t);
+                                            field_names.push(t.clone());
+                                            embedded.get_or_insert(t);
                                         }
                                     }
                                 }
@@ -783,6 +802,25 @@ impl GoExtractor {
                                 });
                             }
                         }
+                    }
+                    if has_tags_fw && has_json_tag {
+                        ctx.facts.push(SemanticFact::SchemaDefinition {
+                            owner: name.clone(),
+                            name: name.clone(),
+                        });
+                        if let Some(parent) = embedded {
+                            ctx.facts.push(SemanticFact::SchemaComposition {
+                                owner: name.clone(),
+                                name: name.clone(),
+                                parent,
+                            });
+                        }
+                    }
+                    if has_validate_tag {
+                        ctx.facts.push(SemanticFact::SchemaValidation {
+                            owner: name.clone(),
+                            target: name.clone(),
+                        });
                     }
                 }
             }
@@ -1103,6 +1141,73 @@ impl GoExtractor {
             return;
         }
 
+        // Wave 11: nats/rabbit queue consumers (import-gated) → SUBSCRIBES.
+        let has_nats = ctx
+            .imports
+            .iter()
+            .any(|i| i.module == "github.com/nats-io/nats.go" || i.module.ends_with("/nats.go"));
+        let has_rabbit = ctx.imports.iter().any(|i| {
+            i.module == "github.com/rabbitmq/amqp091-go"
+                || i.module == "github.com/streadway/amqp"
+        });
+        let nats_sub = has_nats && matches!(method.as_str(), "Subscribe" | "QueueSubscribe");
+        if nats_sub || (has_rabbit && method == "Consume") {
+            let store = if nats_sub { "nats" } else { "rabbitmq" };
+            ctx.store_refs.push(StoreRef {
+                caller: Some(owner.clone()),
+                store: store.to_string(),
+                technology: Some(store.to_string()),
+                op: StoreOp::Subscribe,
+                target: first_string_arg(node, src),
+                line: node.start_position().row as u32 + 1,
+            });
+            return;
+        }
+        // Wave 11: robfig/cron + gocron schedule registrations → Schedule.
+        let has_cron = ctx.imports.iter().any(|i| {
+            i.module.starts_with("github.com/robfig/cron") || i.module.contains("go-co-op/gocron")
+        });
+        if has_cron && matches!(method.as_str(), "AddFunc" | "AddJob" | "AddFuncWithSeconds") {
+            let symbol = positional_identifier(node, 2, src).unwrap_or_else(|| owner.clone());
+            ctx.entrypoints.push(Entrypoint {
+                symbol,
+                kind: "schedule".to_string(),
+                line: node.start_position().row as u32 + 1,
+            });
+            return;
+        }
+        if has_cron && method == "Do" {
+            let symbol = positional_identifier(node, 1, src).unwrap_or_else(|| owner.clone());
+            ctx.entrypoints.push(Entrypoint {
+                symbol,
+                kind: "schedule".to_string(),
+                line: node.start_position().row as u32 + 1,
+            });
+            return;
+        }
+        // Wave 11: stdlib `plugin.Open("x.so")` — a plugin loading surface.
+        let has_go_plugin = ctx.imports.iter().any(|i| i.module == "plugin");
+        if has_go_plugin && method == "Open" && recv == "plugin" {
+            ctx.facts.push(SemanticFact::Registration {
+                owner: owner.clone(),
+                kind: "plugin".to_string(),
+                target: first_string_arg(node, src).unwrap_or_else(|| "plugin".to_string()),
+            });
+            return;
+        }
+        // Wave 11: `json.Unmarshal(data, &x)` validates the schema of x's
+        // type (encoding/json-import-gated).
+        let has_json = ctx.imports.iter().any(|i| i.module == "encoding/json");
+        if has_json && method == "Unmarshal" && recv == "json" {
+            if let Some(target) = unmarshal_target(node, src) {
+                ctx.facts.push(SemanticFact::SchemaValidation {
+                    owner: owner.clone(),
+                    target,
+                });
+            }
+            return;
+        }
+
         let Some(binding) = ctx.router_bindings.get(&recv).cloned() else {
             return;
         };
@@ -1206,6 +1311,55 @@ fn join_path(prefix: &str, path: &str) -> String {
     format!("{a}/{b}")
 }
 
+/// nth (1-indexed) argument of a call when it is a bare identifier
+/// (cron `c.AddFunc("0 * * * *", fn)` / gocron `s.Do(fn)`).
+fn positional_identifier(call: Node, index: usize, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut i = 0;
+    for arg in args.named_children(&mut cursor) {
+        i += 1;
+        if i != index {
+            continue;
+        }
+        if arg.kind() == "identifier" {
+            let t = clean(node_text(Some(arg), src));
+            return if t.is_empty() { None } else { Some(t) };
+        }
+        return None;
+    }
+    None
+}
+
+/// Target variable name of `json.Unmarshal(data, &user)`: the second
+/// argument with a leading `&` stripped (`&user` → `user`).
+fn unmarshal_target(call: Node, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut i = 0;
+    for arg in args.named_children(&mut cursor) {
+        i += 1;
+        if i != 2 {
+            continue;
+        }
+        if arg.kind() == "prefix_expression"
+            && arg.child_by_field_name("operator").map(|o| node_text(Some(o), src) == "&").unwrap_or(false)
+        {
+            let inner = arg.child_by_field_name("operand")?;
+            if inner.kind() == "identifier" {
+                let t = clean(node_text(Some(inner), src));
+                return if t.is_empty() { None } else { Some(t) };
+            }
+        }
+        if arg.kind() == "identifier" {
+            let t = clean(node_text(Some(arg), src));
+            return if t.is_empty() { None } else { Some(t) };
+        }
+        return None;
+    }
+    None
+}
+
 /// nth (1-indexed) argument of a call as a handler name: an identifier's
 /// text, `(anonymous)` for a function literal, else the collapsed text.
 fn handler_arg(node: Node, index: usize, src: &[u8]) -> Option<String> {
@@ -1275,6 +1429,18 @@ fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
         }
         SemanticFact::Callback { owner, callback } => {
             (owner.clone(), "callback".to_string(), callback.clone())
+        }
+        SemanticFact::SchemaDefinition { owner, name } => {
+            (owner.clone(), "schema".to_string(), name.clone())
+        }
+        SemanticFact::SchemaComposition { owner, name, parent } => {
+            (owner.clone(), "schema".to_string(), format!("{name}\u{0}composes:{parent}"))
+        }
+        SemanticFact::SchemaValidation { owner, target } => {
+            (owner.clone(), "schema-validation".to_string(), target.clone())
+        }
+        SemanticFact::ReactiveState { owner, name, access } => {
+            (owner.clone(), "reactive".to_string(), format!("{name}\u{0}{access}"))
         }
     }
 }
@@ -2401,6 +2567,104 @@ mod tests {
         assert!(
             rs.contains(&("Command".into(), "builder".into(), "Command".into())),
             "AddCommand builder missing: {rs:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 11: schema contracts + queue/schedule/plugin surfaces
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn wave11_go_schema_definition_composition_validation() {
+        let ef = extract(
+            "import \"encoding/json\"\n\n// Parent has json tags.\ntype Parent struct {\n\tID string `json:\"id\"`\n}\n\ntype User struct {\n\tParent\n\tName string `json:\"name\" validate:\"required\"`\n}\n\nfunc load(data []byte, u *User) error {\n\treturn json.Unmarshal(data, u)\n}\n",
+        );
+        let schemas: Vec<&SemanticFact> = ef
+            .facts
+            .iter()
+            .filter(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. }
+                    | SemanticFact::SchemaComposition { .. }
+                    | SemanticFact::SchemaValidation { .. }
+            ))
+            .collect();
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { owner, name } if owner == "User" && name == "User"
+            )),
+            "json-tagged struct must be a SchemaDefinition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaComposition { owner, name, parent } if owner == "User" && name == "User" && parent == "Parent"
+            )),
+            "embedded struct must be a SchemaComposition: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaValidation { owner, target } if owner == "User" && target == "User"
+            )),
+            "validate tag must emit SchemaValidation: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaValidation { owner, target } if owner == "load" && target == "u"
+            )),
+            "json.Unmarshal must emit SchemaValidation: {schemas:?}"
+        );
+        // no json/xml import → no schema definition facts
+        let ef2 = extract(
+            "type Plain struct {\n\tID string `json:\"id\"`\n}\n",
+        );
+        assert!(
+            !ef2.facts.iter().any(|f| matches!(
+                f,
+                SemanticFact::SchemaDefinition { .. } | SemanticFact::SchemaComposition { .. }
+            )),
+            "no json import → no schema definition facts: {:?}",
+            ef2.facts
+        );
+    }
+
+    #[test]
+    fn wave11_go_queue_schedule_plugin() {
+        // nats consumer → SUBSCRIBES.
+        let ef = extract(
+            "import \"github.com/nats-io/nats.go\"\n\nfunc start(nc *nats.Conn) {\n\tnc.Subscribe(\"orders.created\", handler)\n}\n",
+        );
+        assert!(
+            ef.store_refs.iter().any(|sr| {
+                sr.op == StoreOp::Subscribe
+                    && sr.store == "nats"
+                    && sr.target.as_deref() == Some("orders.created")
+            }),
+            "nats consumer missing: {:?}",
+            ef.store_refs
+        );
+        // robfig/cron AddFunc → schedule entrypoint.
+        let ef2 = extract(
+            "import \"github.com/robfig/cron/v3\"\n\nfunc main() {\n\tc := cron.New()\n\tc.AddFunc(\"0 * * * *\", sweep)\n}\n\nfunc sweep() {}\n",
+        );
+        assert!(
+            ef2.entrypoints
+                .iter()
+                .any(|e| e.kind == "schedule" && e.symbol == "sweep"),
+            "cron AddFunc schedule missing: {:?}",
+            ef2.entrypoints
+        );
+        // stdlib plugin.Open → plugin registration.
+        let ef3 = extract(
+            "import \"plugin\"\n\nfunc load() {\n\tp, err := plugin.Open(\"widgets.so\")\n}\n",
+        );
+        assert!(
+            regs(&ef3).iter().any(|(_, k, t)| k == "plugin" && t == "widgets.so"),
+            "plugin.Open missing: {:?}",
+            regs(&ef3)
         );
     }
 }

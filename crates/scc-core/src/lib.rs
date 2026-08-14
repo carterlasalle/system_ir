@@ -1024,6 +1024,9 @@ pub mod kinds {
     pub const TRUST_BOUNDARY: &str = "trust_boundary";
     pub const SECURITY_CONTROL: &str = "security_control";
     pub const RUNTIME_OBSERVATION: &str = "runtime_observation";
+    // Wave 11: first-class schema and reactive-state contracts.
+    pub const SCHEMA: &str = "schema";
+    pub const REACTIVE: &str = "reactive";
 }
 
 pub mod predicates {
@@ -1042,6 +1045,8 @@ pub mod predicates {
     pub const PRODUCES: &str = "produces";
     pub const TRANSFORMS: &str = "transforms";
     pub const VALIDATES: &str = "validates";
+    pub const DEFINES: &str = "defines";
+    pub const COMPOSES: &str = "composes";
     pub const ROUTES_TO: &str = "routes_to";
     pub const HANDLES: &str = "handles";
     pub const INVOKES: &str = "invokes";

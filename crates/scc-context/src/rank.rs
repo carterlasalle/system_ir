@@ -296,9 +296,165 @@ pub fn collect_lexical_candidates_full(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Startup-atlas confidence ranking (Wave 11 — GENERALIZATION II)
+// ---------------------------------------------------------------------------
+//
+// `rank_startup_atlas` orders the startup atlas' three fact sections
+// (components, entrypoints, contracts) so the highest-confidence entries
+// render first. The rule is precision via ordering, NOT deletion: every
+// entry survives, but evidence-backed facts (graph-derived edges, explicit
+// surface kinds, producer/consumer contracts) rank above heuristic ones
+// (bare-name components, generic flow-compiler entrypoints, schema/reactive
+// inferences), so an agent under a token budget reads the strongest facts
+// first. The scoring is a pure function of the `SystemAtlas` fields — no
+// store access, no heuristics invented from a bare get() — and is fully
+// deterministic: ties break on the entry id (lexicographic).
+
+use scc_core::{AtlasComponent, AtlasEntrypoint, Contract, ContractSubclass, SystemAtlas};
+
+/// Confidence (0..1) of one component entry: how much of it is graph-derived
+/// evidence vs a bare-name heuristic.
+///
+/// A component named only (no purpose, no implementation, no edges) is the
+/// heuristic floor (`0.2`) — the component compiler can still emit a name
+/// from clustering alone. Every attribute that carries an EXTRACTED/
+/// graph-resolved fact raises the score: a responsibility claim (purpose),
+/// implementation paths + member symbols, consumes/produces and
+/// upstream/downstream edges, ownership claims, failure behavior, and a
+/// hierarchy layer assigned by the clusterer. The strongest components
+/// (all evidence present) reach `1.0`.
+pub fn component_confidence(c: &AtlasComponent) -> f64 {
+    let mut score: f64 = 0.2; // bare-name heuristic floor
+    if !c.purpose.is_empty() {
+        score += 0.15;
+    }
+    if !c.implementation.is_empty() {
+        score += 0.10;
+    }
+    if !c.symbols.is_empty() {
+        score += 0.10;
+    }
+    if !c.consumes.is_empty() {
+        score += 0.10;
+    }
+    if !c.produces.is_empty() {
+        score += 0.10;
+    }
+    if !c.upstream.is_empty() {
+        score += 0.10;
+    }
+    if !c.downstream.is_empty() {
+        score += 0.10;
+    }
+    if !c.owns.is_empty() {
+        score += 0.10;
+    }
+    if !c.failure_behavior.is_empty() {
+        score += 0.05;
+    }
+    if c.layer != "component" {
+        score += 0.05; // hierarchy clusterer assigned a real layer
+    }
+    score.min(1.0)
+}
+
+/// Confidence (0..1) of one entrypoint entry by surface kind: extractor
+/// evidence-backed kinds outrank the flow compiler's generic heuristic.
+///
+/// `route`/`http` (ROUTE entities), `cli`/`cli-subcommand` (CLI flag
+/// facts), `public_api` (EXPORTS evidence), `event`/`queue` (topic
+/// publish/subscribe), and the other invocation-surface kinds all come from
+/// explicit extractor facts. The generic `entrypoint` kind is the flow
+/// compiler's heuristic marker and ranks lower; an unknown/empty kind is the
+/// floor. A resolved symbol id is a weak positive signal on top.
+pub fn entrypoint_confidence(e: &AtlasEntrypoint) -> f64 {
+    let base: f64 = match e.kind.as_str() {
+        "route" | "http" => 1.0,
+        "cli" | "cli-subcommand" => 0.95,
+        "public_api" | "public-api" => 0.9,
+        "event" => 0.85,
+        "queue" => 0.85,
+        "schedule" => 0.8,
+        "process" => 0.8,
+        "plugin" => 0.75,
+        "framework_callback" => 0.75,
+        "lifecycle" => 0.7,
+        "entrypoint" => 0.4, // heuristic, not extractor evidence
+        _ => 0.3,
+    };
+    let symbol_bonus = if e.symbol.is_empty() { 0.0 } else { 0.05 };
+    (base + symbol_bonus).min(1.0)
+}
+
+/// Confidence (0..1) of one contract entry by subclass evidence: concrete
+/// surfaces with a producer + consumers outrank schema/reactive inferences.
+///
+/// `http`/`cli`/`event`/`config` contracts come from ROUTE / CLI-flag /
+/// TOPIC / CONFIGURATION entities — the strongest evidence. A real producer
+/// symbol, non-empty consumers, and preserved evidence ids each add to the
+/// score. `schema` (SchemaDefinition, derived from validation/model
+/// schemas) and the other inferred subclasses rank lowest: the contract
+/// ontology knows the surface is a schema, but there is no producer or
+/// consumer wiring to make it an observed contract. The gap is engineered:
+/// even a bare http contract (`0.95`) outranks a fully-wired schema
+/// (`0.35 + 0.10 + 0.05 + 0.05 = 0.55`).
+pub fn contract_confidence(c: &Contract) -> f64 {
+    let base: f64 = match c.subclass {
+        ContractSubclass::Http => 0.95,
+        ContractSubclass::Cli => 0.90,
+        ContractSubclass::Event => 0.85,
+        ContractSubclass::Configuration => 0.80,
+        ContractSubclass::PublicApi => 0.75,
+        ContractSubclass::Rpc => 0.75,
+        ContractSubclass::Message => 0.70,
+        ContractSubclass::Plugin => 0.70,
+        ContractSubclass::Extension => 0.70,
+        ContractSubclass::Serialization => 0.65,
+        ContractSubclass::CallContract => 0.60,
+        ContractSubclass::Schema => 0.35, // schema/reactive: inferred, not observed
+    };
+    let producer_bonus = if c.producer.is_empty() || c.producer == c.id {
+        0.0
+    } else {
+        0.10
+    };
+    let consumers_bonus = if c.consumers.is_empty() { 0.0 } else { 0.05 };
+    let evidence_bonus = if c.evidence.is_empty() { 0.0 } else { 0.05 };
+    (base + producer_bonus + consumers_bonus + evidence_bonus).min(1.0)
+}
+
+/// Order the startup atlas sections by evidence-backed confidence, highest
+/// first. Every entry is kept — this is precision via ordering, never
+/// deletion. Deterministic: ties break on the entry id (lexicographic; for
+/// entrypoints, which carry no id, on name then kind then symbol).
+pub fn rank_startup_atlas(atlas: &mut SystemAtlas) {
+    atlas.components.sort_by(|a, b| {
+        component_confidence(b)
+            .partial_cmp(&component_confidence(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    atlas.entrypoints.sort_by(|a, b| {
+        entrypoint_confidence(b)
+            .partial_cmp(&entrypoint_confidence(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+    atlas.contracts.sort_by(|a, b| {
+        contract_confidence(b)
+            .partial_cmp(&contract_confidence(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn term_tokenization() {
@@ -366,5 +522,198 @@ mod tests {
         let s = entity_similarity(&e, &t);
         assert!(s > 0.0, "got {s}");
         assert!(s >= 4.0, "expected name+attr hits, got {s}");
+    }
+
+    // ---- Wave 11: startup-atlas confidence ranking ----
+
+    fn component(name: &str) -> AtlasComponent {
+        AtlasComponent {
+            name: name.to_string(),
+            purpose: String::new(),
+            implementation: Vec::new(),
+            implementation_paths: Vec::new(),
+            symbols: Vec::new(),
+            consumes: Vec::new(),
+            produces: Vec::new(),
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            failure_behavior: Vec::new(),
+            owns: Vec::new(),
+            layer: "component".into(),
+            parent: None,
+        }
+    }
+
+    fn rich_component(name: &str) -> AtlasComponent {
+        let mut c = component(name);
+        c.purpose = "owns the billing pipeline".into();
+        c.implementation = vec!["src/billing".into(), "BillingService".into()];
+        c.symbols = vec!["BillingService".into()];
+        c.consumes = vec!["db.ledger".into()];
+        c.produces = vec!["Invoice".into()];
+        c.upstream = vec!["api".into()];
+        c.downstream = vec!["notifier".into()];
+        c.owns = vec![scc_core::AtlasOwnershipClaim {
+            target: "db.ledger".into(),
+            provenance: "write-edge".into(),
+        }];
+        c.layer = "subsystem".into();
+        c
+    }
+
+    fn empty_atlas() -> SystemAtlas {
+        SystemAtlas {
+            repository: String::new(),
+            revision: String::new(),
+            indexed_at: String::new(),
+            freshness: String::new(),
+            purpose: String::new(),
+            components: Vec::new(),
+            entrypoints: Vec::new(),
+            contracts: Vec::new(),
+            coverage: BTreeMap::new(),
+            flows: Vec::new(),
+            invariants: Vec::new(),
+            deployment_units: Vec::new(),
+            external_systems: Vec::new(),
+            trust_boundaries: Vec::new(),
+            async_boundaries: Vec::new(),
+            implementation_map: BTreeMap::new(),
+            data_stores: Vec::new(),
+            archetype: None,
+            state_authority: BTreeMap::new(),
+            hierarchy: Vec::new(),
+            evidence_summary: BTreeMap::new(),
+            warnings: Vec::new(),
+            public_api: BTreeMap::new(),
+            framework_semantics: BTreeMap::new(),
+            pipeline: Vec::new(),
+            landmarks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn component_confidence_orders_evidence_over_heuristic() {
+        // a bare-name component is the heuristic floor
+        assert!((component_confidence(&component("zzz_bare")) - 0.2).abs() < 1e-9);
+        // a fully-evidenced component is capped at 1.0, never above
+        assert_eq!(component_confidence(&rich_component("billing")), 1.0);
+        // every graph attribute contributes
+        let mut mid = component("mid");
+        mid.purpose = "p".into();
+        mid.implementation = vec!["src/mid".into()];
+        mid.owns = vec![scc_core::AtlasOwnershipClaim {
+            target: "db.x".into(),
+            provenance: "write-edge".into(),
+        }];
+        let bare = component_confidence(&component("bare"));
+        let mid_score = component_confidence(&mid);
+        let rich_score = component_confidence(&rich_component("billing"));
+        assert!(mid_score > bare, "{mid_score} > {bare}");
+        assert!(rich_score > mid_score, "{rich_score} > {mid_score}");
+        assert!((0.0..=1.0).contains(&mid_score));
+    }
+
+    #[test]
+    fn entrypoint_confidence_ranks_surface_kinds() {
+        let ep = |kind: &str, symbol: &str| AtlasEntrypoint {
+            name: "e".into(),
+            kind: kind.into(),
+            trigger: "t".into(),
+            symbol: symbol.into(),
+        };
+        // http/cli/public_api evidence-backed > generic heuristic
+        assert!(entrypoint_confidence(&ep("route", "s")) > entrypoint_confidence(&ep("entrypoint", "s")));
+        assert!(entrypoint_confidence(&ep("http", "s")) > entrypoint_confidence(&ep("entrypoint", "s")));
+        assert!(entrypoint_confidence(&ep("cli-subcommand", "s")) > entrypoint_confidence(&ep("entrypoint", "s")));
+        assert!(entrypoint_confidence(&ep("public_api", "s")) > entrypoint_confidence(&ep("entrypoint", "s")));
+        // unknown kind is the floor
+        assert!(entrypoint_confidence(&ep("entrypoint", "s")) > entrypoint_confidence(&ep("", "s")));
+        // a resolved symbol id is a weak positive signal (on a kind below
+        // the 1.0 cap, so the bonus is observable)
+        assert!(entrypoint_confidence(&ep("entrypoint", "repo://x/symbol/h")) > entrypoint_confidence(&ep("entrypoint", "")));
+        assert!((0.0..=1.0).contains(&entrypoint_confidence(&ep("route", "s"))));
+    }
+
+    #[test]
+    fn contract_confidence_ranks_surface_subclasses_over_schema() {
+        let contract = |subclass: ContractSubclass, producer: &str, consumers: usize, evidence: usize| Contract {
+            id: "id".into(),
+            kind: subclass.as_str().into(),
+            subclass,
+            producer: producer.into(),
+            consumers: (0..consumers).map(|i| format!("c{i}")).collect(),
+            operations: vec!["op".into()],
+            evidence: (0..evidence).map(|i| format!("ev{i}")).collect(),
+        };
+        let schema = contract(ContractSubclass::Schema, "", 0, 0);
+        let schema_wired = contract(ContractSubclass::Schema, "producer", 2, 2);
+        // http/cli/event/config with producer+consumers beat schema (even a
+        // fully-wired schema): 0.55 max vs 0.95 bare http
+        for subclass in [
+            ContractSubclass::Http,
+            ContractSubclass::Cli,
+            ContractSubclass::Event,
+            ContractSubclass::Configuration,
+        ] {
+            let surface = contract(subclass, "producer", 2, 2);
+            assert!(
+                contract_confidence(&surface) > contract_confidence(&schema_wired),
+                "{:?} must beat schema",
+                subclass
+            );
+        }
+        // wiring raises a contract's confidence
+        assert!(contract_confidence(&schema_wired) > contract_confidence(&schema));
+        assert!((contract_confidence(&schema) - 0.35).abs() < 1e-9);
+        assert!((0.0..=1.0).contains(&contract_confidence(&schema_wired)));
+    }
+
+    #[test]
+    fn rank_startup_atlas_sorts_mixed_evidence_deterministically() {
+        let mut atlas = empty_atlas();
+        atlas.components = vec![
+            rich_component("billing"),
+            component("zzz_bare"),
+            rich_component("aaa_billing_dup"), // same confidence as billing
+            component("aaa_bare"),
+        ];
+        atlas.entrypoints = vec![
+            AtlasEntrypoint { name: "zzz".into(), kind: "entrypoint".into(), trigger: "t".into(), symbol: "".into() },
+            AtlasEntrypoint { name: "api".into(), kind: "route".into(), trigger: "GET /x".into(), symbol: "repo://r/symbol/h".into() },
+            AtlasEntrypoint { name: "cli".into(), kind: "cli-subcommand".into(), trigger: "t".into(), symbol: "".into() },
+        ];
+        atlas.contracts = vec![
+            Contract::new("c-schema", "schema", "").with_subclass(ContractSubclass::Schema),
+            Contract::new("c-http", "http", "repo://r/symbol/h").with_subclass(ContractSubclass::Http),
+            Contract::new("c-cli", "cli", "").with_subclass(ContractSubclass::Cli),
+        ];
+
+        rank_startup_atlas(&mut atlas);
+
+        // components: evidence first, then bare; ties by name lexicographic
+        assert_eq!(atlas.components[0].name, "aaa_billing_dup");
+        assert_eq!(atlas.components[1].name, "billing");
+        assert_eq!(atlas.components[2].name, "aaa_bare");
+        assert_eq!(atlas.components[3].name, "zzz_bare");
+        // every entry kept — precision via ordering, not deletion
+        assert_eq!(atlas.components.len(), 4);
+
+        // entrypoints: evidence-backed surfaces first, heuristic last
+        assert_eq!(atlas.entrypoints[0].kind, "route");
+        assert_eq!(atlas.entrypoints[1].kind, "cli-subcommand");
+        assert_eq!(atlas.entrypoints[2].kind, "entrypoint");
+        assert_eq!(atlas.entrypoints.len(), 3);
+
+        // contracts: http > cli > schema, ties by id
+        assert_eq!(atlas.contracts[0].id, "c-http");
+        assert_eq!(atlas.contracts[1].id, "c-cli");
+        assert_eq!(atlas.contracts[2].id, "c-schema");
+        assert_eq!(atlas.contracts.len(), 3);
+
+        // idempotent + deterministic: re-ranking changes nothing
+        let snapshot = format!("{:?}", atlas);
+        rank_startup_atlas(&mut atlas);
+        assert_eq!(format!("{:?}", atlas), snapshot);
     }
 }
