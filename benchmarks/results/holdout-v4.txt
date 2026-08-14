@@ -1,11 +1,11 @@
-scc bench atlas --holdout — dev corpus vs blind holdout (v1)
+scc bench atlas --holdout — development corpus vs validation corpus (v1)
 
-=== DEV corpus ===
-scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)
+=== DEVELOPMENT corpus ===
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)
   mode: corpus: /Users/rocket/system_ir/benchmarks/corpus
   gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
-  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec   f/1k  toks  note
-  bat                       1.000  0.800  0.600  0.400  1.000  1.000  0.000    0.760  0.000   1.74 14952  
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec     f2   f/1k  toks  note
+  bat                       1.000  0.800  0.600  0.400  1.000  1.000  0.286    0.760  0.051  0.180   1.83 14213  
       missed: entrypoints:bat cache
       missed: behavior:App.new
       missed: behavior:App.inputs
@@ -15,11 +15,9 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/integration_tests.rs
       missed: tests:tests/snapshot_tests.rs` + `tests/snapshots/
       missed: tests:tests/test_pretty_printer.rs
-      missed: tests:tests/syntax-tests
-      missed: tests:tests/benchmarks
       missed: tests:src/syntax_mapping.rs` `mod tests` (line 190)
       missed: tests:tests/github-actions.rs
-  celery                    1.000  0.250  0.667  0.500  0.625  1.000  0.000    0.608  0.000   0.95 28315  resolved:39
+  celery                    1.000  0.250  0.667  0.500  0.625  1.000  0.000    0.608  0.077  0.201   0.48 55913  
       missed: entrypoints:@app.task
       missed: entrypoints:@shared_task
       missed: entrypoints:app.send_task
@@ -40,7 +38,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:t/unit/tasks/test_canvas.py
       missed: tests:t/unit/backends/
       missed: tests:t/unit/worker/
-  clap                      1.000  0.625  0.429  0.143  0.000  1.000  0.600    0.439  0.000   0.81 14840  
+  clap                      1.000  0.625  0.429  0.143  0.556  1.000  0.800    0.550  0.093  0.214   0.77 22068  
       missed: entrypoints:#[derive(Parser)]
       missed: entrypoints:clap_complete.generate
       missed: entrypoints:clap_mangen
@@ -54,25 +52,18 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: state_authority:ArgPredicate
       missed: state_authority:ValueParser
       missed: state_authority:StyledStr
-      missed: contracts:long
       missed: contracts:short('f')
-      missed: contracts:Arg.required
-      missed: contracts:Arg.num_args
       missed: contracts:ErrorKind.InvalidValue
       missed: contracts:ErrorKind.UnknownArgument
       missed: contracts:ErrorKind.DisplayHelp
-      missed: contracts:Command.bin_name
-      missed: contracts:Command.arg_required_else_help
       missed: tests:clap_builder/src/builder/tests.rs
-      missed: tests:ErrorKind
-  docker-compose            0.667  0.333  0.000  0.571  0.091  1.000  0.000    0.332  0.000   0.32 41183  
+  docker-compose            0.667  0.417  0.000  0.571  0.091  1.000  0.143    0.349  0.039  0.132   0.25 56641  
       missed: architecture:api.Compose
       missed: architecture:types.Project
       missed: entrypoints:psCmd
       missed: entrypoints:startCommand
       missed: entrypoints:stopCommand
       missed: entrypoints:restartCmd
-      missed: entrypoints:pullCommand
       missed: entrypoints:logsCmd
       missed: entrypoints:Up(ctx context.Context, project *types.Project, options api.UpOptions) error
       missed: entrypoints:Down(ctx context.Context, projectName string, options api.DownOptions) error
@@ -103,10 +94,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:pkg/compose/executor_test.go
       missed: tests:cmd/compose/up_test.go
       missed: tests:cmd/compose/compose_test.go
-      missed: tests:pkg/e2e
-  express                   0.700  0.000  0.125  0.000  0.556  0.000  0.000    0.276  0.000   5.49  2368  
-      missed: architecture:Router
-      missed: architecture:Route
+  express                   0.900  0.000  0.125  0.000  0.556  0.000  0.000    0.316  0.335  0.186   3.51  4275  
       missed: architecture:urlencoded
       missed: entrypoints:require('express')
       missed: entrypoints:app.listen
@@ -143,7 +131,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:test/req.ip.js
       missed: tests:test/req.route.js
       missed: tests:test/utils.js
-  fastapi                   1.000  0.667  0.857  0.000  0.714  1.000  0.000    0.648  0.004   0.78 25583  
+  fastapi                   1.000  0.667  0.857  0.000  0.714  1.000  0.000    0.648  0.046  0.140   0.28 70965  
       missed: entrypoints:app.get
       missed: entrypoints:app.post
       missed: entrypoints:fastapi = "fastapi.cli:main"
@@ -162,7 +150,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/test_fastapi_cli.py
       missed: tests:docs_src/app_testing/tutorial003_py310.py
       missed: tests:tests/test_dependency_overrides.py
-  flask                     1.000  0.333  1.000  0.500  0.857  1.000  0.000    0.738  0.000   1.67 16741  
+  flask                     1.000  0.333  1.000  0.500  0.857  1.000  0.000    0.738  0.108  0.292   1.56 17946  
       missed: entrypoints:app.run
       missed: entrypoints:@app.route
       missed: entrypoints:@app.get
@@ -180,7 +168,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/test_user_error_handler.py
       missed: tests:tests/test_session_interface.py
       missed: tests:tests/test_views.py
-  gin                       1.000  0.750  0.167  1.000  0.000  1.000  0.000    0.583  0.000   0.87 21777  
+  gin                       1.000  0.750  0.167  1.000  0.333  1.000  0.000    0.650  0.098  0.232   0.70 31588  
       missed: entrypoints:gin.New()
       missed: entrypoints:gin.Default()
       missed: behavior:gin.Default
@@ -194,9 +182,6 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:GET /v1/:path
       missed: contracts:GET /test/:param
       missed: contracts:POST /
-      missed: contracts:Engine.NoRoute
-      missed: contracts:Context.Param
-      missed: contracts:Context.ShouldBindJSON
       missed: tests:gin_test.go
       missed: tests:gin_integration_test.go
       missed: tests:benchmarks_test.go
@@ -204,14 +189,13 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:auth_test.go
       missed: tests:errors_test.go
       missed: tests:router.Group("/users")
-  gorilla-mux               1.000  1.000  0.800  0.800  0.000  1.000  0.000    0.720  0.000   1.11 14440  
+  gorilla-mux               1.000  1.000  0.800  0.800  0.125  1.000  0.000    0.745  0.162  0.369   1.23 13843  
       missed: behavior:NewRouter
       missed: state_authority:varsKey
       missed: contracts:r.HandleFunc("/api", emptyHandler).Methods("POST")
       missed: contracts:Queries("time", "{time:[0-9]+}")
       missed: contracts:Queries("foo", "{foo:[0-9]+}")
       missed: contracts:PathPrefix("/sub/").Subrouter()
-      missed: contracts:Subrouter
       missed: contracts:Host("{subdomain}.domain.com")
       missed: contracts:r.HandleFunc("/", func1).Name("func1")
       missed: contracts:{name:pattern}
@@ -223,7 +207,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:example_cors_method_middleware_test.go
       missed: tests:mux_httpserver_test.go
       missed: tests:bench_test.go
-  junit4                    1.000  0.571  0.000  0.857  0.000  1.000  0.714    0.486  0.000   0.60 31605  
+  junit4                    1.000  0.571  0.000  0.857  0.111  1.000  1.000    0.508  0.069  0.204   0.29 68924  
       missed: entrypoints:runClasses(Class<?>... classes)
       missed: entrypoints:@RunWith
       missed: entrypoints:@Test
@@ -238,15 +222,12 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:@Test
       missed: contracts:timeout()
       missed: contracts:assertEquals(Object expected, Object actual)
-      missed: contracts:assertThrows
       missed: contracts:@Before
       missed: contracts:@BeforeClass
       missed: contracts:@Rule
       missed: contracts:@Ignore
       missed: contracts:@FixMethodOrder(MethodSorters.NAME_ASCENDING)
-      missed: tests:JUnitCoreReturnsCorrectExitCodeTest
-      missed: tests:ExpectedTest
-  kind                      0.400  0.000  0.125  0.000  0.667  1.000  0.000    0.238  0.000   0.57 19330  
+  kind                      0.400  0.000  0.125  0.000  0.667  1.000  0.000    0.238  0.031  0.074   0.47 23370  
       missed: architecture:create.Cluster
       missed: architecture:delete.Cluster
       missed: architecture:nodeimage.Build
@@ -287,8 +268,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/write_test.go
       missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/remove_test.go
       missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/merge_test.go
-  microservices-demo        0.917  0.000  0.000  0.000  0.000  1.000  0.000    0.183  0.000   0.63 17589  
-      missed: architecture:loadgenerator
+  microservices-demo        1.000  0.000  0.000  0.000  0.000  1.000  0.000    0.200  0.074  0.149   0.50 23960  
       missed: entrypoints:src/checkoutservice/main.go
       missed: entrypoints:src/currencyservice/server.js
       missed: entrypoints:src/productcatalogservice/server.go
@@ -333,7 +313,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:src/checkoutservice/money/money_test.go
       missed: tests:src/frontend/money/money_test.go
       missed: tests:src/loadgenerator/locustfile.py
-  mockito                   1.000  0.333  0.000  0.571  0.000  1.000  0.875    0.381  0.000   0.22 62965  
+  mockito                   1.000  0.333  0.000  0.571  0.444  1.000  1.000    0.470  0.027  0.102   0.12 145468  
       missed: entrypoints:mock(Class<T> classToMock)
       missed: entrypoints:when(T methodCall)
       missed: entrypoints:verify(T mock)
@@ -351,17 +331,12 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: state_authority:mockito-core
       missed: state_authority:MockUtil
       missed: state_authority:GlobalConfiguration
-      missed: contracts:OngoingStubbing
-      missed: contracts:VerificationMode
       missed: contracts:ArgumentMatcher<T>
-      missed: contracts:ArgumentCaptor
       missed: contracts:@Mock
       missed: contracts:@InjectMocks
       missed: contracts:Strictness.STRICT_STUBS
-      missed: contracts:MockSettings.extraInterfaces
       missed: contracts:@Captor
-      missed: tests:ArgumentCaptorTest
-  nest                      1.000  0.143  0.125  0.571  0.000  0.833  0.000    0.368  0.000   0.37 32682  resolved:7
+  nest                      1.000  0.143  0.125  0.571  0.000  0.833  0.143    0.368  0.011  0.047   0.11 104546  
       missed: entrypoints:NestFactory.create(AppModule)
       missed: entrypoints:NestFactory.createMicroservice
       missed: entrypoints:NestFactory.createApplicationContext
@@ -389,13 +364,12 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:APP_GUARD
       missed: landmarks:Param` / `Body` / `Query
       missed: tests:packages/core/test
-      missed: tests:integration/
       missed: tests:sample/01-cats-app/src/cats/cats.controller.spec.ts
       missed: tests:sample/19-auth-jwt/e2e/app/app.e2e-spec.ts
       missed: tests:sample/02-gateways/e2e/events-gateway/gateway.e2e-spec.ts
       missed: tests:sample/26-queues/e2e/audio/audio.e2e-spec.ts
       missed: tests:packages/common/test
-  prettier                  1.000  0.429  0.000  0.250  0.091  1.000  0.000    0.354  0.093   0.61 24523  
+  prettier                  1.000  0.429  0.000  0.250  0.091  1.000  0.556    0.354  0.009  0.039   0.21 70536  
       missed: entrypoints:src/index.js
       missed: entrypoints:src/cli/index.js
       missed: entrypoints:src/standalone.js
@@ -424,16 +398,11 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:html
       missed: contracts:yaml
       missed: contracts:CATEGORY_OUTPUT
-      missed: tests:tests/format
-      missed: tests:tests/unit
-      missed: tests:tests/integration
-      missed: tests:tests/config
-      missed: tests:tests/dts
       missed: tests:tests/format/js
       missed: tests:tests/format/css
       missed: tests:tests/unit/doc-builders.js
       missed: tests:tests/unit/editorconfig-to-prettier.js
-  pydantic                  1.000  1.000  0.167  0.500  0.000  1.000  0.000    0.533  0.000   0.53 36015  
+  pydantic                  1.000  1.000  0.167  0.500  0.167  1.000  0.000    0.567  0.077  0.148   0.17 117242  
       missed: behavior:__get_pydantic_core_schema__
       missed: behavior:model_rebuild
       missed: behavior:TypeAdapter.json_schema
@@ -446,7 +415,6 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:strict=True
       missed: contracts:mode='json'
       missed: contracts:ConfigDict(defer_build=True)
-      missed: contracts:indent
       missed: contracts:mode='validation'
       missed: tests:tests/test_main.py
       missed: tests:tests/test_type_adapter.py
@@ -456,7 +424,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/test_dataclasses.py
       missed: tests:tests/test_create_model.py
       missed: tests:tests/test_errors.py
-  serde                     0.750  0.000  0.400  0.000  0.000  1.000  0.000    0.230  0.000   0.39 12826  
+  serde                     0.750  0.000  0.400  0.000  0.000  1.000  0.000    0.230  0.126  0.088   0.35 14217  
       missed: architecture:de::value
       missed: entrypoints:#[derive(Serialize)]
       missed: entrypoints:#[derive(Deserialize)]
@@ -485,7 +453,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:test_suite/tests/test_enum_adjacently_tagged.rs
       missed: tests:test_suite/tests/regression/issue2565.rs
       missed: tests:test_suite/tests/ui
-  shadcn-ui                 0.714  0.000  0.000  0.000  0.000  0.800  0.000    0.143  0.000   0.34 14734  
+  shadcn-ui                 0.714  0.000  0.000  0.000  0.000  0.800  0.125    0.143  0.013  0.048   0.18 28379  
       missed: architecture:@shadcn/react
       missed: architecture:@shadcn/helpers
       missed: entrypoints:npx shadcn init
@@ -528,8 +496,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:packages/shadcn/test
       missed: tests:apps/v4/registry/calendar.test.ts
       missed: tests:apps/v4/registry/config.test.ts
-      missed: tests:packages/tests
-  sqlalchemy                1.000  1.000  0.167  0.167  0.143  1.000  0.000    0.495  0.000   0.24 107565  resolved:94
+  sqlalchemy                1.000  1.000  0.167  0.167  0.143  1.000  0.000    0.495  0.078  0.210   0.07 392174  resolved:41
       missed: behavior:create_engine -> Engine.connect -> Connection.execute
       missed: behavior:Session.execute -> ORMExecuteState
       missed: behavior:declarative_base -> Mapper.configure
@@ -553,7 +520,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:test/dialect/sqlite/
       missed: tests:test/aaa_profiling/test_orm.py
       missed: tests:test/aaa_profiling/test_pool.py
-  svelte                    1.000  0.125  0.500  0.500  0.000  1.000  0.000    0.425  0.000   1.18 16909  
+  svelte                    1.000  0.125  0.500  0.500  0.300  1.000  0.000    0.485  0.059  0.177   0.87 26529  
       missed: entrypoints:src/index-server.js
       missed: entrypoints:svelte/compiler
       missed: entrypoints:svelte/internal
@@ -576,9 +543,6 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:bind:value
       missed: contracts:bind:this
       missed: contracts:bind:group
-      missed: contracts:runes
-      missed: contracts:css
-      missed: contracts:mount
       missed: tests:packages/svelte/tests/compiler-errors
       missed: tests:packages/svelte/tests/runtime-runes
       missed: tests:packages/svelte/tests/runtime-legacy
@@ -588,17 +552,17 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:packages/svelte/tests/snapshot
       missed: tests:packages/svelte/tests/server-side-rendering
       missed: tests:packages/svelte/tests/store
-  mean                      0.907  0.418  0.306  0.367  0.237  0.932  0.109    0.447  0.005   0.97 27847
+  mean                      0.922  0.422  0.306  0.367  0.339  0.932  0.203    0.471  0.079  0.162   0.70 65140
   scored: 20   skipped: 0
-  resolved calls (semantic backends upgraded): 140
-  gate: FAIL (overall mean recall 0.447 >= 0.5)
+  resolved calls (semantic backends upgraded): 41
+  gate: FAIL (overall mean recall 0.471 >= 0.5)
 
-=== HOLDOUT corpus ===
-scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v2)
-  mode: holdout: /Users/rocket/system_ir/benchmarks/holdout
+=== VALIDATION corpus ===
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)
+  mode: validation: /Users/rocket/system_ir/benchmarks/holdout
   gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
-  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec   f/1k  toks  note
-  aiohttp                   0.889  0.111  0.000  0.143  0.125  1.000  0.000    0.254  0.000   0.55 20024  resolved:109
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec     f2   f/1k  toks  note
+  aiohttp                   0.889  0.111  0.000  0.143  0.125  1.000  0.200    0.254  0.033  0.098   0.21 53424  resolved:8
       missed: architecture:aiohttp.web
       missed: entrypoints:web.run_app
       missed: entrypoints:web.Application
@@ -627,12 +591,11 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:'/download/*'
       missed: contracts:middleware(handler) -> handler
       missed: contracts:WS message JSON/bytes frames
-      missed: tests:tests/
       missed: tests:tests/test_web_application.py
       missed: tests:tests/test_web_urldispatcher.py
       missed: tests:tests/test_client_session.py
       missed: tests:tests/test_web_functional.py
-  axios                     0.333  0.100  0.143  0.167  0.000  1.000  0.000    0.149  0.021   0.69  8641  resolved:30
+  axios                     0.333  0.100  0.143  0.167  0.000  1.000  0.000    0.149  0.015  0.043   0.63  9552  
       missed: architecture:lib/axios.js
       missed: architecture:core/Axios
       missed: architecture:core/dispatchRequest
@@ -674,7 +637,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:test/module/
       missed: tests:test/types/
       missed: tests:test/specs/
-  black                     0.625  0.857  0.167  0.333  0.357  1.000  0.000    0.468  0.003   1.17 16247  resolved:314
+  black                     0.625  0.857  0.167  0.333  0.357  1.000  0.000    0.468  0.056  0.171   0.84 22637  
       missed: architecture:black.main
       missed: architecture:NormalizerVisitor
       missed: architecture:blib2to3 parser
@@ -703,7 +666,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/test_parse.py
       missed: tests:tests/test_ipynb.py
       missed: tests:tests/test_rusty.py
-  chi                       0.286  0.167  0.000  0.667  0.000  0.875  0.000    0.224  0.000   0.55 14496  
+  chi                       0.286  0.167  0.000  0.667  0.000  0.875  0.000    0.224  0.041  0.115   0.52 15406  
       missed: architecture:chi.go
       missed: architecture:mux.go
       missed: architecture:tree.go
@@ -745,7 +708,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:context_test.go
       missed: tests:chain_test.go
       missed: tests:middleware/
-  click                     0.000  0.444  0.143  0.833  0.111  1.000  0.167    0.306  0.039   0.78 14134  resolved:154
+  click                     0.000  0.444  0.143  0.833  0.111  1.000  0.167    0.306  0.048  0.115   0.61 18100  
       missed: architecture:click.core
       missed: architecture:click.decorators
       missed: architecture:click.parser
@@ -779,7 +742,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/test_options.py
       missed: tests:tests/test_commands.py
       missed: tests:tests/test_parser.py
-  cobra                     0.000  0.000  0.125  0.429  0.182  1.000  0.000    0.147  0.000   0.49 12128  
+  cobra                     0.000  0.000  0.125  0.429  0.182  1.000  0.000    0.147  0.137  0.096   0.36 16663  
       missed: architecture:command.go
       missed: architecture:args.go
       missed: architecture:bash_completions.go
@@ -823,7 +786,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:completions_test.go
       missed: tests:active_help_test.go
       missed: tests:bash_completions_test.go
-  django                    0.375  0.700  0.000  0.333  0.250  1.000  0.250    0.332  0.000   0.06 227121  resolved:263
+  django                    0.375  0.700  0.000  0.333  0.250  1.000  0.250    0.332  0.007  0.030   0.01 2190102  resolved:103
       missed: architecture:django.conf.settings
       missed: architecture:django.urls
       missed: architecture:django.http
@@ -851,7 +814,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tests/urls/
       missed: tests:tests/model_fields/
       missed: tests:tests/known_good_python/
-  guava                     1.000  1.000  0.000  0.875  0.000  1.000  0.000    0.575  0.000   0.44 63660  
+  guava                     1.000  1.000  0.000  0.875  0.000  1.000  0.286    0.575  0.012  0.048   0.10 287176  
       missed: behavior:CacheBuilder.build -> LocalCache creation -> CacheLoader
       missed: behavior:LocalCache.get -> segment lookup -> load via CacheLoader
       missed: behavior:ImmutableList.copyOf -> copyIntoRegularList
@@ -873,23 +836,12 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:Hashing.sha256()
       missed: contracts:ImmutableMultimap.of(k, v1, v2)
       missed: contracts:TypeToken.of(MyType.class)
-      missed: tests:guava-tests/
       missed: tests:guava-tests/test/com/google/common/collect/
       missed: tests:guava-tests/test/com/google/common/cache/
       missed: tests:guava-tests/test/com/google/common/base/
       missed: tests:guava-tests/test/com/google/common/hash/
       missed: tests:guava-tests/test/com/google/common/eventbus/
-      missed: tests:guava-testlib/
-  helm                      0.100  0.067  0.000  0.286  0.000  0.556  0.000    0.090  0.000   0.07 53823  
-      missed: architecture:cmd/helm
-      missed: architecture:pkg/action
-      missed: architecture:pkg/chart
-      missed: architecture:pkg/engine
-      missed: architecture:pkg/release
-      missed: architecture:pkg/storage
-      missed: architecture:pkg/repo
-      missed: architecture:pkg/kube
-      missed: architecture:pkg/registry
+  helm                      1.000  0.067  0.000  0.286  0.077  0.556  0.000    0.286  0.010  0.033   0.18 75863  
       missed: entrypoints:helm install
       missed: entrypoints:helm upgrade
       missed: entrypoints:helm rollback
@@ -929,7 +881,6 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:--values <file>
       missed: contracts:--version <ver>
       missed: contracts:chart.yaml apiVersion/name/version
-      missed: contracts:values.yaml
       missed: landmarks:action.Install
       missed: landmarks:action.Upgrade
       missed: landmarks:DownloadManager
@@ -940,7 +891,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:pkg/chart/*_test.go
       missed: tests:pkg/repo/*_test.go
       missed: tests:pkg/storage/*_test.go
-  kustomize                 0.364  0.444  0.000  0.571  0.000  0.889  0.333    0.276  0.000   0.20 60395  
+  kustomize                 0.364  0.444  0.000  0.571  0.000  0.889  0.333    0.276  0.016  0.055   0.14 85855  
       missed: architecture:api/krusty
       missed: architecture:api/internal/target
       missed: architecture:api/builtins
@@ -981,7 +932,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:api/internal/target/
       missed: tests:api/builtins/
       missed: tests:api/resmap/
-  netty                     1.000  0.900  0.000  0.875  0.000  1.000  0.000    0.555  0.000   0.14 173567  
+  netty                     1.000  0.900  0.000  0.875  0.000  1.000  0.000    0.555  0.080  0.230   0.05 470145  
       missed: entrypoints:ServerBootstrap.bind
       missed: behavior:ServerBootstrap.bind -> initAndRegister -> channel registration
       missed: behavior:NioEventLoop.run -> select -> processSelectedKeys -> handle events
@@ -1006,11 +957,8 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:codec/src/test/java/io/netty/handler/codec/
       missed: tests:codec-http/src/test/java/io/netty/handler/codec/http/
       missed: tests:handler/src/test/java/io/netty/handler/
-  rayon                     0.111  0.400  0.000  0.429  0.000  1.000  0.000    0.188  0.000   0.60 13379  
-      missed: architecture:src/iter
-      missed: architecture:src/slice
+  rayon                     0.444  0.400  0.000  0.429  0.000  1.000  0.000    0.255  0.036  0.095   0.79 13935  
       missed: architecture:src/vec
-      missed: architecture:src/collections
       missed: architecture:src/join
       missed: architecture:src/scope
       missed: architecture:src/thread_pool
@@ -1048,14 +996,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:rayon-core/tests/
       missed: tests:tests/run-pass/
       missed: tests:tests/compile_fail/
-  react                     0.000  1.000  0.000  0.167  0.000  0.250  0.000    0.233  0.000   0.08 133967  
-      missed: architecture:packages/react
-      missed: architecture:packages/react-dom
-      missed: architecture:packages/react-reconciler
-      missed: architecture:packages/react-server
-      missed: architecture:packages/scheduler
-      missed: architecture:packages/react-is
-      missed: architecture:packages/react-devtools
+  react                     1.000  1.000  0.000  0.167  0.000  0.250  0.000    0.433  0.011  0.046   0.03 517319  
       missed: behavior:createRoot -> createContainer -> scheduleUpdateOnFiber
       missed: behavior:scheduleUpdateOnFiber -> performConcurrentWorkOnRoot
       missed: behavior:performUnitOfWork -> beginWork -> completeUnitOfWork
@@ -1089,7 +1030,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:packages/react-reconciler/__tests__/
       missed: tests:packages/react-server/__tests__/
       missed: tests:packages/react-devtools/__tests__/
-  requests                  0.875  0.200  0.571  0.429  0.000  0.875  0.000    0.415  0.017   1.07 14946  
+  requests                  0.875  0.200  0.571  0.429  0.100  0.875  0.250    0.435  0.118  0.216   1.14 14853  
       missed: architecture:requests.api
       missed: entrypoints:requests.request
       missed: entrypoints:requests.get
@@ -1115,14 +1056,11 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: contracts:json={'key': 'value'}
       missed: contracts:files={'file': open(...)}
       missed: contracts:proxies={'https': 'http://proxy:8080'}
-      missed: contracts:codes
       missed: landmarks:REDIRECT_STATI
-      missed: tests:tests/
       missed: tests:tests/test_requests.py
       missed: tests:tests/test_sessions.py
       missed: tests:tests/test_utils.py
-  ripgrep                   0.750  0.286  0.000  0.143  0.000  1.000  0.000    0.236  0.003   0.76 11812  
-      missed: architecture:crates/core
+  ripgrep                   0.875  0.286  0.000  0.143  0.000  1.000  0.000    0.261  0.015  0.043   0.60 16591  
       missed: architecture:crates/core/flags
       missed: entrypoints:main -> run(flags::parse())
       missed: entrypoints:flags::parse
@@ -1163,7 +1101,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:crates/printer/tests/
       missed: tests:crates/ignore/tests/
       missed: tests:crates/matcher/tests/
-  tokio                     0.100  0.100  0.000  0.429  0.000  0.875  0.000    0.126  0.000   0.33 14997  
+  tokio                     0.100  0.100  0.000  0.429  0.000  0.875  0.000    0.126  0.012  0.040   0.15 32523  
       missed: architecture:tokio/src/runtime
       missed: architecture:tokio/src/task
       missed: architecture:tokio/src/sync
@@ -1211,16 +1149,9 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:tokio/tests/sync_*.rs
       missed: tests:tokio/tests/io_*.rs
       missed: tests:tokio/tests/net_*.rs
-  vitest                    0.000  0.500  0.000  0.429  0.000  1.000  0.143    0.186  0.004   0.23 35528  resolved:63
-      missed: architecture:packages/vitest
+  vitest                    0.778  0.500  0.000  0.429  0.000  1.000  0.143    0.341  0.095  0.157   0.19 77664  
       missed: architecture:packages/vitest/src/node
       missed: architecture:packages/vitest/src/runtime
-      missed: architecture:packages/expect
-      missed: architecture:packages/mocker
-      missed: architecture:packages/spy
-      missed: architecture:packages/snapshot
-      missed: architecture:packages/ui
-      missed: architecture:packages/coverage-v8
       missed: entrypoints:vitest run
       missed: entrypoints:vitest watch
       missed: entrypoints:vi.fn
@@ -1254,15 +1185,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:test/reporters/
       missed: tests:test/snapshots/
       missed: tests:packages/expect/__tests__/
-  vue                       0.000  1.000  0.000  0.143  0.000  1.000  0.000    0.229  0.000   0.70 15776  resolved:98
-      missed: architecture:packages/vue
-      missed: architecture:packages/runtime-core
-      missed: architecture:packages/runtime-dom
-      missed: architecture:packages/reactivity
-      missed: architecture:packages/compiler-core
-      missed: architecture:packages/compiler-dom
-      missed: architecture:packages/compiler-sfc
-      missed: architecture:packages/server-renderer
+  vue                       1.000  1.000  0.000  0.143  0.000  1.000  0.000    0.429  0.078  0.166   0.79 24044  resolved:3
       missed: behavior:createApp -> ensureRenderer -> createRenderer -> app.mount
       missed: behavior:createRenderer -> render -> patch
       missed: behavior:patch -> processComponent/processElement
@@ -1292,13 +1215,12 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:packages/reactivity/__tests__/
       missed: tests:packages/compiler-core/__tests__/
       missed: tests:packages/compiler-sfc/__tests__/
-  zerolog                   0.000  0.167  0.000  0.714  0.000  0.889  0.000    0.176  0.000   0.43 16264  
+  zerolog                   0.125  0.167  0.000  0.714  0.000  0.889  0.000    0.201  0.042  0.100   0.35 22703  
       missed: architecture:log.go
       missed: architecture:context.go
       missed: architecture:console.go
       missed: architecture:array.go
       missed: architecture:globals.go
-      missed: architecture:internal/json
       missed: architecture:hook.go
       missed: architecture:cmd/zerolog
       missed: entrypoints:zerolog.New(writer)
@@ -1339,8 +1261,7 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:array_test.go
       missed: tests:internal/json tests
       missed: tests:benchmark_test.go
-  zod                       0.750  0.000  0.000  0.600  0.000  1.000  0.000    0.270  0.000   0.74 12227  resolved:137
-      missed: architecture:packages/zod
+  zod                       0.875  0.000  0.000  0.600  0.000  1.000  0.000    0.295  0.026  0.095   0.70 14250  
       missed: architecture:v4/classic
       missed: entrypoints:z.string
       missed: entrypoints:z.number
@@ -1377,18 +1298,19 @@ scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §5
       missed: tests:packages/integration/
       missed: tests:packages/resolution/
       missed: tests:packages/treeshake/
-  mean                      0.378  0.422  0.057  0.450  0.051  0.910  0.045    0.272  0.004   0.50 46657
+  mean                      0.597  0.422  0.057  0.450  0.060  0.910  0.081    0.317  0.044  0.100   0.42 198940
   scored: 20   skipped: 0
-  resolved calls (semantic backends upgraded): 1168
-  gate: FAIL (overall mean recall 0.272 >= 0.5)
+  resolved calls (semantic backends upgraded): 114
+  gate: FAIL (overall mean recall 0.317 >= 0.5)
 
-=== gap (holdout - dev) ===
+=== gap (validation - development) ===
   layer                     gap
-  architecture           -0.529
-  entrypoints            +0.004
+  architecture           -0.324
+  entrypoints            +0.000
   behavior               -0.249
   state_authority        +0.083
-  contracts              -0.186
-  overall                -0.175
-  verdict: OVERFIT (holdout 0.272 vs dev 0.447; tolerance 0.050)
+  contracts              -0.279
+  overall                -0.154
+  verdict: OVERFIT (validation 0.317 vs development 0.471; tolerance 0.050)
+  F2: development 0.162 | validation 0.100
   results written to: /Users/rocket/system_ir/benchmarks/results/holdout-v3.txt

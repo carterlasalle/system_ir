@@ -1,4 +1,5 @@
 # Blind v1 — validation vs blind (aggregates only)
+blind manifest sha256: 591f0a7f4b6497f5afd2de87df26af6ad35bc4b4f4f360bcb7e60f9da482b4d5 (20 ground-truth files, 20 blind-test repos)
 validation corpus: validation: /Users/rocket/system_ir/benchmarks/holdout
 blind corpus:      blind-test: /Users/rocket/system_ir/benchmarks/blind-test
 results:           /Users/rocket/system_ir/benchmarks/results/blind-v1.txt
@@ -17,8 +18,18 @@ overall (gate)            0.317        0.270     -0.047
 scored: validation 20 (skipped 0) | blind 20 (skipped 0)
 precision: validation 0.044 | blind 0.072
 F2: validation 0.100 | blind 0.137
-density (facts/1k tokens): validation 0.42 | blind 0.47
-atlas tokens: validation 195427 | blind 54461
+density (facts/1k tokens): validation 0.42 | blind 0.46
+atlas tokens: validation 199009 | blind 54789
+
+## blind transfer ratio (blind / validation) — how much of the validation recall transfers to the unseen blind corpus
+  architecture            0.582
+  entrypoints             0.513
+  behavior                0.487
+  state_authority         1.652
+  contracts               0.255
+  landmarks               1.077
+  tests                   0.226
+  overall                 0.851
 
 ## generalization gap (blind - validation) — informational, not gating
   architecture           -0.249
