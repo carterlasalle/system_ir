@@ -996,11 +996,29 @@ fn zod_object_expr(v: &Node, src: &[u8], zod_locals: &BTreeSet<String>) -> bool 
         .unwrap_or(false)
 }
 
+/// The defining expression text of a zod `z.object(...)` / `z.<schema>(...)`
+/// construction call (the `function` part of a call whose receiver is a zod
+/// local): `z.object({ name: z.string() })` → the whole call's source text.
+/// Returns None when the call is not a zod schema construction.
+fn zod_object_expr_text(f: &Node, src: &[u8], zod_locals: &BTreeSet<String>) -> Option<String> {
+    if f.kind() != "member_expression" {
+        return None;
+    }
+    let obj = f.child_by_field_name("object")?;
+    if obj.kind() != "identifier" || !zod_locals.contains(node_text(&obj, src)) {
+        return None;
+    }
+    let parent = f.parent()?;
+    if parent.kind() != "call_expression" {
+        return None;
+    }
+    Some(bound_expr(&parent, src))
+}
+
 /// Parent schema name of a zod composition value: `Base.extend({...})` /
 /// `Base.merge(...)` → `Base`. Anonymous bases (`z.object({...}).extend(...)`)
 /// are not resolvable → None.
-fn zod_compose_parent(v: &Node, src: &[u8]) -> Option<String> {
-    if v.kind() != "call_expression" {
+fn zod_compose_parent(v: &Node, src: &[u8]) -> Option<String> {    if v.kind() != "call_expression" {
         return None;
     }
     let f = v.child_by_field_name("function")?;
@@ -1672,6 +1690,27 @@ fn collect_facts(
                                 expr: bound_expr(&node, src),
                             });
                         }
+                    }
+                    // inline schema construction in any context
+                    // (`z.object({...})` inside test bodies, handlers,
+                    // callbacks, and non-exported const values) — the
+                    // concrete code form is the fact; write.rs dedupes by
+                    // expr (entity id = expr) and accumulates counts so the
+                    // atlas surfaces only the *repeated* DSL surface. The
+                    // module-level exported-const path above still emits
+                    // named definitions.
+                    if let Some(expr) = zod_object_expr_text(&function, src, &zod_locals) {
+                        let owner = ctx
+                            .caller
+                            .clone()
+                            .or_else(|| ctx.const_owner.clone())
+                            .or_else(|| ctx.class.clone())
+                            .unwrap_or_else(|| module_name.clone());
+                        facts.push(SemanticFact::SchemaDefinition {
+                            owner,
+                            name: expr.clone(),
+                            expr,
+                        });
                     }
                 }
                 // Express registrations (import-verified): app/router/server/
@@ -3313,6 +3352,54 @@ mod tests {
     }
 
     #[test]
+    fn wave12_inline_zod_object_captured_in_function_body() {
+        // `z.object({...})` inside a function body (the zod test/handler
+        // form) must emit an inline SchemaDefinition carrying the expr.
+        let ef = extract(
+            "src/probe.ts",
+            "import { z } from \"zod/v4\";\nfunction f() {\n  const schema = z.object({ name: z.string() });\n  schema.parse({ name: \"x\" });\n}\n",
+        );
+        let defs: Vec<&str> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaDefinition { expr, .. } if !expr.is_empty() => {
+                    Some(expr.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            defs.contains(&"z.object({ name: z.string() })"),
+            "inline def with expr: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn wave12_inline_zod_object_in_test_callback() {
+        // zod's real test form: `import * as z from "zod/v4"` + the
+        // z.object call inside a `test("...", () => {...})` callback.
+        let ef = extract(
+            "src/probe.test.ts",
+            "import * as z from \"zod/v4\";\nimport { test } from \"vitest\";\n\ntest(\"obj\", () => {\n  const schema = z.object({ name: z.string() });\n});\n",
+        );
+        let defs: Vec<&str> = ef
+            .facts
+            .iter()
+            .filter_map(|f| match f {
+                SemanticFact::SchemaDefinition { expr, .. } if !expr.is_empty() => {
+                    Some(expr.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            defs.contains(&"z.object({ name: z.string() })"),
+            "inline def in test callback: {defs:?}"
+        );
+    }
+
+    #[test]
     fn symbols_and_methods() {
         let ef = extract(
             "src/lib.ts",
@@ -4602,3 +4689,4 @@ export class M {}
         );
     }
 }
+

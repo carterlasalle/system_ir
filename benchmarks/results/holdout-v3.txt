@@ -13,10 +13,10 @@ overall (gate)            0.471        0.317     -0.154
 
 scored: development 20 (skipped 0) | validation 20 (skipped 0)
 precision: development 0.079 | validation 0.044
-F2: development 0.162 | validation 0.100
-resolved calls (upgraded): development 41 | validation 114
+F2: development 0.161 | validation 0.100
+resolved calls (upgraded): development 44 | validation 56
 density (facts/1k tokens): development 0.70 | validation 0.42
-atlas tokens: development 65140 | validation 198940
+atlas tokens: development 65148 | validation 199019
 
 ## per-layer precision + F2 (startup-required layers)
 layer              P:development P:validation   F2:development F2:validation

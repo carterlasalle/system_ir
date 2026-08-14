@@ -527,7 +527,25 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // `schema:` prefix: `schema: User`, `schema: User extends Base`,
     // `schema: User validates`. Producer = the DEFINES subject (the owner
     // symbol that declared the schema).
+    //
+    // Inline constructions (name == expr, the `z.object({...})` test and
+    // handler forms) are frequency-capped: only the *repeated* DSL surface
+    // (count >= 2, top 40 by count) renders — one-off test schemas are
+    // noise, not architecture, and would flood the contracts layer.
+    let mut inline: Vec<(u64, String)> = Vec::new();
     for s in view.entities_of_kind(scc_core::kinds::SCHEMA) {
+        let is_inline = s
+            .attributes
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0;
+        if is_inline {
+            if let Some(c) = s.attributes.get("count").and_then(|v| v.as_u64()) {
+                inline.push((c, s.id.clone()));
+            }
+            continue;
+        }
         let owner = view
             .in_pred(&s.id, scc_core::predicates::DEFINES)
             .into_iter()
@@ -537,13 +555,15 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         // the defining expression (`z.object({ name: z.string() })`)
         // renders as `schema: <name> = <expr>` when the extractor
         // captured one — the concrete code form a human would quote.
+        // Inline constructions use the expression itself as the name
+        // (`schema: z.object({...})`); never render `X = X`.
         if let Some(expr) = s
             .attributes
             .get("expr")
             .and_then(|v| v.as_str())
             .map(|e| e.to_string())
         {
-            if !expr.is_empty() {
+            if !expr.is_empty() && expr != s.name {
                 ops.push(format!("{} = {}", s.name, expr));
             }
         }
@@ -575,6 +595,27 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                 producer: owner.clone().unwrap_or_else(|| s.id.clone()),
                 consumers: Vec::new(),
                 operations: ops,
+                evidence: s.evidence.clone(),
+            },
+        );
+    }
+    // repeated inline DSL forms (count desc, id asc for determinism)
+    inline.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for (count, id) in inline.into_iter().take(40) {
+        if count < 2 {
+            continue;
+        }
+        let Some(s) = view.entity(&id) else { continue };
+        push_contract(
+            &mut contracts,
+            &mut contract_seen,
+            scc_core::Contract {
+                id: s.id.clone(),
+                kind: "schema".into(),
+                subclass: ContractSubclass::Schema,
+                producer: s.id.clone(),
+                consumers: Vec::new(),
+                operations: vec![s.name.clone()],
                 evidence: s.evidence.clone(),
             },
         );

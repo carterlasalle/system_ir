@@ -485,6 +485,10 @@ impl<'a> Writer<'a> {
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
                         let sch_id = entity_id(self.repo_id, scc_core::kinds::SCHEMA, name);
+                        // Inline schema constructions (name == expr, the
+                        // `z.object({...})` test/handler forms) accumulate
+                        // a count so the atlas can surface the *repeated*
+                        // DSL forms and drop one-off test noise.
                         let mut se = scc_core::Entity::new(
                             sch_id.clone(),
                             scc_core::kinds::SCHEMA,
@@ -493,6 +497,20 @@ impl<'a> Writer<'a> {
                         se.attr("file", serde_json::json!(path));
                         if !expr.is_empty() {
                             se.attr("expr", serde_json::json!(expr));
+                            if *name == *expr {
+                                let n = self
+                                    .store
+                                    .get_entity(&sch_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|e| {
+                                        e.attributes
+                                            .get("count")
+                                            .and_then(|v| v.as_u64())
+                                    })
+                                    .unwrap_or(0);
+                                se.attr("count", serde_json::json!(n + 1));
+                            }
                         }
                         se.evidence = sym_evidence(owner);
                         self.store.insert_entity(&se, &[path.to_string()])?;

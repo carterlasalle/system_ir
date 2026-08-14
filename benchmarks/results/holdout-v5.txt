@@ -1,0 +1,1316 @@
+scc bench atlas --holdout — development corpus vs validation corpus (v1)
+
+=== DEVELOPMENT corpus ===
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)
+  mode: corpus: /Users/rocket/system_ir/benchmarks/corpus
+  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec     f2   f/1k  toks  note
+  bat                       1.000  0.800  0.600  0.400  1.000  1.000  0.286    0.760  0.051  0.179   1.82 14292  
+      missed: entrypoints:bat cache
+      missed: behavior:App.new
+      missed: behavior:App.inputs
+      missed: state_authority:InputDescription
+      missed: state_authority:PrettyPrinter
+      missed: state_authority:Controller
+      missed: tests:tests/integration_tests.rs
+      missed: tests:tests/snapshot_tests.rs` + `tests/snapshots/
+      missed: tests:tests/test_pretty_printer.rs
+      missed: tests:src/syntax_mapping.rs` `mod tests` (line 190)
+      missed: tests:tests/github-actions.rs
+  celery                    1.000  0.250  0.667  0.500  0.625  1.000  0.000    0.608  0.077  0.201   0.48 55847  
+      missed: entrypoints:@app.task
+      missed: entrypoints:@shared_task
+      missed: entrypoints:app.send_task
+      missed: entrypoints:app.worker_main
+      missed: entrypoints:app.start
+      missed: entrypoints:celery -A proj worker
+      missed: behavior:chord header -> add_unlock_chord_task
+      missed: behavior:worker consumer -> task.run
+      missed: state_authority:app.conf
+      missed: state_authority:task_keyprefix = 'celery-task-meta-'
+      missed: state_authority:celery/worker/state.py
+      missed: contracts:broker='amqp://guest@localhost//'
+      missed: contracts:redis://localhost:6379/0
+      missed: contracts:name='celery.accumulate'
+      missed: tests:t/unit/
+      missed: tests:t/integration/
+      missed: tests:t/unit/app/test_app.py
+      missed: tests:t/unit/tasks/test_canvas.py
+      missed: tests:t/unit/backends/
+      missed: tests:t/unit/worker/
+  clap                      1.000  0.625  0.429  0.143  0.556  1.000  0.800    0.550  0.093  0.214   0.77 22068  
+      missed: entrypoints:#[derive(Parser)]
+      missed: entrypoints:clap_complete.generate
+      missed: entrypoints:clap_mangen
+      missed: behavior:Command.new
+      missed: behavior:Arg.new
+      missed: behavior:ArgMatches.get_one
+      missed: behavior:clap_complete.generate_to
+      missed: state_authority:ArgMatches
+      missed: state_authority:Command
+      missed: state_authority:mkeymap
+      missed: state_authority:ArgPredicate
+      missed: state_authority:ValueParser
+      missed: state_authority:StyledStr
+      missed: contracts:short('f')
+      missed: contracts:ErrorKind.InvalidValue
+      missed: contracts:ErrorKind.UnknownArgument
+      missed: contracts:ErrorKind.DisplayHelp
+      missed: tests:clap_builder/src/builder/tests.rs
+  docker-compose            0.667  0.417  0.000  0.571  0.091  1.000  0.143    0.349  0.039  0.132   0.25 56700  
+      missed: architecture:api.Compose
+      missed: architecture:types.Project
+      missed: entrypoints:psCmd
+      missed: entrypoints:startCommand
+      missed: entrypoints:stopCommand
+      missed: entrypoints:restartCmd
+      missed: entrypoints:logsCmd
+      missed: entrypoints:Up(ctx context.Context, project *types.Project, options api.UpOptions) error
+      missed: entrypoints:Down(ctx context.Context, projectName string, options api.DownOptions) error
+      missed: behavior:up` -> composeService.Up -> create -> start
+      missed: behavior:down` -> composeService.Down -> remove containers/networks
+      missed: behavior:create` -> createNetwork/createVolume/container creation
+      missed: behavior:runUp` -> backend.Up with Create/Build options
+      missed: behavior:ps` -> composeService.Ps -> []api.ContainerSummary
+      missed: behavior:pull` -> composeService.Pull -> image pulls
+      missed: behavior:logs` -> composeService.Logs -> LogConsumer callbacks
+      missed: behavior:exec` -> composeService.Exec -> run command in container
+      missed: state_authority:types.Project
+      missed: state_authority:api.UpOptions
+      missed: state_authority:api.DownOptions
+      missed: contracts:up [OPTIONS] [SERVICE...]
+      missed: contracts:down [OPTIONS] [SERVICES]
+      missed: contracts:ps [OPTIONS] [SERVICE...]
+      missed: contracts:exec [OPTIONS] SERVICE COMMAND [ARGS...]
+      missed: contracts:build [OPTIONS] [SERVICE...]
+      missed: contracts:pull [OPTIONS] [SERVICE...]
+      missed: contracts:restart [OPTIONS] [SERVICE...]
+      missed: contracts:logs [OPTIONS] [SERVICE...]
+      missed: contracts:--force-recreate
+      missed: contracts:--remove-orphans
+      missed: tests:pkg/compose/create_test.go
+      missed: tests:pkg/compose/down_test.go
+      missed: tests:pkg/compose/loader_test.go
+      missed: tests:pkg/compose/executor_test.go
+      missed: tests:cmd/compose/up_test.go
+      missed: tests:cmd/compose/compose_test.go
+  express                   0.900  0.000  0.125  0.000  0.556  0.000  0.000    0.316  0.335  0.186   3.51  4275  
+      missed: architecture:urlencoded
+      missed: entrypoints:require('express')
+      missed: entrypoints:app.listen
+      missed: entrypoints:app.handle
+      missed: entrypoints:app.init
+      missed: entrypoints:app.engine
+      missed: entrypoints:app.param
+      missed: entrypoints:exports.application
+      missed: behavior:app.route` -> `router.route
+      missed: behavior:methods.forEach` -> `app.get
+      missed: behavior:app.listen` -> `http.createServer(this)` -> `app.handle
+      missed: behavior:app.render` -> `tryRender` -> `View.prototype.render
+      missed: behavior:res.sendFile` -> `sendfile` helper
+      missed: behavior:res.redirect
+      missed: behavior:res.json
+      missed: state_authority:this.router
+      missed: state_authority:this.settings
+      missed: state_authority:this.engines
+      missed: state_authority:this.cache
+      missed: state_authority:res.locals
+      missed: state_authority:req.app
+      missed: state_authority:trustProxyDefaultSymbol
+      missed: contracts:case sensitive routing
+      missed: contracts:view engine
+      missed: contracts:query parser
+      missed: contracts:res.status(code)
+      missed: landmarks:methods
+      missed: landmarks:app.request
+      missed: tests:test/app.router.js
+      missed: tests:test/app.param.js
+      missed: tests:test/app.head.js
+      missed: tests:test/app.options.js
+      missed: tests:test/res.json.js
+      missed: tests:test/req.ip.js
+      missed: tests:test/req.route.js
+      missed: tests:test/utils.js
+  fastapi                   1.000  0.667  0.857  0.000  0.714  1.000  0.000    0.648  0.046  0.140   0.28 70982  
+      missed: entrypoints:app.get
+      missed: entrypoints:app.post
+      missed: entrypoints:fastapi = "fastapi.cli:main"
+      missed: behavior:generate_operation_id
+      missed: state_authority:self.dependency_overrides
+      missed: state_authority:self.router
+      missed: state_authority:app.state
+      missed: state_authority:model_name_map
+      missed: state_authority:app.openapi_url
+      missed: contracts:read_items_items__get
+      missed: contracts:response_model=Item
+      missed: tests:tests/test_application.py
+      missed: tests:tests/test_dependencies_utils.py
+      missed: tests:tests/test_router_include_context.py
+      missed: tests:tests/test_openapi_separate_input_output_schemas.py
+      missed: tests:tests/test_fastapi_cli.py
+      missed: tests:docs_src/app_testing/tutorial003_py310.py
+      missed: tests:tests/test_dependency_overrides.py
+  flask                     1.000  0.333  1.000  0.500  0.857  1.000  0.000    0.738  0.108  0.292   1.56 17946  
+      missed: entrypoints:app.run
+      missed: entrypoints:@app.route
+      missed: entrypoints:@app.get
+      missed: entrypoints:@app.post
+      missed: entrypoints:flask = "flask.cli:main"
+      missed: entrypoints:flask run
+      missed: state_authority:app.view_functions
+      missed: state_authority:self.url_map
+      missed: state_authority:jinja_env
+      missed: contracts:flask routes
+      missed: tests:tests/test_basic.py
+      missed: tests:tests/test_blueprints.py
+      missed: tests:tests/test_cli.py
+      missed: tests:tests/test_templating.py
+      missed: tests:tests/test_user_error_handler.py
+      missed: tests:tests/test_session_interface.py
+      missed: tests:tests/test_views.py
+  gin                       1.000  0.750  0.167  1.000  0.333  1.000  0.000    0.650  0.098  0.232   0.70 31588  
+      missed: entrypoints:gin.New()
+      missed: entrypoints:gin.Default()
+      missed: behavior:gin.Default
+      missed: behavior:ServeHTTP
+      missed: behavior:Context.JSON
+      missed: behavior:RouterGroup.handle
+      missed: behavior:Context.Next
+      missed: contracts:router.GET("/ping"
+      missed: contracts:GET /test
+      missed: contracts:GET /:count
+      missed: contracts:GET /v1/:path
+      missed: contracts:GET /test/:param
+      missed: contracts:POST /
+      missed: tests:gin_test.go
+      missed: tests:gin_integration_test.go
+      missed: tests:benchmarks_test.go
+      missed: tests:context_test.go
+      missed: tests:auth_test.go
+      missed: tests:errors_test.go
+      missed: tests:router.Group("/users")
+  gorilla-mux               1.000  1.000  0.800  0.800  0.125  1.000  0.000    0.745  0.162  0.369   1.23 13843  
+      missed: behavior:NewRouter
+      missed: state_authority:varsKey
+      missed: contracts:r.HandleFunc("/api", emptyHandler).Methods("POST")
+      missed: contracts:Queries("time", "{time:[0-9]+}")
+      missed: contracts:Queries("foo", "{foo:[0-9]+}")
+      missed: contracts:PathPrefix("/sub/").Subrouter()
+      missed: contracts:Host("{subdomain}.domain.com")
+      missed: contracts:r.HandleFunc("/", func1).Name("func1")
+      missed: contracts:{name:pattern}
+      missed: tests:mux_test.go
+      missed: tests:route_test.go
+      missed: tests:regexp_test.go
+      missed: tests:example_route_test.go
+      missed: tests:example_authentication_middleware_test.go
+      missed: tests:example_cors_method_middleware_test.go
+      missed: tests:mux_httpserver_test.go
+      missed: tests:bench_test.go
+  junit4                    1.000  0.571  0.000  0.857  0.111  1.000  1.000    0.508  0.069  0.204   0.29 68924  
+      missed: entrypoints:runClasses(Class<?>... classes)
+      missed: entrypoints:@RunWith
+      missed: entrypoints:@Test
+      missed: behavior:JUnitCore.run` -> Request.classes -> Computer -> Runner
+      missed: behavior:BlockJUnit4ClassRunner` -> MethodRoadie -> RunRules -> before/test/after
+      missed: behavior:ParentRunner.run` -> runChildren
+      missed: behavior:RunNotifier.fireTestStarted` -> listeners
+      missed: behavior:--filter` -> FilterFactories -> Filter
+      missed: behavior:assertThrows` -> ThrowingRunnable.run() inside try/catch
+      missed: behavior:@RunWith(Parameterized.class)` -> Parameterized -> per-parameter-set child runners
+      missed: state_authority:RuleContainer
+      missed: contracts:@Test
+      missed: contracts:timeout()
+      missed: contracts:assertEquals(Object expected, Object actual)
+      missed: contracts:@Before
+      missed: contracts:@BeforeClass
+      missed: contracts:@Rule
+      missed: contracts:@Ignore
+      missed: contracts:@FixMethodOrder(MethodSorters.NAME_ASCENDING)
+  kind                      0.400  0.000  0.125  0.000  0.667  1.000  0.000    0.238  0.031  0.074   0.47 23480  
+      missed: architecture:create.Cluster
+      missed: architecture:delete.Cluster
+      missed: architecture:nodeimage.Build
+      missed: architecture:app.Main
+      missed: architecture:providers.Provider
+      missed: architecture:internalencoding
+      missed: entrypoints:main.go
+      missed: entrypoints:pkg/cmd/kind/root.go
+      missed: entrypoints:pkg/cmd/kind/create/create.go
+      missed: entrypoints:pkg/cmd/kind/create/cluster/createcluster.go
+      missed: entrypoints:pkg/cmd/kind/delete/delete.go
+      missed: entrypoints:pkg/cmd/kind/get/get.go
+      missed: entrypoints:func (p *Provider) Create(name string, options ...CreateOption) error
+      missed: entrypoints:func (p *Provider) Delete(name, explicitKubeconfigPath string) error
+      missed: entrypoints:func (p *Provider) List() ([]string, error)
+      missed: behavior:kind create cluster` -> NewProvider -> Provider.Create -> create.Cluster
+      missed: behavior:CreateWithConfigFile` -> internalencoding.Load -> Cluster config
+      missed: behavior:CreateWithWaitForReady` -> wait for control-plane readiness
+      missed: behavior:Provider.Delete
+      missed: behavior:nodeimage.Build` -> docker build of node image
+      missed: behavior:docker.NewProvider
+      missed: behavior:CreateWithWaitForReady
+      missed: state_authority:DefaultClusterName
+      missed: state_authority:providers.Provider
+      missed: state_authority:docker.NewProvider
+      missed: state_authority:podman.NewProvider
+      missed: state_authority:nerdctl.NewProvider
+      missed: state_authority:pkg/cluster/internal/kubeconfig
+      missed: state_authority:v1alpha4
+      missed: contracts:kind.x-k8s.io/v1alpha4
+      missed: contracts:ControlPlaneRole NodeRole = "control-plane"
+      missed: contracts:WorkerRole NodeRole = "worker"
+      missed: tests:pkg/internal/apis/config/encoding/load_test.go
+      missed: tests:pkg/internal/apis/config/validate_test.go
+      missed: tests:pkg/internal/apis/config/cluster_util_test.go
+      missed: tests:pkg/cluster/internal/providers/docker/network_test.go
+      missed: tests:pkg/cluster/internal/providers/common/namer_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/write_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/remove_test.go
+      missed: tests:pkg/cluster/internal/kubeconfig/internal/kubeconfig/merge_test.go
+  microservices-demo        1.000  0.000  0.000  0.000  0.000  1.000  0.000    0.200  0.074  0.149   0.50 23930  
+      missed: entrypoints:src/checkoutservice/main.go
+      missed: entrypoints:src/currencyservice/server.js
+      missed: entrypoints:src/productcatalogservice/server.go
+      missed: entrypoints:src/adservice/src/main/java/hipstershop/AdService.java
+      missed: entrypoints:src/emailservice/email_server.py
+      missed: entrypoints:src/recommendationservice/recommendation_server.py
+      missed: entrypoints:src/shippingservice/main.go
+      missed: entrypoints:src/frontend/main.go
+      missed: entrypoints:src/cartservice/src/Program.cs
+      missed: entrypoints:src/paymentservice/server.js
+      missed: behavior:ListProducts` -> catalog_loader.go -> products.json
+      missed: behavior:getCart` -> CartService.GetCart
+      missed: behavior:PlaceOrder` -> GetCart -> GetQuote -> Charge -> SendOrderConfirmation -> ShipOrder
+      missed: behavior:AddItem` -> CartService -> cartstore
+      missed: behavior:Convert` -> CurrencyService
+      missed: behavior:GetAds` -> AdService
+      missed: behavior:ListRecommendations` -> RecommendationService
+      missed: behavior:homeHandler` -> getProducts -> ProductCatalogService.ListProducts
+      missed: state_authority:redis-cart
+      missed: state_authority:RedisCartStore
+      missed: state_authority:ICartStore
+      missed: state_authority:SpannerCartStore
+      missed: state_authority:src/productcatalogservice/products.json
+      missed: state_authority:cookieSessionID
+      missed: state_authority:kubernetes-manifests
+      missed: state_authority:helm-chart
+      missed: state_authority:skaffold.yaml
+      missed: contracts:rpc GetCart(GetCartRequest) returns (Cart)
+      missed: contracts:rpc ListProducts(Empty) returns (ListProductsResponse)
+      missed: contracts:rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse)
+      missed: contracts:rpc GetSupportedCurrencies(Empty) returns (GetSupportedCurrenciesResponse)
+      missed: contracts:containerPort: 9555
+      missed: contracts:port: 7070
+      missed: contracts:port: 5050
+      missed: contracts:port: 50051
+      missed: contracts:port: 3550
+      missed: contracts:/_healthz
+      missed: contracts:GET /product/{id}
+      missed: tests:src/productcatalogservice/product_catalog_test.go
+      missed: tests:src/shippingservice/shippingservice_test.go
+      missed: tests:src/frontend/validator/validator_test.go
+      missed: tests:src/checkoutservice/money/money_test.go
+      missed: tests:src/frontend/money/money_test.go
+      missed: tests:src/loadgenerator/locustfile.py
+  mockito                   1.000  0.333  0.000  0.571  0.444  1.000  1.000    0.470  0.027  0.102   0.12 145468  
+      missed: entrypoints:mock(Class<T> classToMock)
+      missed: entrypoints:when(T methodCall)
+      missed: entrypoints:verify(T mock)
+      missed: entrypoints:mockitoSession()
+      missed: entrypoints:spy(T object)
+      missed: entrypoints:doReturn(Object toBeReturned)
+      missed: behavior:mock()` -> MockitoCore.mock -> MockMaker.createMock
+      missed: behavior:when()` -> MockitoCore.when -> stubbingStarted() -> OngoingStubbing.thenReturn
+      missed: behavior:verify()` -> MockitoCore.verify -> VerificationModeFactory.times(1)
+      missed: behavior:any()`/`eq()` -> reportMatcher() -> matcher stack
+      missed: behavior:timeout(long millis)
+      missed: behavior:inOrder(mocks)` -> InOrder.verify
+      missed: behavior:MockitoExtension.beforeEach
+      missed: behavior:doThrow(Throwable...)` -> MOCKITO_CORE.stubber() -> Stubber.doThrow
+      missed: state_authority:mockito-core
+      missed: state_authority:MockUtil
+      missed: state_authority:GlobalConfiguration
+      missed: contracts:ArgumentMatcher<T>
+      missed: contracts:@Mock
+      missed: contracts:@InjectMocks
+      missed: contracts:Strictness.STRICT_STUBS
+      missed: contracts:@Captor
+  nest                      1.000  0.143  0.125  0.571  0.000  0.833  0.143    0.368  0.011  0.047   0.11 104546  
+      missed: entrypoints:NestFactory.create(AppModule)
+      missed: entrypoints:NestFactory.createMicroservice
+      missed: entrypoints:NestFactory.createApplicationContext
+      missed: entrypoints:app.listen(port)
+      missed: entrypoints:@Controller('cats')
+      missed: entrypoints:packages/core/index.ts
+      missed: behavior:NestFactory.create` -> `NestApplication
+      missed: behavior:Controller` -> `RoutesResolver
+      missed: behavior:MessagePattern` -> server
+      missed: behavior:Test.createTestingModule` -> `TestingModuleBuilder.compile` -> `TestingModule
+      missed: behavior:NestContainer` -> `InstanceLoader` -> `Injector
+      missed: behavior:ExpressAdapter` -> `RouterMethodFactory
+      missed: behavior:NestFactory.create` -> `GraphInspector
+      missed: state_authority:ModulesContainer
+      missed: state_authority:InstanceLoader
+      missed: state_authority:DependenciesScanner
+      missed: contracts:@Controller('cats')
+      missed: contracts:@Get(':id')
+      missed: contracts:@Param('id', new ParseIntPipe())
+      missed: contracts:@UseGuards(RolesGuard)
+      missed: contracts:Test.createTestingModule
+      missed: contracts:NestExpressApplication
+      missed: contracts:@EventPattern
+      missed: contracts:Transport
+      missed: contracts:APP_GUARD
+      missed: landmarks:Param` / `Body` / `Query
+      missed: tests:packages/core/test
+      missed: tests:sample/01-cats-app/src/cats/cats.controller.spec.ts
+      missed: tests:sample/19-auth-jwt/e2e/app/app.e2e-spec.ts
+      missed: tests:sample/02-gateways/e2e/events-gateway/gateway.e2e-spec.ts
+      missed: tests:sample/26-queues/e2e/audio/audio.e2e-spec.ts
+      missed: tests:packages/common/test
+  prettier                  1.000  0.429  0.000  0.250  0.091  1.000  0.556    0.354  0.009  0.039   0.21 70536  
+      missed: entrypoints:src/index.js
+      missed: entrypoints:src/cli/index.js
+      missed: entrypoints:src/standalone.js
+      missed: entrypoints:src/cli/context.js
+      missed: behavior:format` -> `coreFormat` -> `parse` -> `printAstToDoc` -> `printDocToString
+      missed: behavior:check` -> `format` text comparison
+      missed: behavior:parse` -> `resolveParser` -> `parser.preprocess
+      missed: behavior:printAstToDoc` -> `prepareToPrint` -> doc cache Map
+      missed: behavior:formatFiles` -> `formatFile` -> `writeOutput
+      missed: behavior:listDifferent` -> `prettier.check
+      missed: behavior:formatFile` -> `mockable.writeFormattedFile
+      missed: behavior:normalizeInputAndOptions` -> `normalizeFormatOptions
+      missed: state_authority:printAstToDoc
+      missed: state_authority:resolveConfig
+      missed: state_authority:editorconfig
+      missed: state_authority:context.argv
+      missed: state_authority:mockable
+      missed: state_authority:directory-ignorer
+      missed: contracts:--write
+      missed: contracts:--check
+      missed: contracts:--list-different
+      missed: contracts:--debug-check
+      missed: contracts:--log-level
+      missed: contracts:babel
+      missed: contracts:postcss
+      missed: contracts:html
+      missed: contracts:yaml
+      missed: contracts:CATEGORY_OUTPUT
+      missed: tests:tests/format/js
+      missed: tests:tests/format/css
+      missed: tests:tests/unit/doc-builders.js
+      missed: tests:tests/unit/editorconfig-to-prettier.js
+  pydantic                  1.000  1.000  0.167  0.500  0.167  1.000  0.000    0.567  0.077  0.148   0.17 117242  
+      missed: behavior:__get_pydantic_core_schema__
+      missed: behavior:model_rebuild
+      missed: behavior:TypeAdapter.json_schema
+      missed: behavior:model_post_init
+      missed: behavior:__pydantic_init_subclass__
+      missed: state_authority:__pydantic_fields__
+      missed: state_authority:model_extra
+      missed: state_authority:ConfigDict.validate_assignment
+      missed: contracts:model_config = ConfigDict(validate_assignment=True)
+      missed: contracts:strict=True
+      missed: contracts:mode='json'
+      missed: contracts:ConfigDict(defer_build=True)
+      missed: contracts:mode='validation'
+      missed: tests:tests/test_main.py
+      missed: tests:tests/test_type_adapter.py
+      missed: tests:tests/test_json_schema.py
+      missed: tests:tests/test_validators.py
+      missed: tests:tests/test_model_validator.py
+      missed: tests:tests/test_dataclasses.py
+      missed: tests:tests/test_create_model.py
+      missed: tests:tests/test_errors.py
+  serde                     0.750  0.000  0.400  0.000  0.000  1.000  0.000    0.230  0.126  0.088   0.35 14217  
+      missed: architecture:de::value
+      missed: entrypoints:#[derive(Serialize)]
+      missed: entrypoints:#[derive(Deserialize)]
+      missed: entrypoints:Serialize::serialize
+      missed: entrypoints:Deserialize::deserialize
+      missed: entrypoints:serde_json::to_string
+      missed: entrypoints:serde_json::from_str
+      missed: behavior:Serialize.serialize
+      missed: behavior:serde_json::to_string
+      missed: behavior:Deserializer.deserialize_enum
+      missed: state_authority:serde/src/private
+      missed: state_authority:serde_derive_internals
+      missed: state_authority:serde_core/src
+      missed: state_authority:Content
+      missed: state_authority:serde_core/src/format.rs
+      missed: contracts:serialize_struct
+      missed: contracts:deserialize_struct
+      missed: contracts:#[serde(tag = "t", content = "c")]
+      missed: contracts:Error::custom
+      missed: contracts:serde_test::Token
+      missed: contracts:serde_json::to_string
+      missed: tests:test_suite/tests/test_ser.rs
+      missed: tests:test_suite/tests/test_de.rs
+      missed: tests:test_suite/tests/test_roundtrip.rs
+      missed: tests:test_suite/tests/test_annotations.rs
+      missed: tests:test_suite/tests/test_enum_adjacently_tagged.rs
+      missed: tests:test_suite/tests/regression/issue2565.rs
+      missed: tests:test_suite/tests/ui
+  shadcn-ui                 0.714  0.000  0.000  0.000  0.000  0.800  0.125    0.143  0.013  0.048   0.18 28379  
+      missed: architecture:@shadcn/react
+      missed: architecture:@shadcn/helpers
+      missed: entrypoints:npx shadcn init
+      missed: entrypoints:shadcn add
+      missed: entrypoints:npx shadcn create
+      missed: entrypoints:next dev --turbopack --port 4000
+      missed: entrypoints:scripts/build-registry.mts
+      missed: entrypoints:apps/v4/app/(app)/docs/[[...slug]]/page.tsx
+      missed: entrypoints:apps/v4/app/(app)/blocks/[...categories]/page.tsx
+      missed: entrypoints:apps/v4/app/api/search/route.ts
+      missed: behavior:build-registry.mts
+      missed: behavior:add` command -> fetch item address -> apply component to project
+      missed: behavior:components.json
+      missed: behavior:packages/shadcn/src/commands/apply.ts
+      missed: behavior:apps/v4/lib/source.ts
+      missed: behavior:createFromSource
+      missed: behavior:capture-registry.mts
+      missed: behavior:capture-explore.mts
+      missed: state_authority:apps/v4/registry.json
+      missed: state_authority:apps/v4/components.json
+      missed: state_authority:apps/v4/lib/registry.ts
+      missed: state_authority:apps/v4/lib/config.ts
+      missed: state_authority:registry/new-york-v4
+      missed: state_authority:registry/bases
+      missed: state_authority:apps/v4/lib/themes.ts
+      missed: contracts:"button"
+      missed: contracts:apps/v4/registry/new-york-v4/ui/card.tsx
+      missed: contracts:apps/v4/registry/new-york-v4/ui/dialog.tsx
+      missed: contracts:npx shadcn init
+      missed: contracts:shadcn add
+      missed: contracts:--yes
+      missed: contracts:data-slot="dialog"
+      missed: contracts:data-slot="card"
+      missed: contracts:[[...slug]]
+      missed: landmarks:apps/v4/source.config.ts
+      missed: tests:packages/shadcn/src/commands/add.test.ts
+      missed: tests:packages/shadcn/src/commands/init.test.ts
+      missed: tests:packages/shadcn/src/commands/build.test.ts
+      missed: tests:packages/shadcn/src/commands/apply.test.ts
+      missed: tests:packages/shadcn/test
+      missed: tests:apps/v4/registry/calendar.test.ts
+      missed: tests:apps/v4/registry/config.test.ts
+  sqlalchemy                1.000  1.000  0.167  0.167  0.143  1.000  0.000    0.495  0.078  0.210   0.07 392174  resolved:44
+      missed: behavior:create_engine -> Engine.connect -> Connection.execute
+      missed: behavior:Session.execute -> ORMExecuteState
+      missed: behavior:declarative_base -> Mapper.configure
+      missed: behavior:Transaction -> commit/rollback
+      missed: behavior:QueuePool -> _ConnectionFairy
+      missed: state_authority:engine.pool
+      missed: state_authority:Session identity map
+      missed: state_authority:sessionmaker(bind=engine)
+      missed: state_authority:_sa_instance_state
+      missed: state_authority:Session.connection
+      missed: contracts:create_engine("sqlite://")
+      missed: contracts:"sqlite:///:memory:"
+      missed: contracts:LABEL_STYLE_TABLENAME_PLUS_COL
+      missed: contracts:select(t1).where(t1.c.c2 == t2.c.c1)
+      missed: contracts:test_session_commit_rollback
+      missed: contracts:name = "sqlite"
+      missed: tests:test/orm/test_session.py
+      missed: tests:test/orm/test_query.py
+      missed: tests:test/engine/test_transaction.py
+      missed: tests:test/engine/test_pool.py
+      missed: tests:test/dialect/sqlite/
+      missed: tests:test/aaa_profiling/test_orm.py
+      missed: tests:test/aaa_profiling/test_pool.py
+  svelte                    1.000  0.125  0.500  0.500  0.300  1.000  0.000    0.485  0.059  0.177   0.87 26529  
+      missed: entrypoints:src/index-server.js
+      missed: entrypoints:svelte/compiler
+      missed: entrypoints:svelte/internal
+      missed: entrypoints:svelte/store` / `svelte/motion
+      missed: entrypoints:phases/1-parse
+      missed: entrypoints:phases/2-analyze
+      missed: entrypoints:phases/3-transform
+      missed: behavior:compile
+      missed: behavior:migrate
+      missed: behavior:preprocess
+      missed: behavior:flushSync` / `fork
+      missed: state_authority:mounted_components
+      missed: state_authority:get_or_init_context_map
+      missed: state_authority:active_reaction
+      missed: state_authority:STATE_SYMBOL
+      missed: contracts:$state
+      missed: contracts:$derived
+      missed: contracts:$effect
+      missed: contracts:$props
+      missed: contracts:bind:value
+      missed: contracts:bind:this
+      missed: contracts:bind:group
+      missed: tests:packages/svelte/tests/compiler-errors
+      missed: tests:packages/svelte/tests/runtime-runes
+      missed: tests:packages/svelte/tests/runtime-legacy
+      missed: tests:packages/svelte/tests/runtime-browser
+      missed: tests:packages/svelte/tests/parser-modern
+      missed: tests:packages/svelte/tests/parser-legacy
+      missed: tests:packages/svelte/tests/snapshot
+      missed: tests:packages/svelte/tests/server-side-rendering
+      missed: tests:packages/svelte/tests/store
+  mean                      0.922  0.422  0.306  0.367  0.339  0.932  0.203    0.471  0.079  0.161   0.70 65148
+  scored: 20   skipped: 0
+  resolved calls (semantic backends upgraded): 44
+  gate: FAIL (overall mean recall 0.471 >= 0.5)
+
+=== VALIDATION corpus ===
+scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)
+  mode: validation: /Users/rocket/system_ir/benchmarks/holdout
+  gate: overall mean recall (architecture+entrypoints+behavior+state_authority+contracts) >= 0.5
+  repo                       arch  entry  behav  state  contr  landm  tests  overall   prec     f2   f/1k  toks  note
+  aiohttp                   0.889  0.111  0.000  0.143  0.125  1.000  0.200    0.254  0.033  0.098   0.21 53424  
+      missed: architecture:aiohttp.web
+      missed: entrypoints:web.run_app
+      missed: entrypoints:web.Application
+      missed: entrypoints:app.router.add_route
+      missed: entrypoints:routes.get/post
+      missed: entrypoints:app.add_routes
+      missed: entrypoints:ClientSession.get/post
+      missed: entrypoints:python -m aiohttp.web
+      missed: entrypoints:web.WebSocketResponse
+      missed: behavior:handle_request -> UrlDispatcher.resolve -> handler call -> Response.prepare
+      missed: behavior:_build_middlewares -> handler chain
+      missed: behavior:ClientSession._request -> connector.connect -> response.read
+      missed: behavior:UrlDispatcher.resolve -> _find_match -> match_info
+      missed: behavior:WebSocketResponse.prepare -> websocket handshake
+      missed: behavior:app._on_startup/_on_cleanup signal dispatch
+      missed: state_authority:app.router
+      missed: state_authority:app.middlewares
+      missed: state_authority:app['key']
+      missed: state_authority:ClientSession.connector
+      missed: state_authority:ClientSession.cookie_jar
+      missed: state_authority:Request.app
+      missed: contracts:web.run_app(app, host='0.0.0.0', port=8080)
+      missed: contracts:@routes.get('/items/{item_id}')
+      missed: contracts:--host / --port
+      missed: contracts:'/items/{item_id}'
+      missed: contracts:'/download/*'
+      missed: contracts:middleware(handler) -> handler
+      missed: contracts:WS message JSON/bytes frames
+      missed: tests:tests/test_web_application.py
+      missed: tests:tests/test_web_urldispatcher.py
+      missed: tests:tests/test_client_session.py
+      missed: tests:tests/test_web_functional.py
+  axios                     0.333  0.100  0.143  0.167  0.000  1.000  0.000    0.149  0.015  0.043   0.63  9553  
+      missed: architecture:lib/axios.js
+      missed: architecture:core/Axios
+      missed: architecture:core/dispatchRequest
+      missed: architecture:core/InterceptorManager
+      missed: architecture:core/AxiosHeaders
+      missed: architecture:core/AxiosError
+      missed: entrypoints:axios(config)
+      missed: entrypoints:axios.get/post/put/delete
+      missed: entrypoints:axios.create(config)
+      missed: entrypoints:instance.interceptors.request.use
+      missed: entrypoints:instance.interceptors.response.use
+      missed: entrypoints:axios.all
+      missed: entrypoints:axios.spread
+      missed: entrypoints:axios.CancelToken
+      missed: entrypoints:axios.isAxiosError
+      missed: behavior:createInstance -> new Axios -> bind request
+      missed: behavior:dispatchRequest -> transformRequest -> adapter(request)
+      missed: behavior:InterceptorManager.forEach -> chain execution
+      missed: behavior:adapter rejection -> AxiosError -> response error shape
+      missed: behavior:dispatchRequest -> transformResponse -> settle
+      missed: behavior:CancelToken -> reason -> promise rejection
+      missed: state_authority:instance.defaults
+      missed: state_authority:instance.interceptors.request/response
+      missed: state_authority:context.defaults
+      missed: state_authority:mergeConfig
+      missed: state_authority:AxiosHeaders
+      missed: contracts:axios({ method: 'get', url: '/user' })
+      missed: contracts:axios.get('/user', { params: {...} })
+      missed: contracts:.then(response => response.data)
+      missed: contracts:axios.create({ baseURL, timeout })
+      missed: contracts:interceptor use(fn, fn)
+      missed: contracts:cancelToken: new CancelToken(cb)
+      missed: contracts:transformRequest/transformResponse
+      missed: contracts:axios.isAxiosError(err)
+      missed: contracts:validateStatus
+      missed: contracts:headers common get/accept
+      missed: tests:test/
+      missed: tests:test/unit/
+      missed: tests:test/module/
+      missed: tests:test/types/
+      missed: tests:test/specs/
+  black                     0.625  0.857  0.167  0.333  0.357  1.000  0.000    0.468  0.056  0.171   0.79 24016  
+      missed: architecture:black.main
+      missed: architecture:NormalizerVisitor
+      missed: architecture:blib2to3 parser
+      missed: entrypoints:python -m black
+      missed: behavior:format_str -> lib2to3_parse -> LineGenerator.visit -> transform_line -> EmptyLineTracker
+      missed: behavior:transform_line -> NormalizerVisitor transforms
+      missed: behavior:main -> get_cache -> read_cache/write_cache
+      missed: behavior:format_stdin_to_stdout -> format_str -> write to stdout
+      missed: behavior:main --check -> Report.done -> exit code
+      missed: state_authority:Report
+      missed: state_authority:DEFAULT_LINE_LENGTH
+      missed: state_authority:DEFAULT_EXCLUDES / DEFAULT_INCLUDES
+      missed: state_authority:compileCache
+      missed: contracts:black <src>...
+      missed: contracts:-c/--code <code>
+      missed: contracts:-l/--line-length <int>
+      missed: contracts:-t/--target-version <ver>
+      missed: contracts:--exclude <regex>
+      missed: contracts:-q/--quiet
+      missed: contracts:-v/--verbose
+      missed: contracts:-W/--workers <n>
+      missed: contracts:--config <path>
+      missed: tests:tests/
+      missed: tests:tests/test_black.py
+      missed: tests:tests/test_format.py
+      missed: tests:tests/test_parse.py
+      missed: tests:tests/test_ipynb.py
+      missed: tests:tests/test_rusty.py
+  chi                       0.286  0.167  0.000  0.667  0.000  0.875  0.000    0.224  0.041  0.115   0.52 15465  
+      missed: architecture:chi.go
+      missed: architecture:mux.go
+      missed: architecture:tree.go
+      missed: architecture:context.go
+      missed: architecture:chain.go
+      missed: entrypoints:r.Get
+      missed: entrypoints:r.Post
+      missed: entrypoints:r.Put
+      missed: entrypoints:r.Delete
+      missed: entrypoints:r.Patch
+      missed: entrypoints:r.Use
+      missed: entrypoints:r.With
+      missed: entrypoints:r.Mount
+      missed: entrypoints:r.NotFound
+      missed: entrypoints:http.ListenAndServe
+      missed: behavior:Mux.ServeHTTP -> FindRoute -> tree lookup -> handler dispatch
+      missed: behavior:FindRoute -> radix tree match -> URLParams capture
+      missed: behavior:Mux.handle -> buildChain -> middlewares wrap handler
+      missed: behavior:r.Route(pattern, fn) -> NewRouter -> Mount
+      missed: behavior:context.WithURLParams -> set URL params in context
+      missed: behavior:Chain.Handler -> wrap each middleware
+      missed: behavior:NotFound handler -> default 404
+      missed: state_authority:RouteContext
+      missed: state_authority:m.middlewares
+      missed: contracts:r.Get("/user/{name}", handler)
+      missed: contracts:r.Route("/articles", func(r chi.Router) {...})
+      missed: contracts:r.Use(middleware.Logger)
+      missed: contracts:r.With(middleware.Timeout(60*time.Second)).Get(...)
+      missed: contracts:r.Mount("/admin", subRouter)
+      missed: contracts:/user/{name}
+      missed: contracts:/user/{name:[a-z]+}
+      missed: contracts:/page/*
+      missed: contracts:chi.URLParam(r, "name")
+      missed: contracts:r.Method("GET", "/path", handler)
+      missed: contracts:r.NotFound(handler)
+      missed: landmarks:middleware.RequestID
+      missed: tests:mux_test.go
+      missed: tests:tree_test.go
+      missed: tests:context_test.go
+      missed: tests:chain_test.go
+      missed: tests:middleware/
+  click                     0.000  0.444  0.143  0.833  0.111  1.000  0.167    0.306  0.048  0.115   0.61 18100  
+      missed: architecture:click.core
+      missed: architecture:click.decorators
+      missed: architecture:click.parser
+      missed: architecture:click.termui
+      missed: architecture:click.types
+      missed: architecture:click.exceptions
+      missed: architecture:click.formatting
+      missed: architecture:click.globals
+      missed: entrypoints:click.command
+      missed: entrypoints:click.group
+      missed: entrypoints:click.option
+      missed: entrypoints:click.argument
+      missed: entrypoints:cli()
+      missed: behavior:Group.invoke -> _parse_args -> CommandCollection/Group subcommand dispatch
+      missed: behavior:Context.push/pop
+      missed: behavior:Command.parse_args -> _OptionParser.parse_args
+      missed: behavior:make_pass_decorator -> Context.find_object
+      missed: behavior:parser.parse_args -> split_opts -> consume value
+      missed: behavior:Command.get_help -> HelpFormatter.render
+      missed: state_authority:current_context
+      missed: contracts:@click.command()
+      missed: contracts:@click.option('--count', type=int)
+      missed: contracts:@click.argument('filename')
+      missed: contracts:@click.group()
+      missed: contracts:ctx.params
+      missed: contracts:@click.pass_context
+      missed: contracts:@click.version_option(version=...)
+      missed: contracts:type=click.Choice([...])
+      missed: tests:tests/test_basic.py
+      missed: tests:tests/test_arguments.py
+      missed: tests:tests/test_options.py
+      missed: tests:tests/test_commands.py
+      missed: tests:tests/test_parser.py
+  cobra                     0.000  0.000  0.125  0.429  0.182  1.000  0.000    0.147  0.137  0.096   0.36 16663  
+      missed: architecture:command.go
+      missed: architecture:args.go
+      missed: architecture:bash_completions.go
+      missed: architecture:powershell_completions.go
+      missed: architecture:zsh_completions.go
+      missed: architecture:fish_completions.go
+      missed: architecture:completions.go
+      missed: architecture:active_help.go
+      missed: entrypoints:NewCommand
+      missed: entrypoints:rootCmd.Execute
+      missed: entrypoints:rootCmd.ExecuteC
+      missed: entrypoints:cmd.AddCommand
+      missed: entrypoints:cmd.Flags()
+      missed: entrypoints:cmd.PersistentFlags()
+      missed: entrypoints:cmd.SetArgs
+      missed: entrypoints:cmd.SetOut/SetErr
+      missed: entrypoints:cmd.Help
+      missed: entrypoints:cmd.Version
+      missed: behavior:findNext -> match command name against subcommands
+      missed: behavior:ExecuteC -> c.execute -> parseFlags -> Run/RunE
+      missed: behavior:validateArgs -> arg validators run
+      missed: behavior:InitDefaultHelpFlag/InitDefaultHelpCmd
+      missed: behavior:GenBashCompletion -> completion script emission
+      missed: behavior:c.Flags().Parse -> flag parsing through pflag
+      missed: behavior:help command invocation -> helpFunc
+      missed: state_authority:c.commands
+      missed: state_authority:c.flags
+      missed: state_authority:c.parent
+      missed: state_authority:c.helpFlagVal
+      missed: contracts:cobra.Command{Use: "app", Run: func(cmd, args)}
+      missed: contracts:rootCmd.Execute()
+      missed: contracts:cmd.AddCommand(sub)
+      missed: contracts:cmd.Flags().StringVarP(&val, "name", "n", "", "usage")
+      missed: contracts:cmd.PersistentFlags().Bool("verbose", false, "...")
+      missed: contracts:Args: cobra.ExactArgs(2)
+      missed: contracts:args.go validators: cobra.NoArgs / MinimumNArgs(1)
+      missed: contracts:RunE: func(cmd *cobra.Command, args []string) error
+      missed: contracts:SilenceUsage: true
+      missed: tests:command_test.go
+      missed: tests:args_test.go
+      missed: tests:completions_test.go
+      missed: tests:active_help_test.go
+      missed: tests:bash_completions_test.go
+  django                    0.375  0.700  0.000  0.333  0.250  1.000  0.250    0.332  0.007  0.030   0.01 2190102  resolved:54
+      missed: architecture:django.conf.settings
+      missed: architecture:django.urls
+      missed: architecture:django.http
+      missed: architecture:django.middleware
+      missed: architecture:django.core.exceptions
+      missed: entrypoints:django-admin
+      missed: entrypoints:manage.py
+      missed: entrypoints:django.setup
+      missed: behavior:django.setup -> apps.populate(INSTALLED_APPS)
+      missed: behavior:get_resolver -> URLResolver.resolve -> ResolverMatch
+      missed: behavior:execute_from_command_line -> get_commands -> load_command_class -> BaseCommand.execute
+      missed: behavior:URLResolver.resolve -> match -> view callback invocation
+      missed: behavior:settings.lazy load: first settings access imports settings module and checks globals
+      missed: behavior:BaseCommand.execute -> handle
+      missed: state_authority:django.conf.settings
+      missed: state_authority:django.apps.apps
+      missed: state_authority:get_urlconf
+      missed: state_authority:CommandParser
+      missed: contracts:python manage.py <command>
+      missed: contracts:path('route/', views.index)
+      missed: contracts:re_path(r'^articles/(?P<year>[0-9]{4})/$', views.year_archive)
+      missed: contracts:include('app.urls')
+      missed: contracts:command <app_label>.<Command>
+      missed: contracts:call_command('migrate', verbosity=0)
+      missed: tests:tests/urls/
+      missed: tests:tests/model_fields/
+      missed: tests:tests/known_good_python/
+  guava                     1.000  1.000  0.000  0.875  0.000  1.000  0.286    0.575  0.012  0.048   0.10 287176  
+      missed: behavior:CacheBuilder.build -> LocalCache creation -> CacheLoader
+      missed: behavior:LocalCache.get -> segment lookup -> load via CacheLoader
+      missed: behavior:ImmutableList.copyOf -> copyIntoRegularList
+      missed: behavior:ImmutableCollection.add -> UnsupportedOperationException
+      missed: behavior:RegularImmutableMap.get -> hash lookup
+      missed: behavior:EventBus.post -> subscriber dispatch
+      missed: behavior:Hashing.md5 -> hashFunction.newHasher -> hash
+      missed: behavior:Preconditions.checkArgument -> IllegalArgumentException
+      missed: state_authority:Interners
+      missed: contracts:ImmutableList.of(a, b, c)
+      missed: contracts:ImmutableMap.of(k1, v1, k2, v2)
+      missed: contracts:CacheBuilder.newBuilder().maximumSize(n).build(loader)
+      missed: contracts:cache.get(key, callable)
+      missed: contracts:cache.put(key, value)
+      missed: contracts:Preconditions.checkArgument(cond, msg)
+      missed: contracts:Preconditions.checkState(cond)
+      missed: contracts:Optional.of(x).isPresent()
+      missed: contracts:MoreObjects.firstNonNull(a, b)
+      missed: contracts:Hashing.sha256()
+      missed: contracts:ImmutableMultimap.of(k, v1, v2)
+      missed: contracts:TypeToken.of(MyType.class)
+      missed: tests:guava-tests/test/com/google/common/collect/
+      missed: tests:guava-tests/test/com/google/common/cache/
+      missed: tests:guava-tests/test/com/google/common/base/
+      missed: tests:guava-tests/test/com/google/common/hash/
+      missed: tests:guava-tests/test/com/google/common/eventbus/
+  helm                      1.000  0.067  0.000  0.286  0.077  0.556  0.000    0.286  0.010  0.033   0.18 75863  
+      missed: entrypoints:helm install
+      missed: entrypoints:helm upgrade
+      missed: entrypoints:helm rollback
+      missed: entrypoints:helm uninstall
+      missed: entrypoints:helm list
+      missed: entrypoints:helm get manifest
+      missed: entrypoints:helm repo add/update
+      missed: entrypoints:helm search repo
+      missed: entrypoints:helm pull
+      missed: entrypoints:helm package
+      missed: entrypoints:helm lint
+      missed: entrypoints:helm dependency update
+      missed: entrypoints:helm plugin install
+      missed: entrypoints:helm create
+      missed: behavior:main -> NewRootCmd -> cmd.Execute
+      missed: behavior:install -> action.Install -> release create/install flow (pkg/cmd/install.go + pkg/action/install.go)
+      missed: behavior:upgrade -> action.Upgrade -> release upgrade flow
+      missed: behavior:release content -> engine.Render -> rendered manifests (pkg/engine/engine.go)
+      missed: behavior:kube client apply -> create/update resources
+      missed: behavior:storage driver (secrets/configmap) -> release record persistence
+      missed: behavior:dependency update -> repo download -> chart unpack (pkg/downloader/)
+      missed: behavior:registry login/push/pull
+      missed: state_authority:action.Install/Upgrade
+      missed: state_authority:storage driver
+      missed: state_authority:release info
+      missed: state_authority:repo file
+      missed: state_authority:chart cache
+      missed: contracts:helm install <release> <chart>
+      missed: contracts:helm upgrade <release> <chart>
+      missed: contracts:helm list -A
+      missed: contracts:helm get manifest <release>
+      missed: contracts:helm repo add <name> <url>
+      missed: contracts:helm pull <chart>
+      missed: contracts:helm lint <chart-dir>
+      missed: contracts:--namespace <ns>
+      missed: contracts:--set key=value
+      missed: contracts:--values <file>
+      missed: contracts:--version <ver>
+      missed: contracts:chart.yaml apiVersion/name/version
+      missed: landmarks:action.Install
+      missed: landmarks:action.Upgrade
+      missed: landmarks:DownloadManager
+      missed: landmarks:registry.Client
+      missed: tests:cmd/helm/*_test.go
+      missed: tests:pkg/action/*_test.go
+      missed: tests:pkg/engine/*_test.go
+      missed: tests:pkg/chart/*_test.go
+      missed: tests:pkg/repo/*_test.go
+      missed: tests:pkg/storage/*_test.go
+  kustomize                 0.364  0.444  0.000  0.571  0.000  0.889  0.333    0.276  0.016  0.055   0.14 85855  
+      missed: architecture:api/krusty
+      missed: architecture:api/internal/target
+      missed: architecture:api/builtins
+      missed: architecture:api/resmap
+      missed: architecture:api/resource
+      missed: architecture:api/types
+      missed: architecture:api/filters
+      missed: entrypoints:kustomize build
+      missed: entrypoints:kustomize edit
+      missed: entrypoints:kustomize create
+      missed: entrypoints:kustomize cfg
+      missed: entrypoints:kustomize build <dir>
+      missed: behavior:main -> NewDefaultCommand().Execute()
+      missed: behavior:build -> makeKustomizer -> Kustomizer.Run -> target makeKustomization
+      missed: behavior:Run -> NewLoader -> NewKustTarget -> makeKustomization
+      missed: behavior:makeKustomization -> load kustomization.yaml -> generate resources (api/internal/target/kusttarget.go)
+      missed: behavior:accumulator merge -> resmap.ResMap accumulation
+      missed: behavior:builtins configmaps/secret generators -> resource creation (api/builtins/)
+      missed: behavior:kyaml RNode pipeline -> transformer filters -> mutated resources (kyaml/yaml/)
+      missed: behavior:Run -> accumulate -> ResMap output
+      missed: state_authority:kustomization.yaml
+      missed: state_authority:PluginLoader
+      missed: state_authority:filesys.FileSystem
+      missed: contracts:kustomize build <dir>
+      missed: contracts:kustomize build <overlay> --output -
+      missed: contracts:kustomization.yaml resources: [...]
+      missed: contracts:apiVersion: kustomize.config.k8s.io/v1beta1
+      missed: contracts:namePrefix: prod-
+      missed: contracts:commonLabels: {app: web}
+      missed: contracts:configMapGenerator: [{name: x, literals: [...]}]
+      missed: contracts:secretGenerator: [{name: x, files: [...]}]
+      missed: contracts:bases: [...]
+      missed: contracts:patches: [...]
+      missed: contracts:namespace: prod
+      missed: contracts:helmCharts: [{name: chart}]
+      missed: landmarks:filesys.FileSystem
+      missed: tests:api/krusty/
+      missed: tests:api/internal/target/
+      missed: tests:api/builtins/
+      missed: tests:api/resmap/
+  netty                     1.000  0.900  0.000  0.875  0.000  1.000  0.000    0.555  0.080  0.230   0.05 470145  
+      missed: entrypoints:ServerBootstrap.bind
+      missed: behavior:ServerBootstrap.bind -> initAndRegister -> channel registration
+      missed: behavior:NioEventLoop.run -> select -> processSelectedKeys -> handle events
+      missed: behavior:AbstractChannelHandlerContext.invokeChannelRead -> pipeline propagation
+      missed: behavior:ChannelOutboundBuffer.write -> flush -> socket write
+      missed: behavior:ByteToMessageDecoder.channelRead -> decode loop -> fireChannelRead
+      missed: behavior:EmbeddedChannel.writeInbound -> inbound processing
+      missed: behavior:ChannelFuture.addListener -> promise completion
+      missed: state_authority:Promise/ChannelPromise
+      missed: contracts:new ServerBootstrap().group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(init).bind(port)
+      missed: contracts:pipeline.addLast("decoder", new ByteToMessageDecoder(){...})
+      missed: contracts:channelRead(ctx, msg)
+      missed: contracts:write(ctx, msg)
+      missed: contracts:EmbeddedChannel(new Handler()).writeInbound(msg)
+      missed: contracts:ByteBuf.alloc().buffer(n)
+      missed: contracts:channel.closeFuture().sync()
+      missed: contracts:NioEventLoopGroup(threads)
+      missed: contracts:handler extends ChannelInboundHandlerAdapter
+      missed: contracts:ChannelFuture.addListener(f)
+      missed: tests:transport/src/test/java/io/netty/channel/
+      missed: tests:buffer/src/test/java/io/netty/buffer/
+      missed: tests:codec/src/test/java/io/netty/handler/codec/
+      missed: tests:codec-http/src/test/java/io/netty/handler/codec/http/
+      missed: tests:handler/src/test/java/io/netty/handler/
+  rayon                     0.444  0.400  0.000  0.429  0.000  1.000  0.000    0.255  0.036  0.095   0.79 14001  
+      missed: architecture:src/vec
+      missed: architecture:src/join
+      missed: architecture:src/scope
+      missed: architecture:src/thread_pool
+      missed: architecture:src/prelude
+      missed: entrypoints:par_iter
+      missed: entrypoints:par_iter_mut
+      missed: entrypoints:par_sort
+      missed: entrypoints:par_chunks
+      missed: entrypoints:par_extend
+      missed: entrypoints:into_par_iter
+      missed: behavior:join(a, b) -> task spawn -> work-stealing execution
+      missed: behavior:par_iter -> ParallelIterator::map -> find_any/for_each
+      missed: behavior:par_sort -> merge sort with parallel merges
+      missed: behavior:scope(|s| s.spawn(...)) -> scope registration -> execute tasks
+      missed: behavior:ThreadPoolBuilder::build -> new thread pool + Registry
+      missed: behavior:Registry::new -> spawn worker threads -> steal loop
+      missed: behavior:par_iter -> split -> drive_unindexed -> consume each item
+      missed: behavior:bridge consumer: fold/reduce across splits
+      missed: state_authority:ThreadPool
+      missed: state_authority:WorkerThread
+      missed: state_authority:global registry
+      missed: state_authority:job registry
+      missed: contracts:use rayon::prelude::*
+      missed: contracts:v.par_iter().map(f).collect()
+      missed: contracts:v.par_iter_mut().for_each(f)
+      missed: contracts:v.par_sort()
+      missed: contracts:join(f, g)
+      missed: contracts:scope(|s| { s.spawn(move || ...); })
+      missed: contracts:ThreadPoolBuilder::new().num_threads(n).build()
+      missed: contracts:v.par_chunks(n)
+      missed: contracts:par_extend into existing collection
+      missed: contracts:par_iter().filter().fold()
+      missed: tests:src/tests
+      missed: tests:tests/
+      missed: tests:rayon-core/tests/
+      missed: tests:tests/run-pass/
+      missed: tests:tests/compile_fail/
+  react                     1.000  1.000  0.000  0.167  0.000  0.250  0.000    0.433  0.011  0.046   0.03 517319  
+      missed: behavior:createRoot -> createContainer -> scheduleUpdateOnFiber
+      missed: behavior:scheduleUpdateOnFiber -> performConcurrentWorkOnRoot
+      missed: behavior:performUnitOfWork -> beginWork -> completeUnitOfWork
+      missed: behavior:commitRoot -> commitMutationEffects -> commitLayoutEffects
+      missed: behavior:dispatchSetState -> scheduleUpdateOnFiber
+      missed: behavior:renderWithHooks -> mountWorkInProgressHook
+      missed: behavior:ReactFlightServer render -> serializeJSX -> emit model chunks
+      missed: state_authority:FiberRoot
+      missed: state_authority:workInProgress
+      missed: state_authority:hook.memoizedState
+      missed: state_authority:ReactCurrentDispatcher
+      missed: state_authority:shared.pendingLanes
+      missed: contracts:createRoot(container).render(<App/>)
+      missed: contracts:useState(initialState) -> [state, setState]
+      missed: contracts:useEffect(effect, deps)
+      missed: contracts:useContext(Context)
+      missed: contracts:createContext(defaultValue)
+      missed: contracts:forwardRef(render)
+      missed: contracts:memo(Component)
+      missed: contracts:Suspense fallback={...}
+      missed: contracts:lazy(() => import('./Comp'))
+      missed: contracts:<App /> JSX element creation
+      missed: landmarks:ReactFiberBeginWork
+      missed: landmarks:ReactFiberCommitWork
+      missed: landmarks:ReactFiberHooks
+      missed: landmarks:ReactFiberLane
+      missed: landmarks:ReactFiberWorkLoop
+      missed: landmarks:pushEffect
+      missed: tests:packages/react/__tests__/
+      missed: tests:packages/react-dom/__tests__/
+      missed: tests:packages/react-reconciler/__tests__/
+      missed: tests:packages/react-server/__tests__/
+      missed: tests:packages/react-devtools/__tests__/
+  requests                  0.875  0.200  0.571  0.429  0.100  0.875  0.250    0.435  0.118  0.216   1.14 14853  
+      missed: architecture:requests.api
+      missed: entrypoints:requests.request
+      missed: entrypoints:requests.get
+      missed: entrypoints:requests.post
+      missed: entrypoints:requests.put
+      missed: entrypoints:requests.delete
+      missed: entrypoints:requests.head
+      missed: entrypoints:requests.patch
+      missed: entrypoints:Session.get/post
+      missed: behavior:Session.request -> Session.prepare_request -> Session.send -> HTTPAdapter.send
+      missed: behavior:HTTPAdapter.send -> urllib3.urlopen -> build Response
+      missed: behavior:Response.raise_for_status -> HTTPError
+      missed: state_authority:Session.auth
+      missed: state_authority:Response.content
+      missed: state_authority:PreparedRequest.url/headers/body
+      missed: state_authority:default_headers
+      missed: contracts:get(url, params=..., headers=..., timeout=...)
+      missed: contracts:timeout=(connect, read)
+      missed: contracts:allow_redirects=False
+      missed: contracts:stream=True
+      missed: contracts:verify=False
+      missed: contracts:auth=('user', 'pass')
+      missed: contracts:json={'key': 'value'}
+      missed: contracts:files={'file': open(...)}
+      missed: contracts:proxies={'https': 'http://proxy:8080'}
+      missed: landmarks:REDIRECT_STATI
+      missed: tests:tests/test_requests.py
+      missed: tests:tests/test_sessions.py
+      missed: tests:tests/test_utils.py
+  ripgrep                   0.875  0.286  0.000  0.143  0.000  1.000  0.000    0.261  0.015  0.043   0.60 16636  
+      missed: architecture:crates/core/flags
+      missed: entrypoints:main -> run(flags::parse())
+      missed: entrypoints:flags::parse
+      missed: entrypoints:Printer::print
+      missed: entrypoints:grep_cli::decompress
+      missed: entrypoints:--type/--type-add
+      missed: behavior:main -> flags::parse -> run -> SearchWorkerBuilder -> SearchWorker.search
+      missed: behavior:SearchWorker.search -> searcher.search -> Sink matches
+      missed: behavior:WalkBuilder -> ignore::Walk -> file iteration with gitignore filtering (crates/ignore/src/walk.rs)
+      missed: behavior:matcher.find_at -> regex match over haystack
+      missed: behavior:Printer.print -> write match lines/context
+      missed: behavior:haystack streaming: read buffer -> search -> print
+      missed: behavior:parallel search: work-stealing thread pool over files
+      missed: state_authority:HiArgs
+      missed: state_authority:LowArgs
+      missed: state_authority:SearchWorker
+      missed: state_authority:ignore::Types
+      missed: state_authority:Stats
+      missed: state_authority:MatchBuffer
+      missed: contracts:rg <pattern> [<path>...]
+      missed: contracts:-e/--regexp <pattern>
+      missed: contracts:-i/--ignore-case
+      missed: contracts:-v/--invert-match
+      missed: contracts:-n/--line-number
+      missed: contracts:-c/--count
+      missed: contracts:-l/--files-with-matches
+      missed: contracts:-L/--files-without-match
+      missed: contracts:--json
+      missed: contracts:-A/-B/-C <n>
+      missed: contracts:-g/--glob <pattern>
+      missed: contracts:-t/--type <type>
+      missed: contracts:-u/--unrestricted
+      missed: contracts:-a/--text
+      missed: contracts:--hidden
+      missed: contracts:-r/--replace <text>
+      missed: tests:crates/core/tests/
+      missed: tests:crates/searcher/tests/
+      missed: tests:crates/printer/tests/
+      missed: tests:crates/ignore/tests/
+      missed: tests:crates/matcher/tests/
+  tokio                     0.100  0.100  0.000  0.429  0.000  0.875  0.000    0.126  0.012  0.040   0.15 32523  
+      missed: architecture:tokio/src/runtime
+      missed: architecture:tokio/src/task
+      missed: architecture:tokio/src/sync
+      missed: architecture:tokio/src/io
+      missed: architecture:tokio/src/net
+      missed: architecture:tokio/src/fs
+      missed: architecture:tokio/src/time
+      missed: architecture:tokio/src/process
+      missed: architecture:tokio/src/signal
+      missed: entrypoints:#[tokio::main]
+      missed: entrypoints:tokio::runtime::Runtime
+      missed: entrypoints:tokio::spawn
+      missed: entrypoints:tokio::select!
+      missed: entrypoints:tokio::join!
+      missed: entrypoints:tokio::sync::Mutex::lock
+      missed: entrypoints:tokio::time::sleep
+      missed: entrypoints:tokio::net::TcpListener::accept
+      missed: entrypoints:tokio::io::AsyncWriteExt::write_all
+      missed: behavior:Runtime::new -> Builder::build -> create scheduler + driver
+      missed: behavior:block_on -> enter runtime -> park driver loop
+      missed: behavior:spawn -> schedule task on worker queue -> worker poll loop
+      missed: behavior:worker.poll -> poll_task -> run task future
+      missed: behavior:sleep -> register timer in time driver -> park until deadline
+      missed: behavior:TcpListener.accept -> poll_accept -> socket readiness via driver
+      missed: behavior:select! -> poll all branches -> winner continuation
+      missed: behavior:blocking pool: spawn_blocking -> BlockingPool -> thread spawn
+      missed: state_authority:worker.current_task / queue
+      missed: state_authority:TimeDriver
+      missed: state_authority:IO driver
+      missed: state_authority:BlockingPool
+      missed: contracts:#[tokio::main] async fn main()
+      missed: contracts:Runtime::new()
+      missed: contracts:tokio::spawn(async { ... }) -> JoinHandle
+      missed: contracts:Mutex::new(x).lock().await
+      missed: contracts:mpsc::channel(n)
+      missed: contracts:sleep(Duration).await
+      missed: contracts:timeout(dur, future).await
+      missed: contracts:TcpListener::bind(addr).await? -> accept().await
+      missed: contracts:select! { ... }
+      missed: contracts:tokio::fs::read_to_string(path).await
+      missed: landmarks:semaphore::Semaphore
+      missed: tests:tokio/tests/
+      missed: tests:tokio/tests/rt_common.rs
+      missed: tests:tokio/tests/time.rs
+      missed: tests:tokio/tests/sync_*.rs
+      missed: tests:tokio/tests/io_*.rs
+      missed: tests:tokio/tests/net_*.rs
+  vitest                    0.778  0.500  0.000  0.429  0.000  1.000  0.143    0.341  0.095  0.157   0.19 77664  
+      missed: architecture:packages/vitest/src/node
+      missed: architecture:packages/vitest/src/runtime
+      missed: entrypoints:vitest run
+      missed: entrypoints:vitest watch
+      missed: entrypoints:vi.fn
+      missed: entrypoints:vi.mock
+      missed: entrypoints:config defineConfig
+      missed: behavior:cli.ts -> startVitest -> createVitest -> runTests
+      missed: behavior:Vitest.runFiles -> createPool -> runTests in workers
+      missed: behavior:worker runTests -> describe/it collection -> execution
+      missed: behavior:expect -> matchers execution -> assertion result (packages/expect/src/index.ts)
+      missed: behavior:vi.mock -> hoisted mock registration -> module interception (packages/mocker/src/)
+      missed: behavior:reporter onTaskUpdate -> terminal output
+      missed: behavior:watch mode -> watcher -> re-run affected files
+      missed: state_authority:workspace/project
+      missed: state_authority:mockMap
+      missed: state_authority:snapshot manager
+      missed: state_authority:ViteNodeServer
+      missed: contracts:vitest run <pattern>
+      missed: contracts:vitest --watch
+      missed: contracts:test('name', fn)
+      missed: contracts:describe('suite', () => {...})
+      missed: contracts:expect(value).toBe(expected)
+      missed: contracts:expect(x).toThrow()
+      missed: contracts:vi.fn(impl)
+      missed: contracts:vi.mock('./module', factory)
+      missed: contracts:vi.spyOn(obj, 'method')
+      missed: contracts:beforeAll/afterAll hooks
+      missed: contracts:defineConfig({ test: {...} })
+      missed: tests:test/core/
+      missed: tests:test/cli/
+      missed: tests:test/config/
+      missed: tests:test/reporters/
+      missed: tests:test/snapshots/
+      missed: tests:packages/expect/__tests__/
+  vue                       1.000  1.000  0.000  0.143  0.000  1.000  0.000    0.429  0.078  0.166   0.79 24044  resolved:2
+      missed: behavior:createApp -> ensureRenderer -> createRenderer -> app.mount
+      missed: behavior:createRenderer -> render -> patch
+      missed: behavior:patch -> processComponent/processElement
+      missed: behavior:effect -> ReactiveEffect.run -> track/trigger
+      missed: behavior:ref -> toReactive -> reactive
+      missed: behavior:compile(template) -> baseCompile -> generate render function
+      missed: behavior:app.mount -> render(vnode, rootContainer)
+      missed: state_authority:app._instance
+      missed: state_authority:renderer
+      missed: state_authority:targetMap
+      missed: state_authority:component.ctx
+      missed: state_authority:compileCache
+      missed: state_authority:instance.setupState
+      missed: contracts:createApp(App).mount('#app')
+      missed: contracts:ref(0).value
+      missed: contracts:reactive({count: 0})
+      missed: contracts:computed(() => ...)
+      missed: contracts:watch(source, callback)
+      missed: contracts:defineComponent({setup() {...}})
+      missed: contracts:<template>...</template> compiled SFC
+      missed: contracts:onMounted(cb)
+      missed: contracts:app.use(plugin)
+      missed: contracts:v-model / v-if directives
+      missed: tests:packages/vue/__tests__/
+      missed: tests:packages/runtime-core/__tests__/
+      missed: tests:packages/runtime-dom/__tests__/
+      missed: tests:packages/reactivity/__tests__/
+      missed: tests:packages/compiler-core/__tests__/
+      missed: tests:packages/compiler-sfc/__tests__/
+  zerolog                   0.125  0.167  0.000  0.714  0.000  0.889  0.000    0.201  0.042  0.100   0.35 22731  
+      missed: architecture:log.go
+      missed: architecture:context.go
+      missed: architecture:console.go
+      missed: architecture:array.go
+      missed: architecture:globals.go
+      missed: architecture:hook.go
+      missed: architecture:cmd/zerolog
+      missed: entrypoints:zerolog.New(writer)
+      missed: entrypoints:log.Logger
+      missed: entrypoints:log.Info
+      missed: entrypoints:log.Debug
+      missed: entrypoints:log.Error
+      missed: entrypoints:log.Warn
+      missed: entrypoints:log.Fatal
+      missed: entrypoints:logger.With()
+      missed: entrypoints:zerolog.SetGlobalLevel
+      missed: entrypoints:log.Sample
+      missed: behavior:Info().Msg("...") -> newEvent -> Level -> write JSON
+      missed: behavior:With().Str("k","v").Logger() -> clone with context fields
+      missed: behavior:New -> newContext -> newEvent with context
+      missed: behavior:SetGlobalLevel -> global level gate in newEvent
+      missed: behavior:Event.write -> appendJSON -> writer.Write
+      missed: behavior:ConsoleWriter -> Write -> human formatting (console.go)
+      missed: behavior:Hook.Run on level events
+      missed: behavior:Sample -> sampler decision per event
+      missed: state_authority:globals
+      missed: state_authority:TimestampFieldName/LevelFieldName
+      missed: contracts:zerolog.New(os.Stderr).With().Timestamp().Logger()
+      missed: contracts:log.Info().Msg("hello")
+      missed: contracts:log.Error().Err(err).Msg("failed")
+      missed: contracts:log.Info().Str("k", "v").Int("n", 1).Msg("...")
+      missed: contracts:log.Info().Dict("d", dict)
+      missed: contracts:log.Info().Array("a", array)
+      missed: contracts:zerolog.SetGlobalLevel(zerolog.InfoLevel)
+      missed: contracts:log.Logger = log.With().Str("service", "x").Logger()
+      missed: contracts:log.Info().Timestamp()
+      missed: contracts:event.Enabled()
+      missed: contracts:hook.Run(e, level, msg)
+      missed: landmarks:array.Array
+      missed: tests:log_test.go
+      missed: tests:context_test.go
+      missed: tests:console_test.go
+      missed: tests:array_test.go
+      missed: tests:internal/json tests
+      missed: tests:benchmark_test.go
+  zod                       0.875  0.000  0.000  0.600  0.000  1.000  0.000    0.295  0.026  0.095   0.70 14248  
+      missed: architecture:v4/classic
+      missed: entrypoints:z.string
+      missed: entrypoints:z.number
+      missed: entrypoints:z.object
+      missed: entrypoints:z.array
+      missed: entrypoints:z.union
+      missed: entrypoints:z.enum
+      missed: entrypoints:schema.parse
+      missed: entrypoints:schema.safeParse
+      missed: entrypoints:schema.parseAsync
+      missed: entrypoints:z.infer
+      missed: entrypoints:z.coerce.string
+      missed: behavior:ZodString.parse -> _parse -> check
+      missed: behavior:ZodObject._parse -> parseObjectShape -> parse each field
+      missed: behavior:parse -> runAsyncValidations/syncValidations
+      missed: behavior:schema.safeParse -> parse -> catch error -> result object
+      missed: behavior:union._parse -> try each member
+      missed: behavior:coerce -> primitive coerce step before validation (coerce.ts)
+      missed: behavior:formatError -> flattenError
+      missed: state_authority:globalRegistry
+      missed: state_authority:errorTree
+      missed: contracts:z.string().min(1)
+      missed: contracts:z.number().int()
+      missed: contracts:z.object({ name: z.string() })
+      missed: contracts:z.array(z.string())
+      missed: contracts:z.union([z.string(), z.number()])
+      missed: contracts:z.enum(['a', 'b'])
+      missed: contracts:schema.parse(data) -> typed output
+      missed: contracts:schema.safeParse(data) -> {success, data|error}
+      missed: contracts:z.infer<typeof schema>
+      missed: contracts:schema.pick({...}) / .omit({...})
+      missed: tests:packages/zod/src/v4/classic/tests/
+      missed: tests:packages/zod/package.json test scripts
+      missed: tests:packages/integration/
+      missed: tests:packages/resolution/
+      missed: tests:packages/treeshake/
+  mean                      0.597  0.422  0.057  0.450  0.060  0.910  0.081    0.317  0.044  0.100   0.42 199019
+  scored: 20   skipped: 0
+  resolved calls (semantic backends upgraded): 56
+  gate: FAIL (overall mean recall 0.317 >= 0.5)
+
+=== gap (validation - development) ===
+  layer                     gap
+  architecture           -0.324
+  entrypoints            +0.000
+  behavior               -0.249
+  state_authority        +0.083
+  contracts              -0.279
+  overall                -0.154
+  verdict: OVERFIT (validation 0.317 vs development 0.471; tolerance 0.050)
+  F2: development 0.161 | validation 0.100
+  results written to: /Users/rocket/system_ir/benchmarks/results/holdout-v3.txt
