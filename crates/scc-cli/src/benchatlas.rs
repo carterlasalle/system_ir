@@ -355,6 +355,10 @@ pub struct RepoRecall {
     /// not fatal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends_missing: Vec<String>,
+    /// Resolution error text when the backend was found but the resolve
+    /// pass failed (e.g. LSP handshake) — degraded, not fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_error: Option<String>,
     /// Number of ground-truth items in the (informational) landmarks layer.
     pub landmark_items: usize,
     /// When set, the repo was not scored (missing dir / missing ground
@@ -400,6 +404,7 @@ impl Default for RepoRecall {
             resolved_calls: 0,
             backends_used: Vec::new(),
             backends_missing: Vec::new(),
+            resolve_error: None,
             landmark_items: 0,
             skipped_reason: None,
             missed: Vec::new(),
@@ -820,6 +825,7 @@ pub fn score_repo(
     crate::commands::cmd_index(repo_dir, true).map_err(|e| format!("index failed: {e}"))?;
     let mut backends_used: Vec<String> = Vec::new();
     let mut backends_missing: Vec<String> = Vec::new();
+    let mut resolve_error: Option<String> = None;
     let resolved_calls = if resolve {
         match crate::resolve_and_recompile(repo_dir) {
             Ok(rep) => {
@@ -832,6 +838,7 @@ pub fn score_repo(
                     "benchatlas: semantic resolution skipped for {}: {e}",
                     repo_dir.display()
                 );
+                resolve_error = Some(e.to_string());
                 0
             }
         }
@@ -946,6 +953,7 @@ pub fn score_repo(
         resolved_calls,
         backends_used,
         backends_missing,
+        resolve_error,
         landmark_items: gt.landmarks.len(),
         skipped_reason: None,
         missed,
