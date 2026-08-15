@@ -1,0 +1,80 @@
+{
+  "row": {
+    "budget": 16000,
+    "context_tokens": 0,
+    "first_plan_accuracy": 1.0,
+    "mean_exploration": 0.0,
+    "mean_files_opened": 0.0,
+    "mean_files_opened_before_first_correct": 0.0,
+    "mean_graph_tool_calls": 0.0,
+    "mean_search_tool_calls": 0.0,
+    "repo": "cli-service",
+    "success_rate": 1.0,
+    "tasks": 3,
+    "variant": "raw"
+  },
+  "summary": {
+    "mean_duration_ms": 22.0,
+    "mean_files_opened": 0.0,
+    "mean_first_correct_ms": null,
+    "mean_first_plan_correct": 1.0,
+    "mean_graph_tool_calls": 0.0,
+    "mean_localization": 0.0,
+    "mean_read_tool_calls": 0.0,
+    "mean_search_tool_calls": 0.0,
+    "mean_wrong_first_locations": 0.0,
+    "passed": 3,
+    "results": [
+      {
+        "duration_ms": 22,
+        "exit_ok": true,
+        "files_opened": 0,
+        "files_surfaced": 0,
+        "files_total": 3,
+        "first_correct_ms": null,
+        "first_plan_correct": true,
+        "graph_tool_calls": 0,
+        "id": "cli-service.deploy-env-required",
+        "output_bytes": 61,
+        "read_tool_calls": 0,
+        "search_tool_calls": 0,
+        "total_tool_calls": 0,
+        "wrong_first_locations": 0
+      },
+      {
+        "duration_ms": 22,
+        "exit_ok": true,
+        "files_opened": 0,
+        "files_surfaced": 0,
+        "files_total": 1,
+        "first_correct_ms": null,
+        "first_plan_correct": true,
+        "graph_tool_calls": 0,
+        "id": "cli-service.health-route",
+        "output_bytes": 42,
+        "read_tool_calls": 0,
+        "search_tool_calls": 0,
+        "total_tool_calls": 0,
+        "wrong_first_locations": 0
+      },
+      {
+        "duration_ms": 22,
+        "exit_ok": true,
+        "files_opened": 0,
+        "files_surfaced": 0,
+        "files_total": 3,
+        "first_correct_ms": null,
+        "first_plan_correct": true,
+        "graph_tool_calls": 0,
+        "id": "cli-service.serve-paging-flag",
+        "output_bytes": 44,
+        "read_tool_calls": 0,
+        "search_tool_calls": 0,
+        "total_tool_calls": 0,
+        "wrong_first_locations": 0
+      }
+    ],
+    "tasks": 3,
+    "variant": "raw"
+  }
+}
