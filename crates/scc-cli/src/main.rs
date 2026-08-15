@@ -13,6 +13,7 @@ use std::path::PathBuf;
                    into an evidence-backed machine model of a software system, then emits small task-specific context packs \
                    for coding agents. Give agents more repository understanding per token."
 )]
+// trace:v1 id=impl.scc.cli.main work=WORK-SCC-014 satisfies=REQ-SCC-IR
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -23,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// trace:exempt reason=internal-detail
 enum Commands {
     /// Initialize the SCC workspace (.scc/config.yaml + database)
     Init,
@@ -56,6 +58,18 @@ enum Commands {
     Context {
         #[command(subcommand)]
         sub: ContextSub,
+    },
+
+    /// The System Surface Map: the actual callable API layer (Wave 14)
+    Surface {
+        /// Personalize the map for a task goal (task PPR re-ranking)
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Append per-entry rank reasons
+        #[arg(long)]
+        explain: bool,
     },
 
     /// Impact analysis for a change
@@ -349,7 +363,15 @@ enum BenchSub {
 }
 
 #[derive(Subcommand)]
+// trace:exempt reason=internal-detail
 enum ContextSub {
+    /// Wave 14C startup artifact: Atlas + Surface fusion, deterministic per
+    /// epoch (prompt-cache stable)
+    Startup {
+        /// Token budget (default: the full startup split, 20000)
+        #[arg(long)]
+        budget: Option<usize>,
+    },
     /// Task context pack for a goal
     Task {
         goal: String,
@@ -455,6 +477,7 @@ enum SetupSub {
     Hermes,
 }
 
+// trace:exempt reason=internal-detail
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default SIGPIPE behavior: dying silently on `scc ... | head` is the
     // standard Unix contract; ignoring it makes println! panic on EPIPE.
@@ -492,6 +515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => commands::cmd_watch(&root),
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {
+            ContextSub::Startup { budget } => commands::cmd_context_startup(&root, budget),
             ContextSub::Task { goal, files, symbols, budget, json, hook, resolve } => {
                 if resolve {
                     let rep = scc_cli::resolve_and_recompile(&root)?;
@@ -527,6 +551,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Impact { diff, files, symbols, json } => {
             commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json)
+        }
+        Commands::Surface { task, budget, explain } => {
+            commands::cmd_surface(&root, task.as_deref(), budget, explain)
         }
         Commands::Atlas { budget, json, resolve } => {
             if resolve {

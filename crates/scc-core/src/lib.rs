@@ -4,7 +4,7 @@
 //! document serializes to the documented export format without translation.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA_VERSION: &str = "0.1.0";
 
@@ -1215,6 +1215,391 @@ pub fn truncate_to_budget(text: &str, budget: usize) -> String {
 
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// ---------------------------------------------------------------------------
+// Wave 14: System Surface Map — the actual callable code surface (Aider
+// RepoMap equivalent built from System IR). Level 1 of the four-level
+// context stack (docs/SYSTEM_DESIGN.md Wave 14).
+// ---------------------------------------------------------------------------
+
+/// A source range: file path + 1-based inclusive line span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SourceRange {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+// trace:exempt reason=internal-detail
+impl SourceRange {
+// trace:exempt reason=internal-detail
+    pub fn new(path: impl Into<String>, start_line: u32, end_line: u32) -> Self {
+        SourceRange {
+            path: path.into(),
+            start_line,
+            end_line,
+        }
+    }
+}
+
+/// Symbol visibility as declared in source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+    Package,
+}
+
+// trace:exempt reason=internal-detail
+impl Visibility {
+// trace:exempt reason=internal-detail
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Protected => "protected",
+            Visibility::Private => "private",
+            Visibility::Package => "package",
+        }
+    }
+}
+
+/// The kind of code surface a definition exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
+pub enum SurfaceKind {
+    Function,
+    Method,
+    Constructor,
+    Class,
+    Interface,
+    Trait,
+    Type,
+    Enum,
+    Const,
+    Module,
+    Record,
+}
+
+// trace:exempt reason=internal-detail
+impl SurfaceKind {
+// trace:exempt reason=internal-detail
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SurfaceKind::Function => "function",
+            SurfaceKind::Method => "method",
+            SurfaceKind::Constructor => "constructor",
+            SurfaceKind::Class => "class",
+            SurfaceKind::Interface => "interface",
+            SurfaceKind::Trait => "trait",
+            SurfaceKind::Type => "type",
+            SurfaceKind::Enum => "enum",
+            SurfaceKind::Const => "const",
+            SurfaceKind::Module => "module",
+            SurfaceKind::Record => "record",
+        }
+    }
+}
+
+/// One function/method parameter in structured form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SemanticParameter {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<String>,
+    /// `&self` / `self` receiver parameters.
+    #[serde(default)]
+    pub receiver: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub variadic: bool,
+}
+
+/// The structured machine form of a signature — the semantic layer over
+/// the exact source text. Benchmark matching uses this, never string
+/// comparisons of source signatures alone.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SemanticSignature {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
+    #[serde(default)]
+    pub async_: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generic_parameters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<SemanticParameter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<String>,
+    /// `where` / trait-bound constraints (`T: Send + Sync`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+}
+
+/// Why a surface entry earned its rank (explainability; `scc surface
+/// --explain` renders this).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SurfaceRank {
+    pub task_ppr: f64,
+    pub global_ppr: f64,
+    pub lexical: f64,
+    pub semantic: f64,
+    pub confidence: f64,
+    pub criticality: f64,
+    pub change_risk: f64,
+    pub novelty: f64,
+    pub total: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+// trace:exempt reason=internal-detail
+impl Default for SurfaceRank {
+// trace:exempt reason=internal-detail
+    fn default() -> Self {
+        SurfaceRank {
+            task_ppr: 0.0,
+            global_ppr: 0.0,
+            lexical: 0.0,
+            semantic: 0.0,
+            confidence: 0.0,
+            criticality: 0.0,
+            change_risk: 0.0,
+            novelty: 0.0,
+            total: 0.0,
+            reasons: Vec::new(),
+        }
+    }
+}
+
+/// One ranked definition on the system surface — a callable/typeable
+/// reality of the architecture, with exact signatures and architectural
+/// meaning attached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SurfaceEntry {
+    pub id: String,
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub kind: SurfaceKind,
+    pub path: String,
+    pub range: SourceRange,
+    /// Exact source representation of the signature.
+    pub source_signature: String,
+    /// Whitespace/dialect-normalized signature (dedupe/comparison/index).
+    pub canonical_signature: String,
+    pub semantic_signature: SemanticSignature,
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub exported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsystem: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_authorities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_surfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callees: Vec<String>,
+    pub provenance: Provenance,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default)]
+    pub rank: SurfaceRank,
+}
+
+/// A definition deliberately omitted by a token-budget cut — the artifact
+/// never silently implies completeness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SurfaceOmission {
+    pub count: usize,
+    pub kind: String,
+    pub reason: String,
+}
+
+/// The System Surface Map: the ranked actual-API layer of a repository,
+/// built from System IR (Level 1 of the context stack).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SystemSurfaceMap {
+    pub repository: String,
+    pub revision: String,
+    pub epoch: String,
+    pub entries: Vec<SurfaceEntry>,
+    #[serde(default)]
+    pub token_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<SurfaceOmission>,
+}
+
+/// A normalized reference between two symbols (Wave 14): the graph the
+/// ranker walks. Many SCC relationships already express these concepts;
+/// this layer normalizes them for ranking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct ReferenceEdge {
+    pub source_symbol: String,
+    pub target_symbol: String,
+    pub kind: ReferenceKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<SourceRange>,
+    pub provenance: Provenance,
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
+pub enum ReferenceKind {
+    Read,
+    Write,
+    Call,
+    TypeUse,
+    Instantiate,
+    Implement,
+    Extend,
+    Decorate,
+    Register,
+    Import,
+    Export,
+}
+
+// trace:exempt reason=internal-detail
+impl ReferenceKind {
+// trace:exempt reason=internal-detail
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReferenceKind::Read => "read",
+            ReferenceKind::Write => "write",
+            ReferenceKind::Call => "call",
+            ReferenceKind::TypeUse => "type_use",
+            ReferenceKind::Instantiate => "instantiate",
+            ReferenceKind::Implement => "implement",
+            ReferenceKind::Extend => "extend",
+            ReferenceKind::Decorate => "decorate",
+            ReferenceKind::Register => "register",
+            ReferenceKind::Import => "import",
+            ReferenceKind::Export => "export",
+        }
+    }
+}
+
+/// A token-optimized context candidate (Aider-style hard budget search).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct ContextItem {
+    pub id: String,
+    pub value: f64,
+    pub token_cost: usize,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// The startup/task context budget split (Wave 14 dynamic budgets).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct ContextBudget {
+    pub total: usize,
+    pub atlas: usize,
+    pub surface: usize,
+    pub task_delta: usize,
+    pub structural_source: usize,
+}
+
+// trace:exempt reason=internal-detail
+impl Default for ContextBudget {
+// trace:exempt reason=internal-detail
+    fn default() -> Self {
+        ContextBudget {
+            total: 20_000,
+            atlas: 13_000,
+            surface: 7_000,
+            task_delta: 3_000,
+            structural_source: 6_000,
+        }
+    }
+}
+
+/// What the agent has already seen — novelty suppression source (the
+/// general form of Aider treating chat files specially).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct ContextLedger {
+    pub model_epoch: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub visible_entities: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub visible_symbols: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub visible_files: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub visible_components: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub visible_flows: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_task: Option<String>,
+}
+
+/// One structural-source unit: semantic skeleton of an implementation
+/// slice (Level 2), with provenance back to the exact source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct StructuralSourceUnit {
+    pub path: String,
+    /// `source: <path>:L<start>-L<end>` provenance line.
+    pub source: String,
+    pub representation: String,
+    pub revision: String,
+    pub content: String,
+}
+
+/// The deterministic startup artifact (Atlas + Surface), hash-stable per
+/// epoch so prompt caches hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct ContextArtifact {
+    pub kind: String,
+    pub epoch: String,
+    pub renderer_version: String,
+    pub trust_policy: String,
+    pub budget: ContextBudget,
+    pub sha256: String,
+    pub text: String,
+}
+
+/// One task-seed resolution: task language -> SCC entities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct TaskSeed {
+    pub kind: String,
+    pub id: String,
+    pub weight: f64,
 }
 
 #[cfg(test)]

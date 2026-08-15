@@ -5,8 +5,14 @@
 //! evidence status, and warnings. STALE facts never enter trusted sections.
 
 pub mod atlas;
+pub mod context_ledger;
 pub mod packs;
+pub mod pagerank;
 pub mod rank;
+pub mod selector;
+pub mod startup;
+pub mod structural_source;
+pub mod surface;
 
 use scc_core::estimate_tokens;
 use scc_graph::{RealityGraph, TrustedGraphView, TrustPolicy};
@@ -15,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail
+// trace:v1 id=impl.scc.context work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub struct ContextSettings {
     pub startup_tokens: usize,
     pub task_tokens: usize,
@@ -39,6 +47,7 @@ impl Default for ContextSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct ContextPack {
     pub kind: String,
     pub repository_revision: String,
@@ -97,6 +106,7 @@ impl ContextPack {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub struct ContextCompiler<'a> {
     pub store: &'a Store,
     /// Trusted view: the only way this compiler may query the reality graph.

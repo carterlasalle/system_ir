@@ -1,0 +1,1168 @@
+//! Personalized PageRank over the System IR reference graph (Wave 14B).
+//!
+//! Layering invariants: ranking NEVER creates architectural truth — it only
+//! normalizes relationships that already exist as trusted facts in the
+//! `TrustedGraphView` and walks them. `FlowGraph` remains the causal
+//! authority; this module never orders flow steps.
+//!
+//! Structure:
+//! - [`build_reference_graph`] normalizes existing trusted relationships into
+//!   [`ReferenceEdge`]s (never invents new relationships).
+//! - [`SystemRanker`] runs personalized PageRank (power iteration, damping
+//!   0.85, 50 iterations) over symbol↔symbol reference edges, with an
+//!   architectural seed vector for the global vector and task-seed
+//!   personalization for task vectors.
+//! - [`architectural_specificity`] boosts public facades/entrypoints/state
+//!   owners/contract endpoints/flow participants and penalizes generic
+//!   utilities, generated/vendored code, and ubiquitous symbols — keeping
+//!   central utilities from dominating the ranking.
+//! - [`final_importance`] is the spec's blend of task/global PPR with
+//!   lexical, semantic, confidence, criticality, change-risk and novelty
+//!   signals.
+//!
+//! Everything is deterministic (fixed iteration count, sorted indices,
+//! id-ordered traversals) and no-panic (clamped weights, guarded
+//! division).
+
+use scc_core::{
+    kinds, predicates, Provenance, ReferenceEdge, ReferenceKind, Relationship, SourceRange,
+    SurfaceEntry, TaskSeed,
+};
+use scc_graph::TrustedGraphView;
+use std::collections::{HashMap, HashSet};
+
+// ---------------------------------------------------------------------------
+// Edge weight constants (spec §2)
+// ---------------------------------------------------------------------------
+
+/// Weight category for flow-participation edges (flows are trusted facts;
+/// the ranker never invents flow ordering).
+pub const FLOW_PARTICIPATION: f64 = 1.5;
+/// Weight category for invocation edges (`invokes`, callbacks).
+pub const INVOCATION: f64 = 1.5;
+/// Weight category for public-API edges (`exports`).
+pub const PUBLIC_API: f64 = 1.4;
+/// Weight category for state/reactive ownership edges (`owns`).
+pub const OWNS_STATE: f64 = 1.4;
+/// Weight category for data-flow edges (`reads`/`writes`/`produces`/`consumes`).
+pub const PRODUCES_CONSUMES: f64 = 1.3;
+/// Weight category for `implements` edges.
+pub const IMPLEMENTS: f64 = 1.25;
+/// Weight category for `inherits` edges.
+pub const EXTENDS: f64 = 1.2;
+/// Weight category for symbol-resolved `calls` edges.
+pub const CALLS_RESOLVED: f64 = 1.2;
+/// Weight category for contract-registration edges (`registers`).
+pub const CONTRACT_PARTICIPATION: f64 = 1.2;
+/// Weight category for `publishes`/`subscribes` edges.
+pub const SUBSCRIBES_PUBLISHES: f64 = 1.2;
+/// Neutral dependency weight (unmapped predicates, `depends_on`).
+pub const DEPENDS_ON: f64 = 1.0;
+/// Weight category for text-extracted (unresolved) `calls` edges.
+pub const CALLS_EXTRACTED: f64 = 0.9;
+/// Weight category for `imports` edges.
+pub const IMPORTS: f64 = 0.6;
+/// Weight category for containment edges (`contains`).
+pub const CONTAINS: f64 = 0.4;
+
+/// Provenance weights (spec §2): STALE facts weigh zero (the trusted view
+/// already excludes them; the zero is a belt-and-suspenders floor).
+pub const PROV_OBSERVED: f64 = 1.0;
+pub const PROV_RESOLVED: f64 = 1.0;
+pub const PROV_EXTRACTED: f64 = 0.85;
+pub const PROV_DECLARED: f64 = 0.8;
+pub const PROV_INFERRED: f64 = 0.6;
+pub const PROV_STALE: f64 = 0.0;
+
+/// PageRank damping factor.
+pub const DAMPING_FACTOR: f64 = 0.85;
+/// Fixed power-iteration count (deterministic).
+pub const POWER_ITERATIONS: usize = 50;
+/// Warm-start blend of the global vector into the task vector's start state.
+pub const WARM_START_GLOBAL_BLEND: f64 = 0.3;
+
+/// Ubiquity threshold: a symbol referenced by more distinct sources than
+/// this is "ubiquitous" and gets penalized by [`architectural_specificity`].
+pub const UBIQUITY_THRESHOLD: usize = 20;
+
+/// Generic utility name tokens that make a symbol architecturally generic.
+const GENERIC_NAMES: [&str; 7] = [
+    "utils", "logger", "errors", "common", "types", "helpers", "config",
+];
+
+/// Entity kinds that count as invocation surfaces (route/endpoint/event/
+/// topic/queue handlers are reachable from outside the process).
+const INVOCATION_KINDS: [&str; 5] = [
+    kinds::ROUTE,
+    kinds::ENDPOINT,
+    kinds::EVENT,
+    kinds::TOPIC,
+    kinds::QUEUE,
+];
+
+/// Entity kinds that count as contract endpoints for registration edges.
+const CONTRACT_KINDS: [&str; 2] = [kinds::CONTRACT, kinds::REGISTRY];
+
+// ---------------------------------------------------------------------------
+// Weight helpers
+// ---------------------------------------------------------------------------
+
+/// Provenance weight per spec §2.
+// trace:exempt reason=internal-detail
+pub fn provenance_weight(provenance: Provenance) -> f64 {
+    match provenance {
+        Provenance::Observed => PROV_OBSERVED,
+        Provenance::Resolved => PROV_RESOLVED,
+        Provenance::Extracted => PROV_EXTRACTED,
+        Provenance::Declared => PROV_DECLARED,
+        Provenance::Inferred => PROV_INFERRED,
+        Provenance::Stale => PROV_STALE,
+    }
+}
+
+/// Rarity of a target symbol: `log(total_symbols / (1 + in_degree))`
+/// clamped to [0.25, 1.5]. Occurrence = in-degree count of the target
+/// (distinct referencing sources). A ubiquitous `logger`-ish symbol is
+/// rare-except-common and gets downweighted; a distinctive symbol is rare
+/// and gets boosted.
+// trace:exempt reason=internal-detail
+pub fn rarity(total_symbols: usize, in_degree: usize) -> f64 {
+    if total_symbols == 0 {
+        return 1.0;
+    }
+    let r = (total_symbols as f64 / (1 + in_degree) as f64).ln();
+    r.clamp(0.25, 1.5)
+}
+
+/// Predicate weight category for an SCC predicate. `calls` is refined by
+/// provenance: symbol-resolved calls weigh more than text-extracted ones.
+// trace:exempt reason=internal-detail
+pub fn predicate_weight(predicate: &str, provenance: Provenance) -> f64 {
+    match predicate {
+        predicates::CALLS => match provenance {
+            Provenance::Resolved => CALLS_RESOLVED,
+            _ => CALLS_EXTRACTED,
+        },
+        predicates::INVOKES | predicates::HANDLES_CALLBACK => INVOCATION,
+        predicates::EXPORTS => PUBLIC_API,
+        predicates::OWNS => OWNS_STATE,
+        predicates::READS | predicates::WRITES => PRODUCES_CONSUMES,
+        predicates::IMPLEMENTS | predicates::IMPLEMENTED_BY => IMPLEMENTS,
+        predicates::INHERITS => EXTENDS,
+        predicates::REGISTERS => CONTRACT_PARTICIPATION,
+        predicates::PUBLISHES | predicates::SUBSCRIBES => SUBSCRIBES_PUBLISHES,
+        predicates::IMPORTS => IMPORTS,
+        predicates::CONTAINS => CONTAINS,
+        _ => DEPENDS_ON,
+    }
+}
+
+/// Full edge weight (spec §2): `predicate_weight * provenance_weight *
+/// confidence * rarity`. `target_in_degree` is the in-degree count of the
+/// target symbol (distinct referencing sources).
+// trace:exempt reason=internal-detail
+pub fn edge_weight(
+    predicate: &str,
+    provenance: Provenance,
+    confidence: f64,
+    total_symbols: usize,
+    target_in_degree: usize,
+) -> f64 {
+    predicate_weight(predicate, provenance)
+        * provenance_weight(provenance)
+        * confidence.clamp(0.0, 1.0)
+        * rarity(total_symbols, target_in_degree)
+}
+
+// ---------------------------------------------------------------------------
+// Reference normalization
+// ---------------------------------------------------------------------------
+
+/// Map an SCC predicate to a [`ReferenceKind`], given the target entity
+/// kind (needed to scope `owns` to state/reactive per the spec). `None`
+/// means the predicate is not part of the normalized reference surface —
+/// it is left alone, never invented.
+// trace:exempt reason=internal-detail
+fn reference_kind(predicate: &str, target_kind: &str) -> Option<ReferenceKind> {
+    match predicate {
+        predicates::CALLS | predicates::INVOKES | predicates::HANDLES_CALLBACK => {
+            Some(ReferenceKind::Call)
+        }
+        predicates::READS => Some(ReferenceKind::Read),
+        predicates::WRITES => Some(ReferenceKind::Write),
+        predicates::OWNS if target_kind == kinds::STATE || target_kind == kinds::REACTIVE => {
+            Some(ReferenceKind::Write)
+        }
+        predicates::IMPLEMENTS | predicates::IMPLEMENTED_BY => Some(ReferenceKind::Implement),
+        predicates::INHERITS => Some(ReferenceKind::Extend),
+        predicates::REGISTERS | predicates::PUBLISHES | predicates::SUBSCRIBES => {
+            Some(ReferenceKind::Register)
+        }
+        predicates::IMPORTS => Some(ReferenceKind::Import),
+        predicates::EXPORTS => Some(ReferenceKind::Export),
+        predicates::DECORATES | predicates::ANNOTATES => Some(ReferenceKind::Decorate),
+        _ => None,
+    }
+}
+
+/// Evidence file/line for a relationship, when available. The trusted view
+/// does not expose store evidence rows, so this uses the symbol entities'
+/// recorded `file`/`start_line`/`end_line` attributes (the same source
+/// evidence the extractors recorded at index time). Subject first, then
+/// object; deduplicated; empty when neither endpoint is a symbol.
+// trace:exempt reason=internal-detail
+fn locations_for(view: &TrustedGraphView, rel: &Relationship) -> Vec<SourceRange> {
+    let mut locs: Vec<SourceRange> = Vec::new();
+    for id in [&rel.subject, &rel.object] {
+        let Some(e) = view.entity(id) else { continue };
+        if e.kind != kinds::SYMBOL {
+            continue;
+        }
+        let Some(path) = e.attributes.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let start = e
+            .attributes
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let end = e
+            .attributes
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let start = start.max(1);
+        let loc = SourceRange::new(path, start, end.max(start));
+        if !locs.contains(&loc) {
+            locs.push(loc);
+        }
+    }
+    locs
+}
+
+/// Normalize existing trusted relationships into reference edges. Never
+/// invents new relationships: every edge traces to one trusted fact.
+///
+/// Mapping (actual predicates from `scc_core::predicates`):
+/// - `calls`/`invokes`/`handles_callback` → Call
+/// - `reads` → Read; `writes` → Write
+/// - `owns` (state/reactive entity) → Write
+/// - `implements`/`implemented_by` → Implement
+/// - `inherits` → Extend
+/// - `registers`/`publishes`/`subscribes` → Register
+/// - `imports` → Import; `exports` → Export
+/// - `decorates`/`annotates` → Decorate
+///
+/// Confidence passes through from the relationship (default 1.0); locations
+/// are the evidence file/line when available. Deterministic: the trusted
+/// view returns relationships sorted by id.
+// trace:v1 id=impl.scc.pagerank work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn build_reference_graph(view: &TrustedGraphView) -> Vec<ReferenceEdge> {
+    let mut out: Vec<ReferenceEdge> = Vec::new();
+    for rel in view.all_rels() {
+        let target_kind = view
+            .entity(&rel.object)
+            .map(|e| e.kind.as_str())
+            .unwrap_or("");
+        let kind = match reference_kind(&rel.predicate, target_kind) {
+            Some(k) => k,
+            None => continue,
+        };
+        // `implemented_by` is stored interface→class; normalize to class→interface.
+        let (source, target) = if rel.predicate == predicates::IMPLEMENTED_BY {
+            (rel.object.clone(), rel.subject.clone())
+        } else {
+            (rel.subject.clone(), rel.object.clone())
+        };
+        out.push(ReferenceEdge {
+            source_symbol: source,
+            target_symbol: target,
+            kind,
+            locations: locations_for(view, rel),
+            provenance: rel.provenance,
+            confidence: rel.confidence as f32,
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// SystemRanker
+// ---------------------------------------------------------------------------
+
+/// Personalized PageRank over the symbol reference graph.
+///
+/// Nodes are symbol entities (id-sorted for determinism). Edges are
+/// trusted relationships whose both endpoints are symbols and whose
+/// predicate normalizes to a reference kind; weights follow the spec
+/// formula. The global vector is computed once per epoch (Main caches the
+/// `SystemRanker`); task vectors personalize from `TaskSeed`s with a
+/// warm start blended from the global vector.
+// trace:exempt reason=internal-detail
+pub struct SystemRanker<'a> {
+    view: &'a TrustedGraphView<'a>,
+    /// Sorted symbol entity ids; index i in every vector == `symbols[i]`.
+    symbols: Vec<String>,
+    index: HashMap<String, usize>,
+    /// Row-normalized out-edge adjacency: (target index, weight).
+    adjacency: Vec<Vec<(usize, f64)>>,
+    /// Distinct referencing sources per symbol (rarity/ubiquity input).
+    in_degree: Vec<usize>,
+    /// Precomputed global (architecturally seeded) PageRank vector.
+    global: Vec<f64>,
+}
+
+// trace:exempt reason=internal-detail
+impl<'a> SystemRanker<'a> {
+    /// Build the ranker from the trusted view. Deterministic; O(E) edges.
+// trace:exempt reason=internal-detail
+    pub fn new(view: &'a TrustedGraphView<'a>) -> SystemRanker<'a> {
+        let mut symbols: Vec<String> = view
+            .entities()
+            .filter(|e| e.kind == kinds::SYMBOL)
+            .map(|e| e.id.clone())
+            .collect();
+        symbols.sort();
+        let index: HashMap<String, usize> = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+        let n = symbols.len();
+
+        // Pass 1: collect symbol↔symbol edges + per-target distinct sources.
+        let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+        let mut in_sources: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for rel in view.all_rels() {
+            let (Some(&si), Some(&ti)) = (index.get(&rel.subject), index.get(&rel.object)) else {
+                continue;
+            };
+            let target_kind = view
+                .entity(&rel.object)
+                .map(|e| e.kind.as_str())
+                .unwrap_or("");
+            if reference_kind(&rel.predicate, target_kind).is_none() {
+                continue;
+            }
+            in_sources[ti].insert(si);
+            let w = predicate_weight(&rel.predicate, rel.provenance)
+                * provenance_weight(rel.provenance)
+                * rel.confidence.clamp(0.0, 1.0);
+            edges.push((si, ti, w));
+        }
+        let in_degree: Vec<usize> = in_sources.iter().map(|s| s.len()).collect();
+
+        // Aggregate parallel edges (sum weights), apply rarity, row-normalize.
+        let mut agg: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+        for (si, ti, w) in edges {
+            let r = rarity(n, in_degree[ti]);
+            *agg[si].entry(ti).or_insert(0.0) += w * r;
+        }
+        let mut adjacency: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for (i, row) in agg.iter().enumerate() {
+            let sum: f64 = row.values().sum();
+            if sum > 0.0 {
+                let mut v: Vec<(usize, f64)> =
+                    row.iter().map(|(j, w)| (*j, w / sum)).collect();
+                v.sort_by_key(|(j, _)| *j);
+                adjacency[i] = v;
+            }
+        }
+
+        let ranker = SystemRanker {
+            view,
+            symbols,
+            index,
+            adjacency,
+            in_degree,
+            global: Vec::new(),
+        };
+        let global = Self::ppr(&ranker.adjacency, &ranker.global_personalization());
+        let mut ranker = ranker;
+        ranker.global = global;
+        ranker
+    }
+
+    /// Symbol entity ids in rank order (index i in every vector maps to
+    /// `symbols()[i]`).
+// trace:exempt reason=internal-detail
+    pub fn symbols(&self) -> &[String] {
+        &self.symbols
+    }
+
+    /// Symbol index for an entity id, if it is a ranked symbol.
+// trace:exempt reason=internal-detail
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.index.get(id).copied()
+    }
+
+    /// Distinct referencing sources of a symbol id (0 when absent).
+// trace:exempt reason=internal-detail
+    pub fn in_degree(&self, id: &str) -> usize {
+        self.index
+            .get(id)
+            .map(|i| self.in_degree[*i])
+            .unwrap_or(0)
+    }
+
+    /// Precomputed global PageRank vector (architecturally seeded; see
+    /// [`SystemRanker::global_personalization`]). Main caches the ranker per
+    /// epoch and reads this.
+// trace:exempt reason=internal-detail
+    pub fn global_vector(&self) -> Vec<f64> {
+        self.global.clone()
+    }
+
+    /// Task-personalized PageRank vector. Seeds come from `TaskSeed`s whose
+    /// `id` is a symbol entity id; the seed vector carries `weight` at each
+    /// matched index. Warm start: 0.3 × global + 0.7 × normalized seeds.
+    /// Unresolvable seed sets fall back to the global vector (never panic).
+// trace:exempt reason=internal-detail
+    pub fn task_vector(&self, seeds: &[TaskSeed]) -> Vec<f64> {
+        let n = self.symbols.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut s = vec![0.0; n];
+        let mut found = false;
+        for seed in seeds {
+            if let Some(&i) = self.index.get(&seed.id) {
+                s[i] += seed.weight.max(0.0);
+                found = true;
+            }
+        }
+        if !found {
+            return self.global.clone();
+        }
+        let sum: f64 = s.iter().sum();
+        if sum <= 0.0 {
+            return self.global.clone();
+        }
+        let s: Vec<f64> = s.iter().map(|v| v / sum).collect();
+        let mut start = vec![0.0; n];
+        for i in 0..n {
+            start[i] = WARM_START_GLOBAL_BLEND * self.global[i] + (1.0 - WARM_START_GLOBAL_BLEND) * s[i];
+        }
+        Self::ppr_with(&self.adjacency, &s, &start)
+    }
+
+    /// Architectural seed vector (weight 1.0 per seed): exported symbols,
+    /// symbols with entrypoint attributes, invocation-surface handlers,
+    /// primary entrypoints, state owners, contract producers, and flow
+    /// entrypoints.
+// trace:exempt reason=internal-detail
+    fn global_personalization(&self) -> Vec<f64> {
+        let n = self.symbols.len();
+        let mut seeds = vec![0.0; n];
+        // Flow entrypoints: flows record the entry symbol id in attributes.
+        let mut flow_eps: HashSet<String> = HashSet::new();
+        for f in self.view.flows() {
+            if let Some(ep) = f.attributes.get("entrypoint").and_then(|v| v.as_str()) {
+                flow_eps.insert(ep.to_string());
+            }
+        }
+        for (i, id) in self.symbols.iter().enumerate() {
+            let mut seed = false;
+            if let Some(e) = self.view.entity(id) {
+                let exported = e
+                    .attributes
+                    .get("exported")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let has_entrypoints = e
+                    .attributes
+                    .get("entrypoints")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                seed = seed || exported || has_entrypoints;
+            }
+            if flow_eps.contains(id.as_str()) {
+                seed = true;
+            }
+            for r in self.view.out_edges(id) {
+                let tk = self
+                    .view
+                    .entity(&r.object)
+                    .map(|e| e.kind.as_str())
+                    .unwrap_or("");
+                match r.predicate.as_str() {
+                    predicates::HANDLES if INVOCATION_KINDS.contains(&tk) => seed = true,
+                    predicates::OWNS if tk == kinds::STATE || tk == kinds::REACTIVE => seed = true,
+                    predicates::REGISTERS | predicates::PUBLISHES
+                        if CONTRACT_KINDS.contains(&tk) =>
+                    {
+                        seed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if seed {
+                seeds[i] = 1.0;
+            }
+        }
+        seeds
+    }
+
+    /// Personalized power iteration: `r' = (1-d)·s + d·(M^T r +
+    /// dangling/n)`, `POWER_ITERATIONS` times, starting from `start`.
+// trace:exempt reason=internal-detail
+    fn ppr_with(adjacency: &[Vec<(usize, f64)>], personalization: &[f64], start: &[f64]) -> Vec<f64> {
+        let n = adjacency.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut r = start.to_vec();
+        let d = DAMPING_FACTOR;
+        for _ in 0..POWER_ITERATIONS {
+            let mut nr = vec![0.0; n];
+            let mut dangling = 0.0;
+            for (i, row) in adjacency.iter().enumerate() {
+                let ri = r[i];
+                if row.is_empty() {
+                    dangling += ri;
+                } else {
+                    for (j, w) in row {
+                        nr[*j] += ri * w;
+                    }
+                }
+            }
+            let d_mass = d * dangling / n as f64;
+            for k in 0..n {
+                nr[k] = (1.0 - d) * personalization[k] + d * nr[k] + d_mass;
+            }
+            r = nr;
+        }
+        r
+    }
+
+    /// Global run: personalization = normalized architectural seeds; start
+    /// state = the same seed distribution (uniform when no seed fires).
+// trace:exempt reason=internal-detail
+    fn ppr(adjacency: &[Vec<(usize, f64)>], seeds: &[f64]) -> Vec<f64> {
+        let n = adjacency.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let sum: f64 = seeds.iter().sum();
+        let s: Vec<f64> = if sum > 0.0 {
+            seeds.iter().map(|v| v / sum).collect()
+        } else {
+            vec![1.0 / n as f64; n]
+        };
+        Self::ppr_with(adjacency, &s, &s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Architectural specificity
+// ---------------------------------------------------------------------------
+
+/// Is the qualified name or path segment a generic utility token?
+// trace:exempt reason=internal-detail
+fn is_generic_utility(qualified_name: &str, path: &str) -> bool {
+    let mut segs: Vec<String> = Vec::new();
+    for part in path.split('/') {
+        for piece in part.split('.') {
+            if !piece.is_empty() {
+                segs.push(piece.to_lowercase());
+            }
+        }
+    }
+    for part in qualified_name.split(['.', ':']) {
+        if !part.is_empty() {
+            segs.push(part.to_lowercase());
+        }
+    }
+    segs.iter().any(|s| GENERIC_NAMES.contains(&s.as_str()))
+}
+
+/// Does the path point into test code (`test`/`tests`/`spec` segments,
+/// `test_*`/`*_test` files)?
+// trace:exempt reason=internal-detail
+fn path_has_test(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let seg = seg.to_lowercase();
+        seg == "test"
+            || seg == "tests"
+            || seg == "spec"
+            || seg.starts_with("test_")
+            || seg.ends_with("_test")
+    })
+}
+
+/// Does the path point at generated code (`generated`/`gen_*` segments,
+/// protobuf markers)?
+// trace:exempt reason=internal-detail
+fn is_generated(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let seg = seg.to_lowercase();
+        seg.contains("generated")
+            || seg.starts_with("gen_")
+            || seg.ends_with("_pb2.py")
+            || seg.ends_with("_pb.go")
+    })
+}
+
+/// Does the path point into vendored code?
+// trace:exempt reason=internal-detail
+fn is_vendored(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        matches!(
+            seg,
+            "vendor" | "third_party" | "node_modules" | ".venv" | "site-packages" | "bower_components"
+        )
+    })
+}
+
+/// Ubiquity: distinct referencing sources of the symbol in the reference
+/// graph (only predicates that normalize to a reference kind).
+// trace:exempt reason=internal-detail
+fn ubiquity(view: &TrustedGraphView, symbol_id: &str) -> usize {
+    let mut sources: HashSet<&str> = HashSet::new();
+    for r in view.in_edges(symbol_id) {
+        let tk = view
+            .entity(&r.object)
+            .map(|e| e.kind.as_str())
+            .unwrap_or("");
+        if reference_kind(&r.predicate, tk).is_some() {
+            sources.insert(&r.subject);
+        }
+    }
+    sources.len()
+}
+
+/// Architectural specificity of a surface entry: a multiplier in
+/// [0.25, 1.25] that boosts public facades/entrypoints/state owners/
+/// contract endpoints/flow participants and penalizes generic utilities,
+/// test/generated/vendored code, and ubiquitous symbols (in-degree above
+/// [`UBIQUITY_THRESHOLD`]). Apply it to PPR values before blending so
+/// central utilities never dominate the ranking.
+// trace:exempt reason=internal-detail
+pub fn architectural_specificity(entry: &SurfaceEntry, view: &TrustedGraphView) -> f64 {
+    let mut score: f64 = 1.0;
+    if entry.exported {
+        score += 0.15;
+    }
+    if !entry.invocation_surfaces.is_empty() {
+        score += 0.10;
+    }
+    if !entry.state_authorities.is_empty() {
+        score += 0.10;
+    }
+    if !entry.contracts.is_empty() {
+        score += 0.10;
+    }
+    if !entry.flows.is_empty() {
+        score += 0.05;
+    }
+    // Public facade: exported member of a component.
+    if entry.exported && entry.component.is_some() {
+        score += 0.05;
+    }
+
+    let mut factor = 1.0;
+    if is_generic_utility(&entry.qualified_name, &entry.path) {
+        factor *= 0.5;
+    }
+    if path_has_test(&entry.path) {
+        factor *= 0.5;
+    }
+    if is_generated(&entry.path) {
+        factor *= 0.5;
+    }
+    if is_vendored(&entry.path) {
+        factor *= 0.5;
+    }
+    if ubiquity(view, &entry.symbol_id) > UBIQUITY_THRESHOLD {
+        factor *= 0.5;
+    }
+
+    (score * factor).clamp(0.25, 1.25)
+}
+
+// ---------------------------------------------------------------------------
+// Final importance blend
+// ---------------------------------------------------------------------------
+
+/// 30% task PPR.
+pub const TASK_PPR_WEIGHT: f64 = 0.30;
+/// 20% global PPR (50% when no task focus).
+pub const GLOBAL_PPR_WEIGHT: f64 = 0.20;
+/// 15% lexical overlap.
+pub const LEXICAL_WEIGHT: f64 = 0.15;
+/// 10% semantic relevance.
+pub const SEMANTIC_WEIGHT: f64 = 0.10;
+/// 10% evidence confidence.
+pub const CONFIDENCE_WEIGHT: f64 = 0.10;
+/// 10% criticality.
+pub const CRITICALITY_WEIGHT: f64 = 0.10;
+/// 5% change/risk.
+pub const CHANGE_RISK_WEIGHT: f64 = 0.05;
+/// Novelty bonus weight (additive term).
+pub const NOVELTY_WEIGHT: f64 = 0.05;
+/// Global PPR weight when there is no task focus (task share moves to
+/// global: 20% + 30% = 50%).
+pub const NO_TASK_GLOBAL_WEIGHT: f64 = 0.50;
+
+/// The spec's final importance blend. All inputs are expected in [0, 1];
+/// the novelty term is additive on top. With no task focus, the task-PPR
+/// share moves to the global vector (global gets 50%).
+///
+/// `has_task` — is this ranking task-focused (true) or the startup/global
+/// surface (false)?
+#[allow(clippy::too_many_arguments)]
+// trace:exempt reason=internal-detail
+pub fn final_importance(
+    task_ppr: f64,
+    global_ppr: f64,
+    lexical: f64,
+    semantic: f64,
+    confidence: f64,
+    criticality: f64,
+    change_risk: f64,
+    novelty: f64,
+    has_task: bool,
+) -> f64 {
+    let (tw, gw) = if has_task {
+        (TASK_PPR_WEIGHT, GLOBAL_PPR_WEIGHT)
+    } else {
+        (0.0, NO_TASK_GLOBAL_WEIGHT)
+    };
+    tw * task_ppr
+        + gw * global_ppr
+        + LEXICAL_WEIGHT * lexical
+        + SEMANTIC_WEIGHT * semantic
+        + CONFIDENCE_WEIGHT * confidence
+        + CRITICALITY_WEIGHT * criticality
+        + CHANGE_RISK_WEIGHT * change_risk
+        + NOVELTY_WEIGHT * novelty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scc_core::{Entity, Relationship, Visibility};
+    use scc_graph::{RealityGraph, TrustPolicy};
+    use scc_store::Store;
+    use std::collections::HashMap;
+
+// trace:exempt reason=internal-detail
+    fn fixture(
+        entities: Vec<Entity>,
+        rels: Vec<Relationship>,
+    ) -> (tempfile::TempDir, Store, RealityGraph) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        for e in &entities {
+            store.insert_entity(e, &["src/fixture.ts".to_string()]).unwrap();
+        }
+        for r in &rels {
+            store.insert_relationship(r, "src/fixture.ts").unwrap();
+        }
+        let mut out: HashMap<String, Vec<Relationship>> = HashMap::new();
+        let mut inn: HashMap<String, Vec<Relationship>> = HashMap::new();
+        for r in &rels {
+            out.entry(r.subject.clone()).or_default().push(r.clone());
+            inn.entry(r.object.clone()).or_default().push(r.clone());
+        }
+        let graph = RealityGraph {
+            repo_id: "r".into(),
+            entities: entities.into_iter().map(|e| (e.id.clone(), e)).collect(),
+            out,
+            inn,
+            components: vec![],
+            flows: vec![],
+            invariants: vec![],
+        };
+        (dir, store, graph)
+    }
+
+// trace:exempt reason=internal-detail
+    fn sym(repo: &str, path: &str, name: &str) -> Entity {
+        let mut e = Entity::new(
+            scc_core::symbol_id(repo, path, name),
+            kinds::SYMBOL,
+            name,
+        );
+        e.attr("file", serde_json::json!(path));
+        e.attr("exported", serde_json::json!(false));
+        e.attr("start_line", serde_json::json!(1));
+        e.attr("end_line", serde_json::json!(10));
+        e
+    }
+
+// trace:exempt reason=internal-detail
+    fn entity(id: &str, kind: &str, name: &str) -> Entity {
+        Entity::new(id, kind, name)
+    }
+
+// trace:exempt reason=internal-detail
+    fn rel(n: u64, subject: &str, pred: &str, object: &str, prov: Provenance) -> Relationship {
+        Relationship::new(format!("rel:{n}"), subject, pred, object, prov)
+    }
+
+    // ---- (a) reference normalization maps the right kinds ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn reference_normalization_maps_kinds() {
+        let (a, b, i, c, s, t, m, x, d) = (
+            scc_core::symbol_id("r", "src/a.ts", "A"),
+            scc_core::symbol_id("r", "src/b.ts", "B"),
+            scc_core::symbol_id("r", "src/i.ts", "I"),
+            "repo://r/contract/c",
+            "repo://r/state/s",
+            "repo://r/topic/t",
+            "repo://r/module/m",
+            "repo://r/export/x",
+            "repo://r/annotation/d",
+        );
+        let mut a_ent = sym("r", "src/a.ts", "A");
+        a_ent.attr("file", serde_json::json!("src/a.ts"));
+        a_ent.attr("start_line", serde_json::json!(10));
+        a_ent.attr("end_line", serde_json::json!(20));
+        let b_ent = sym("r", "src/b.ts", "B");
+        let i_ent = sym("r", "src/i.ts", "I");
+        let c_ent = entity(c, kinds::CONTRACT, "c");
+        let s_ent = entity(s, kinds::STATE, "s");
+        let t_ent = entity(t, kinds::TOPIC, "t");
+        let m_ent = entity(m, kinds::MODULE, "m");
+        let x_ent = entity(x, kinds::EXPORT, "x");
+        let d_ent = entity(d, kinds::ANNOTATION, "d");
+
+        let mut rels = vec![
+            rel(1, &a, predicates::CALLS, &b, Provenance::Extracted),
+            rel(2, &a, predicates::INVOKES, &b, Provenance::Extracted),
+            rel(3, &a, predicates::HANDLES_CALLBACK, &b, Provenance::Extracted),
+            rel(4, &a, predicates::IMPLEMENTS, &i, Provenance::Extracted),
+            rel(5, &i, predicates::IMPLEMENTED_BY, &a, Provenance::Extracted),
+            rel(6, &a, predicates::INHERITS, &b, Provenance::Extracted),
+            rel(7, &a, predicates::REGISTERS, c, Provenance::Extracted),
+            rel(8, &a, predicates::PUBLISHES, t, Provenance::Extracted),
+            rel(9, &b, predicates::SUBSCRIBES, t, Provenance::Extracted),
+            rel(10, &a, predicates::OWNS, s, Provenance::Extracted),
+            rel(11, &a, predicates::READS, s, Provenance::Extracted),
+            rel(12, &b, predicates::WRITES, s, Provenance::Extracted),
+            rel(13, &a, predicates::IMPORTS, m, Provenance::Extracted),
+            rel(14, &a, predicates::EXPORTS, x, Provenance::Extracted),
+            rel(15, &a, predicates::DECORATES, d, Provenance::Extracted),
+            // OWNS of a non-state entity must NOT normalize to Write.
+            rel(16, &a, predicates::OWNS, c, Provenance::Extracted),
+            // Confidence passthrough.
+            rel(17, &a, predicates::CALLS, d, Provenance::Extracted),
+        ];
+        rels[16].confidence = 0.7;
+        let (_dir, store, graph) = fixture(
+            vec![a_ent.clone(), b_ent, i_ent, c_ent, s_ent, t_ent, m_ent, x_ent, d_ent],
+            rels,
+        );
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let edges = build_reference_graph(&view);
+
+        let kinds_between = |src: &str, tgt: &str| -> Vec<ReferenceKind> {
+            let mut v: Vec<ReferenceKind> = edges
+                .iter()
+                .filter(|e| e.source_symbol == src && e.target_symbol == tgt)
+                .map(|e| e.kind)
+                .collect();
+            v.sort();
+            v
+        };
+
+        // calls/invokes/handles_callback → Call (3 edges) and
+        // inherits → Extend (all A -> B edges).
+        assert_eq!(
+            kinds_between(&a, &b),
+            vec![
+                ReferenceKind::Call,
+                ReferenceKind::Call,
+                ReferenceKind::Call,
+                ReferenceKind::Extend
+            ]
+        );
+        // implements + implemented_by → Implement (both directions normalize
+        // to A -> I).
+        assert_eq!(kinds_between(&a, &i), vec![ReferenceKind::Implement; 2]);
+        // registers/publishes/subscribes → Register.
+        assert_eq!(kinds_between(&a, c), vec![ReferenceKind::Register]);
+        assert_eq!(kinds_between(&a, t), vec![ReferenceKind::Register]);
+        assert_eq!(kinds_between(&b, t), vec![ReferenceKind::Register]);
+        // owns(state) → Write; reads → Read; writes → Write.
+        let mut as_edges = kinds_between(&a, s);
+        as_edges.sort();
+        assert_eq!(as_edges, vec![ReferenceKind::Read, ReferenceKind::Write]);
+        assert_eq!(kinds_between(&b, s), vec![ReferenceKind::Write]);
+        // imports → Import; exports → Export; decorates → Decorate.
+        assert_eq!(kinds_between(&a, m), vec![ReferenceKind::Import]);
+        assert_eq!(kinds_between(&a, x), vec![ReferenceKind::Export]);
+        assert_eq!(kinds_between(&a, d), vec![ReferenceKind::Call, ReferenceKind::Decorate]);
+        // OWNS of a contract is NOT normalized (no Write A->C).
+        assert!(!kinds_between(&a, c).contains(&ReferenceKind::Write));
+
+        // Locations: evidence file/line from the subject symbol attrs.
+        let call = edges
+            .iter()
+            .find(|e| e.source_symbol == a && e.target_symbol == b && e.kind == ReferenceKind::Call)
+            .unwrap();
+        assert!(call.locations.contains(&SourceRange::new("src/a.ts", 10, 20)));
+        assert!(call.locations.contains(&SourceRange::new("src/b.ts", 1, 10)));
+
+        // Confidence passthrough: default 1.0; explicit 0.7 preserved.
+        assert_eq!(call.confidence, 1.0);
+        let low = edges
+            .iter()
+            .find(|e| e.source_symbol == a && e.target_symbol == d && e.kind == ReferenceKind::Call)
+            .unwrap();
+        assert!((low.confidence - 0.7).abs() < 1e-6);
+    }
+
+    // ---- (b) rarity downweights ubiquitous vs distinctive ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn rarity_downweights_ubiquitous() {
+        // Distinctive target (in-degree 1) is far rarer than a ubiquitous
+        // logger-ish target (in-degree 50).
+        let logger = rarity(100, 50);
+        let distinctive = rarity(100, 1);
+        assert!(logger < distinctive);
+        assert!((logger - (100.0_f64 / 51.0).ln()).abs() < 1e-9);
+
+        // Clamp bounds.
+        assert_eq!(rarity(100, 10_000), 0.25);
+        assert_eq!(rarity(100, 0), 1.5);
+        assert_eq!(rarity(0, 0), 1.0);
+
+        // Full edge weight: ubiquitous target downweights the edge.
+        let w_common = edge_weight(predicates::CALLS, Provenance::Extracted, 1.0, 100, 50);
+        let w_rare = edge_weight(predicates::CALLS, Provenance::Extracted, 1.0, 100, 1);
+        assert!(w_common < w_rare);
+
+        // Provenance: STALE weighs zero; RESOLVED calls weigh more than
+        // EXTRACTED calls.
+        assert_eq!(edge_weight(predicates::CALLS, Provenance::Stale, 1.0, 100, 1), 0.0);
+        let resolved = edge_weight(predicates::CALLS, Provenance::Resolved, 1.0, 100, 1);
+        let extracted = edge_weight(predicates::CALLS, Provenance::Extracted, 1.0, 100, 1);
+        assert!(resolved > extracted);
+    }
+
+    // ---- (c) central utility pollution is corrected by specificity ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn utility_pollution_ranks_below_public_api() {
+        let api_id = scc_core::symbol_id("r", "src/api/order.ts", "OrderApi");
+        let util_id = scc_core::symbol_id("r", "src/utils/helpers.ts", "helpers");
+        let mut api_ent = sym("r", "src/api/order.ts", "OrderApi");
+        api_ent.attr("exported", serde_json::json!(true));
+        api_ent.attr("entrypoints", serde_json::json!(["http"]));
+        let util_ent = sym("r", "src/utils/helpers.ts", "helpers");
+
+        let mut entities = vec![api_ent.clone(), util_ent.clone()];
+        let mut rels: Vec<Relationship> = Vec::new();
+        let mut n = 1u64;
+        // 40 callers all invoke the util symbol.
+        for i in 0..40 {
+            let caller = scc_core::symbol_id("r", "src/callers/c.rs", &format!("c{i}"));
+            entities.push(sym("r", "src/callers/c.rs", &format!("c{i}")));
+            rels.push(rel(
+                n,
+                &caller,
+                predicates::CALLS,
+                &util_id,
+                Provenance::Extracted,
+            ));
+            n += 1;
+        }
+        // Two callers reach the public API.
+        let c1 = scc_core::symbol_id("r", "src/callers/c.rs", "c0");
+        let c2 = scc_core::symbol_id("r", "src/callers/c.rs", "c1");
+        rels.push(rel(n, &c1, predicates::CALLS, &api_id, Provenance::Extracted));
+        n += 1;
+        rels.push(rel(n, &c2, predicates::CALLS, &api_id, Provenance::Extracted));
+
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+        let g = ranker.global_vector();
+        let util_idx = ranker.index_of(&util_id).unwrap();
+        let api_idx = ranker.index_of(&api_id).unwrap();
+
+        // Specificity: util is generic + ubiquitous (40 distinct callers >
+        // threshold) → floor; api is an exported entrypoint facade → cap.
+        let util_entry = surface_entry(&util_id, "helpers", "src/utils/helpers.ts", false);
+        let api_entry = surface_entry(&api_id, "OrderApi", "src/api/order.ts", true);
+        let spec_util = architectural_specificity(&util_entry, &view);
+        let spec_api = architectural_specificity(&api_entry, &view);
+        assert_eq!(spec_util, 0.25);
+        assert_eq!(spec_api, 1.25);
+        assert!(spec_api > spec_util);
+
+        // After specificity, the public API ranks above the central utility
+        // even though the utility is referenced by far more callers.
+        assert!(g[api_idx] * spec_api > g[util_idx] * spec_util);
+    }
+
+    // ---- (d) task personalization lifts billing seeds above unrelated ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn task_personalization_ranks_billing_above_unrelated() {
+        let billing_client = scc_core::symbol_id("r", "src/billing/client.ts", "BillingClient");
+        let billing_retry = scc_core::symbol_id("r", "src/billing/client.ts", "BillingClient.retry");
+        let billing_worker = scc_core::symbol_id("r", "src/billing/worker.ts", "BillingWorker");
+        let billing_process = scc_core::symbol_id("r", "src/billing/worker.ts", "BillingWorker.process");
+        let auth_service = scc_core::symbol_id("r", "src/auth/service.ts", "AuthService");
+        let auth_login = scc_core::symbol_id("r", "src/auth/service.ts", "AuthService.login");
+        let logger = scc_core::symbol_id("r", "src/logger.ts", "Logger");
+        let logger_log = scc_core::symbol_id("r", "src/logger.ts", "Logger.log");
+
+        let entities = vec![
+            sym("r", "src/billing/client.ts", "BillingClient"),
+            sym("r", "src/billing/client.ts", "BillingClient.retry"),
+            sym("r", "src/billing/worker.ts", "BillingWorker"),
+            sym("r", "src/billing/worker.ts", "BillingWorker.process"),
+            sym("r", "src/auth/service.ts", "AuthService"),
+            sym("r", "src/auth/service.ts", "AuthService.login"),
+            sym("r", "src/logger.ts", "Logger"),
+            sym("r", "src/logger.ts", "Logger.log"),
+        ];
+        let rels = vec![
+            rel(1, &billing_client, predicates::CALLS, &billing_retry, Provenance::Extracted),
+            rel(2, &billing_worker, predicates::CALLS, &billing_process, Provenance::Extracted),
+            rel(3, &billing_process, predicates::CALLS, &billing_retry, Provenance::Extracted),
+            rel(4, &auth_service, predicates::CALLS, &auth_login, Provenance::Extracted),
+            rel(5, &logger, predicates::CALLS, &logger_log, Provenance::Extracted),
+        ];
+
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+
+        let seeds = vec![
+            TaskSeed {
+                kind: "symbol".into(),
+                id: billing_retry.clone(),
+                weight: 1.0,
+            },
+            TaskSeed {
+                kind: "symbol".into(),
+                id: billing_process.clone(),
+                weight: 1.0,
+            },
+        ];
+        let tv = ranker.task_vector(&seeds);
+        let i_retry = ranker.index_of(&billing_retry).unwrap();
+        let i_process = ranker.index_of(&billing_process).unwrap();
+        let i_login = ranker.index_of(&auth_login).unwrap();
+        let i_log = ranker.index_of(&logger_log).unwrap();
+
+        // Billing seeds rank above unrelated symbols.
+        assert!(tv[i_retry] > tv[i_login]);
+        assert!(tv[i_retry] > tv[i_log]);
+        assert!(tv[i_process] > tv[i_login]);
+        assert!(tv[i_process] > tv[i_log]);
+        // Both seeds beat a symbol that merely calls into the unrelated
+        // cluster's leaf.
+        assert!(tv[i_retry] > tv[ranker.index_of(&logger).unwrap()]);
+
+        // Unresolvable seeds degrade to the global vector (no panic).
+        let junk = vec![TaskSeed { kind: "symbol".into(), id: "repo://r/symbol/nope/Nope".into(), weight: 1.0 }];
+        let fallback = ranker.task_vector(&junk);
+        let g = ranker.global_vector();
+        assert_eq!(fallback, g);
+        assert_eq!(fallback.len(), tv.len());
+    }
+
+    // ---- helper for SurfaceEntry fixtures ----
+
+// trace:exempt reason=internal-detail
+    fn surface_entry(symbol_id: &str, name: &str, path: &str, exported: bool) -> SurfaceEntry {
+        let mut entry = SurfaceEntry {
+            id: symbol_id.to_string(),
+            symbol_id: symbol_id.to_string(),
+            qualified_name: name.to_string(),
+            kind: scc_core::SurfaceKind::Function,
+            path: path.to_string(),
+            range: SourceRange::new(path, 1, 1),
+            source_signature: String::new(),
+            canonical_signature: String::new(),
+            semantic_signature: scc_core::SemanticSignature::default(),
+            visibility: Visibility::Public,
+            exported,
+            modifiers: vec![],
+            annotations: vec![],
+            component: Some("Order".to_string()),
+            subsystem: None,
+            flows: vec![],
+            contracts: vec![],
+            state_authorities: vec![],
+            invocation_surfaces: vec![],
+            callers: vec![],
+            callees: vec![],
+            provenance: Provenance::Extracted,
+            confidence: 1.0,
+            rank: scc_core::SurfaceRank::default(),
+        };
+        if exported {
+            entry.invocation_surfaces.push("http".into());
+            entry.flows.push("f1".into());
+            entry.contracts.push("c1".into());
+        }
+        entry
+    }
+
+    // ---- final_importance blend ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn final_importance_blend_constants() {
+        // All signals at 1.0 with task focus: 0.30+0.20+0.15+0.10+0.10+
+        // 0.10+0.05+0.05 = 1.05 (novelty is additive).
+        let v = final_importance(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, true);
+        assert!((v - 1.05).abs() < 1e-9);
+
+        // Task focus weights task PPR over global.
+        let tasky = final_importance(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true);
+        assert!((tasky - 0.30).abs() < 1e-9);
+
+        // No task: task share moves to global (50%).
+        let globaly = final_importance(1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false);
+        assert!((globaly - 0.25).abs() < 1e-9);
+
+        // No task with full global: 0.50 + 0.15 + 0.10 + 0.10 + 0.10 + 0.05
+        // + 0.05 = 1.05.
+        let full = final_importance(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false);
+        assert!((full - 1.05).abs() < 1e-9);
+    }
+
+    // ---- architectural_specificity penalties ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn specificity_penalizes_generic_test_and_vendored() {
+        let (_dir, store, graph) = fixture(vec![sym("r", "src/x.ts", "X")], vec![]);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+
+        let util = surface_entry("s1", "logger", "src/utils/logger.ts", false);
+        // Generic utility name/path → 0.5 (symbol "s1" is not in the graph,
+        // so no ubiquity penalty; 0.5 is the single-penalty floor here).
+        assert_eq!(architectural_specificity(&util, &view), 0.5);
+
+        let testy = surface_entry("s2", "TestHelper", "tests/unit/helper_test.rs", false);
+        assert_eq!(architectural_specificity(&testy, &view), 0.5);
+
+        let vendored = surface_entry("s3", "Dep", "vendor/dep/src/lib.rs", false);
+        assert_eq!(architectural_specificity(&vendored, &view), 0.5);
+
+        let generated = surface_entry("s4", "Proto", "src/generated/models.rs", false);
+        assert_eq!(architectural_specificity(&generated, &view), 0.5);
+
+        // Plain exported facade with no penalties hits the cap.
+        let facade = surface_entry("s5", "OrderApi", "src/api/order.ts", true);
+        assert_eq!(architectural_specificity(&facade, &view), 1.25);
+    }
+}

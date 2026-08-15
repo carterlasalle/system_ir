@@ -22,3 +22,6 @@ title = "Holdout generalization wave"
 [work."WORK-SCC-013"]
 type = "work"
 title = "Wave 13: occurrence identity, blind lock, package!=atom clustering"
+
+[work."WORK-SCC-014"]
+title = "Wave 14: full context stack (surface map, ranker, structural source, startup fusion)"

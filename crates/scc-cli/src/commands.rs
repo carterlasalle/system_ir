@@ -122,6 +122,138 @@ pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Resul
     Ok(())
 }
 
+/// `scc context startup [--budget N]` — the Wave 14 startup artifact:
+/// the Atlas + Surface fusion, deterministic per epoch (prompt-cache
+/// stable). Records what the session just showed in the context ledger so
+/// task deltas suppress already-visible APIs.
+// trace:exempt reason=internal-detail
+pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let config = load_config(root)?;
+    let stale = crate::stale_paths(&store)?;
+    let comp = compiler(&store, &config, stale)?;
+    let ctx = comp.ctx();
+    let budget = startup_budget(budget_tokens);
+    let startup =
+        scc_context::startup::build_startup(&ctx, &budget, scc_context::startup::RENDERER_VERSION);
+    print!("{}", scc_context::startup::render_startup(&startup));
+
+    // Record what the session just showed (novelty-suppression source).
+    let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
+    let mut led = ledger_store.load();
+    let (syms, files, comps, flows) = scc_context::startup::visible_ids_from_startup(&ctx, &budget);
+    led.visible_entities.extend(syms.iter().cloned());
+    led.visible_symbols.extend(syms);
+    led.visible_files.extend(files);
+    led.visible_components.extend(comps);
+    led.visible_flows.extend(flows);
+    ledger_store.save(&led);
+    Ok(())
+}
+
+/// Wave 14 dynamic budgets: `--budget N` scales the total and keeps the
+/// default atlas:surface split (13:7); no `--budget` uses the defaults.
+// trace:exempt reason=internal-detail
+fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
+    let def = scc_core::ContextBudget::default();
+    match tokens {
+        None => def,
+        Some(n) => {
+            let total = def.total.max(1) as f64;
+            scc_core::ContextBudget {
+                total: n,
+                atlas: ((n as f64) * (def.atlas as f64 / total)).round() as usize,
+                surface: ((n as f64) * (def.surface as f64 / total)).round() as usize,
+                task_delta: def.task_delta,
+                structural_source: def.structural_source,
+            }
+        }
+    }
+}
+
+/// `scc surface [--task "<goal>"] [--budget N] [--explain]` — the System
+/// Surface Map: the actual callable API layer, global or task-personalized.
+/// The rendered entries are recorded in the context ledger.
+// trace:exempt reason=internal-detail
+pub fn cmd_surface(
+    root: &Path,
+    task: Option<&str>,
+    budget: Option<usize>,
+    explain: bool,
+) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let config = load_config(root)?;
+    let stale = crate::stale_paths(&store)?;
+    let comp = compiler(&store, &config, stale)?;
+    let ctx = comp.ctx();
+    let budget_tokens = budget.unwrap_or(scc_core::ContextBudget::default().surface);
+    let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
+    match task {
+        Some(goal) => {
+            let (out, ids) =
+                scc_context::startup::task_surface_with_ids(&ctx, goal, budget_tokens, explain);
+            print!("{out}");
+            if !ids.is_empty() {
+                let mut led = ledger_store.load();
+                record_visible_ids(&mut led, &ctx, &ids);
+                ledger_store.save(&led);
+            }
+        }
+        None => {
+            let map = scc_context::surface::compile_surface_map(&ctx);
+            print!(
+                "{}",
+                scc_context::surface::render_surface_map(&map, Some(budget_tokens))
+            );
+            let mut led = ledger_store.load();
+            record_visible_surface(&mut led, &map);
+            ledger_store.save(&led);
+        }
+    }
+    Ok(())
+}
+
+/// Mark entity ids as visible, classifying them into the ledger's
+/// kind-scoped sets by entity kind.
+// trace:exempt reason=internal-detail
+fn record_visible_ids(
+    led: &mut scc_core::ContextLedger,
+    ctx: &scc_context::ContextCompiler,
+    ids: &[String],
+) {
+    for id in ids {
+        led.visible_entities.insert(id.clone());
+        if let Some(e) = ctx.view.entity(id) {
+            match e.kind.as_str() {
+                kinds::SYMBOL => {
+                    led.visible_symbols.insert(id.clone());
+                }
+                kinds::COMPONENT => {
+                    led.visible_components.insert(id.clone());
+                }
+                kinds::FLOW => {
+                    led.visible_flows.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Mark a surface map's entries visible (symbols, files, components).
+// trace:exempt reason=internal-detail
+fn record_visible_surface(led: &mut scc_core::ContextLedger, map: &scc_core::SystemSurfaceMap) {
+    for e in &map.entries {
+        led.visible_entities.insert(e.symbol_id.clone());
+        led.visible_symbols.insert(e.symbol_id.clone());
+        led.visible_files.insert(e.path.clone());
+        if let Some(c) = &e.component {
+            led.visible_components.insert(c.clone());
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
 pub fn cmd_context_task(
     root: &Path,
     goal: &str,
@@ -151,6 +283,33 @@ pub fn cmd_context_task(
     } else {
         let pack: scc_context::ContextPack = serde_json::from_str(&pack_json)?;
         print!("{}", pack.content);
+        // Wave 14E: append the task delta — only NEW relevant APIs vs the
+        // context ledger — after the pack content. Hook mode keeps the
+        // total output within its 1500-token cap (the delta gets the
+        // remaining budget); an explicit --budget caps the total the same
+        // way; the default gives the delta its own task_delta slice.
+        let store = open_store(root)?;
+        let config = load_config(root)?;
+        let stale = crate::stale_paths(&store)?;
+        let comp = compiler(&store, &config, stale)?;
+        let ctx = comp.ctx();
+        let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
+        let visible = ledger_store.load();
+        let delta_budget = if hook {
+            budget.unwrap_or(0).saturating_sub(pack.tokens)
+        } else {
+            budget
+                .map(|b| b.saturating_sub(pack.tokens))
+                .unwrap_or(scc_core::ContextBudget::default().task_delta)
+        };
+        let (delta, ids) =
+            scc_context::startup::task_delta_with_ids(&ctx, goal, &visible, delta_budget);
+        print!("\n{delta}");
+        if !ids.is_empty() {
+            let mut led = visible;
+            record_visible_ids(&mut led, &ctx, &ids);
+            ledger_store.save(&led);
+        }
     }
     Ok(())
 }

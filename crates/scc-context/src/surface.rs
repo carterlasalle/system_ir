@@ -1,0 +1,1490 @@
+//! System Surface Map compiler (Wave 14, Level 1): the actual callable
+//! code surface built from the TrustedGraphView — an Aider RepoMap
+//! equivalent on System IR.
+//!
+//! Every SYMBOL entity in the trusted view becomes a [`SurfaceEntry`]
+//! carrying exact signatures (source + canonical + semantic), visibility,
+//! modifiers/annotations, component attribution, and the architectural
+//! meaning attached to the symbol (flows, contracts, state ownership,
+//! invocation surfaces, callers/callees). Deterministic and no-panic:
+//! unparseable signatures degrade to name-only [`SemanticSignature`]s.
+
+use crate::ContextCompiler;
+use scc_core::{
+    estimate_tokens, kinds, predicates, Provenance, SemanticParameter, SemanticSignature,
+    SourceRange, SurfaceEntry, SurfaceKind, SurfaceRank, SystemSurfaceMap, Visibility,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Symbol-kind strings the indexer emits (write.rs core_symbol_kind),
+/// plus "trait" for tolerance.
+const SYMBOL_KINDS: [&str; 9] = [
+    "function", "method", "class", "interface", "trait", "type", "const", "enum", "module",
+];
+
+// ---------------------------------------------------------------------------
+// Top-level API
+// ---------------------------------------------------------------------------
+
+/// Build the System Surface Map (Level 1) from the trusted view.
+// trace:v1 id=impl.scc.surface work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn compile_surface_map(compiler: &ContextCompiler) -> SystemSurfaceMap {
+    let view = &compiler.view;
+
+    // ---- attribution tables ----
+    let mut symbol_comp_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut comp_names: BTreeMap<String, String> = BTreeMap::new();
+    for c in view.components() {
+        comp_names.insert(c.id.clone(), c.name.clone());
+        for r in sorted_rels(view.out_pred(&c.id, predicates::CONTAINS)) {
+            for sr in sorted_rels(view.out_pred(&r.object, predicates::CONTAINS)) {
+                symbol_comp_id.insert(sr.object.clone(), c.id.clone());
+            }
+        }
+    }
+    let mut subsys_of_comp: BTreeMap<String, String> = BTreeMap::new();
+    for kind in [kinds::SUBSYSTEM, kinds::SERVICE] {
+        for e in view.entities_of_kind(kind) {
+            for r in sorted_rels(view.out_pred(&e.id, predicates::CONTAINS)) {
+                subsys_of_comp
+                    .entry(r.object.clone())
+                    .or_insert_with(|| e.name.clone());
+            }
+        }
+    }
+
+    // invocation surfaces
+    let surfaces = scc_graph::flows::invocation_surfaces(view.graph);
+    let mut surface_by_symbol: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for s in surfaces {
+        surface_by_symbol
+            .entry(s.symbol.clone())
+            .or_default()
+            .push((s.kind.as_str().to_string(), s.trigger.clone()));
+    }
+
+    let mut entries: Vec<SurfaceEntry> = Vec::new();
+    for e in view.entities_of_kind(kinds::SYMBOL) {
+        let Some(kind_str) = e.attributes.get("kind").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !SYMBOL_KINDS.contains(&kind_str) {
+            continue;
+        }
+        entries.push(build_entry(
+            compiler,
+            e,
+            kind_str,
+            &symbol_comp_id,
+            &comp_names,
+            &subsys_of_comp,
+            &surface_by_symbol,
+        ));
+    }
+    entries.sort_by(|a, b| {
+        a.qualified_name
+            .cmp(&b.qualified_name)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let store = compiler.store;
+    let mut map = SystemSurfaceMap {
+        repository: store.repository().name,
+        revision: compiler.revision(),
+        epoch: store
+            .cache_epoch()
+            .unwrap_or_else(|_| "no-epoch".into()),
+        entries,
+        token_count: 0,
+        omitted: Vec::new(),
+    };
+    let full = render_surface_map(&map, None);
+    map.token_count = estimate_tokens(&full);
+    map
+}
+
+/// Deterministic, budget-capped render of a [`SystemSurfaceMap`].
+// trace:exempt reason=internal-detail
+pub fn render_surface_map(map: &SystemSurfaceMap, budget_tokens: Option<usize>) -> String {
+    let budget_chars = budget_tokens.map(|t| t.saturating_mul(4));
+
+    let mut groups: BTreeMap<(String, String, String), Vec<&SurfaceEntry>> = BTreeMap::new();
+    for e in &map.entries {
+        let comp = e.component.clone().unwrap_or_else(|| "(unattributed)".to_string());
+        let sub = e.subsystem.clone().unwrap_or_default();
+        groups.entry((comp, sub, e.path.clone())).or_default().push(e);
+    }
+
+    let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
+    let mut total_chars = out.chars().count();
+    let mut omitted: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cut = false;
+
+    for ((comp, sub, path), mut es) in groups {
+        es.sort_by(|a, b| entry_order(a, b));
+        let header = group_header(&comp, &sub, &path);
+        let mut blocks: Vec<String> = Vec::new();
+        let mut block_chars: usize = 0;
+        for e in es {
+            if cut {
+                *omitted.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
+                continue;
+            }
+            let block = render_entry(e);
+            let bc = block.chars().count();
+            if fits(total_chars + header.chars().count() + block_chars + bc, budget_chars) {
+                blocks.push(block);
+                block_chars += bc;
+            } else {
+                cut = true;
+                *omitted.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
+            }
+        }
+        if !blocks.is_empty() {
+            out.push_str(&header);
+            for b in blocks {
+                out.push_str(&b);
+            }
+            total_chars += header.chars().count() + block_chars;
+        }
+    }
+
+    if !omitted.is_empty() {
+        out.push('\n');
+        out.push_str("OMITTED (token budget exceeded):\n");
+        for (kind, count) in &omitted {
+            out.push_str(&format!("  {count} lower-ranked {kind} definitions\n"));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Entry builder
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+// trace:exempt reason=internal-detail
+fn build_entry(
+    compiler: &ContextCompiler,
+    e: &scc_core::Entity,
+    kind_str: &str,
+    symbol_comp_id: &BTreeMap<String, String>,
+    comp_names: &BTreeMap<String, String>,
+    subsys_of_comp: &BTreeMap<String, String>,
+    surface_by_symbol: &BTreeMap<String, Vec<(String, String)>>,
+) -> SurfaceEntry {
+    let view = &compiler.view;
+    let name = e.name.clone();
+    let simple = name.rsplit('.').next().unwrap_or(&name).to_string();
+    let parent = attr_str(e, "parent");
+    let exported = e.attributes.get("exported").and_then(|v| v.as_bool()) == Some(true);
+    let file = attr_str(e, "file").unwrap_or_default();
+    let start = attr_u32(e, "start_line");
+    let end = attr_u32(e, "end_line");
+
+    let source_sig = attr_str(e, "signature").unwrap_or_default();
+    let source_signature = if source_sig.trim().is_empty() {
+        synthesized_signature(kind_str, &simple)
+    } else {
+        source_sig
+    };
+    let parsed_inner = parse_sig_inner(&source_signature);
+    let parsed_sig = parse_signature(&source_signature, &name, parent.as_deref());
+
+    let kind = map_kind(kind_str, &name, parent.as_deref());
+    let qualified = if kind_str == "method" {
+        match &parent {
+            Some(p) if !p.is_empty() => format!("{}.{}", p, simple),
+            _ => name.clone(),
+        }
+    } else {
+        name.clone()
+    };
+
+    let visibility = entry_visibility(
+        exported,
+        parent.as_deref(),
+        &parsed_inner.modifiers,
+        parsed_inner.ret_before_name.as_deref(),
+    );
+
+    // modifiers: async/static/final/abstract/readonly (+variadic)
+    const SURFACE_MODIFIERS: [&str; 5] = ["async", "static", "final", "abstract", "readonly"];
+    let mut modifiers: Vec<String> = parsed_inner
+        .modifiers
+        .iter()
+        .filter(|m| SURFACE_MODIFIERS.contains(&m.as_str()))
+        .cloned()
+        .collect();
+    if parsed_sig.parameters.iter().any(|p| p.variadic)
+        && !modifiers.iter().any(|m| m == "variadic")
+    {
+        modifiers.push("variadic".into());
+    }
+
+    // annotations
+    let mut annotations: Vec<String> = Vec::new();
+    for r in sorted_rels(view.in_pred(&e.id, predicates::ANNOTATES)) {
+        if let Some(a) = view.entity(&r.subject) {
+            annotations.push(a.name.clone());
+        }
+    }
+    annotations.sort();
+    annotations.dedup();
+
+    // flows
+    let mut flows: BTreeSet<String> = BTreeSet::new();
+    for f in view.flows() {
+        if f.steps
+            .iter()
+            .any(|s| step_matches(s, &e.id, &name, &qualified, &file))
+        {
+            flows.insert(f.name.clone());
+        }
+    }
+
+    // contracts
+    let mut contracts: BTreeSet<String> = BTreeSet::new();
+    // http: ROUTE handler == this symbol
+    for r in view.entities_of_kind(kinds::ROUTE) {
+        if r.attributes.get("handler").and_then(|v| v.as_str()) == Some(&e.id) {
+            let m = attr_str(r, "method").unwrap_or_default();
+            let p = attr_str(r, "path").unwrap_or_default();
+            if !p.is_empty() {
+                contracts.insert(format!("http: {}", format!("{} {}", m, p).trim()));
+            }
+        }
+    }
+    // cli flags
+    if let Some(flags) = e.attributes.get("cli_flags").and_then(|v| v.as_array()) {
+        for f in flags {
+            if let Some(s) = f.as_str() {
+                contracts.insert(format!("cli: {}", s));
+            }
+        }
+    }
+    // event topics
+    for pred in [predicates::CONSUMES, predicates::PUBLISHES] {
+        for rel in sorted_rels(view.out_pred(&e.id, pred)) {
+            if let Some(t) = view.entity(&rel.object) {
+                if t.kind == kinds::TOPIC {
+                    contracts.insert(format!("event: {}", t.name));
+                }
+            }
+        }
+    }
+    // REGISTERS -> CONTRACT entities
+    for rel in sorted_rels(view.out_pred(&e.id, predicates::REGISTERS)) {
+        if let Some(t) = view.entity(&rel.object) {
+            if t.kind == kinds::CONTRACT {
+                contracts.insert(format!("register:{}", view.name_of(&t.id)));
+            }
+        }
+    }
+    // DEFINES -> SCHEMA entities
+    for rel in sorted_rels(view.out_pred(&e.id, predicates::DEFINES)) {
+        if let Some(t) = view.entity(&rel.object) {
+            if t.kind == kinds::SCHEMA {
+                contracts.insert(format!("schema:{}", t.name));
+            }
+        }
+    }
+
+    // state authorities
+    let mut state_authorities: Vec<String> = Vec::new();
+    for rel in sorted_rels(view.out_pred(&e.id, predicates::OWNS)) {
+        if let Some(t) = view.entity(&rel.object) {
+            if t.kind == kinds::STATE || t.kind == kinds::REACTIVE {
+                state_authorities.push(t.name.clone());
+            }
+        }
+    }
+    state_authorities.sort();
+    state_authorities.dedup();
+
+    // invocation surfaces
+    let mut inv: Vec<String> = Vec::new();
+    if let Some(surfs) = surface_by_symbol.get(&e.id) {
+        for (kind, trigger) in surfs {
+            inv.push(format!("{}: {}", kind, trigger));
+        }
+    }
+    if let Some(eps) = e.attributes.get("entrypoints").and_then(|v| v.as_array()) {
+        for ep in eps {
+            if let Some(s) = ep.as_str() {
+                inv.push(format!("entrypoint:{}", s));
+            }
+        }
+    }
+    inv.sort();
+
+    // callers / callees
+    let mut callers: Vec<String> = Vec::new();
+    for r in sorted_rels(view.in_pred(&e.id, predicates::CALLS)) {
+        callers.push(view.name_of(&r.subject));
+    }
+    callers.sort();
+    callers.dedup();
+    callers.truncate(12);
+    let mut callees: Vec<String> = Vec::new();
+    for r in sorted_rels(view.out_pred(&e.id, predicates::CALLS)) {
+        callees.push(view.name_of(&r.object));
+    }
+    callees.sort();
+    callees.dedup();
+    callees.truncate(12);
+
+    // provenance
+    let has_resolved_call = view
+        .out_pred(&e.id, predicates::CALLS)
+        .iter()
+        .any(|r| r.provenance == Provenance::Resolved);
+    let provenance = if has_resolved_call {
+        Provenance::Resolved
+    } else {
+        Provenance::Extracted
+    };
+    let confidence: f32 = if has_resolved_call { 1.0 } else { 0.85 };
+
+    // component / subsystem
+    let component = symbol_comp_id
+        .get(&e.id)
+        .and_then(|cid| comp_names.get(cid))
+        .cloned();
+    let subsystem = symbol_comp_id
+        .get(&e.id)
+        .and_then(|cid| subsys_of_comp.get(cid))
+        .cloned();
+
+    SurfaceEntry {
+        id: e.id.clone(),
+        symbol_id: e.id.clone(),
+        qualified_name: qualified,
+        kind,
+        path: file.clone(),
+        range: SourceRange::new(file, start, end),
+        source_signature: source_signature.clone(),
+        canonical_signature: canonicalize(&source_signature),
+        semantic_signature: parsed_sig,
+        visibility,
+        exported,
+        modifiers,
+        annotations,
+        component,
+        subsystem,
+        flows: flows.into_iter().collect(),
+        contracts: contracts.into_iter().collect(),
+        state_authorities,
+        invocation_surfaces: inv,
+        callers,
+        callees,
+        provenance,
+        confidence,
+        rank: SurfaceRank::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Semantic signature parser
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+// trace:exempt reason=internal-detail
+struct ParsedSignature {
+    modifiers: Vec<String>,
+    async_: bool,
+    name: String,
+    owner: Option<String>,
+    ret_before_name: Option<String>,
+    params: Vec<String>,
+    generic_parameters: Vec<String>,
+    returns: Option<String>,
+    constraints: Vec<String>,
+}
+
+// trace:exempt reason=internal-detail
+fn parse_signature(sig: &str, fallback_name: &str, parent: Option<&str>) -> SemanticSignature {
+    let p = parse_sig_inner(sig);
+    let name = if p.name.is_empty() {
+        fallback_name.to_string()
+    } else {
+        p.name
+    };
+    let mut parameters: Vec<SemanticParameter> = Vec::new();
+    for raw in &p.params {
+        if let Some(sp) = parse_param(raw) {
+            parameters.push(sp);
+        }
+    }
+    let mut generic_parameters = p.generic_parameters;
+    generic_parameters.sort();
+    generic_parameters.dedup();
+    SemanticSignature {
+        name,
+        owner: p.owner.or_else(|| parent.map(|s| s.to_string())),
+        visibility: visibility_from_modifiers(&p.modifiers),
+        async_: p.async_,
+        generic_parameters,
+        parameters,
+        returns: p.returns,
+        constraints: p.constraints,
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn parse_sig_inner(sig: &str) -> ParsedSignature {
+    let mut p = ParsedSignature::default();
+    let s = sig.trim();
+    if s.is_empty() {
+        return p;
+    }
+
+    // 1. modifier + callable-keyword prefix
+    let mut rest: &str = s;
+    let mut consumed_keyword: Option<String> = None;
+    while let Some((word, after)) = leading_word(rest) {
+        let is_mod = is_modifier_word(&word);
+        let is_kw = !is_mod && is_callable_keyword(&word);
+        if !is_mod && !is_kw {
+            break;
+        }
+        let mut after = after;
+        let token = if after.starts_with('(') {
+            match take_group(after, '(', ')') {
+                Some((g, r)) => {
+                    after = r;
+                    format!("{}({})", word, g)
+                }
+                None => word.clone(),
+            }
+        } else {
+            word.clone()
+        };
+        if is_mod {
+            if word == "async" {
+                p.async_ = true;
+            }
+            if !p.modifiers.iter().any(|m| m == &token) {
+                p.modifiers.push(token);
+            }
+        } else {
+            consumed_keyword = Some(word);
+        }
+        rest = after.trim_start();
+    }
+
+    // 2. Go receiver group
+    let is_go = matches!(consumed_keyword.as_deref(), Some("func") | Some("function"));
+    if is_go && rest.starts_with('(') {
+        if let Some((group, after)) = take_group(rest, '(', ')') {
+            p.owner = receiver_owner(&group);
+            rest = after.trim_start();
+        }
+    }
+
+    // 3. Parameter list
+    let (prefix, params, tail) = match split_params(rest) {
+        Some(x) => (x.0, x.1, x.2),
+        None => {
+            if let Some((w, _)) = leading_word(rest) {
+                if is_identifier(&w) {
+                    p.name = w;
+                }
+            }
+            return p;
+        }
+    };
+    p.params = params;
+
+    // 4. Name + generics + java-style return type
+    let prefix = prefix.trim();
+    let (name_region, generics) = if prefix.ends_with('>') {
+        match find_matching_open(prefix, '<', '>') {
+            Some(idx) => (&prefix[..idx], Some(&prefix[idx..])),
+            None => (prefix, None),
+        }
+    } else {
+        (prefix, None)
+    };
+    let words: Vec<&str> = name_region.split_whitespace().collect();
+    if let Some(last) = words.last() {
+        if is_identifier(last) {
+            p.name = last.to_string();
+            if words.len() > 1 {
+                p.ret_before_name = Some(words[..words.len() - 1].join(" "));
+            }
+        } else if let Some(first) = words.first() {
+            if is_identifier(first) {
+                p.name = first.to_string();
+            }
+        }
+    }
+
+    if let Some(g) = generics {
+        let inner = g.trim_start_matches('<').trim_end_matches('>');
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for item in split_top(inner, ',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (name_part, bound) = match item.find(':') {
+                Some(idx) => (&item[..idx], Some(item[idx + 1..].trim())),
+                None => (item, None),
+            };
+            let gn = name_part.trim();
+            if gn.is_empty() {
+                continue;
+            }
+            if seen.insert(gn.to_string()) {
+                p.generic_parameters.push(gn.to_string());
+            }
+            if let Some(b) = bound {
+                let c = format!("{}: {}", gn, b);
+                if !c.is_empty() && seen.insert(c.clone()) {
+                    p.constraints.push(c);
+                }
+            }
+        }
+    }
+
+    // 5. Tail: returns + where/throws constraints
+    let (ret_text, constraints) = split_tail(tail.trim());
+    p.returns = parse_return(&ret_text, p.ret_before_name.as_deref());
+    if let Some(cs) = constraints {
+        for c in split_top(&cs, ',') {
+            let c = c.trim();
+            if !c.is_empty() && !p.constraints.iter().any(|x| x == c) {
+                p.constraints.push(c.to_string());
+            }
+        }
+    }
+    p
+}
+
+// trace:exempt reason=internal-detail
+fn split_tail(tail: &str) -> (String, Option<String>) {
+    let t = tail.trim();
+    for marker in ["where ", "throws ", " where ", " throws "] {
+        if let Some(idx) = find_depth0_pattern(t, marker) {
+            let before = if idx == 0 {
+                String::new()
+            } else {
+                t[..idx].trim().to_string()
+            };
+            let after = t[idx + marker.len()..]
+                .trim()
+                .trim_end_matches(',')
+                .trim()
+                .to_string();
+            return (before, Some(after));
+        }
+    }
+    (t.to_string(), None)
+}
+
+// trace:exempt reason=internal-detail
+fn parse_return(text: &str, ret_before: Option<&str>) -> Option<String> {
+    let t = text
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    if t.is_empty() {
+        return ret_before.map(|s| s.to_string());
+    }
+    for arrow in ["->", "=>"] {
+        if let Some(idx) = find_depth0_pattern(&t, arrow) {
+            let mut r = t[idx + arrow.len()..]
+                .trim()
+                .trim_end_matches(':')
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+            // unwrap multi-parenthesized return `(A, B)`
+            if let Some((g, _)) = take_group(&r, '(', ')') {
+                r = g;
+            }
+            if !r.is_empty() {
+                // strip leading pointer/reference markers
+                while let Some(stripped) = r.strip_prefix('*').or_else(|| r.strip_prefix('&')) {
+                    r = stripped.trim().to_string();
+                }
+                return Some(r);
+            }
+            return ret_before.map(|s| s.to_string());
+        }
+    }
+    if t.starts_with('(') {
+        if let Some((g, _)) = take_group(&t, '(', ')') {
+            return Some(g);
+        }
+    }
+    if let Some(rb) = ret_before {
+        return Some(rb.to_string());
+    }
+    if t.chars().all(|c| c.is_whitespace() || matches!(c, ':' | ';' | ',')) {
+        return None;
+    }
+    // strip leading pointer/reference markers
+    let mut r = t;
+    while let Some(stripped) = r.strip_prefix('*').or_else(|| r.strip_prefix('&')) {
+        r = stripped.trim().to_string();
+    }
+    if r.is_empty() { None } else { Some(r) }
+}
+
+// trace:exempt reason=internal-detail
+fn parse_param(raw: &str) -> Option<SemanticParameter> {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let variadic = s.contains("...") || s.starts_with('*') || s.starts_with("**");
+
+    for pfx in ["&mut ", "&", "*", "mut ", "ref ", "..."] {
+        if let Some(after) = s.strip_prefix(pfx) {
+            s = after.trim().to_string();
+            break;
+        }
+    }
+    let head = leading_word(&s).map(|(w, _)| w).unwrap_or_default();
+    if head == "self" || head == "this" || head == "Self" {
+        return Some(SemanticParameter {
+            name: head,
+            ty: None,
+            receiver: true,
+            default: None,
+            variadic,
+        });
+    }
+
+    let (left, default) = match find_depth0_char(&s, '=') {
+        Some(idx) => (s[..idx].trim().to_string(), Some(s[idx + 1..].trim().to_string())),
+        None => (s, None),
+    };
+    if left.is_empty() {
+        return None;
+    }
+    let (mut name, ty) = if let Some(idx) = find_depth0_char(&left, ':') {
+        (left[..idx].trim().to_string(), Some(left[idx + 1..].trim().to_string()))
+    } else {
+        split_name_type(&left)
+    };
+    while let Some(stripped) = name.strip_prefix('&').or_else(|| name.strip_prefix('*')) {
+        name = stripped.trim().to_string();
+    }
+    if let Some(stripped) = name.strip_prefix("mut ") {
+        name = stripped.trim().to_string();
+    }
+    name = name.trim_end_matches('?').trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let receiver = name == "self" || name == "this";
+    Some(SemanticParameter {
+        name,
+        ty,
+        receiver,
+        default,
+        variadic,
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn split_name_type(left: &str) -> (String, Option<String>) {
+    let words: Vec<&str> = left.split_whitespace().collect();
+    if words.is_empty() {
+        return (String::new(), None);
+    }
+    if words.len() == 1 {
+        return (words[0].to_string(), None);
+    }
+    let first = words[0];
+    let last = words[words.len() - 1];
+    let first_is_type = is_type_word(first)
+        || first.chars().next().map(|c| !c.is_ascii_lowercase()).unwrap_or(false)
+        || first.contains('<')
+        || first.contains('[')
+        || first.contains('.')
+        || first.ends_with("[]");
+    let last_is_plain = is_identifier(last) && !is_type_word(last);
+    if first_is_type && last_is_plain {
+        (last.to_string(), Some(words[..words.len() - 1].join(" ")))
+    } else {
+        (first.to_string(), Some(words[1..].join(" ")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Visibility helpers
+// ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+fn visibility_from_modifiers(mods: &[String]) -> Option<Visibility> {
+    if mods.iter().any(|m| m == "pub" || m == "public") {
+        Some(Visibility::Public)
+    } else if mods.iter().any(|m| m == "protected") {
+        Some(Visibility::Protected)
+    } else if mods.iter().any(|m| m == "private") {
+        Some(Visibility::Private)
+    } else {
+        None
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn entry_visibility(
+    exported: bool,
+    parent: Option<&str>,
+    mods: &[String],
+    ret_before_name: Option<&str>,
+) -> Visibility {
+    if exported {
+        return Visibility::Public;
+    }
+    if let Some(v) = visibility_from_modifiers(mods) {
+        return v;
+    }
+    if parent.is_some() && ret_before_name.is_some() {
+        return Visibility::Package;
+    }
+    Visibility::Private
+}
+
+// ---------------------------------------------------------------------------
+// Kind mapping
+// ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+fn map_kind(kind_str: &str, name: &str, parent: Option<&str>) -> SurfaceKind {
+    match kind_str {
+        "method" => {
+            let simple = name.rsplit('.').next().unwrap_or(name);
+            if parent.map(|p| simple == p).unwrap_or(false) || simple == "__init__" {
+                SurfaceKind::Constructor
+            } else {
+                SurfaceKind::Method
+            }
+        }
+        "function" => SurfaceKind::Function,
+        "class" => SurfaceKind::Class,
+        "interface" => SurfaceKind::Interface,
+        "trait" => SurfaceKind::Trait,
+        "enum" => SurfaceKind::Enum,
+        "type" => SurfaceKind::Type,
+        "const" => SurfaceKind::Const,
+        "module" => SurfaceKind::Module,
+        _ => SurfaceKind::Function,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Miscellaneous helpers
+// ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+fn canonicalize(sig: &str) -> String {
+    sig.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+// trace:exempt reason=internal-detail
+fn synthesized_signature(kind_str: &str, simple: &str) -> String {
+    match kind_str {
+        "class" | "interface" | "trait" | "enum" | "module" => format!("{} {}", kind_str, simple),
+        "type" => format!("type {}", simple),
+        _ => simple.to_string(),
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn step_matches(s: &scc_core::FlowStep, id: &str, name: &str, qualified: &str, file: &str) -> bool {
+    s.actor == id || s.actor == name || s.actor == qualified || (!file.is_empty() && s.actor.contains(file))
+}
+
+// trace:exempt reason=internal-detail
+fn sorted_rels(rels: Vec<&scc_core::Relationship>) -> Vec<&scc_core::Relationship> {
+    let mut v = rels;
+    v.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.subject.cmp(&b.subject))
+            .then_with(|| a.object.cmp(&b.object))
+    });
+    v
+}
+
+// trace:exempt reason=internal-detail
+fn attr_str(e: &scc_core::Entity, key: &str) -> Option<String> {
+    e.attributes.get(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn attr_u32(e: &scc_core::Entity, key: &str) -> u32 {
+    e.attributes
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+// trace:exempt reason=internal-detail
+fn fits(total_chars: usize, budget_chars: Option<usize>) -> bool {
+    budget_chars.is_none_or(|b| total_chars <= b)
+}
+
+// trace:exempt reason=internal-detail
+fn entry_tier(e: &SurfaceEntry) -> u8 {
+    if e.exported || e.visibility == Visibility::Public || !e.invocation_surfaces.is_empty() {
+        0
+    } else if e.rank.total > 0.0 {
+        1
+    } else {
+        2
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn entry_order(a: &SurfaceEntry, b: &SurfaceEntry) -> std::cmp::Ordering {
+    entry_tier(a)
+        .cmp(&entry_tier(b))
+        .then_with(|| b.rank.total.partial_cmp(&a.rank.total).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
+        .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+// ---------------------------------------------------------------------------
+// Renderer
+// ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+fn render_entry(e: &SurfaceEntry) -> String {
+    let mut out = String::new();
+    let name = e.qualified_name.rsplit('.').next().unwrap_or(&e.qualified_name);
+    out.push_str(&format!("  {} {}\n\n", e.kind.as_str(), name));
+    for line in e.source_signature.split('\n') {
+        out.push_str("    ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    let sections: [(&str, &[String]); 6] = [
+        ("Used by", &e.callers),
+        ("Calls", &e.callees),
+        ("Participates in", &e.flows),
+        ("Contracts", &e.contracts),
+        ("Owns", &e.state_authorities),
+        ("Invocation", &e.invocation_surfaces),
+    ];
+    for (label, vals) in sections {
+        if vals.is_empty() {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&format!("  {label}:\n    {}\n", vals.join(", ")));
+    }
+    out.push('\n');
+    out
+}
+
+// trace:exempt reason=internal-detail
+fn group_header(comp: &str, sub: &str, path: &str) -> String {
+    let mut h = String::new();
+    h.push('\n');
+    h.push_str(&comp.to_uppercase());
+    h.push_str("\n\n");
+    if sub.is_empty() {
+        h.push_str(path);
+    } else {
+        h.push_str(&format!("{}  [{}]", path, sub));
+    }
+    h.push_str("\n\n");
+    h
+}
+
+// ---------------------------------------------------------------------------
+// Token-level helpers
+// ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+fn is_modifier_word(w: &str) -> bool {
+    matches!(
+        w,
+        "async" | "await" | "static" | "final" | "abstract" | "readonly"
+            | "sealed" | "override" | "virtual" | "synchronized" | "native"
+            | "extern" | "unsafe" | "inline" | "const" | "var" | "let" | "mutable"
+            | "pub" | "public" | "private" | "protected" | "package" | "internal"
+            | "open" | "suspend" | "operator" | "export" | "default" | "declare"
+            | "data" | "value"
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn is_callable_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "fn" | "def" | "func" | "function" | "class" | "struct" | "interface"
+            | "trait" | "enum" | "type" | "module"
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn is_type_word(w: &str) -> bool {
+    matches!(
+        w,
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double"
+            | "bool" | "boolean" | "string" | "str" | "void" | "unsigned"
+            | "signed" | "usize" | "isize" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "i8" | "i16" | "i32" | "i64" | "i128" | "any"
+            | "object" | "Option" | "Result" | "Vec" | "Map" | "List" | "Set"
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn is_identifier(w: &str) -> bool {
+    let mut chars = w.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '?')
+}
+
+// trace:exempt reason=internal-detail
+fn leading_word(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '?' {
+            end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((s[..end].to_string(), &s[end..]))
+}
+
+// trace:exempt reason=internal-detail
+fn take_group(text: &str, open: char, close: char) -> Option<(String, &str)> {
+    if !text.starts_with(open) {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (i, ch) in text.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[1..i].to_string(), &text[i + ch.len_utf8()..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn find_matching_open(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, ch) in text.char_indices().rev() {
+        if ch == close {
+            depth += 1;
+        } else if ch == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn split_params(rest: &str) -> Option<(String, Vec<String>, String)> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut open: Option<usize> = None;
+    for (i, ch) in rest.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' if depth == 0 => {
+                open = Some(i);
+                break;
+            }
+            ')' if depth == 0 => return None,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let i0 = open?;
+    let (inner, after) = take_group(&rest[i0..], '(', ')')?;
+    let prefix = rest[..i0].to_string();
+    let params = split_top(&inner, ',');
+    Some((prefix, params, after.trim().to_string()))
+}
+
+// trace:exempt reason=internal-detail
+fn split_top(text: &str, sep: char) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut prev: Option<char> = None;
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if let Some(q) = quote {
+            cur.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '(' | '[' | '{' => {
+                paren_depth += 1;
+                cur.push(ch);
+            }
+            ')' | ']' | '}' => {
+                paren_depth -= 1;
+                cur.push(ch);
+            }
+            '<' if angle_depth == 0 && prev.map(|p| p.is_alphanumeric() || p == '_' || p == '>').unwrap_or(false) => {
+                angle_depth += 1;
+                cur.push(ch);
+            }
+            '>' if angle_depth > 0 && prev != Some('-') => {
+                angle_depth -= 1;
+                cur.push(ch);
+            }
+            c if c == sep && paren_depth == 0 && angle_depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+        prev = Some(ch);
+    }
+    out.push(cur);
+    out.into_iter().map(|s| s.trim().to_string()).collect()
+}
+
+// trace:exempt reason=internal-detail
+fn find_depth0_pattern(text: &str, pat: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (i, ch) in text.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && text[i..].starts_with(pat) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn find_depth0_char(text: &str, target: char) -> Option<usize> {
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut prev: Option<char> = None;
+    for (i, ch) in text.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => paren_depth += 1,
+            ')' | ']' | '}' => paren_depth -= 1,
+            '<' if angle_depth == 0 && prev.map(|p| p.is_alphanumeric() || p == '_' || p == '>').unwrap_or(false) => angle_depth += 1,
+            '>' if angle_depth > 0 && prev != Some('-') => angle_depth -= 1,
+            c if c == target && paren_depth == 0 && angle_depth == 0 => return Some(i),
+            _ => {}
+        }
+        prev = Some(ch);
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn receiver_owner(group: &str) -> Option<String> {
+    let inner = group.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = inner.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    let t = if words.len() <= 1 {
+        words[0]
+    } else {
+        words[words.len() - 1]
+    };
+    let t = t.trim_start_matches('*').trim_start_matches('&');
+    let seg = t.rsplit('.').next().unwrap_or(t);
+    let seg = seg.trim().trim_start_matches('*');
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scc_core::{
+        entity_id, relationship_id, symbol_id, Entity, Flow, FlowKind, FlowStep, Relationship,
+    };
+    use scc_store::Store;
+
+// trace:exempt reason=internal-detail
+    fn fixture_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+
+        let fid = entity_id(&repo, kinds::FILE, path);
+        store.insert_entity(&Entity::new(fid.clone(), kinds::FILE, path), &[path.to_string()]).unwrap();
+
+        let comp_id = entity_id(&repo, kinds::COMPONENT, "api");
+        store.replace_components(&[Entity::new(comp_id.clone(), kinds::COMPONENT, "api")]).unwrap();
+        store.insert_relationship(
+            &Relationship::new(relationship_id(1), comp_id.clone(), predicates::CONTAINS, fid.clone(), Provenance::Extracted),
+            path,
+        ).unwrap();
+
+        let svc_id = entity_id(&repo, kinds::SERVICE, "core");
+        store.insert_entity(&Entity::new(svc_id.clone(), kinds::SERVICE, "core"), &[path.to_string()]).unwrap();
+        store.insert_relationship(
+            &Relationship::new(relationship_id(2), svc_id, predicates::CONTAINS, comp_id.clone(), Provenance::Extracted),
+            path,
+        ).unwrap();
+
+        let mut rid: u64 = 3;
+        let mut sym = |name: &str, kind: &str, sig: Option<&str>, exported: bool, parent: Option<&str>| -> String {
+            let id = symbol_id(&repo, path, name);
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, name);
+            e.attr("kind", serde_json::json!(kind));
+            e.attr("file", serde_json::json!(path));
+            if let Some(s) = sig { e.attr("signature", serde_json::json!(s)); }
+            e.attr("exported", serde_json::json!(exported));
+            e.attr("start_line", serde_json::json!(1u32));
+            e.attr("end_line", serde_json::json!(10u32));
+            if let Some(p) = parent { e.attr("parent", serde_json::json!(p)); }
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+            rid += 1;
+            store.insert_relationship(
+                &Relationship::new(relationship_id(rid), fid.clone(), predicates::CONTAINS, id.clone(), Provenance::Extracted),
+                path,
+            ).unwrap();
+            id
+        };
+
+        let _ = sym("UserService", "class", None, true, None);
+        let _ = sym("UserService.UserService", "method", Some("public UserService(String name)"), false, Some("UserService"));
+        let get_id = sym("UserService.get", "method", Some("public User get(String id) throws NotFound"), false, Some("UserService"));
+        let _ = sym("UserService.hash", "method", Some("String hash()"), false, Some("UserService"));
+        let update_id = sym("UserService.update", "method", Some("async fn update(&mut self, patch: Json) -> bool"), false, Some("UserService"));
+        let create_id = sym("create_user", "function", Some("def create_user(name: str, age: int = 0) -> User"), true, None);
+        let db_id = sym("db", "function", Some("func db() *DB"), false, None);
+
+        // annotation RestController ANNOTATES get
+        let ann_id = entity_id(&repo, kinds::ANNOTATION, "RestController");
+        store.insert_entity(&Entity::new(ann_id.clone(), kinds::ANNOTATION, "RestController"), &[path.to_string()]).unwrap();
+        rid += 1;
+        store.insert_relationship(
+            &Relationship::new(relationship_id(rid), ann_id, predicates::ANNOTATES, get_id.clone(), Provenance::Extracted),
+            path,
+        ).unwrap();
+
+        // route: GET /api/users -> create_user
+        let route_id = entity_id(&repo, kinds::ROUTE, "GET /api/users");
+        let mut re = Entity::new(route_id.clone(), kinds::ROUTE, "GET /api/users");
+        re.attr("method", serde_json::json!("GET"));
+        re.attr("path", serde_json::json!("/api/users"));
+        re.attr("handler", serde_json::json!(create_id.clone()));
+        store.insert_entity(&re, &[path.to_string()]).unwrap();
+
+        // CALLS
+        rid += 1;
+        store.insert_relationship(
+            &Relationship::new(relationship_id(rid), create_id.clone(), predicates::CALLS, get_id.clone(), Provenance::Extracted),
+            path,
+        ).unwrap();
+        rid += 1;
+        store.insert_relationship(
+            &Relationship::new(relationship_id(rid), db_id.clone(), predicates::CALLS, create_id.clone(), Provenance::Resolved),
+            path,
+        ).unwrap();
+
+        // STATE: db OWNS sessions
+        let state_id = entity_id(&repo, kinds::STATE, "sessions");
+        store.insert_entity(&Entity::new(state_id.clone(), kinds::STATE, "sessions"), &[path.to_string()]).unwrap();
+        rid += 1;
+        store.insert_relationship(
+            &Relationship::new(relationship_id(rid), db_id.clone(), predicates::OWNS, state_id, Provenance::Extracted),
+            path,
+        ).unwrap();
+
+        // REACTIVE: update OWNS cursor
+        let rx_id = entity_id(&repo, kinds::REACTIVE, "cursor");
+        store.insert_entity(&Entity::new(rx_id.clone(), kinds::REACTIVE, "cursor"), &[path.to_string()]).unwrap();
+        rid += 1;
+        store.insert_relationship(
+            &Relationship::new(relationship_id(rid), update_id.clone(), predicates::OWNS, rx_id, Provenance::Extracted),
+            path,
+        ).unwrap();
+
+        // Flow signup
+        store.replace_flows(&[Flow {
+            id: entity_id(&repo, kinds::FLOW, "signup"),
+            kind: FlowKind::Workflow,
+            name: "signup".into(),
+            trigger: Some("http".into()),
+            steps: vec![
+                FlowStep {
+                    id: "step:1".into(),
+                    order: 1,
+                    actor: get_id.clone(),
+                    operation: "load user".into(),
+                    condition: None,
+                    r#async: None,
+                    timeout_ms: None,
+                    retry_policy: None,
+                    failure_outcome: None,
+                    provenance: Some(Provenance::Extracted),
+                    evidence: vec![],
+                },
+                FlowStep {
+                    id: "step:2".into(),
+                    order: 2,
+                    actor: "db".into(),
+                    operation: "persist".into(),
+                    condition: None,
+                    r#async: None,
+                    timeout_ms: None,
+                    retry_policy: None,
+                    failure_outcome: None,
+                    provenance: Some(Provenance::Extracted),
+                    evidence: vec![],
+                },
+            ],
+            attributes: std::collections::BTreeMap::new(),
+        }]).unwrap();
+
+        let _ = (get_id, create_id, db_id, update_id);
+        (dir, store)
+    }
+
+// trace:exempt reason=internal-detail
+    fn entry<'a>(map: &'a SystemSurfaceMap, qn: &str) -> &'a SurfaceEntry {
+        map.entries.iter().find(|e| e.qualified_name == qn).expect("entry not found")
+    }
+
+// trace:exempt reason=internal-detail
+    fn make_ctx<'a>(store: &'a Store) -> ContextCompiler<'a> {
+        let graph = Box::leak(Box::new(scc_graph::RealityGraph::load(store).unwrap()));
+        ContextCompiler::new(store, graph, crate::ContextSettings::default(), Vec::new())
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn compiles_surface_map_with_attribution() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+
+        assert_eq!(map.entries.len(), 7);
+        assert_eq!(map.repository, "repo");
+        assert_eq!(map.revision, "not-indexed");
+        assert!(map.token_count > 0);
+
+        let cls = entry(&map, "UserService");
+        assert_eq!(cls.kind, SurfaceKind::Class);
+        assert_eq!(cls.visibility, Visibility::Public);
+        assert!(cls.exported);
+        assert_eq!(cls.source_signature, "class UserService");
+        assert_eq!(cls.range.path, "api/app.py");
+        assert_eq!(cls.component.as_deref(), Some("api"));
+        assert_eq!(cls.subsystem.as_deref(), Some("core"));
+
+        let ctor = entry(&map, "UserService.UserService");
+        assert_eq!(ctor.kind, SurfaceKind::Constructor);
+        assert_eq!(ctor.visibility, Visibility::Public);
+        assert_eq!(ctor.semantic_signature.parameters[0].name, "name");
+        assert_eq!(ctor.semantic_signature.parameters[0].ty.as_deref(), Some("String"));
+
+        let get = entry(&map, "UserService.get");
+        assert_eq!(get.kind, SurfaceKind::Method);
+        assert_eq!(get.visibility, Visibility::Public);
+        assert_eq!(get.annotations, vec!["RestController"]);
+        assert_eq!(get.flows, vec!["signup"]);
+        assert_eq!(get.callers, vec!["create_user"]);
+        assert!(get.callees.is_empty());
+        let gs = &get.semantic_signature;
+        assert_eq!(gs.parameters[0].name, "id");
+        assert_eq!(gs.parameters[0].ty.as_deref(), Some("String"));
+        assert!(!gs.parameters[0].receiver);
+        assert_eq!(gs.returns.as_deref(), Some("User"));
+        assert!(gs.constraints.iter().any(|c| c == "NotFound"));
+        assert_eq!(get.provenance, Provenance::Extracted);
+        assert_eq!(get.confidence, 0.85);
+
+        let hash = entry(&map, "UserService.hash");
+        assert_eq!(hash.visibility, Visibility::Package);
+
+        let update = entry(&map, "UserService.update");
+        assert_eq!(update.visibility, Visibility::Private);
+        assert_eq!(update.modifiers, vec!["async"]);
+        assert_eq!(update.state_authorities, vec!["cursor"]);
+        let us = &update.semantic_signature;
+        assert!(us.async_);
+        assert!(us.parameters[0].receiver);
+        assert_eq!(us.parameters[1].name, "patch");
+        assert_eq!(us.returns.as_deref(), Some("bool"));
+
+        let create = entry(&map, "create_user");
+        assert_eq!(create.kind, SurfaceKind::Function);
+        assert_eq!(create.visibility, Visibility::Public);
+        assert!(create.exported);
+        assert_eq!(create.canonical_signature, "def create_user(name: str, age: int = 0) -> user");
+        assert_eq!(create.contracts, vec!["http: GET /api/users"]);
+        assert_eq!(create.callees, vec!["UserService.get"]);
+        assert_eq!(create.invocation_surfaces, vec![
+            "http: GET /api/users",
+            "public_api: export:create_user (function)",
+        ]);
+        assert_eq!(create.semantic_signature.parameters[1].name, "age");
+        assert_eq!(create.semantic_signature.parameters[1].default.as_deref(), Some("0"));
+        assert_eq!(create.semantic_signature.returns.as_deref(), Some("User"));
+
+        let db = entry(&map, "db");
+        assert_eq!(db.visibility, Visibility::Private);
+        assert_eq!(db.state_authorities, vec!["sessions"]);
+        assert_eq!(db.provenance, Provenance::Resolved);
+        assert_eq!(db.confidence, 1.0);
+        assert_eq!(db.semantic_signature.returns.as_deref(), Some("DB"));
+        assert_eq!(db.flows, vec!["signup"]);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn renderer_groups_and_budget_cuts() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+
+        let full = render_surface_map(&map, None);
+        assert!(full.starts_with("SCC SYSTEM SURFACE MAP\n\n"));
+        assert!(full.contains("API\n\napi/app.py  [core]"));
+        assert!(full.contains("  class UserService\n"));
+        assert!(full.contains("  function create_user\n"));
+        assert!(full.contains("  constructor UserService\n"));
+        assert!(full.contains("Used by:"));
+        assert!(full.contains("http: GET /api/users"));
+        assert!(!full.contains("OMITTED"));
+        assert_eq!(map.token_count, estimate_tokens(&full));
+
+        let tiny = render_surface_map(&map, Some(1));
+        assert!(tiny.contains("OMITTED (token budget exceeded):"));
+        assert!(tiny.contains("3 lower-ranked method definitions"));
+        assert!(tiny.contains("1 lower-ranked class definitions"));
+        assert!(tiny.contains("1 lower-ranked constructor definitions"));
+        assert!(tiny.contains("2 lower-ranked function definitions"));
+        assert!(!tiny.contains("  class UserService\n"));
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn semantic_parser_never_panics() {
+        for sig in &["", "   ", "(", ")", "()", "=>", "->", "(((", "fn", "public", "= 42"] {
+            let s = parse_signature(sig, "fallback", None);
+            assert_eq!(s.name, "fallback");
+        }
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn semantic_parser_language_tolerant() {
+        // Rust with generics, where clause, receiver
+        let s = parse_signature(
+            "pub async fn render<T: Bound>(&self, x: T) -> String where T: Clone + Send",
+            "render",
+            Some("Widget"),
+        );
+        assert_eq!(s.name, "render");
+        assert!(s.async_);
+        assert!(s.generic_parameters.contains(&"T".to_string()));
+        assert!(s.constraints.contains(&"T: Bound".to_string()));
+        assert!(s.constraints.contains(&"T: Clone + Send".to_string()));
+        assert_eq!(s.visibility, Some(Visibility::Public));
+        assert_eq!(s.returns.as_deref(), Some("String"));
+        assert!(s.parameters[0].receiver);
+        assert_eq!(s.parameters[1].ty.as_deref(), Some("T"));
+        assert_eq!(s.owner.as_deref(), Some("Widget"));
+
+        // Go receiver + multi-return
+        let g = parse_signature(
+            "func (s *Store) Get(ctx context.Context) (User, error)",
+            "Get",
+            Some("Store"),
+        );
+        assert_eq!(g.name, "Get");
+        assert_eq!(g.owner.as_deref(), Some("Store"));
+        assert_eq!(g.parameters[0].ty.as_deref(), Some("context.Context"));
+        assert_eq!(g.returns.as_deref(), Some("User, error"));
+    }
+}
