@@ -4,30 +4,30 @@ validation corpus:  validation: /Users/rocket/system_ir/benchmarks/holdout
 results:            /Users/rocket/system_ir/benchmarks/results/holdout-v3.txt
 
 layer               development   validation        gap
-architecture              0.922        0.597     -0.324
+architecture              0.918        0.624     -0.293
 entrypoints               0.422        0.422     +0.000
 behavior                  0.306        0.057     -0.249
 state_authority           0.367        0.450     +0.083
-contracts                 0.339        0.075     -0.264
-overall (gate)            0.471        0.320     -0.151
+contracts                 0.339        0.060     -0.279
+overall (gate)            0.470        0.323     -0.148
 
 scored: development 20 (skipped 0) | validation 20 (skipped 0)
-precision: development 0.079 | validation 0.044
-F2: development 0.162 | validation 0.100
-resolved calls (upgraded): development 20 | validation 261
-density (facts/1k tokens): development 0.70 | validation 0.43
-atlas tokens: development 65138 | validation 199058
+precision: development 0.080 | validation 0.045
+F2: development 0.164 | validation 0.100
+resolved calls (upgraded): development 0 | validation 171
+density (facts/1k tokens): development 0.72 | validation 0.42
+atlas tokens: development 59308 | validation 132004
 
 ## per-layer precision + F2 (startup-required layers)
 layer              P:development P:validation   F2:development F2:validation
-architecture              0.161        0.050          0.403        0.124
+architecture              0.162        0.052          0.404        0.129
 entrypoints               0.012        0.047          0.049        0.122
-behavior                  0.060        0.000          0.096        0.001
-state_authority           0.101        0.122          0.141        0.244
-contracts                 0.062        0.001          0.119        0.006
+behavior                  0.063        0.000          0.106        0.001
+state_authority           0.102        0.122          0.144        0.244
+contracts                 0.062        0.001          0.119        0.005
 overall (gate)            0.000        0.000          0.000        0.000
 
-## verdict: OVERFIT (gap = -0.151; tolerance = 0.050)
+## verdict: OVERFIT (gap = -0.148; tolerance = 0.050)
 The validation corpus lags the development corpus by more than the tolerance band; rules tuned on the development corpus do not generalize to unseen repos.
 
 ## validation repo overall recall (sorted)
@@ -40,7 +40,7 @@ The validation corpus lags the development corpus by more than the tolerance ban
   django                      0.332
   guava                       0.575
   helm                        0.286
-  kustomize                   0.276
+  kustomize                   0.385
   netty                       0.555
   rayon                       0.255
   react                       0.433
@@ -50,4 +50,4 @@ The validation corpus lags the development corpus by more than the tolerance ban
   vitest                      0.341
   vue                         0.429
   zerolog                     0.201
-  zod                         0.355
+  zod                         0.295
