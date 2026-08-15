@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::benchctx::{locate_fixtures_dir, BenchmarkCorpus};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+// trace:exempt reason=internal-detail  # agent-run recorder data, traced as part of impl.scc.bench.agent
 pub struct AgentTaskResult {
     pub id: String,
     pub exit_ok: bool,
@@ -43,9 +44,15 @@ pub struct AgentTaskResult {
     pub wrong_first_locations: usize,
     /// wall time until the first ground-truth file appears in a tool event or output
     pub first_correct_ms: Option<u64>,
+    /// the agent's first plan (output before the first tool event) names a
+    /// ground-truth key (file or symbol)
+    pub first_plan_correct: bool,
+    /// knowledge-graph query tool calls (MCP tools named graph/gitnexus)
+    pub graph_tool_calls: usize,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+// trace:exempt reason=internal-detail  # agent-run recorder aggregate, traced as part of impl.scc.bench.agent
 pub struct AgentBenchSummary {
     pub tasks: usize,
     pub passed: usize,
@@ -57,6 +64,13 @@ pub struct AgentBenchSummary {
     pub mean_wrong_first_locations: f64,
     /// mean over tasks that had a first-correct observation (None if none did)
     pub mean_first_correct_ms: Option<f64>,
+    /// knowledge-graph query tool calls per task (MCP tools named graph/gitnexus)
+    pub mean_graph_tool_calls: f64,
+    /// fraction of tasks whose first plan names a ground-truth key
+    pub mean_first_plan_correct: f64,
+    /// variant name for `scc bench external` runs (empty for `bench agent`)
+    #[serde(default)]
+    pub variant: String,
     pub results: Vec<AgentTaskResult>,
 }
 
@@ -149,11 +163,24 @@ pub fn print_agent_gate(g: &AgentGateResult) {
     );
 }
 
-/// `scc bench agent --cmd "<command>"` — the command receives the task goal
-/// via the `SCC_GOAL` env var and the repo path as its working directory
-/// (like `claude -p "$SCC_GOAL"` or `codex exec -- "$SCC_GOAL"`).
-// trace:v1 id=impl.scc.bench.agent work=WORK-SCC-002 verifies=REQ-SCC-TEST
-pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummary, String> {
+/// One ground-truth task definition used by the variant runners
+/// ([`run_variant_tasks`]). The `files` are the localization ground truth
+/// (the benchagent protocol compares tool events against them); `plan_keys`
+/// are the first-plan correctness keys (files + symbols).
+#[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail  # data container of the variant runner (impl.scc.bench.variant)
+pub struct VariantTask {
+    pub id: String,
+    pub repo: String,
+    pub goal: String,
+    pub files: Vec<String>,
+    pub plan_keys: Vec<String>,
+}
+
+/// Load the `benchmarks/tasks.json` corpus as [`VariantTask`]s (plan keys =
+/// ground-truth files, matching the original `bench agent` protocol).
+// trace:exempt reason=internal-detail  # corpus loader of the variant runner (impl.scc.bench.variant)
+fn load_corpus_tasks() -> Result<Vec<VariantTask>, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let corpus_path = fixtures
         .parent()
@@ -167,12 +194,66 @@ pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummar
         .ok_or("cannot locate benchmarks/tasks.json")?;
     let text = std::fs::read_to_string(&corpus_path).map_err(|e| e.to_string())?;
     let corpus: BenchmarkCorpus = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(corpus
+        .tasks
+        .iter()
+        .map(|t| VariantTask {
+            id: t.id.clone(),
+            repo: t.repo.clone(),
+            goal: t.goal.clone(),
+            files: t.ground_truth.files.clone(),
+            plan_keys: t.ground_truth.files.clone(),
+        })
+        .collect())
+}
+
+/// `scc bench agent --cmd "<command>"` — the command receives the task goal
+/// via the `SCC_GOAL` env var and the repo path as its working directory
+/// (like `claude -p "$SCC_GOAL"` or `codex exec -- "$SCC_GOAL"`).
+// trace:v1 id=impl.scc.bench.agent work=WORK-SCC-002 verifies=REQ-SCC-TEST
+pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummary, String> {
+    let tasks = load_corpus_tasks()?;
+    run_variant_tasks("", &tasks, |_, _| Ok(cmd.to_string()), min_files)
+}
+
+/// Wave-15 variant benchmark: same protocol as [`run_agent_benchmark`] over
+/// the full `benchmarks/tasks.json` corpus, recording the variant name in
+/// the summary. `cmd` is a shell command; the variant context artifact is
+/// expected to be generated inside it (see benchmarks/run_agent_bench.sh).
+// trace:v1 id=impl.scc.bench.variant work=WORK-SCC-002 verifies=REQ-SCC-TEST
+pub fn run_variant_benchmark(
+    variant: &str,
+    cmd: &str,
+    min_files: f64,
+) -> Result<AgentBenchSummary, String> {
+    let tasks = load_corpus_tasks()?;
+    run_variant_tasks(variant, &tasks, |_, _| Ok(cmd.to_string()), min_files)
+}
+
+/// The shared variant runner: for each task, copy the fixture repo, index
+/// it, ask `cmd_for` for the per-task shell command (this is where a
+/// variant generates its context artifact into the freshly indexed repo and
+/// returns the agent command that consumes it), then run the benchagent
+/// protocol. Aggregates the same metrics as `bench agent` plus
+/// first-plan accuracy and graph-query counts, and records `variant`.
+// trace:exempt reason=internal-detail  # shared runner internals; variant entry point is impl.scc.bench.variant
+pub fn run_variant_tasks<F>(
+    variant: &str,
+    tasks: &[VariantTask],
+    mut cmd_for: F,
+    min_files: f64,
+) -> Result<AgentBenchSummary, String>
+where
+    F: FnMut(&VariantTask, &Path) -> Result<String, String>,
+{
+    let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
 
     let mut summary = AgentBenchSummary {
-        tasks: corpus.tasks.len(),
+        variant: variant.to_string(),
+        tasks: tasks.len(),
         ..Default::default()
     };
-    for task in &corpus.tasks {
+    for task in tasks {
         let repo_dir = fixtures.join(&task.repo);
         let tmp = tempfile::TempDir::new().map_err(|e| e.to_string())?;
         let root = tmp.path().join("repo");
@@ -180,26 +261,31 @@ pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummar
         // index first so the agent starts warm (matches the SCC baseline flow)
         crate::commands::cmd_index(&root, true).map_err(|e| e.to_string())?;
 
-        let res = run_task(cmd, &root, &task.id, &task.goal, &task.ground_truth.files)?;
+        let cmd = cmd_for(task, &root)?;
+        let res = run_task(&cmd, &root, &task.id, &task.goal, &task.files, &task.plan_keys)?;
         summary.mean_localization +=
-            res.files_surfaced as f64 / task.ground_truth.files.len().max(1) as f64;
+            res.files_surfaced as f64 / task.files.len().max(1) as f64;
         summary.mean_duration_ms += res.duration_ms as f64;
         summary.mean_files_opened += res.files_opened as f64;
         summary.mean_search_tool_calls += res.search_tool_calls as f64;
         summary.mean_read_tool_calls += res.read_tool_calls as f64;
         summary.mean_wrong_first_locations += res.wrong_first_locations as f64;
+        summary.mean_graph_tool_calls += res.graph_tool_calls as f64;
+        summary.mean_first_plan_correct += res.first_plan_correct as usize as f64;
         if res.exit_ok {
             summary.passed += 1;
         }
         summary.results.push(res);
     }
-    let n = corpus.tasks.len() as f64;
+    let n = tasks.len() as f64;
     summary.mean_duration_ms /= n;
     summary.mean_localization /= n;
     summary.mean_files_opened /= n;
     summary.mean_search_tool_calls /= n;
     summary.mean_read_tool_calls /= n;
     summary.mean_wrong_first_locations /= n;
+    summary.mean_graph_tool_calls /= n;
+    summary.mean_first_plan_correct /= n;
     let with_first: Vec<u64> = summary
         .results
         .iter()
@@ -223,12 +309,14 @@ pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummar
 /// Run one task through `sh -c <cmd>` while streaming stdout line by line:
 /// each line's arrival time is recorded (for first-correct timing) and lines
 /// that look like JSONL events are parsed for tool-level metrics.
+// trace:exempt reason=internal-detail  # agent-run recorder internals (impl.scc.bench.agent)
 fn run_task(
     cmd: &str,
     root: &Path,
     id: &str,
     goal: &str,
     gt_files: &[String],
+    plan_keys: &[String],
 ) -> Result<AgentTaskResult, String> {
     let started = Instant::now();
     let mut child = Command::new("sh")
@@ -254,6 +342,11 @@ fn run_task(
     let mut first_correct_ms: Option<u64> = None;
     let mut gt_seen = false;
     let mut wrong_seen: BTreeSet<String> = BTreeSet::new();
+    // The agent's first plan = the output stream before the first tool
+    // event; first-plan correctness compares that text against the
+    // ground-truth keys (files + symbols).
+    let mut plan_buf = String::new();
+    let mut plan_done = false;
 
     let reader = BufReader::new(stdout);
     for line in reader.split(b'\n') {
@@ -269,7 +362,12 @@ fn run_task(
                 first_correct_ms = Some(elapsed_ms);
             }
         }
+        if !plan_done {
+            plan_buf.push_str(&line);
+            plan_buf.push('\n');
+        }
         if let Some(ev) = parse_event_line(&line, root) {
+            plan_done = true;
             // wrong-first: non-ground-truth files opened before the first
             // ground-truth file was touched (unique, in stream order)
             if !gt_seen {
@@ -296,6 +394,7 @@ fn run_task(
         .iter()
         .filter(|f| output.contains(f.as_str()))
         .count();
+    let first_plan_correct = plan_keys.iter().any(|k| plan_buf.contains(k.as_str()));
     let mut opened: BTreeSet<String> = BTreeSet::new();
     for ev in &events {
         opened.extend(ev.paths.iter().cloned());
@@ -313,6 +412,8 @@ fn run_task(
         total_tool_calls: events.len(),
         wrong_first_locations: wrong_seen.len(),
         first_correct_ms,
+        first_plan_correct,
+        graph_tool_calls: events.iter().filter(|e| e.graph).count(),
     })
 }
 
@@ -324,9 +425,12 @@ enum ToolKind {
 }
 
 #[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail  # event-model internals (impl.scc.bench.agent)
 struct AgentEvent {
     paths: Vec<String>,
     kind: ToolKind,
+    /// knowledge-graph query tool (mcp tool / tool_use named graph/gitnexus)
+    graph: bool,
 }
 
 /// Tolerant JSONL event parser. Recognizes the codex `--json` shape
@@ -334,6 +438,7 @@ struct AgentEvent {
 /// and the generic `{type:"tool_use"|"tool_result"}` shapes. Returns None for
 /// non-JSON lines, in-progress events, and non-tool events (agent messages,
 /// errors, turn markers).
+// trace:exempt reason=internal-detail  # event parser internals (impl.scc.bench.agent)
 fn parse_event_line(line: &str, root: &Path) -> Option<AgentEvent> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
@@ -353,6 +458,7 @@ fn parse_event_line(line: &str, root: &Path) -> Option<AgentEvent> {
             Some(AgentEvent {
                 paths: paths_from_command(command, root),
                 kind: kind_of(tool),
+                graph: false,
             })
         }
         "mcp_tool_call" => {
@@ -365,6 +471,7 @@ fn parse_event_line(line: &str, root: &Path) -> Option<AgentEvent> {
             Some(AgentEvent {
                 paths,
                 kind: kind_of(tool),
+                graph: is_graph_tool(tool),
             })
         }
         "tool_use" => {
@@ -377,6 +484,7 @@ fn parse_event_line(line: &str, root: &Path) -> Option<AgentEvent> {
             Some(AgentEvent {
                 paths,
                 kind: kind_of(tool),
+                graph: is_graph_tool(tool),
             })
         }
         // tool_result is a response, not a call; messages/errors carry no
@@ -500,6 +608,13 @@ fn kind_of(tool: &str) -> ToolKind {
     }
 }
 
+/// A knowledge-graph query tool (MCP graph servers, gitnexus, codegraph).
+// trace:exempt reason=internal-detail  # graph-query classifier feeding variant metrics (impl.scc.bench.variant)
+fn is_graph_tool(tool: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    t.contains("graph") || t.contains("gitnexus")
+}
+
 fn copy_fixture_tree(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -519,22 +634,32 @@ fn copy_fixture_tree(src: &Path, dst: &Path) {
     }
 }
 
+// trace:exempt reason=internal-detail  # summary printer internals (impl.scc.bench.agent)
 pub fn print_agent_summary(s: &AgentBenchSummary) {
-    println!("scc bench agent — ground-truth corpus through an external agent command");
+    if s.variant.is_empty() {
+        println!("scc bench agent — ground-truth corpus through an external agent command");
+    } else {
+        println!("scc bench external — variant {variant}", variant = s.variant);
+    }
     println!(
         "  tasks: {}   exit-ok: {}/{}   mean duration: {:.0} ms   mean localization: {:.3}",
         s.tasks, s.passed, s.tasks, s.mean_duration_ms, s.mean_localization
     );
     println!(
-        "  exploration means: files opened {:.1}   searches {:.1}   reads {:.1}   wrong-first {:.1}   first-correct {}",
+        "  exploration means: files opened {:.1}   searches {:.1}   reads {:.1}   graph {:.1}   wrong-first {:.1}   first-correct {}",
         s.mean_files_opened,
         s.mean_search_tool_calls,
         s.mean_read_tool_calls,
+        s.mean_graph_tool_calls,
         s.mean_wrong_first_locations,
         match s.mean_first_correct_ms {
             Some(v) => format!("{v:.0} ms"),
             None => "— (no JSON event stream)".to_string(),
         }
+    );
+    println!(
+        "  first-plan accuracy: {:.3}",
+        s.mean_first_plan_correct
     );
     for r in &s.results {
         let first = match r.first_correct_ms {
@@ -632,6 +757,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gt.files, vec!["a.py"]);
+    }
+
+    #[test]
+    // trace:exempt reason=unit-test  # wave-15 variant runner test
+fn variant_benchmark_records_variant_name() {
+        // Same protocol as run_agent_benchmark, but the summary carries the
+        // variant name (Wave 15 external suite).
+        let summary = run_variant_benchmark("scc-atlas-surface", "echo \"$SCC_GOAL\"", 0.0).unwrap();
+        assert_eq!(summary.variant, "scc-atlas-surface");
+        assert_eq!(summary.tasks, 21);
+        assert!(summary.results.iter().all(|r| r.exit_ok));
+        // no tool events -> no graph queries; first plan = whole output
+        assert!(summary.results.iter().all(|r| r.graph_tool_calls == 0));
+    }
+
+    #[test]
+    // trace:exempt reason=unit-test  # wave-15 variant runner test
+fn run_variant_tasks_filters_and_first_plan() {
+        // A repo-filtered task list: the closure builds the per-task shell
+        // command (variant artifact injection point) and the runner records
+        // first-plan correctness against the plan keys.
+        let tasks = vec![VariantTask {
+            id: "http-service.rename-transcript-field".into(),
+            repo: "http-service-python".into(),
+            goal: "rename the transcript field".into(),
+            files: vec!["main.py".into(), "services/transcripts.py".into()],
+            plan_keys: vec!["main.py".into(), "handle_transcripts".into()],
+        }];
+        let cmd_for = |_task: &VariantTask, _root: &Path| {
+            // The fake agent's "first plan" names the correct file before
+            // any tool event, then emits one search event.
+            Ok(r#"printf '%s\n' \
+'{"type":"item.completed","item":{"type":"agent_message","text":"Plan: main.py"}}' \
+'{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"rg -n transcript .\"","exit_code":0}}'"#
+                .to_string())
+        };
+        let summary = run_variant_tasks("scc-atlas", &tasks, cmd_for, 0.0).unwrap();
+        assert_eq!(summary.tasks, 1);
+        assert_eq!(summary.variant, "scc-atlas");
+        let r = &summary.results[0];
+        assert!(r.first_plan_correct, "plan mentions main.py before tools");
+        assert_eq!(r.search_tool_calls, 1);
+        assert_eq!(summary.mean_first_plan_correct, 1.0);
+        assert_eq!(summary.mean_search_tool_calls, 1.0);
     }
 
     fn summary_with(search: f64, files: f64, first: Option<f64>) -> AgentBenchSummary {

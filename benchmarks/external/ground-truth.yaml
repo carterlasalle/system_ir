@@ -1,0 +1,43 @@
+# Wave 15 external-benchmark ground truth (Wave-14 spec §75 vocabulary:
+# public_surfaces / important_types / implementation_landmarks).
+#
+# This file holds per-repo tasks for fixture repos NOT covered by
+# benchmarks/tasks.json (the canonical 21-task corpus). Repos that already
+# have tasks.json entries are merged in at load time — do not duplicate them
+# here.
+#
+# Schema (values use inline [a, b] lists):
+#   version: 1
+#   repos:
+#     <fixture-dir-name>:
+#       tasks:
+#         - id: <unique-id>
+#           goal: <agent task goal>
+#           public_surfaces: [files that appear in a competent first plan]
+#           important_types: [types/symbols a human would name in the plan]
+#           implementation_landmarks: [repo-relative files that must be opened
+#                                      to implement the task — the localization
+#                                      ground truth (files[])]
+#           symbols: [extra first-plan keys beyond important_types]
+version: 1
+repos:
+  cli-service:
+    tasks:
+      - id: cli-service.serve-paging-flag
+        goal: "add a --paging flag to the serve subcommand"
+        public_surfaces: [cli.rs, cli.py, main.go]
+        important_types: [Cli, Command, build_parser, rootCmd, serveCmd]
+        implementation_landmarks: [cli.rs, cli.py, main.go]
+        symbols: [Serve, serve, paging]
+      - id: cli-service.deploy-env-required
+        goal: "make the deploy subcommand require a prod environment target"
+        public_surfaces: [cli.rs, cli.py, main.go]
+        important_types: [Deploy, deploy, deployCmd]
+        implementation_landmarks: [cli.rs, cli.py, main.go]
+        symbols: [env]
+      - id: cli-service.health-route
+        goal: "expose a health check route on the router"
+        public_surfaces: [cli.rs]
+        important_types: [build_router, health]
+        implementation_landmarks: [cli.rs]
+        symbols: [Router]

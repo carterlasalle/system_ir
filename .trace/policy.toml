@@ -18,4 +18,4 @@ require_coverage_confirmation = true
 require_semantic_audit = true
 
 [exclusions]
-paths = ["vendor/**", "generated/**", "docs/vendor/**", "benchmarks/blind-lock.json", ".omp/**", ".pi/**", ".agents/**", ".hermes/**", ".trace/**"]
+paths = ["vendor/**", "generated/**", "docs/vendor/**", "benchmarks/blind-lock.json", "benchmarks/external-lock.json", "benchmarks/external/**", "benchmarks/results/**", ".omp/**", ".pi/**", ".agents/**", ".hermes/**", ".trace/**"]
