@@ -1,0 +1,16 @@
+# Budget stress matrix — svelte corpus repo (large: ~4k surface candidates, raw surface ~52k tokens)
+
+Wave 15.1b verification of the required-coverage budget blowout fix.
+The reviewer's stress case: a repo where raw candidate surface >> 24k tokens.
+Before the fix: identical ~52k-token output at every budget (all entries
+required via public_api surfaces, never dropped).
+After the fix: concrete invocation surfaces only are critical coverage;
+required set capped at hard_max; the ranker decides plain exports' fate.
+
+budget   artifact tokens   notes
+4000     ~4452            required items past soft target, under hard_max 4800 (documented soft/hard)
+16000    ~12666           monotonic curve
+24000    ~17011           still under budget: pool exhausted by value/token + quotas/MMR
+
+All artifacts fit the budget semantics: target may be exceeded only by
+required critical coverage, never beyond hard_max (budget + 20%).
