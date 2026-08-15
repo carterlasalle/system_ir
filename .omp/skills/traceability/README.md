@@ -1,4 +1,5 @@
 # Traceability Skill
+<!-- trace:v1 id=doc.tracelayer.skill-readme -->
 
 The canonical TraceLayer agent skill. Agents consume `SKILL.md`; humans
 browse this README. When repositories enable `trace init --skill`, this

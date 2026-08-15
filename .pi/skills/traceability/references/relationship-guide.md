@@ -1,4 +1,5 @@
 # Relationship Guide
+<!-- trace:v1 id=doc.tracelayer.relationship.guide -->
 
 How to link traced artifacts with the right edge. The generated normative
 table lives in `marker-protocol.md` (produced by `trace docs generate` from

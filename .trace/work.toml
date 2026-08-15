@@ -18,3 +18,7 @@ title = "Repo ontology: archetypes, hierarchy, state authority, CFG causality"
 
 [work."WORK-SCC-006"]
 title = "Holdout generalization wave"
+
+[work."WORK-SCC-013"]
+type = "work"
+title = "Wave 13: occurrence identity, blind lock, package!=atom clustering"

@@ -521,29 +521,32 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             },
         );
     }
-    // schema: SCHEMA entities (Wave 11) — the schema name, its composed
+    // schema: SCHEMA concepts (Wave 11/13) — the schema name, its composed
     // parents (COMPOSES edges, schema→parent) and validation lines (the
     // defining owner's VALIDATES edges) render per-subclass with the
     // `schema:` prefix: `schema: User`, `schema: User extends Base`,
-    // `schema: User validates`. Producer = the DEFINES subject (the owner
-    // symbol that declared the schema).
+    // `schema: User validates`. Producer = the most frequent occurrence
+    // owner (a symbol, never the concept/expr itself).
     //
     // Inline constructions (name == expr, the `z.object({...})` test and
     // handler forms) are frequency-capped: only the *repeated* DSL surface
     // (count >= 2, top 40 by count) renders — one-off test schemas are
-    // noise, not architecture, and would flood the contracts layer.
-    let mut inline: Vec<(u64, String)> = Vec::new();
+    // noise, not architecture, and would flood the contracts layer. The
+    // count is DERIVED from the live OCCURRENCE entities — never a stored,
+    // write-time-mutated counter.
+    let mut inline: Vec<(usize, String)> = Vec::new();
     for s in view.entities_of_kind(scc_core::kinds::SCHEMA) {
-        let is_inline = s
+        let count = scc_graph::state::occurrence_count(view.graph, &s.id);
+        let expr = s
             .attributes
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
+            .get("expr")
+            .and_then(|v| v.as_str())
+            .map(|e| e.to_string());
+        let is_inline = expr.as_deref() == Some(s.name.as_str());
+        let producer = scc_graph::state::occurrence_producer(view.graph, &s.id)
+            .unwrap_or_else(|| s.id.clone());
         if is_inline {
-            if let Some(c) = s.attributes.get("count").and_then(|v| v.as_u64()) {
-                inline.push((c, s.id.clone()));
-            }
+            inline.push((count, s.id.clone()));
             continue;
         }
         let owner = view
@@ -557,14 +560,9 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         // captured one — the concrete code form a human would quote.
         // Inline constructions use the expression itself as the name
         // (`schema: z.object({...})`); never render `X = X`.
-        if let Some(expr) = s
-            .attributes
-            .get("expr")
-            .and_then(|v| v.as_str())
-            .map(|e| e.to_string())
-        {
-            if !expr.is_empty() && expr != s.name {
-                ops.push(format!("{} = {}", s.name, expr));
+        if let Some(e) = &expr {
+            if !e.is_empty() && e != &s.name {
+                ops.push(format!("{} = {}", s.name, e));
             }
         }
         let mut composed: Vec<String> = view
@@ -592,7 +590,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                 id: s.id.clone(),
                 kind: "schema".into(),
                 subclass: ContractSubclass::Schema,
-                producer: owner.clone().unwrap_or_else(|| s.id.clone()),
+                producer,
                 consumers: Vec::new(),
                 operations: ops,
                 evidence: s.evidence.clone(),
@@ -606,6 +604,8 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             continue;
         }
         let Some(s) = view.entity(&id) else { continue };
+        let producer = scc_graph::state::occurrence_producer(view.graph, &s.id)
+            .unwrap_or_else(|| s.id.clone());
         push_contract(
             &mut contracts,
             &mut contract_seen,
@@ -613,7 +613,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                 id: s.id.clone(),
                 kind: "schema".into(),
                 subclass: ContractSubclass::Schema,
-                producer: s.id.clone(),
+                producer,
                 consumers: Vec::new(),
                 operations: vec![s.name.clone()],
                 evidence: s.evidence.clone(),
@@ -2228,13 +2228,16 @@ mod tests {
         assert!(ep_kinds.contains("cli"), "cli surface: {ep_kinds:?}");
     }
 
+// trace:exempt reason=internal-detail
+
     /// Wave 11: schema contracts (SCHEMA entities + DEFINES/COMPOSES/
     /// VALIDATES edges) render under CONTRACTS with the `schema:` prefix,
     /// and reactive state (REACTIVE entities + OWNS edges) renders under
     /// STATE & DATA AUTHORITY's REACTIVE STATE subsection, attributed to
     /// the owning symbol's component.
     #[test]
-    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+
+// trace:exempt reason=internal-detail
     fn schema_and_reactive_render_in_atlas() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2289,7 +2292,7 @@ mod tests {
             .unwrap();
 
         // schema User (UserService DEFINES it, COMPOSES Base, VALIDATES
-        // CreateUser)
+        // CreateUser) with one occurrence owned by the User symbol
         let base = entity_id(&repo, kinds::SCHEMA, "Base");
         store
             .insert_entity(
@@ -2302,6 +2305,33 @@ mod tests {
             .insert_entity(
                 &Entity::new(user.clone(), kinds::SCHEMA, "User"),
                 &["api/app.py".to_string()],
+            )
+            .unwrap();
+        let user_occ = scc_core::occurrence_id(&repo, "User", "api/app.py", "User", 1);
+        store
+            .insert_entity(
+                Entity::new(
+                    user_occ.clone(),
+                    scc_core::kinds::OCCURRENCE,
+                    "User@api/app.py@User@1",
+                )
+                .attr("concept", serde_json::json!(user))
+                .attr("path", serde_json::json!("api/app.py"))
+                .attr("owner", serde_json::json!("User"))
+                .attr("line", serde_json::json!(1)),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:occ:user",
+                    user_occ,
+                    scc_core::predicates::OCCURS,
+                    user.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
             )
             .unwrap();
         store
@@ -2342,13 +2372,41 @@ mod tests {
             )
             .unwrap();
 
-        // reactive state count owned by UserService
+        // reactive state count: one concept, one occurrence owned by
+        // UserService (Wave 13 — identity is per concept/path/owner/line)
         let count = entity_id(&repo, kinds::REACTIVE, "count");
         store
             .insert_entity(
-                Entity::new(count.clone(), kinds::REACTIVE, "count")
-                    .attr("access", serde_json::json!("state")),
+                &Entity::new(count.clone(), kinds::REACTIVE, "count"),
                 &["api/app.py".to_string()],
+            )
+            .unwrap();
+        let count_occ = scc_core::occurrence_id(&repo, "count", "api/app.py", "UserService", 1);
+        store
+            .insert_entity(
+                Entity::new(
+                    count_occ.clone(),
+                    scc_core::kinds::OCCURRENCE,
+                    "count@api/app.py@UserService@1",
+                )
+                .attr("concept", serde_json::json!(count))
+                .attr("path", serde_json::json!("api/app.py"))
+                .attr("owner", serde_json::json!("UserService"))
+                .attr("line", serde_json::json!(1))
+                .attr("access", serde_json::json!("state")),
+                &["api/app.py".to_string()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:occ:count",
+                    count_occ.clone(),
+                    scc_core::predicates::OCCURS,
+                    count.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
             )
             .unwrap();
         store
@@ -2357,7 +2415,7 @@ mod tests {
                     "rel:owns:count",
                     svc,
                     predicates::OWNS,
-                    count,
+                    count_occ,
                     Provenance::Extracted,
                 ),
                 "api/app.py",
@@ -2386,6 +2444,9 @@ mod tests {
             ],
             "{schema:?}"
         );
+        // Wave 13 (e): the producer is the occurrence owner symbol — never
+        // the concept/expr itself
+        assert_eq!(schema.producer, "User", "producer = owner symbol: {schema:?}");
 
         // reactive state attributed to the owning symbol's component
         assert!(

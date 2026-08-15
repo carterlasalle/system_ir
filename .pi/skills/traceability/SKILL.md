@@ -13,6 +13,7 @@ description: >-
 ---
 
 # Traceability Skill
+<!-- trace:v1 id=doc.tracelayer.skill -->
 
 Use this skill whenever you work in a repository that uses TraceLayer
 (`trace:v1` markers, `.trace/` config, or `trace` CLI). It keeps your changes
@@ -41,8 +42,12 @@ Use this skill when:
 - reviewing a PR with trace diagnostics;
 - fixing a `trace verify` failure.
 
-Do not use it for untraced repositories, or for edits that touch no traced
-artifacts.
+Do not use it for repositories without TraceLayer installed (no `trace`
+CLI, no `.trace/` config), or for prose edits unrelated to traced
+artifacts. Use it for any mutation that may create, modify, move, test,
+configure, document, or remove trace-worthy behavior — **whether or not
+the target artifact is already traced** (new untraced behavior is exactly
+when the skill matters most).
 
 ## Mental model
 
@@ -164,7 +169,7 @@ Write the understanding first; the marker is the one line that records it.
 | Code — new behavior | line directly above the symbol | `id=impl.<slug> work= satisfies= implements=` |
 | Code — refactor | move the marker with the behavior | keep the same `id=` |
 | Test | above the test function | `verifies=` (requirement) and `exercises=` (implementation), separately |
-| Ops / runbook / config | top of the file or above the section | `documents=` / `deploys=` as applicable |
+| Ops / runbook / config | immediately above the smallest independently meaningful boundary | `documents=` / `deploys=` as applicable; file-level only when the whole file is one semantic artifact |
 | Generated / vendor | nothing | excluded by policy |
 
 ## Commands cheat sheet
@@ -176,6 +181,7 @@ trace why <id>                       # causal path back to a root
 trace impact <id>                    # what a change to <id> affects
 trace graph <id> --depth 2           # local subgraph
 trace web                            # 3D web UI of the marker graph (markers only)
+trace marker suggest <path>[:<line>]  # exact marker for a boundary (uses session context)
 trace verify --changed               # required before completion
 trace status                         # repository health
 trace new <type> --name NAME         # mint a fresh stable ID

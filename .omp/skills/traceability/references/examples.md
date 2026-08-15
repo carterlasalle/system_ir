@@ -1,4 +1,5 @@
 # Examples
+<!-- trace:v1 id=doc.tracelayer.skill-examples -->
 
 Worked examples of correct markers and the full agent workflow. Syntax rules
 are in [marker-protocol.md](marker-protocol.md).

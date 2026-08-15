@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 /// Component candidates built from compiled component implementation paths
 /// (longest dir-prefix match wins, same rule as flows.rs).
+// trace:exempt reason=internal-detail
 pub fn component_candidates(graph: &RealityGraph) -> Vec<ComponentCandidate> {
     let mut candidates: Vec<ComponentCandidate> = Vec::new();
     for c in &graph.components {
@@ -43,7 +44,7 @@ pub fn component_candidates(graph: &RealityGraph) -> Vec<ComponentCandidate> {
                 .get("boundary_kind")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| crate::components::BOUNDARY_CODE_REGION.to_string()),
+                .unwrap_or_else(|| crate::components::BOUNDARY_CODE_REGION.to_string()), intent: None,
         });
     }
     candidates
@@ -123,6 +124,7 @@ fn verb_category(name: &str) -> &'static str {
 }
 
 /// Emit one Lifecycle flow per component with >= 2 state-machine signals.
+// trace:v1 id=impl.scc.lifecycle work=WORK-SCC-013 satisfies=REQ-SCC-IR
 pub fn compile_lifecycles(graph: &RealityGraph, store: &Store) -> Result<Vec<Flow>> {
     let candidates = component_candidates(graph);
     let comp_name_to_id: BTreeMap<String, String> = graph

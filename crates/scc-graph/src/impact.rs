@@ -27,6 +27,7 @@ pub struct Impact {
     pub notes: Vec<String>,
 }
 
+// trace:v1 id=impl.scc.impact work=WORK-SCC-013 satisfies=REQ-SCC-IR
 pub fn compute_impact(
     view: &TrustedGraphView,
     store: &Store,
@@ -261,6 +262,7 @@ pub fn compute_impact(
     Ok(imp)
 }
 
+// trace:exempt reason=internal-detail
 fn component_candidates(comps: &[scc_core::Entity]) -> Vec<crate::components::ComponentCandidate> {
     comps
         .iter()
@@ -288,6 +290,7 @@ fn component_candidates(comps: &[scc_core::Entity]) -> Vec<crate::components::Co
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| crate::components::BOUNDARY_CODE_REGION.to_string()),
+                intent: c.attributes.get("intent").and_then(|v| v.as_str()).map(|s| s.to_string()),
             }
         })
         .collect()

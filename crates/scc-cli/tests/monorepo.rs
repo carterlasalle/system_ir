@@ -24,6 +24,7 @@ flows:
     trigger: radio-audio event
 "#;
 
+// trace:v1 id=test.scc.monorepo work=WORK-SCC-013 verifies=REQ-SCC-IR exercises=impl.scc.clustering
 fn monorepo_with_intent() -> tempfile::TempDir {
     let repo = copy_fixture("monorepo-acceptance");
     std::fs::create_dir_all(workdir(repo.path()).join(".scc")).unwrap();
@@ -33,6 +34,7 @@ fn monorepo_with_intent() -> tempfile::TempDir {
 }
 
 #[test]
+// trace:exempt reason=unit-test
 fn acceptance_scenario_entities_identified_before_any_edit() {
     let repo = monorepo_with_intent();
     let out = run(
@@ -57,8 +59,9 @@ fn acceptance_scenario_entities_identified_before_any_edit() {
     // schema, response contract, tests, affected flow, persistence mapping.
     let must_contain = [
         // semantic clustering: api + shared (db hub) + worker merge into
-        // one backend component; frontend stays separate
-        "component/api-shared-worker",
+        // one backend component named by the declared intent; frontend
+        // stays separate
+        "component/api",
         "component/frontend",
         "route/get-/api/transcripts",
         "route/post-/api/transcripts",
@@ -109,20 +112,23 @@ fn intent_invariants_and_drift() {
 }
 
 #[test]
+// trace:exempt reason=unit-test
 fn impact_identifies_downstream_consumers() {
     let repo = monorepo_with_intent();
     let impact = run_ok(&workdir(repo.path()), &["impact", "api/routes.ts"]);
     assert!(impact.contains("AFFECTED COMPONENTS"), "{impact}");
-    // the backend component is the merged api+shared+worker cluster
-    assert!(impact.contains("api+shared+worker"), "{impact}");
+    // the backend component is the merged api+shared+worker cluster,
+    // named by the declared `api` intent
+    assert!(impact.contains("AFFECTED COMPONENTS
+api"), "{impact}");
     assert!(impact.contains("DOWNSTREAM"), "{impact}");
-    assert!(impact.contains("shared"), "{impact}");
     assert!(impact.contains("CONTRACTS"), "{impact}");
     assert!(impact.contains("GET /api/transcripts/:id"), "{impact}");
     assert!(impact.contains("Raw ASR output must never be overwritten"), "{impact}");
 }
 
 #[test]
+// trace:exempt reason=unit-test
 fn precision_and_recall_on_acceptance_task() {
     let repo = monorepo_with_intent();
     let out = run(
@@ -144,7 +150,7 @@ fn precision_and_recall_on_acceptance_task() {
 
     // ground truth (relevant entities for this change)
     let ground_truth = [
-        "component/api-shared-worker",
+        "component/api",
         "component/frontend",
         "file/shared/db.ts",
         "route/get-/api/transcripts",

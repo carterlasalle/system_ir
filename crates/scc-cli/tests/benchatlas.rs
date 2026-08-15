@@ -33,6 +33,41 @@ fn copy_tree(src: &Path, dst: &Path) {
         }
     }
 }
+
+// trace:exempt reason=unit-test
+
+/// Turn `dir` into a real git checkout and return its HEAD sha — the value
+/// the blind lock pins. The blind guard runs `git rev-parse HEAD` on each
+/// clone before scoring, so integration tests need real repos (the fixture
+/// copies are plain dirs).
+// trace:exempt reason=unit-test
+fn git_repo(dir: &Path) -> String {
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"][..],
+        &[
+            "-c", "user.email=bench@test", "-c", "user.name=bench", "commit", "-q", "-m",
+            "fixture",
+        ][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git command runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
 // trace:v1 id=test.scc.bench.atlas verifies=REQ-SCC-TEST exercises=impl.scc.bench.atlas
 
 #[test]
@@ -247,7 +282,10 @@ fn bench_atlas_holdout_errors_when_holdout_corpus_missing() {
     );
 }
 
+// trace:exempt reason=unit-test
+
 #[test]
+// trace:exempt reason=unit-test
 fn bench_atlas_blind_prints_aggregates_only_and_writes_results_file() {
     // Blind protocol: validation corpus at <root>/benchmarks/holdout and
     // blind corpus at <root>/benchmarks/blind-test (both with ground
@@ -272,6 +310,17 @@ fn bench_atlas_blind_prints_aggregates_only_and_writes_results_file() {
         &ws.join("fixtures/http-service-python"),
         &blind.join("http-service-python"),
     );
+    // Wave 13: the blind corpus is frozen — make the clone a real git
+    // checkout and pin its HEAD in benchmarks/blind-lock.json so the guard
+    // (git rev-parse HEAD == lock commit) runs for real.
+    let commit = git_repo(&blind.join("http-service-python"));
+    std::fs::write(
+        tmp.path().join("benchmarks/blind-lock.json"),
+        format!(
+            r#"{{"blind-test": {{"http-service-python": {{"url": "https://example.invalid/http-service-python", "commit": "{commit}"}}}}}}"#
+        ),
+    )
+    .unwrap();
     std::fs::write(
         validation_gt.join("http-service-python.md"),
         "## components\n- root\n- services\n## entrypoints\n- handle_transcripts\n## flows\n- TranscriptRepository\n## ownership\n- zzz_missing_store\n## contracts\n- GET /api/transcripts\n- GET /api/zzz_missing\n## tests\n- test_transcripts\n",
@@ -363,7 +412,10 @@ fn bench_atlas_blind_refuses_diagnose() {
     );
 }
 
+// trace:exempt reason=unit-test
+
 #[test]
+// trace:exempt reason=unit-test
 fn bench_atlas_blind_errors_when_manifest_changes() {
     // Wave 11: `--blind` verifies the sha256 manifest of the frozen blind
     // set (ground-truth keys + clone list) against the previous run before
@@ -378,6 +430,13 @@ fn bench_atlas_blind_errors_when_manifest_changes() {
     std::fs::write(
         root.join("benchmarks/blind-test-ground-truth/repo.md"),
         "## architecture\n- root\n",
+    )
+    .unwrap();
+    // Wave 13: the lock is a protocol artifact (missing = hard error) — the
+    // empty lock is fine here since the blind-test dir has no clones.
+    std::fs::write(
+        root.join("benchmarks/blind-lock.json"),
+        r#"{"blind-test": {}}"#,
     )
     .unwrap();
     std::fs::create_dir_all(root.join("benchmarks/results")).unwrap();
@@ -400,6 +459,60 @@ fn bench_atlas_blind_errors_when_manifest_changes() {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         stderr.contains("blind-test set changed"),
+        "clear error expected: {stderr}"
+    );
+}
+
+// trace:exempt reason=unit-test
+
+#[test]
+// trace:exempt reason=unit-test
+fn bench_atlas_blind_errors_when_clone_head_mismatches_lock() {
+    // Wave 13: `--blind` verifies each clone's on-disk HEAD against the
+    // committed benchmarks/blind-lock.json BEFORE scoring. A clone sitting
+    // at a commit other than the pin must fail with a clear error naming
+    // the repo, the actual commit, and the pin.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("benchmarks/holdout")).unwrap();
+    std::fs::create_dir_all(root.join("benchmarks/holdout-ground-truth")).unwrap();
+    let blind = root.join("benchmarks/blind-test");
+    let blind_gt = root.join("benchmarks/blind-test-ground-truth");
+    std::fs::create_dir_all(&blind).unwrap();
+    std::fs::create_dir_all(&blind_gt).unwrap();
+    let ws = workspace();
+    copy_tree(
+        &ws.join("fixtures/http-service-python"),
+        &blind.join("http-service-python"),
+    );
+    let commit = git_repo(&blind.join("http-service-python"));
+    // pin a DIFFERENT commit than the clone is actually at
+    let wrong = if commit == "a".repeat(40) {
+        "b".repeat(40)
+    } else {
+        "a".repeat(40)
+    };
+    std::fs::write(
+        root.join("benchmarks/blind-lock.json"),
+        format!(
+            r#"{{"blind-test": {{"http-service-python": {{"url": "https://example.invalid/http-service-python", "commit": "{wrong}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(golden::scc())
+        .args(["bench", "atlas", "--blind"])
+        .current_dir(root)
+        .output()
+        .expect("scc bench atlas --blind runs");
+    assert!(
+        !out.status.success(),
+        "expected failure on clone HEAD mismatch, got success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("blind-test repo http-service-python at")
+            && stderr.contains(&format!("lock pins {wrong}")),
         "clear error expected: {stderr}"
     );
 }

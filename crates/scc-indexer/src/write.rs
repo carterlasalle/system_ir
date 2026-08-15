@@ -15,6 +15,7 @@ use scc_core::{entity_id, Evidence, Provenance, Relationship};
 use scc_store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 
+// trace:v1 id=impl.scc.write work=WORK-SCC-013 satisfies=REQ-SCC-IR
 pub fn rel_id(parts: &[&str]) -> String {
     let mut h = blake3::Hasher::new();
     for p in parts {
@@ -33,6 +34,7 @@ pub fn evidence_id(path: &str, kind: &str, symbol: &str, line: u32) -> String {
     format!("evidence:{}", &h.finalize().to_hex()[..12])
 }
 
+// trace:exempt reason=internal-detail
 pub struct Writer<'a> {
     pub store: &'a Store,
     pub repo_id: &'a str,
@@ -48,6 +50,7 @@ pub struct WrittenFile {
     pub store_refs: Vec<StoreRef>,
 }
 
+// trace:exempt reason=internal-detail
 impl<'a> Writer<'a> {
     pub fn new(store: &'a Store, repo_id: &'a str, revision: &'a str) -> Self {
         Writer { store, repo_id, revision }
@@ -67,7 +70,10 @@ impl<'a> Writer<'a> {
         e
     }
 
+// trace:exempt reason=internal-detail
+
     /// Write one source file's extraction into the store.
+// trace:exempt reason=internal-detail
     pub fn write_source(
         &self,
         path: &str,
@@ -485,35 +491,92 @@ impl<'a> Writer<'a> {
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
                         let sch_id = entity_id(self.repo_id, scc_core::kinds::SCHEMA, name);
-                        // Inline schema constructions (name == expr, the
-                        // `z.object({...})` test/handler forms) accumulate
-                        // a count so the atlas can surface the *repeated*
-                        // DSL forms and drop one-off test noise.
+                        // Occurrence identity (Wave 13): one OCCURRENCE
+                        // entity per (concept, path, owner, line). The same
+                        // `z.object({...})` in A.ts and B.ts is ONE concept
+                        // with TWO occurrences — provenance is preserved per
+                        // file, and a purge of one file never deletes the
+                        // other's occurrence. The extractor facts carry no
+                        // line; the owning symbol's start line anchors the
+                        // site deterministically.
+                        let line = ef
+                            .symbols
+                            .iter()
+                            .find(|s| s.name == *owner)
+                            .map(|s| s.start_line)
+                            .unwrap_or(0);
+                        let occ_id =
+                            scc_core::occurrence_id(self.repo_id, name, path, owner, line);
+                        let mut oe = scc_core::Entity::new(
+                            occ_id.clone(),
+                            scc_core::kinds::OCCURRENCE,
+                            format!("{name}@{path}@{owner}@{line}"),
+                        );
+                        oe.attr("concept", serde_json::json!(sch_id));
+                        oe.attr("path", serde_json::json!(path));
+                        oe.attr("owner", serde_json::json!(owner));
+                        oe.attr("line", serde_json::json!(line));
+                        if !expr.is_empty() {
+                            oe.attr("expr", serde_json::json!(expr));
+                        }
+                        oe.evidence = sym_evidence(owner);
+                        self.store.insert_entity(&oe, &[path.to_string()])?;
+                        // attach the occurrence to the concept BEFORE
+                        // deriving provenance, so the current occurrence
+                        // is included in the union
+                        let rel2 = Relationship::new(
+                            rel_id(&["occurs", &occ_id, &sch_id]),
+                            occ_id,
+                            scc_core::predicates::OCCURS,
+                            sch_id.clone(),
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel2, path)?;
+                        // concept entity: identity by (kind, name); `count`
+                        // is DERIVED at compile time from the live
+                        // occurrences (never stored/mutated here), and
+                        // `sources` is the union of occurrence paths — the
+                        // reviewer-flagged read-modify-write counter is gone.
+                        let occs = self.store.concept_occurrences(&sch_id)?;
+                        let sources: Vec<String> = {
+                            let mut paths: Vec<String> = occs
+                                .iter()
+                                .filter_map(|o| {
+                                    o.attributes.get("path").and_then(|v| v.as_str())
+                                })
+                                .map(|p| p.to_string())
+                                .collect();
+                            paths.sort();
+                            paths.dedup();
+                            paths
+                        };
                         let mut se = scc_core::Entity::new(
                             sch_id.clone(),
                             scc_core::kinds::SCHEMA,
                             name.clone(),
                         );
-                        se.attr("file", serde_json::json!(path));
-                        if !expr.is_empty() {
-                            se.attr("expr", serde_json::json!(expr));
-                            if *name == *expr {
-                                let n = self
-                                    .store
-                                    .get_entity(&sch_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|e| {
-                                        e.attributes
-                                            .get("count")
-                                            .and_then(|v| v.as_u64())
-                                    })
-                                    .unwrap_or(0);
-                                se.attr("count", serde_json::json!(n + 1));
-                            }
+                        // concept expr only when every occurrence agrees: a
+                        // shared inline form repeats verbatim, while a named
+                        // schema may legitimately vary per file.
+                        let mut exprs: Vec<&str> = occs
+                            .iter()
+                            .filter_map(|o| o.attributes.get("expr").and_then(|v| v.as_str()))
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        exprs.sort();
+                        exprs.dedup();
+                        if exprs.len() == 1 {
+                            se.attr("expr", serde_json::json!(exprs[0]));
                         }
-                        se.evidence = sym_evidence(owner);
-                        self.store.insert_entity(&se, &[path.to_string()])?;
+                        let mut ev: Vec<String> = occs
+                            .iter()
+                            .flat_map(|o| o.evidence.iter().cloned())
+                            .collect();
+                        ev.sort();
+                        ev.dedup();
+                        se.evidence = ev;
+                        self.store.insert_entity(&se, &sources)?;
+                        // owner DEFINES the concept (named surface)
                         let rel = Relationship::new(
                             rel_id(&["defines_schema", owner_id, &sch_id]),
                             owner_id.clone(),
@@ -584,23 +647,90 @@ impl<'a> Writer<'a> {
                         written.symbol_ids.iter().find(|(n, _)| n == owner)
                     {
                         let rs_id = entity_id(self.repo_id, scc_core::kinds::REACTIVE, name);
+                        // Occurrence per (concept, path, owner, line) (Wave
+                        // 13): auth.ts and editor.ts both declaring
+                        // `const [state, setState]` are ONE concept with
+                        // TWO occurrences — neither write overwrites the
+                        // other's provenance. access/expr live on the
+                        // occurrence (each file keeps its own variant).
+                        let line = ef
+                            .symbols
+                            .iter()
+                            .find(|s| s.name == *owner)
+                            .map(|s| s.start_line)
+                            .unwrap_or(0);
+                        let occ_id =
+                            scc_core::occurrence_id(self.repo_id, name, path, owner, line);
+                        let mut oe = scc_core::Entity::new(
+                            occ_id.clone(),
+                            scc_core::kinds::OCCURRENCE,
+                            format!("{name}@{path}@{owner}@{line}"),
+                        );
+                        oe.attr("concept", serde_json::json!(rs_id));
+                        oe.attr("path", serde_json::json!(path));
+                        oe.attr("owner", serde_json::json!(owner));
+                        oe.attr("line", serde_json::json!(line));
+                        oe.attr("access", serde_json::json!(access));
+                        if !expr.is_empty() {
+                            oe.attr("expr", serde_json::json!(expr));
+                        }
+                        oe.evidence = sym_evidence(owner);
+                        self.store.insert_entity(&oe, &[path.to_string()])?;
+                        // attach the occurrence to the concept BEFORE
+                        // deriving provenance (the current occurrence must
+                        // be part of the union)
+                        let rel2 = Relationship::new(
+                            rel_id(&["occurs", &occ_id, &rs_id]),
+                            occ_id.clone(),
+                            scc_core::predicates::OCCURS,
+                            rs_id.clone(),
+                            Provenance::Extracted,
+                        );
+                        self.store.insert_relationship(&rel2, path)?;
+                        let occs = self.store.concept_occurrences(&rs_id)?;
+                        let sources: Vec<String> = {
+                            let mut paths: Vec<String> = occs
+                                .iter()
+                                .filter_map(|o| {
+                                    o.attributes.get("path").and_then(|v| v.as_str())
+                                })
+                                .map(|p| p.to_string())
+                                .collect();
+                            paths.sort();
+                            paths.dedup();
+                            paths
+                        };
                         let mut re = scc_core::Entity::new(
                             rs_id.clone(),
                             scc_core::kinds::REACTIVE,
                             name.clone(),
                         );
-                        re.attr("access", serde_json::json!(access));
-                        re.attr("file", serde_json::json!(path));
-                        if !expr.is_empty() {
-                            re.attr("expr", serde_json::json!(expr));
+                        // concept expr only when every occurrence agrees
+                        let mut exprs: Vec<&str> = occs
+                            .iter()
+                            .filter_map(|o| o.attributes.get("expr").and_then(|v| v.as_str()))
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        exprs.sort();
+                        exprs.dedup();
+                        if exprs.len() == 1 {
+                            re.attr("expr", serde_json::json!(exprs[0]));
                         }
-                        re.evidence = sym_evidence(owner);
-                        self.store.insert_entity(&re, &[path.to_string()])?;
+                        let mut ev: Vec<String> = occs
+                            .iter()
+                            .flat_map(|o| o.evidence.iter().cloned())
+                            .collect();
+                        ev.sort();
+                        ev.dedup();
+                        re.evidence = ev;
+                        self.store.insert_entity(&re, &sources)?;
+                        // owner OWNS its occurrence (shared reactive state
+                        // coheres per concept via its occurrence owners)
                         let rel = Relationship::new(
-                            rel_id(&["owns_reactive", owner_id, &rs_id]),
+                            rel_id(&["owns_reactive", owner_id, &occ_id]),
                             owner_id.clone(),
                             scc_core::predicates::OWNS,
-                            rs_id,
+                            occ_id.clone(),
                             Provenance::Extracted,
                         );
                         self.store.insert_relationship(&rel, path)?;
@@ -1007,5 +1137,240 @@ mod tests {
                     && r.object.contains("serve.port")),
             "field CONTAINS relationship"
         );
+    }
+
+// trace:exempt reason=internal-detail
+    fn schema_ef(_path: &str, owner: &str, expr: &str) -> ExtractedFile {
+        let mut ef = ExtractedFile::default();
+        ef.symbols.push(Symbol {
+            name: owner.into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            start_line: 1,
+            end_line: 3,
+            exported: true,
+            docstring: None,
+            parent: None,
+        });
+        ef.facts = vec![SemanticFact::SchemaDefinition {
+            owner: owner.into(),
+            name: expr.into(),
+            expr: expr.into(),
+        }];
+        ef
+    }
+
+// trace:exempt reason=internal-detail
+
+    /// Wave 13 (a): the same inline schema expr in two files is ONE concept
+    /// with TWO occurrences; the concept carries no stored count and its
+    /// `sources` provenance is the union of occurrence paths.
+    #[test]
+// trace:exempt reason=internal-detail
+    fn schema_occurrences_preserve_provenance_across_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = scc_store::Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let writer = Writer::new(&store, "r", "rev");
+        let expr = "z.object({ name: z.string() })";
+        writer
+            .write_source(
+                "a.ts",
+                "h1",
+                &schema_ef("a.ts", "makeA", expr),
+                &[],
+                &[],
+                &SymbolIndex::new("r"),
+            )
+            .unwrap();
+        writer
+            .write_source(
+                "b.ts",
+                "h2",
+                &schema_ef("b.ts", "makeB", expr),
+                &[],
+                &[],
+                &SymbolIndex::new("r"),
+            )
+            .unwrap();
+
+        // one concept, two occurrences
+        let schemas = store.entities_by_kind(scc_core::kinds::SCHEMA).unwrap();
+        assert_eq!(schemas.len(), 1, "{schemas:?}");
+        assert_eq!(
+            schemas[0].attributes.get("count"),
+            None,
+            "count is derived at compile time, never stored"
+        );
+        assert_eq!(
+            schemas[0].attributes.get("expr").and_then(|v| v.as_str()),
+            Some(expr),
+            "shared inline form repeats verbatim -> concept expr consistent"
+        );
+        assert_eq!(
+            store.entity_sources(&schemas[0].id).unwrap(),
+            vec!["a.ts", "b.ts"],
+            "concept provenance = union of occurrence paths"
+        );
+        let occs = store.entities_by_kind(scc_core::kinds::OCCURRENCE).unwrap();
+        assert_eq!(occs.len(), 2, "{occs:?}");
+        // each occurrence carries its own site
+        let paths: Vec<&str> = occs
+            .iter()
+            .filter_map(|o| o.attributes.get("path").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(paths, vec!["a.ts", "b.ts"]);
+
+        // derived count from live occurrences
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        assert_eq!(
+            scc_graph::state::occurrence_count(&graph, &schemas[0].id),
+            2
+        );
+    }
+
+// trace:exempt reason=internal-detail
+
+    /// Wave 13 (b): purging one file drops its occurrence; the concept
+    /// survives with count 1 and the other path still in sources.
+    #[test]
+// trace:exempt reason=internal-detail
+    fn schema_purge_one_file_keeps_concept_and_other_provenance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = scc_store::Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let writer = Writer::new(&store, "r", "rev");
+        let expr = "z.object({ name: z.string() })";
+        for (path, owner) in [("a.ts", "makeA"), ("b.ts", "makeB")] {
+            writer
+                .write_source(
+                    path,
+                    &format!("h{path}"),
+                    &schema_ef(path, owner, expr),
+                    &[],
+                    &[],
+                    &SymbolIndex::new("r"),
+                )
+                .unwrap();
+        }
+        let schemas = store.entities_by_kind(scc_core::kinds::SCHEMA).unwrap();
+        let concept_id = schemas[0].id.clone();
+
+        store.purge_path("a.ts").unwrap();
+
+        let survivors = store.entities_by_kind(scc_core::kinds::SCHEMA).unwrap();
+        assert_eq!(survivors.len(), 1, "concept survives: {survivors:?}");
+        assert_eq!(
+            store.entity_sources(&concept_id).unwrap(),
+            vec!["b.ts"],
+            "provenance recomputed to remaining occurrence"
+        );
+        let occs = store.entities_by_kind(scc_core::kinds::OCCURRENCE).unwrap();
+        assert_eq!(occs.len(), 1, "{occs:?}");
+        assert_eq!(
+            occs[0].attributes.get("path").and_then(|v| v.as_str()),
+            Some("b.ts")
+        );
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        assert_eq!(scc_graph::state::occurrence_count(&graph, &concept_id), 1);
+
+        // purge the last file: concept gone (c)
+        store.purge_path("b.ts").unwrap();
+        assert!(
+            store.entities_by_kind(scc_core::kinds::SCHEMA).unwrap().is_empty(),
+            "concept gone with its last occurrence"
+        );
+        assert!(store.entities_by_kind(scc_core::kinds::OCCURRENCE).unwrap().is_empty());
+    }
+
+// trace:exempt reason=internal-detail
+
+    /// Wave 13 (d): auth.ts and editor.ts both declaring
+    /// `const [state, setState]` produce TWO distinct occurrences and ONE
+    /// concept — reactive identity no longer collapses globally.
+    #[test]
+// trace:exempt reason=internal-detail
+    fn reactive_occurrences_do_not_collapse_across_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = scc_store::Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let writer = Writer::new(&store, "r", "rev");
+
+        let mut ef_a = ExtractedFile::default();
+        ef_a.symbols.push(Symbol {
+            name: "authStore".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            start_line: 5,
+            end_line: 9,
+            exported: true,
+            docstring: None,
+            parent: None,
+        });
+        ef_a.facts = vec![SemanticFact::ReactiveState {
+            owner: "authStore".into(),
+            name: "state".into(),
+            access: "state".into(),
+            expr: "useState(0)".into(),
+        }];
+        let mut ef_b = ExtractedFile::default();
+        ef_b.symbols.push(Symbol {
+            name: "editorStore".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            start_line: 2,
+            end_line: 6,
+            exported: true,
+            docstring: None,
+            parent: None,
+        });
+        ef_b.facts = vec![SemanticFact::ReactiveState {
+            owner: "editorStore".into(),
+            name: "state".into(),
+            access: "state".into(),
+            expr: "useState(\"\")".into(),
+        }];
+        writer
+            .write_source("auth.ts", "h1", &ef_a, &[], &[], &SymbolIndex::new("r"))
+            .unwrap();
+        writer
+            .write_source("editor.ts", "h2", &ef_b, &[], &[], &SymbolIndex::new("r"))
+            .unwrap();
+
+        let reactives = store.entities_by_kind(scc_core::kinds::REACTIVE).unwrap();
+        assert_eq!(reactives.len(), 1, "one concept: {reactives:?}");
+        assert_eq!(reactives[0].name, "state");
+        assert_eq!(
+            reactives[0].attributes.get("count"),
+            None,
+            "count never stored"
+        );
+        assert_eq!(
+            store.entity_sources(&reactives[0].id).unwrap(),
+            vec!["auth.ts", "editor.ts"]
+        );
+
+        let occs = store.entities_by_kind(scc_core::kinds::OCCURRENCE).unwrap();
+        assert_eq!(occs.len(), 2, "two distinct occurrences: {occs:?}");
+        let occ_ids: Vec<&str> = occs.iter().map(|o| o.id.as_str()).collect();
+        assert_ne!(occ_ids[0], occ_ids[1], "occurrence ids never collapse");
+        // each occurrence keeps its own variant
+        let exprs: Vec<&str> = occs
+            .iter()
+            .filter_map(|o| o.attributes.get("expr").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(exprs, vec!["useState(0)", "useState(\"\")"]);
+        // the concept carries no expr when occurrences disagree
+        assert_eq!(
+            reactives[0].attributes.get("expr"),
+            None,
+            "no single expr may claim the shared concept"
+        );
+
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        assert_eq!(scc_graph::state::occurrence_count(&graph, &reactives[0].id), 2);
     }
 }

@@ -141,6 +141,64 @@ fn split_and_merge_coexist_in_one_repo() {
     assert!(atlas.contains("CART+CHECKOUT"), "merge side: {atlas}");
 }
 
+/// Wave 13: a FLAT library package (a workspace member whose direct files
+/// are its modules) is no longer an indivisible atom. The region hierarchy
+/// starts one level below the package dir, and package membership is only
+/// a +5 cohesion signal — below MERGE_THRESHOLD — so modules with NO cross
+/// evidence split into separate components instead of one fused blob.
+#[test]
+// trace:exempt reason=unit-test
+fn flat_library_package_splits_into_unrelated_modules() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("repo");
+    write_flat_package_fixture(&dir);
+
+    run_ok(&dir, &["index", "--quiet"]);
+    let comps = run_ok(&dir, &["components"]);
+    let lines: Vec<&str> = comps.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "flat package must split into 2+ components: {comps}"
+    );
+    for n in ["src/core.py", "src/parser.py", "src/termui.py"] {
+        assert!(lines.contains(&n), "module component {n}: {comps}");
+    }
+    assert!(
+        !lines.contains(&"src"),
+        "no fused package blob: {comps}"
+    );
+}
+
+/// Wave 13: single-link chaining is blocked. Four clusters A-B-C-D with
+/// ONE strong edge (call+state = 6) between consecutive clusters only:
+/// pure max-linkage would collapse the whole chain into one component.
+/// The cohesion-aware acceptance (avg >= 0.4 * max over ALL cross pairs)
+/// stops the chain at the third link — {A,B,C} vs {D} has avg 6/3 = 2 <
+/// 2.4 — so the repo keeps >= 2 components.
+#[test]
+// trace:exempt reason=unit-test
+fn single_link_chaining_is_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("repo");
+    write_chain_fixture(&dir);
+
+    run_ok(&dir, &["index", "--quiet"]);
+    let comps = run_ok(&dir, &["components"]);
+    let lines: Vec<&str> = comps.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "chained clusters must not collapse into one component: {comps}"
+    );
+    assert!(
+        lines.contains(&"a+b+c"),
+        "the first three links cohere (avg 3 >= 2.4): {comps}"
+    );
+    assert!(
+        lines.contains(&"d"),
+        "the tail link must NOT chain on a single edge: {comps}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // fixture writers
 // ---------------------------------------------------------------------------
@@ -202,4 +260,71 @@ fn write_library_fixture(dir: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("README.md"), "# library fixture\n").unwrap();
+}
+
+/// A flat library package: a workspace member (`src`) whose direct files
+/// are its modules, with NO cross imports/calls between them. Package
+/// membership (+5) is the only evidence, below MERGE_THRESHOLD — the
+/// clusterer must split the package into per-module components.
+// trace:exempt reason=unit-test
+fn write_flat_package_fixture(dir: &Path) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        "{\n  \"name\": \"flatlib\",\n  \"workspaces\": [\"src\"]\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/core.py"),
+        "def core_fn() -> str:\n    return 'core'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/parser.py"),
+        "def parse_arg(raw: str) -> str:\n    return raw.strip()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/termui.py"),
+        "def render_line(text: str) -> str:\n    return f'[{text}]'\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("README.md"), "# flat package fixture\n").unwrap();
+}
+
+/// Four chained regions a -> b -> c -> d, ONE strong edge (call + shared
+/// store = 6) between consecutive regions only. Max-linkage alone would
+/// collapse a+b+c+d; the cohesion-aware acceptance stops the chain at
+/// {a,b,c} vs {d} (avg 6/3 = 2 < 0.4 * 6 = 2.4). NOTE: the extractors are
+/// busy — module-level defs are exported (public_api entrypoints that seed
+/// flows, a full flow clique), and store writes key on the connection
+/// RECEIVER name — so the fixture uses private `_`-prefixed functions and
+/// distinct receivers (cursor/engine/pool) per shared store to keep the
+/// graph to exactly the intended 6-weight chain edges.
+// trace:exempt reason=unit-test
+fn write_chain_fixture(dir: &Path) {
+    for d in ["a", "b", "c", "d"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("a/x.py"),
+        "import sqlite3\nfrom b.x import _b_run\n\ndef _a_run(user: str) -> str:\n    cursor = sqlite3.connect('db1.db')\n    cursor.execute('INSERT INTO a (user) VALUES (?)', (user,))\n    cursor.commit()\n    cursor.close()\n    _b_run(user)\n    return 'a'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b/x.py"),
+        "import sqlite3\nfrom c.x import _c_run\n\ndef _b_run(user: str) -> str:\n    cursor = sqlite3.connect('db1.db')\n    cursor.execute('INSERT INTO b (user) VALUES (?)', (user,))\n    cursor.commit()\n    cursor.close()\n    engine = sqlite3.connect('db2.db')\n    engine.execute('INSERT INTO b (user) VALUES (?)', (user,))\n    engine.commit()\n    engine.close()\n    _c_run(user)\n    return 'b'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("c/x.py"),
+        "import sqlite3\nfrom d.x import _d_run\n\ndef _c_run(user: str) -> str:\n    engine = sqlite3.connect('db2.db')\n    engine.execute('INSERT INTO c (user) VALUES (?)', (user,))\n    engine.commit()\n    engine.close()\n    pool = sqlite3.connect('db3.db')\n    pool.execute('INSERT INTO c (user) VALUES (?)', (user,))\n    pool.commit()\n    pool.close()\n    _d_run(user)\n    return 'c'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("d/x.py"),
+        "import sqlite3\n\ndef _d_run(user: str) -> str:\n    pool = sqlite3.connect('db3.db')\n    pool.execute('INSERT INTO d (user) VALUES (?)', (user,))\n    pool.commit()\n    pool.close()\n    return 'd'\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("README.md"), "# chain fixture\n").unwrap();
 }

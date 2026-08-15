@@ -3,6 +3,7 @@
 // Blocking enforcement: pre-edit context guard + fail-closed completion gate.
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
+// trace:v1 id=impl.omp.trace-gate work=WORK-TL-001
 export default function hook(pi: HookAPI): void {
   const run = (args: string[], input: string): { code: number; out: string } => {
     const res = Bun.spawnSync(["uv", "run", "trace", ...args], {
@@ -35,14 +36,19 @@ export default function hook(pi: HookAPI): void {
     return { path, line };
   };
 
-  // Block the first edit of protected traced behavior until context is loaded.
+  // Pre-authoring gate: pass the FULL proposed mutation so TraceLayer can
+  // simulate the edit (new boundaries, modified untraced behavior).
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const { path, line } = fileInfo(event.input);
     if (!path) return;
+    const input = (event.input ?? {}) as Record<string, unknown>;
     const payload = JSON.stringify({
       path,
       line,
+      content: input.content,
+      old_string: input.old_string,
+      new_string: input.new_string,
       session_id: sessionId(ctx),
     });
     const res = run(["hook", "pre-mutation", "--format", "json"], payload);
@@ -58,16 +64,46 @@ export default function hook(pi: HookAPI): void {
     }
   });
 
-  // Fail-closed completion gate: block shutdown while trace verify fails.
-  pi.on("session_shutdown", async (event, ctx) => {
+  // Post-edit coaching: run post-mutation so obligations resolve, and
+  // append the trace guidance directly to the tool result the model sees.
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const { path } = fileInfo(event.input);
+    if (!path) return;
+    const payload = JSON.stringify({ path, session_id: sessionId(ctx) });
+    const res = run(["hook", "post-mutation", "--format", "json"], payload);
+    if (res.code !== 0) return;
+    try {
+      const d = JSON.parse(res.out) as { output?: string };
+      if (typeof d.output !== "string" || !d.output) return;
+      const content = Array.isArray(event.content) ? [...event.content] : [];
+      content.push({
+        type: "text",
+        text: `\n\n<TraceLayer>\n${d.output}\n</TraceLayer>`,
+      });
+      return { content };
+    } catch {
+      return;
+    }
+  });
+
+  // Fail-closed completion gate: block while trace obligations or verify fail.
+  pi.on("session_stop", async (event, ctx) => {
     const payload = JSON.stringify({
       lifecycle: "wip",
       session_id: sessionId(ctx),
     });
     const res = run(["hook", "stop", "--format", "json"], payload);
     if (res.code !== 0) {
-      pi.log(`trace verify: ${res.out}`);
-      return { block: true, reason: "trace verification has blocking failures" };
+      let reason = "trace verification has blocking failures";
+      try {
+        const d = JSON.parse(res.out) as { output?: string };
+        if (typeof d.output === "string" && d.output) reason = d.output;
+      } catch {
+        // keep default reason
+      }
+      pi.log(`trace gate: ${reason}`);
+      return { block: true, reason };
     }
   });
 }

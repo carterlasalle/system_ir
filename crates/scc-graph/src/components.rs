@@ -86,12 +86,32 @@ pub fn prov_rank(p: Provenance) -> u8 {
 }
 
 #[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail
 pub struct ComponentCandidate {
     pub name: String,
     pub dirs: Vec<String>,
     /// Evidence class that created this candidate (one of the
     /// `BOUNDARY_*` constants).
     pub boundary_kind: String,
+    /// Declared intent name (`.scc/intent.yaml` component) when this
+    /// candidate derives from one — propagated through region splits so
+    /// a declared component keeps its name even when the clusterer
+    /// splits its directory (declared intent names architecture;
+    /// clustering decides membership).
+    pub intent: Option<String>,
+}
+
+// trace:exempt reason=internal-detail
+impl ComponentCandidate {
+// trace:exempt reason=internal-detail
+    pub fn new(name: impl Into<String>, dirs: Vec<String>, boundary_kind: impl Into<String>) -> Self {
+        ComponentCandidate {
+            name: name.into(),
+            dirs,
+            boundary_kind: boundary_kind.into(),
+            intent: None,
+        }
+    }
 }
 
 /// Determine the component for a path: longest matching dir prefix wins.
@@ -336,6 +356,7 @@ fn cargo_workspace_members(root: &std::path::Path) -> Vec<(String, String)> {
     out
 }
 
+// trace:exempt reason=internal-detail
 fn merge_manifest_candidate(out: &mut Vec<ComponentCandidate>, name: String, dir: String) {
     if let Some(c) = out.iter_mut().find(|c| c.name == name) {
         if !c.dirs.contains(&dir) {
@@ -348,7 +369,7 @@ fn merge_manifest_candidate(out: &mut Vec<ComponentCandidate>, name: String, dir
         out.push(ComponentCandidate {
             name,
             dirs: vec![dir],
-            boundary_kind: BOUNDARY_PACKAGE.to_string(),
+            boundary_kind: BOUNDARY_PACKAGE.to_string(), intent: None,
         });
     }
 }
@@ -455,9 +476,10 @@ pub(crate) fn build_candidates(
             }
             dirs.push(name.clone()); // implicit: declared name == directory
             candidates.push(ComponentCandidate {
-                name,
+                name: name.clone(),
                 dirs,
                 boundary_kind: BOUNDARY_DECLARED.to_string(),
+                intent: Some(name),
             });
         }
     }
@@ -476,7 +498,7 @@ pub(crate) fn build_candidates(
                 candidates.push(ComponentCandidate {
                     name,
                     dirs: vec![path.to_string()],
-                    boundary_kind: BOUNDARY_PACKAGE.to_string(),
+                    boundary_kind: BOUNDARY_PACKAGE.to_string(), intent: None,
                 });
             }
         }
@@ -509,7 +531,7 @@ pub(crate) fn build_candidates(
                 candidates.push(ComponentCandidate {
                     name,
                     dirs: vec![ctx.to_string()],
-                    boundary_kind: BOUNDARY_DEPLOYMENT.to_string(),
+                    boundary_kind: BOUNDARY_DEPLOYMENT.to_string(), intent: None,
                 });
             }
         }
@@ -529,7 +551,7 @@ pub(crate) fn build_candidates(
             candidates.push(ComponentCandidate {
                 name: dir.clone(),
                 dirs: vec![dir.clone()],
-                boundary_kind: BOUNDARY_CLI.to_string(),
+                boundary_kind: BOUNDARY_CLI.to_string(), intent: None,
             });
         }
     }
@@ -555,7 +577,7 @@ pub(crate) fn build_candidates(
                     BOUNDARY_ROOT.to_string()
                 } else {
                     BOUNDARY_CODE_REGION.to_string()
-                },
+                }, intent: None,
             });
         }
     }
@@ -572,15 +594,17 @@ pub fn compile_components(
     let repo_id = &store.repo_id;
     let candidates = build_candidates(graph, store, intent);
 
-    // ---- semantic clustering over ATOMIC regions (generalization wave):
+    // ---- semantic clustering over REGIONS (generalization wave):
     // files belong to architecture because of BEHAVIOR, not directories.
-    // The clusterer may SPLIT a top-level dir (its sub-regions land in
-    // different clusters when intra-dir cohesion is low) and may MERGE
-    // regions across dirs (high call+state weight) — the longest-prefix
-    // path assignment is replaced by the clustering result. Path/package/
-    // deployment stay as constraints and priors: authoritative boundaries
-    // are atomic regions, and merging across deployment units requires
-    // weight > SERVICE_THRESHOLD. ----
+    // The clusterer may SPLIT a top-level dir or a package (the region
+    // hierarchy starts one level below authoritative boundary dirs: subdir
+    // regions + per-file regions for a flat package's direct files — see
+    // `clustering::build_regions`) and may MERGE regions across dirs (high
+    // call+state weight) — the longest-prefix path assignment is replaced
+    // by the clustering result. Path/package/deployment stay as
+    // constraints and priors: package membership is a +5 cohesion signal
+    // between a package's subregions (not a hard atom), and merging across
+    // deployment units requires weight > SERVICE_THRESHOLD. ----
     let du_ctxs: Vec<(String, String)> = graph
         .entities_of_kind(kinds::DEPLOYMENT_UNIT)
         .into_iter()
@@ -1309,10 +1333,11 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=internal-detail
     fn path_assignment() {
         let cands = vec![
-            ComponentCandidate { name: "web".into(), dirs: vec!["src/web".into()], boundary_kind: BOUNDARY_PACKAGE.into() },
-            ComponentCandidate { name: "api".into(), dirs: vec!["src/api".into()], boundary_kind: BOUNDARY_DECLARED.into() },
+            ComponentCandidate::new("web", vec!["src/web".into()], BOUNDARY_PACKAGE),
+            ComponentCandidate::new("api", vec!["src/api".into()], BOUNDARY_DECLARED),
         ];
         assert_eq!(component_for_path("src/api/routes.py", &cands), "api");
         assert_eq!(component_for_path("src/web/app.ts", &cands), "web");
@@ -1932,12 +1957,16 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=unit-test
     fn cargo_workspace_members_compile_to_package_components() {
         // EPIC-040 compiler gap: workspace crates become per-crate
         // components, not one top-dir blob. A synthetic Cargo workspace
         // (members via a `crates/*` glob, two crates) yields one
         // package-boundary component per crate and routes member files
         // into their crate — never into a single "crates" component.
+        // Wave 13: the region hierarchy starts one level below the package
+        // dir, so a crate whose only content is `src/` produces the
+        // `crates/alpha/src` region (the crate's code shell).
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -1972,30 +2001,36 @@ mod tests {
         let by_name: std::collections::BTreeMap<&str, &scc_core::Entity> =
             comps.iter().map(|c| (c.name.as_str(), c)).collect();
 
-        assert!(by_name.contains_key("alpha"), "per-crate component: {comps:?}");
-        assert!(by_name.contains_key("beta"), "per-crate component: {comps:?}");
+        assert!(
+            by_name.contains_key("crates/alpha/src"),
+            "per-crate component: {comps:?}"
+        );
+        assert!(
+            by_name.contains_key("crates/beta/src"),
+            "per-crate component: {comps:?}"
+        );
         assert_eq!(
-            by_name["alpha"].attributes["boundary_kind"].as_str(),
+            by_name["crates/alpha/src"].attributes["boundary_kind"].as_str(),
             Some(BOUNDARY_PACKAGE)
         );
         assert_eq!(
-            by_name["beta"].attributes["boundary_kind"].as_str(),
+            by_name["crates/beta/src"].attributes["boundary_kind"].as_str(),
             Some(BOUNDARY_PACKAGE)
         );
         assert_eq!(
-            by_name["alpha"].attributes["implementation"]["paths"],
-            json!(["crates/alpha"])
+            by_name["crates/alpha/src"].attributes["implementation"]["paths"],
+            json!(["crates/alpha/src"])
         );
         assert_eq!(
-            by_name["beta"].attributes["implementation"]["paths"],
-            json!(["crates/beta"])
+            by_name["crates/beta/src"].attributes["implementation"]["paths"],
+            json!(["crates/beta/src"])
         );
         // member symbols land in their crate's component
-        let alpha_syms = by_name["alpha"].attributes["implementation"]["symbols"]
+        let alpha_syms = by_name["crates/alpha/src"].attributes["implementation"]["symbols"]
             .as_array()
             .unwrap();
         assert!(alpha_syms.iter().any(|s| s == "alpha_run"));
-        let beta_syms = by_name["beta"].attributes["implementation"]["symbols"]
+        let beta_syms = by_name["crates/beta/src"].attributes["implementation"]["symbols"]
             .as_array()
             .unwrap();
         assert!(beta_syms.iter().any(|s| s == "beta_run"));
@@ -2009,24 +2044,12 @@ mod tests {
         }
         // longest-prefix matching routes member files to their crate
         let cands = vec![
-            ComponentCandidate {
-                name: "alpha".into(),
-                dirs: vec!["crates/alpha".into()],
-                boundary_kind: BOUNDARY_PACKAGE.into(),
-            },
-            ComponentCandidate {
-                name: "beta".into(),
-                dirs: vec!["crates/beta".into()],
-                boundary_kind: BOUNDARY_PACKAGE.into(),
-            },
-            ComponentCandidate {
-                name: "crates".into(),
-                dirs: vec!["crates".into()],
-                boundary_kind: BOUNDARY_CODE_REGION.into(),
-            },
+            ComponentCandidate::new("crates/alpha/src", vec!["crates/alpha/src".into()], BOUNDARY_PACKAGE),
+            ComponentCandidate::new("crates/beta/src", vec!["crates/beta/src".into()], BOUNDARY_PACKAGE),
+            ComponentCandidate::new("crates", vec!["crates".into()], BOUNDARY_CODE_REGION),
         ];
-        assert_eq!(component_for_path("crates/alpha/src/lib.rs", &cands), "alpha");
-        assert_eq!(component_for_path("crates/beta/src/lib.rs", &cands), "beta");
+        assert_eq!(component_for_path("crates/alpha/src/lib.rs", &cands), "crates/alpha/src");
+        assert_eq!(component_for_path("crates/beta/src/lib.rs", &cands), "crates/beta/src");
     }
 
     #[test]

@@ -1,0 +1,84 @@
+{
+  "blind-test": {
+    "axum": {
+      "url": "https://github.com/tokio-rs/axum",
+      "commit": "151cd5c12325373b86daf405a6afc0a0086a6706"
+    },
+    "buildx": {
+      "url": "https://github.com/docker/buildx",
+      "commit": "fa6720d993b3db049a988602978ff5c344a48f09"
+    },
+    "changesets": {
+      "url": "https://github.com/changesets/changesets",
+      "commit": "b4dc91f545ff2afead214278b7b5ebc8d4e96322"
+    },
+    "echo": {
+      "url": "https://github.com/labstack/echo",
+      "commit": "05489dc1730161df26b72d1ae2a3ba6fb8178fc7"
+    },
+    "fastify": {
+      "url": "https://github.com/fastify/fastify",
+      "commit": "b7de40faa21e3cff3a214921223dff2203944902"
+    },
+    "fiber": {
+      "url": "https://github.com/gofiber/fiber",
+      "commit": "527a7adab0600607220021fe08ffa022993b8638"
+    },
+    "gson": {
+      "url": "https://github.com/google/gson",
+      "commit": "119818bc666d3b9f897d6c0ca7546ce28e9bbcac"
+    },
+    "hono": {
+      "url": "https://github.com/honojs/hono",
+      "commit": "41bdc4288ed7023c24d35f32bd065bd963435e3e"
+    },
+    "httpx": {
+      "url": "https://github.com/encode/httpx",
+      "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+    },
+    "hyper": {
+      "url": "https://github.com/hyperium/hyper",
+      "commit": "fca07bd3937d4a3a4822372acdf766d0640796af"
+    },
+    "jinja2": {
+      "url": "https://github.com/pallets/jinja",
+      "commit": "5ef70112a1ff19c05324ff889dd30405b1002044"
+    },
+    "lit": {
+      "url": "https://github.com/lit/lit",
+      "commit": "c42ee1e96b8fd61f7256f61d715daef572e76e52"
+    },
+    "preact": {
+      "url": "https://github.com/preactjs/preact",
+      "commit": "86944f4b491ac47c4428bc1d2a5beb2018de4ec0"
+    },
+    "redis-py": {
+      "url": "https://github.com/redis/redis-py",
+      "commit": "6a6b581b48225afa0b76912d1028c6035baee932"
+    },
+    "retrofit": {
+      "url": "https://github.com/square/retrofit",
+      "commit": "d0b112dad073b7fe49c953ebc46ff1b424cb1e51"
+    },
+    "rich": {
+      "url": "https://github.com/Textualize/rich",
+      "commit": "9d8f9a372cc5916fd4781fec207ced7ddac2f08f"
+    },
+    "rxjs": {
+      "url": "https://github.com/ReactiveX/rxjs",
+      "commit": "54796b38a57e6309f9861e174737479bb3f63f61"
+    },
+    "tonic": {
+      "url": "https://github.com/hyperium/tonic",
+      "commit": "0231d4ce94eec167d755b86e69e9dee0aefcf302"
+    },
+    "typer": {
+      "url": "https://github.com/fastapi/typer",
+      "commit": "9a7b2e83f6b62c750d6026b0de9ebf2026a8b8fa"
+    },
+    "zap": {
+      "url": "https://github.com/uber-go/zap",
+      "commit": "018b91390e74732e9e40f8d356887b8d06461886"
+    }
+  }
+}

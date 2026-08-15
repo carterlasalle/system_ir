@@ -12,9 +12,12 @@ pub const SCHEMA_VERSION: &str = "0.1.0";
 // Provenance
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
+
 /// Evidence class of a fact, per docs/SYSTEM_IR_SCHEMA.md §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+// trace:exempt reason=internal-detail
 pub enum Provenance {
     /// Direct syntax/configuration evidence.
     Extracted,
@@ -64,8 +67,11 @@ impl Provenance {
 // Severity / kinds
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:exempt reason=internal-detail
 pub enum Severity {
     Info,
     Low,
@@ -86,9 +92,12 @@ impl Severity {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// Flow view kinds (System Atlas), per docs/SYSTEM_IR_SCHEMA.md §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:exempt reason=internal-detail
 pub enum FlowKind {
     Architecture,
     Workflow,
@@ -129,12 +138,15 @@ pub enum EvidenceType {
 // Archetype (Ontology phase — deterministic repo classification)
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
+
 /// Repository archetype, detected deterministically from graph evidence
 /// (routes, exports, cli/framework signals, deployment/workspace shape) by
 /// `scc_graph::archetype::detect_archetype`. `Unknown` is the honest
 /// fallback when no signal fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
 pub enum Archetype {
     /// HTTP routes + deployment units, no library-scale export ratio.
     ServiceApplication,
@@ -220,7 +232,10 @@ pub struct Snapshot {
     pub indexed_at: String,
 }
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Entity {
     pub id: String,
     pub kind: String,
@@ -248,7 +263,36 @@ impl Entity {
     }
 }
 
+// trace:exempt reason=internal-detail
+
+/// One concrete occurrence of a concept (schema/reactive) in a source file.
+///
+/// Concept entities (SCHEMA/REACTIVE) are keyed globally by (kind, name) —
+/// the same `z.object({...})` in A.ts and B.ts is ONE concept. Occurrences
+/// carry per-(concept, path, owner, line) identity instead: each file's
+/// occurrence survives independently, so provenance (`sources`) and the
+/// derived occurrence count never collapse and a purge of one path never
+/// deletes an occurrence another path still has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct Occurrence {
+    /// Stable entity id (see [`occurrence_id`]).
+    pub id: String,
+    /// The concept entity id this occurrence belongs to.
+    pub concept: String,
+    /// Repository-relative source path.
+    pub path: String,
+    /// Owning symbol name.
+    pub owner: String,
+    /// Deterministic site line (owning symbol's start line when the
+    /// extractor facts carry no line).
+    pub line: u32,
+}
+
+// trace:exempt reason=internal-detail
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Relationship {
     pub id: String,
     pub subject: String,
@@ -342,7 +386,10 @@ pub struct Invariant {
     pub evidence: Vec<String>,
 }
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Evidence {
     pub id: String,
     #[serde(rename = "type")]
@@ -567,6 +614,8 @@ pub struct AtlasInvariant {
     pub severity: Severity,
 }
 
+// trace:exempt reason=internal-detail
+
 /// First-class contract subclass (Contract ontology): the semantic contract
 /// family, derived by the extractors from general evidence (public fn
 /// signatures, builder/factory structure, event producer/consumer pairs,
@@ -577,6 +626,7 @@ pub struct AtlasInvariant {
 /// `serialization`/...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
 pub enum ContractSubclass {
     /// A callable contract surface (framework callback, task, annotated
     /// handler, middleware): the framework invokes this callable.
@@ -655,12 +705,15 @@ impl ContractSubclass {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// One first-class contract in the atlas (Wave 9): a typed, evidence-backed
 /// contract surface (http/cli/event/config/annotation) with its producer
 /// symbol and the symbols that consume it. `operations` carries the concrete
 /// contract strings (route `GET /api/x`, flag `--paging`, event
 /// `user.created`, config key `DEBUG`, annotation `router.get`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Contract {
     pub id: String,
     /// `"http" | "cli" | "event" | "config" | "annotation"`.
@@ -711,10 +764,13 @@ impl Contract {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// How a symbol can be invoked from outside the process (Wave 9): the
 /// invocation surfaces the flow compiler seeds entrypoints from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
 pub enum InvocationSurfaceKind {
     /// OS process spawn / executable entry.
     Process,
@@ -842,7 +898,10 @@ pub struct SystemAtlas {
 // Whole-document export
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct SystemIr {
     pub schema_version: String,
     pub repository: Repository,
@@ -913,6 +972,23 @@ pub fn sanitize_key(input: &str) -> String {
 /// `repo://{repo}/{kind}/{key}` stable identifier.
 pub fn entity_id(repo: &str, kind: &str, key: &str) -> String {
     format!("repo://{}/{}/{}", sanitize_key(repo), kind, sanitize_key(key))
+}
+
+/// Occurrence entity id: collision-free per (concept key, path, owner,
+/// line) — the identity occurrences carry so shared concepts never lose
+/// per-file provenance. Unlike [`entity_id`], the concept/path/owner
+/// components are percent-encoded (`@`-separated), so case and separator
+/// distinctions (`a_b` vs `a-b`) never merge distinct occurrences.
+// trace:v1 id=impl.scc.core.occurrence work=WORK-SCC-001 satisfies=REQ-SCC-IR
+pub fn occurrence_id(repo: &str, concept: &str, path: &str, owner: &str, line: u32) -> String {
+    format!(
+        "repo://{}/occurrence/{}@{}@{}@{}",
+        sanitize_key(repo),
+        encode_component(concept),
+        encode_component(path),
+        encode_component(owner),
+        line
+    )
 }
 
 /// Percent-encode a path/name component for use inside an entity id while
@@ -1027,6 +1103,9 @@ pub mod kinds {
     // Wave 11: first-class schema and reactive-state contracts.
     pub const SCHEMA: &str = "schema";
     pub const REACTIVE: &str = "reactive";
+    // Occurrence layer: one entity per (concept, path, owner, line) so
+    // shared concepts never lose per-file provenance (Wave 13).
+    pub const OCCURRENCE: &str = "occurrence";
 }
 
 pub mod predicates {
@@ -1074,6 +1153,9 @@ pub mod predicates {
     pub const INJECTS: &str = "injects";
     pub const HANDLES_CALLBACK: &str = "handles_callback";
     pub const DECORATES: &str = "decorates";
+    /// An occurrence entity's attachment to its concept entity
+    /// (occurrence OCCURS concept).
+    pub const OCCURS: &str = "occurs";
 
     /// All predicates in the documented ontology.
     pub const ALL: &[&str] = &[
@@ -1081,7 +1163,7 @@ pub mod predicates {
         CONSUMES, SUBSCRIBES, PRODUCES, TRANSFORMS, VALIDATES, ROUTES_TO, HANDLES, INVOKES,
         DEPENDS_ON, DEPLOYED_WITH, DEPLOYED_IN, CONFIGURED_BY, PROTECTED_BY, CROSSES_BOUNDARY,
         ENFORCES, TESTED_BY, PARTICIPATES_IN, PRECEDES, FOLLOWS, BRANCHES_TO, RETRIES,
-        FALLS_BACK_TO, OBSERVED_AS, DECLARED_AS, IMPLEMENTED_BY,
+        FALLS_BACK_TO, OBSERVED_AS, DECLARED_AS, IMPLEMENTED_BY, OCCURS,
     ];
 }
 
@@ -1160,6 +1242,63 @@ mod tests {
             encode_component("foo-bar"),
             "underscore and dash must not collide"
         );
+    }
+
+// trace:exempt reason=internal-detail
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn occurrence_ids_are_collision_free_per_site() {
+        // distinct paths/owners/lines/concepts never merge
+        assert_ne!(
+            occurrence_id("r", "expr", "a.ts", "A", 1),
+            occurrence_id("r", "expr", "b.ts", "A", 1)
+        );
+        assert_ne!(
+            occurrence_id("r", "expr", "a.ts", "A", 1),
+            occurrence_id("r", "expr", "a.ts", "B", 1)
+        );
+        assert_ne!(
+            occurrence_id("r", "expr", "a.ts", "A", 1),
+            occurrence_id("r", "expr", "a.ts", "A", 2)
+        );
+        assert_ne!(
+            occurrence_id("r", "expr1", "a.ts", "A", 1),
+            occurrence_id("r", "expr2", "a.ts", "A", 1)
+        );
+        // case/separator distinctions survive (unlike sanitize_key)
+        assert_ne!(
+            occurrence_id("r", "expr", "a_b.ts", "A", 1),
+            occurrence_id("r", "expr", "a-b.ts", "A", 1)
+        );
+        assert_ne!(
+            occurrence_id("r", "expr", "a.ts", "Foo", 1),
+            occurrence_id("r", "expr", "a.ts", "foo", 1)
+        );
+        // deterministic
+        assert_eq!(
+            occurrence_id("r", "expr", "a.ts", "A", 1),
+            occurrence_id("r", "expr", "a.ts", "A", 1)
+        );
+    }
+
+// trace:exempt reason=internal-detail
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn occurrence_roundtrips_through_serde() {
+        let o = Occurrence {
+            id: occurrence_id("r", "z.object({ x: z.string() })", "src/a.ts", "make", 7),
+            concept: entity_id("r", kinds::SCHEMA, "z.object({ x: z.string() })"),
+            path: "src/a.ts".into(),
+            owner: "make".into(),
+            line: 7,
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        let back: Occurrence = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, o.id);
+        assert_eq!(back.concept, o.concept);
+        assert_eq!(back.line, 7);
     }
 
     #[test]

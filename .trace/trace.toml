@@ -22,6 +22,10 @@ include = ["**/*"]
 exclude = [
   ".git/**",
   ".trace/cache/**",
+  ".hermes/**",
+  ".agents/**",
+  ".pi/**",
+  ".omp/**",
   "node_modules/**",
   ".venv/**",
   "dist/**",

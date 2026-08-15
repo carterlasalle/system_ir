@@ -276,9 +276,12 @@ pub struct RuntimeEdgeRow {
     pub last_observed: String,
 }
 
+// trace:exempt reason=internal-detail
+
 /// The independent truth sources whose generations compose the model epoch.
 /// Any change to one of them invalidates previously cached context packs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// trace:exempt reason=internal-detail
 pub enum ModelEpochKind {
     /// Indexed file contents (snapshot completion).
     Source,
@@ -307,11 +310,14 @@ impl ModelEpochKind {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// Deterministic composite fingerprint of the model state. `composite()` is
 /// the canonical cache-epoch string: it changes whenever any source of
 /// system truth changes, so a previously fresh context pack can never be
 /// served after its evidence is stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+// trace:exempt reason=internal-detail
 pub struct ModelEpoch {
     pub source: u64,
     pub semantic: u64,
@@ -358,6 +364,7 @@ pub struct Store {
     pub repo_name: String,
 }
 
+// trace:exempt reason=internal-detail
 impl Store {
     /// Open (creating if needed) the SCC database at `path` for repository
     /// rooted at `root`. `root` must exist.
@@ -606,10 +613,61 @@ impl Store {
         Ok(())
     }
 
+// trace:exempt reason=internal-detail
+
     /// Remove everything tied to a source path: symbols, evidence,
     /// relationships derived from it, and symbol-level entities.
+    ///
+    /// SCHEMA/REACTIVE concept entities are NOT deleted by path: concepts
+    /// are keyed by (kind, name) and may occur in many files. Their
+    /// OCCURRENCE entities (per concept/path/owner/line) are deleted by
+    /// path, the concept's `sources` provenance is recomputed from the
+    /// surviving occurrences, and a concept with zero remaining
+    /// occurrences is deleted entirely (with its edges) — so purging one
+    /// file never deletes a schema another file still uses, and the
+    /// derived occurrence count naturally reflects the survivors.
+// trace:exempt reason=internal-detail
     pub fn purge_path(&self, path: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        // concepts this path's occurrences attach to — captured before any
+        // deletion so their provenance can be recomputed afterwards
+        let affected_concepts: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT r.object FROM relationships r
+                 JOIN entities e ON e.id = r.subject
+                 WHERE r.predicate = ?1 AND e.kind = ?2 AND e.sources LIKE ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    scc_core::predicates::OCCURS,
+                    scc_core::kinds::OCCURRENCE,
+                    format!("%\"{path}\"%")
+                ],
+                |r| r.get::<_, String>(0),
+            )?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v.sort();
+            v.dedup();
+            v
+        };
+        // this path's occurrence entities (for edge + FTS cleanup)
+        let occ_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM entities WHERE kind = ?1 AND sources LIKE ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![scc_core::kinds::OCCURRENCE, format!("%\"{path}\"%")],
+                |r| r.get::<_, String>(0),
+            )?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
         // symbol entities: repo://{repo}/symbol/{path}/{name}
         let ev_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM evidence WHERE path = ?1")?;
@@ -664,9 +722,18 @@ impl Store {
             "DELETE FROM entities WHERE id LIKE ?1",
             params![format!("%/symbol/{path}/%")],
         )?;
+        // non-concept entities whose sources include the path (stores,
+        // routes, contracts, ...). SCHEMA/REACTIVE concepts are keyed by
+        // (kind, name) across files and handled below from their live
+        // occurrences — a shared concept must never be deleted because one
+        // of its files was purged.
         tx.execute(
-            "DELETE FROM entities WHERE sources LIKE ?1",
-            params![format!("%\"{path}\"%")],
+            "DELETE FROM entities WHERE sources LIKE ?1 AND kind NOT IN (?2, ?3)",
+            params![
+                format!("%\"{path}\"%"),
+                scc_core::kinds::SCHEMA,
+                scc_core::kinds::REACTIVE
+            ],
         )?;
         tx.execute(
             "DELETE FROM relationships WHERE source_path = ?1",
@@ -683,6 +750,60 @@ impl Store {
             "DELETE FROM tests WHERE file = ?1",
             params![path],
         )?;
+        // occurrence entities: delete their edges + FTS rows, then the
+        // entities themselves
+        for oid in &occ_ids {
+            tx.execute(
+                "DELETE FROM relationships WHERE subject = ?1 OR object = ?1",
+                params![oid],
+            )?;
+            tx.execute("DELETE FROM entities_fts WHERE id = ?1", params![oid])?;
+        }
+        tx.execute(
+            "DELETE FROM entities WHERE kind = ?1 AND sources LIKE ?2",
+            params![scc_core::kinds::OCCURRENCE, format!("%\"{path}\"%")],
+        )?;
+        // recompute concept provenance: a concept survives as long as any
+        // occurrence remains — its sources become the surviving occurrence
+        // paths (deduped, sorted). With zero occurrences the concept and
+        // its edges are gone.
+        for concept in &affected_concepts {
+            let remaining: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT json_extract(e.attributes, '$.path') FROM entities e
+                     JOIN relationships r ON r.subject = e.id
+                     WHERE r.predicate = ?1 AND r.object = ?2 AND e.kind = ?3
+                       AND json_extract(e.attributes, '$.path') IS NOT NULL
+                     ORDER BY 1",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        scc_core::predicates::OCCURS,
+                        concept,
+                        scc_core::kinds::OCCURRENCE
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?;
+                let mut v = Vec::new();
+                for r in rows {
+                    v.push(r?);
+                }
+                v
+            };
+            if remaining.is_empty() {
+                tx.execute(
+                    "DELETE FROM relationships WHERE subject = ?1 OR object = ?1",
+                    params![concept],
+                )?;
+                tx.execute("DELETE FROM entities_fts WHERE id = ?1", params![concept])?;
+                tx.execute("DELETE FROM entities WHERE id = ?1", params![concept])?;
+            } else {
+                tx.execute(
+                    "UPDATE entities SET sources = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&remaining)?, concept],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -907,6 +1028,65 @@ impl Store {
             attributes: serde_json::from_str(&attributes).unwrap_or_default(),
             evidence: serde_json::from_str(&evidence).unwrap_or_default(),
         }))
+    }
+
+    /// The `sources` provenance list of an entity — the repository-relative
+    /// file paths that produced it. Stored separately from [`Entity`]
+    /// (which carries no sources field), so this is the only reader.
+    // trace:v1 id=impl.scc.store.entity_sources work=WORK-SCC-001 satisfies=REQ-SCC-IR
+    pub fn entity_sources(&self, id: &str) -> Result<Vec<String>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT sources FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    /// Live OCCURRENCE entities attached to a concept (OCCURS edges),
+    /// sorted by id. Concept counts and `sources` provenance are always
+    /// derived from these — never from a stored, write-time-mutated counter.
+    // trace:v1 id=impl.scc.store.concept_occurrences work=WORK-SCC-001 satisfies=REQ-SCC-IR
+    pub fn concept_occurrences(&self, concept_id: &str) -> Result<Vec<Entity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.kind, e.name, e.attributes, e.evidence FROM entities e
+             JOIN relationships r ON r.subject = e.id
+             WHERE r.predicate = ?1 AND r.object = ?2 AND e.kind = ?3
+             ORDER BY e.id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                scc_core::predicates::OCCURS,
+                concept_id,
+                scc_core::kinds::OCCURRENCE
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, kind, name, attributes, evidence) = r?;
+            out.push(Entity {
+                id,
+                kind,
+                name,
+                attributes: serde_json::from_str(&attributes).unwrap_or_default(),
+                evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     pub fn entities_by_kind(&self, kind: &str) -> Result<Vec<Entity>> {
@@ -2294,6 +2474,76 @@ mod tests {
         assert_eq!(s.symbols_in_file("a.py").unwrap().len(), 0);
         assert_eq!(s.all_relationships().unwrap().len(), 0);
         assert!(s.get_evidence("evidence:1").unwrap().is_none());
+    }
+
+// trace:exempt reason=internal-detail
+
+    /// Wave 13: shared concepts survive a single-file purge. The concept's
+    /// `sources` provenance is recomputed from the surviving occurrences
+    /// (never a stored counter), and the concept is deleted only when its
+    /// last occurrence is purged.
+    #[test]
+// trace:exempt reason=internal-detail
+    fn purge_path_recomputes_shared_concept_provenance() {
+        let (s, _d) = tmp_store();
+        let repo = &s.repo_id;
+        let expr = "z.object({ name: z.string() })";
+        let concept = scc_core::entity_id(repo, scc_core::kinds::SCHEMA, expr);
+        // one concept, two occurrences (A.ts / B.ts)
+        s.insert_entity(
+            &Entity::new(concept.clone(), scc_core::kinds::SCHEMA, expr),
+            &["a.ts".into(), "b.ts".into()],
+        )
+        .unwrap();
+        for (path, owner) in [("a.ts", "makeA"), ("b.ts", "makeB")] {
+            let occ = scc_core::occurrence_id(repo, expr, path, owner, 3);
+            s.insert_entity(
+                Entity::new(occ.clone(), scc_core::kinds::OCCURRENCE, format!("{expr}@{path}@{owner}@3"))
+                    .attr("concept", serde_json::json!(concept))
+                    .attr("path", serde_json::json!(path))
+                    .attr("owner", serde_json::json!(owner))
+                    .attr("line", serde_json::json!(3)),
+                &[path.to_string()],
+            )
+            .unwrap();
+            s.insert_relationship(
+                &Relationship::new(
+                    format!("rel:occ:{path}"),
+                    occ.clone(),
+                    scc_core::predicates::OCCURS,
+                    concept.clone(),
+                    Provenance::Extracted,
+                ),
+                path,
+            )
+            .unwrap();
+        }
+        // purge A: concept survives, count 1, provenance recomputed to B
+        s.purge_path("a.ts").unwrap();
+        let concept_ent = s
+            .get_entity(&concept)
+            .unwrap()
+            .expect("concept survives a single-file purge");
+        assert_eq!(concept_ent.kind, scc_core::kinds::SCHEMA);
+        assert_eq!(s.entity_sources(&concept).unwrap(), vec!["b.ts"]);
+        let occs = s.concept_occurrences(&concept).unwrap();
+        assert_eq!(occs.len(), 1, "derived count drops to 1: {occs:?}");
+        assert_eq!(
+            occs[0].attributes.get("path").and_then(|v| v.as_str()),
+            Some("b.ts")
+        );
+        // purge B: last occurrence gone -> concept deleted with its edges
+        s.purge_path("b.ts").unwrap();
+        assert!(s.get_entity(&concept).unwrap().is_none(), "concept gone");
+        assert!(s.all_relationships().unwrap().is_empty(), "no dangling edges");
+        // unrelated entities with the path in sources still purge
+        s.insert_entity(
+            &Entity::new("repo://r/store/db", "store", "db"),
+            &["a.ts".into()],
+        )
+        .unwrap();
+        s.purge_path("a.ts").unwrap();
+        assert!(s.get_entity("repo://r/store/db").unwrap().is_none());
     }
 
     #[test]

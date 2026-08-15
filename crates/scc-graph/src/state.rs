@@ -18,7 +18,7 @@
 //! relationship — nothing is promoted.
 
 use crate::RealityGraph;
-use scc_core::{kinds, predicates, Provenance};
+use scc_core::{kinds, predicates, Entity, Provenance};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const S_PERSISTENT: &str = "persistent";
@@ -50,6 +50,45 @@ pub fn section_label(section: &str) -> &'static str {
         S_DERIVED => "DERIVED / REGISTRIES",
         _ => "STATE",
     }
+}
+
+/// Live OCCURRENCE entities attached to a concept (OCCURS edges), sorted
+/// by id for determinism. Derived counts and provenance always come from
+/// these — concept `count` attributes are never stored or mutated at write
+/// time (Wave 13).
+// trace:v1 id=impl.scc.state.occurrences work=WORK-SCC-005 satisfies=REQ-SCC-IR
+pub fn concept_occurrences<'g>(graph: &'g RealityGraph, concept_id: &str) -> Vec<&'g Entity> {
+    let mut occs: Vec<&Entity> = graph
+        .in_pred(concept_id, predicates::OCCURS)
+        .into_iter()
+        .filter_map(|r| graph.entities.get(&r.subject))
+        .collect();
+    occs.sort_by(|a, b| a.id.cmp(&b.id));
+    occs
+}
+
+/// Derived occurrence count of a concept — the count the schema/reactive
+/// compilers use (never a stored counter). Purge naturally lowers it.
+// trace:v1 id=impl.scc.state.occurrence_count work=WORK-SCC-005 satisfies=REQ-SCC-IR
+pub fn occurrence_count(graph: &RealityGraph, concept_id: &str) -> usize {
+    concept_occurrences(graph, concept_id).len()
+}
+
+/// Most frequent occurrence owner name of a concept (deterministic
+/// tie-break: lexicographic smallest), or `None` when the concept has no
+/// occurrences. The atlas schema producer — an owner symbol, never the
+/// concept/expr itself.
+// trace:v1 id=impl.scc.state.occurrence_producer work=WORK-SCC-005 satisfies=REQ-SCC-IR
+pub fn occurrence_producer(graph: &RealityGraph, concept_id: &str) -> Option<String> {
+    let mut freq: BTreeMap<String, usize> = BTreeMap::new();
+    for occ in concept_occurrences(graph, concept_id) {
+        if let Some(o) = occ.attributes.get("owner").and_then(|v| v.as_str()) {
+            *freq.entry(o.to_string()).or_default() += 1;
+        }
+    }
+    freq.into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(name, _)| name)
 }
 
 /// Cache-technology store detection (store_refs with cache tech): an
@@ -235,42 +274,49 @@ pub fn compile_state_authority(
         }
     }
 
-    // ---- reactive state: REACTIVE entities (Wave 11) owned via OWNS
-    // edges (svelte $state, vue ref/reactive, react useState, mobx,
-    // signals). The owner symbol's component carries the line.
+    // ---- reactive state: REACTIVE concepts rendered per occurrence (Wave
+    // 13). Each (path, owner, line) occurrence keeps its own access/expr
+    // variant, so auth.ts and editor.ts both declaring `const [state,
+    // setState]` render both — never collapse. The derived occurrence
+    // count (occurrence_count) gates nothing here: every concept renders.
     for e in graph.entities_of_kind(kinds::REACTIVE) {
-        let access = e
-            .attributes
-            .get("access")
-            .and_then(|v| v.as_str())
-            .unwrap_or("state");
-        let expr = e
-            .attributes
-            .get("expr")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let mut rels = graph.in_pred(&e.id, predicates::OWNS);
-        rels.sort_by(|a, b| a.id.cmp(&b.id));
-        for r in rels {
-            if let Some(comp) = comp_of(&r.subject) {
-                let line = match &expr {
-                    Some(exp) if !exp.is_empty() => format!(
-                        "{} owns reactive: {} [{}] = {} ({})",
-                        comp,
-                        e.name,
-                        access,
-                        exp,
-                        prov_str(&r.provenance)
-                    ),
-                    _ => format!(
-                        "{} owns reactive: {} [{}] ({})",
-                        comp,
-                        e.name,
-                        access,
-                        prov_str(&r.provenance)
-                    ),
-                };
-                push(S_REACTIVE, line);
+        let mut occs = concept_occurrences(graph, &e.id);
+        occs.sort_by(|a, b| a.id.cmp(&b.id));
+        for occ in occs {
+            let access = occ
+                .attributes
+                .get("access")
+                .and_then(|v| v.as_str())
+                .unwrap_or("state");
+            let expr = occ
+                .attributes
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // the owner symbol OWNS its occurrence
+            let mut rels = graph.in_pred(&occ.id, predicates::OWNS);
+            rels.sort_by(|a, b| a.id.cmp(&b.id));
+            for r in rels {
+                if let Some(comp) = comp_of(&r.subject) {
+                    let line = match &expr {
+                        Some(exp) if !exp.is_empty() => format!(
+                            "{} owns reactive: {} [{}] = {} ({})",
+                            comp,
+                            e.name,
+                            access,
+                            exp,
+                            prov_str(&r.provenance)
+                        ),
+                        _ => format!(
+                            "{} owns reactive: {} [{}] ({})",
+                            comp,
+                            e.name,
+                            access,
+                            prov_str(&r.provenance)
+                        ),
+                    };
+                    push(S_REACTIVE, line);
+                }
             }
         }
     }
@@ -334,16 +380,22 @@ pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
                 .insert(r.object.clone());
         }
     }
-    // reactive entity -> symbols owning it (OWNS edges)
+    // reactive concept -> symbols owning its occurrences (OWNS edges on
+    // the OCCURRENCE entities, keyed by concept): symbols in different
+    // files declaring the same reactive state name cohere (Wave 13 — the
+    // owners come from the per-site occurrences, never a collapsed global
+    // entity).
     let mut reactive_syms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for rs in graph.entities_of_kind(kinds::REACTIVE) {
-        let mut rels = graph.in_pred(&rs.id, predicates::OWNS);
-        rels.sort_by(|a, b| a.id.cmp(&b.id));
-        for r in rels {
-            reactive_syms
-                .entry(rs.id.clone())
-                .or_default()
-                .insert(r.subject.clone());
+        for r in graph.in_pred(&rs.id, predicates::OCCURS) {
+            let mut rels = graph.in_pred(&r.subject, predicates::OWNS);
+            rels.sort_by(|a, b| a.id.cmp(&b.id));
+            for or in rels {
+                reactive_syms
+                    .entry(rs.id.clone())
+                    .or_default()
+                    .insert(or.subject.clone());
+            }
         }
     }
     let mut out: Vec<BTreeSet<String>> = Vec::new();
@@ -478,23 +530,28 @@ pub fn compile_state_claims(
         }
     }
 
-    // reactive state: REACTIVE entities owned via OWNS edges (the owner
-    // symbol's component carries the `reactive: name [access]` claim)
+    // reactive state: REACTIVE concepts rendered per occurrence (the owner
+    // symbol's component carries the `reactive: name [access]` claim,
+    // access coming from the occurrence — each file keeps its own variant)
     for e in graph.entities_of_kind(kinds::REACTIVE) {
-        let access = e
-            .attributes
-            .get("access")
-            .and_then(|v| v.as_str())
-            .unwrap_or("state");
-        let mut rels = graph.in_pred(&e.id, predicates::OWNS);
-        rels.sort_by(|a, b| a.id.cmp(&b.id));
-        for r in rels {
-            if let Some(comp) = comp_of(&r.subject) {
-                claims.insert(StateClaim {
-                    component: comp,
-                    target: format!("reactive: {} [{}]", e.name, access),
-                    provenance: prov_str(&r.provenance),
-                });
+        let mut occs = concept_occurrences(graph, &e.id);
+        occs.sort_by(|a, b| a.id.cmp(&b.id));
+        for occ in occs {
+            let access = occ
+                .attributes
+                .get("access")
+                .and_then(|v| v.as_str())
+                .unwrap_or("state");
+            let mut rels = graph.in_pred(&occ.id, predicates::OWNS);
+            rels.sort_by(|a, b| a.id.cmp(&b.id));
+            for r in rels {
+                if let Some(comp) = comp_of(&r.subject) {
+                    claims.insert(StateClaim {
+                        component: comp,
+                        target: format!("reactive: {} [{}]", e.name, access),
+                        provenance: prov_str(&r.provenance),
+                    });
+                }
             }
         }
     }
@@ -810,12 +867,15 @@ mod tests {
         assert!(!is_cache_store("orders", None));
     }
 
-    /// Wave 11: symbols OWNS-ing the same REACTIVE entity form a
-    /// shared-state authority group (the +4 clustering signal), and the
-    /// REACTIVE STATE section attributes the state to the owner symbol's
-    /// component.
+// trace:exempt reason=internal-detail
+
+    /// Wave 11/13: symbols OWNS-ing occurrences of the same REACTIVE
+    /// concept form a shared-state authority group (the +4 clustering
+    /// signal), and the REACTIVE STATE section attributes each occurrence
+    /// to its owner symbol's component.
     #[test]
-    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+
+// trace:exempt reason=internal-detail
     fn reactive_state_owners_group_and_attribute() {
         let (_dir, store) = open();
         let repo = store.repo_id.clone();
@@ -825,21 +885,64 @@ mod tests {
         let b = sym(&store, "api/app.py", "store_b");
         attach(&store, "api", &b, "api/app.py");
 
+        // one concept, two per-site occurrences (Wave 13: identity is per
+        // concept/path/owner/line — the global REACTIVE entity no longer
+        // collapses owners)
         let rs = entity_id(&repo, kinds::REACTIVE, "count");
         store
             .insert_entity(
-                Entity::new(rs.clone(), kinds::REACTIVE, "count")
-                    .attr("access", serde_json::json!("state")),
+                &Entity::new(rs.clone(), kinds::REACTIVE, "count"),
                 &["api/app.py".into()],
             )
             .unwrap();
-        for (i, s) in [a.clone(), b.clone()].iter().enumerate() {
+        for (i, (occ, owner_id, owner_name)) in [
+            (
+                scc_core::occurrence_id(&repo, "count", "api/app.py", "store_a", 1),
+                a.clone(),
+                "store_a",
+            ),
+            (
+                scc_core::occurrence_id(&repo, "count", "api/app.py", "store_b", 2),
+                b.clone(),
+                "store_b",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_entity(
+                    Entity::new(
+                        occ.clone(),
+                        kinds::OCCURRENCE,
+                        format!("count@api/app.py@{}@{}", owner_name, i + 1),
+                    )
+                    .attr("concept", serde_json::json!(rs))
+                    .attr("path", serde_json::json!("api/app.py"))
+                    .attr("owner", serde_json::json!(owner_name))
+                    .attr("line", serde_json::json!(i + 1))
+                    .attr("access", serde_json::json!("state")),
+                    &["api/app.py".into()],
+                )
+                .unwrap();
             store
                 .insert_relationship(
                     &Relationship::new(
                         format!("rel:owns:{i}"),
-                        s.clone(),
+                        owner_id.clone(),
                         predicates::OWNS,
+                        occ.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "api/app.py",
+                )
+                .unwrap();
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:occ:{i}"),
+                        occ.clone(),
+                        predicates::OCCURS,
                         rs.clone(),
                         Provenance::Extracted,
                     ),
@@ -856,6 +959,7 @@ mod tests {
         );
 
         // section attribution: both owners render under REACTIVE STATE
+        // (identical occurrence variants dedupe to one line)
         let graph = RealityGraph::load(&store).unwrap();
         let mut symbol_comp: HashMap<String, String> = HashMap::new();
         for c in &graph.components {
@@ -872,6 +976,10 @@ mod tests {
             "{:?}",
             state[S_REACTIVE]
         );
+
+        // derived count: two live occurrences
+        assert_eq!(occurrence_count(&graph, &rs), 2);
+        assert_eq!(occurrence_producer(&graph, &rs).as_deref(), Some("store_a"));
 
         // structured claims bridge carries the same attribution
         let claims = compile_state_claims(&graph, &symbol_comp);

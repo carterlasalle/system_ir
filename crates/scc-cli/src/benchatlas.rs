@@ -195,10 +195,13 @@ pub mod sha256 {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// Ground-truth sections parsed from `benchmarks/ground-truth/<name>.md`
 /// (one `- <key string>` bullet per item). The v2 ontology; legacy section
 /// names (components/flows/ownership) are accepted and normalized.
 #[derive(Debug, Clone, Default)]
+// trace:exempt reason=internal-detail
 pub struct GroundTruthDoc {
     pub architecture: Vec<String>,
     pub entrypoints: Vec<String>,
@@ -256,10 +259,13 @@ impl GroundTruthDoc {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// Gap-kind classification for a missed ground-truth item (`--diagnose`):
 /// where the fact disappeared between source and the rendered atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+// trace:exempt reason=internal-detail
 pub enum GapKind {
     /// The symbol/string is not parseable by any enabled extractor
     /// (language disabled, ignored path, or a format no extractor reads).
@@ -306,7 +312,10 @@ pub struct GapFinding {
     pub detail: String,
 }
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct RepoRecall {
     pub repo: String,
     pub architecture: f64,
@@ -351,6 +360,7 @@ pub struct RepoRecall {
     pub gaps: Vec<GapFinding>,
 }
 
+// trace:exempt reason=internal-detail
 impl RepoRecall {
     fn skipped(repo: &str, reason: impl Into<String>) -> Self {
         RepoRecall {
@@ -388,7 +398,10 @@ impl Default for RepoRecall {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct AtlasRecallReport {
     /// One row per requested repo, in sorted order; skipped repos carry
     /// `skipped_reason`.
@@ -1049,9 +1062,12 @@ pub fn run_atlas_bench(
     run_atlas_recall(&corpus_dir, &gt_dir, &names, diagnose, resolve)
 }
 
+// trace:exempt reason=internal-detail
+
 /// Overfit verdict over the dev-vs-holdout overall gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+// trace:exempt reason=internal-detail
 pub enum HoldoutVerdict {
     /// holdout >= dev: the dev-tuned rules generalize at least as well.
     NoOverfit,
@@ -1083,8 +1099,11 @@ pub fn holdout_verdict(dev: f64, holdout: f64) -> HoldoutVerdict {
     }
 }
 
+// trace:exempt reason=internal-detail
+
 /// Dev-vs-holdout comparison for `scc bench atlas --holdout`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct HoldoutComparison {
     pub dev: AtlasRecallReport,
     /// The validation corpus report (`benchmarks/holdout` — the inspected
@@ -1104,6 +1123,7 @@ pub struct HoldoutComparison {
     pub results_file: String,
 }
 
+// trace:exempt reason=internal-detail
 impl HoldoutComparison {
     fn layer_gap(dev: f64, holdout: f64) -> f64 {
         (holdout - dev).clamp(-1.0, 1.0)
@@ -1342,6 +1362,8 @@ pub fn generalization_efficiency(dev_delta: f64, validation_delta: f64) -> f64 {
     validation_delta / dev_delta
 }
 
+// trace:exempt reason=internal-detail
+
 /// Wave-11 gate report over two saved holdout result files (JSON
 /// `HoldoutComparison`s): the GE gate (`--gate-ge MIN`, default 0.0 — fails
 /// when `GE <= MIN`; semantic waves must generalize) and the per-section
@@ -1349,6 +1371,7 @@ pub fn generalization_efficiency(dev_delta: f64, validation_delta: f64) -> f64 {
 /// fails when ANY startup-required section regresses by more than MAX
 /// between the two runs, in development or validation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct CompareReport {
     pub old_file: String,
     pub new_file: String,
@@ -1530,12 +1553,91 @@ pub fn print_compare_report(r: &CompareReport) {
     }
 }
 
+// trace:exempt reason=internal-detail
+
+/// One pinned blind-test clone in `benchmarks/blind-lock.json`: the
+/// upstream URL plus the exact commit the on-disk clone must sit at.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct BlindLockEntry {
+    /// Upstream clone URL (informational — the commit is what is enforced).
+    pub url: String,
+    /// Pinned commit (full sha) the on-disk clone must be at.
+    pub commit: String,
+}
+
+// trace:exempt reason=internal-detail
+
+/// Load the committed blind commit lock (`benchmarks/blind-lock.json`,
+/// shaped `{"blind-test": {<name>: {"url": ..., "commit": ...}}}`) as a
+/// sorted name -> entry map. A missing or malformed lock is a hard error —
+/// the lock is a protocol artifact, and skipping it would silently disable
+/// the commit-pin guard.
+// trace:exempt reason=internal-detail
+fn load_blind_lock(root: &Path) -> Result<BTreeMap<String, BlindLockEntry>, String> {
+    let path = root.join("benchmarks").join("blind-lock.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read blind lock {}: {e}", path.display()))?;
+    #[derive(Deserialize)]
+    struct LockFile {
+        #[serde(rename = "blind-test")]
+        blind_test: BTreeMap<String, BlindLockEntry>,
+    }
+    let lock: LockFile =
+        serde_json::from_str(&text).map_err(|e| format!("parse blind lock {}: {e}", path.display()))?;
+    Ok(lock.blind_test)
+}
+
+// trace:exempt reason=internal-detail
+
+/// The on-disk HEAD commit of a clone dir (`git -C <dir> rev-parse HEAD`),
+/// or an error when the dir is not a git checkout.
+// trace:exempt reason=internal-detail
+fn git_head(dir: &Path) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("cannot run git in {}: {e}", dir.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(format!(
+            "git rev-parse HEAD returned nothing in {}",
+            dir.display()
+        ));
+    }
+    Ok(sha)
+}
+
+// trace:exempt reason=internal-detail
+
+/// Pure HEAD-vs-lock comparison (testable without git): Ok when the
+/// on-disk clone HEAD equals the pinned commit, else a hard error naming
+/// the repo, the actual commit, and the pin.
+// trace:exempt reason=internal-detail
+fn verify_head(name: &str, actual: &str, expected: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("blind-test repo {name} at {actual}, lock pins {expected}"))
+    }
+}
+
 /// Blind-test manifest (Wave 11 — GENERALIZATION II): a sha256 fingerprint
 /// of the frozen blind set — the ground-truth answer keys
-/// (`benchmarks/blind-test-ground-truth/**`) and the clone list
+/// (`benchmarks/blind-test-ground-truth/**`), the clone list
 /// (the committed `benchmarks/blind-test/README.md` manifest plus the
 /// on-disk repo dirs — the git-ls-files equivalent for the gitignored
-/// clones). Written into the blind results header; `--blind` verifies the
+/// clones), and the commit pins from `benchmarks/blind-lock.json` (a
+/// `lock <name> <sha>` line per repo, so the digest covers the pinned
+/// commits). Written into the blind results header; `--blind` verifies the
 /// hash matches the previous run before scoring and errors on mismatch, so
 /// a changed blind set can never silently re-score different keys.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1551,13 +1653,19 @@ pub struct BlindManifest {
     pub text: String,
 }
 
+// trace:exempt reason=internal-detail
+
 /// Deterministic manifest text + sha256 over the blind set under `root`:
 /// every file in `benchmarks/blind-test-ground-truth/**` (path + content
-/// hash) and the clone list (the committed `benchmarks/blind-test/README.md`
+/// hash), the clone list (the committed `benchmarks/blind-test/README.md`
 /// content hash + the sorted top-level repo dir names — the git-ls-files
-/// equivalent for the gitignored clones). Missing ground-truth dir is an
-/// error (the protocol requires it); a missing README is tolerated (the
-/// clone list then reduces to the repo dirs).
+/// equivalent for the gitignored clones), and a `lock <name> <sha>` line
+/// per repo from the committed `benchmarks/blind-lock.json` — the digest
+/// covers the pinned commits. Missing ground-truth dir is an error (the
+/// protocol requires it); a missing README is tolerated (the clone list
+/// then reduces to the repo dirs); a missing lock is an error (the commit
+/// pins are a protocol artifact).
+// trace:exempt reason=internal-detail
 pub fn blind_manifest(root: &Path) -> Result<BlindManifest, String> {
     let gt_dir = root.join("benchmarks").join("blind-test-ground-truth");
     if !gt_dir.is_dir() {
@@ -1594,6 +1702,15 @@ pub fn blind_manifest(root: &Path) -> Result<BlindManifest, String> {
     let dirs = repo_dirs(&blind_dir);
     for d in &dirs {
         out.push_str(&format!("clone {d}\n"));
+    }
+    // commit pins: the committed benchmarks/blind-lock.json (url + commit
+    // per blind-test repo). The digest covers the pinned commits, so a
+    // re-pin (or a reclone that updates the lock) changes the hash —
+    // and run_atlas_blind additionally verifies each on-disk clone HEAD
+    // against the pin before scoring.
+    let lock = load_blind_lock(root)?;
+    for (name, entry) in &lock {
+        out.push_str(&format!("lock {name} {}\n", entry.commit));
     }
 
     let digest = sha256::hex(out.as_bytes());
@@ -1663,8 +1780,11 @@ fn blind_transfer_ratios(c: &BlindComparison) -> Vec<(&'static str, f64)> {
     ]
 }
 
+// trace:exempt reason=internal-detail
+
 /// Blind-test protocol comparison: validation-vs-blind generalization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct BlindComparison {
     /// Validation corpus aggregates (`benchmarks/holdout`) — per-repo
     /// detail stripped.
@@ -1712,15 +1832,20 @@ fn score_protocol_corpus(
     Ok(report)
 }
 
-/// Run the blind protocol: score the validation corpus
-/// (`benchmarks/holdout`) and the blind-test corpus (`benchmarks/blind-test`)
-/// with the same recall pipeline, keep ONLY aggregates (per-repo rows,
-/// missed keys, and filenames are stripped — blind-test failures are never
-/// shown to tuning agents), compute the validation-vs-blind generalization
-/// gap, write `benchmarks/results/blind-v1.txt`, and return the comparison.
+// trace:exempt reason=internal-detail
+
+/// Run the blind protocol: verify the frozen blind clones are at their
+/// pinned commits (`benchmarks/blind-lock.json`), score the validation
+/// corpus (`benchmarks/holdout`) and the blind-test corpus
+/// (`benchmarks/blind-test`) with the same recall pipeline, keep ONLY
+/// aggregates (per-repo rows, missed keys, and filenames are stripped —
+/// blind-test failures are never shown to tuning agents), compute the
+/// validation-vs-blind generalization gap, write
+/// `benchmarks/results/blind-v1.txt`, and return the comparison.
 ///
 /// `--diagnose` is refused: diagnosis prints per-repo miss lines, which
 /// would leak the blind misses ("blind corpus is not diagnosable").
+// trace:exempt reason=internal-detail
 pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison, String> {
     if diagnose {
         return Err("blind corpus is not diagnosable".into());
@@ -1751,6 +1876,18 @@ pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison,
     let validation_gt = root.join("benchmarks").join("holdout-ground-truth");
     let blind_corpus = root.join("benchmarks").join("blind-test");
     let blind_gt = root.join("benchmarks").join("blind-test-ground-truth");
+
+    // Wave 13: the blind corpus is frozen at pinned commits — verify every
+    // clone's on-disk HEAD against benchmarks/blind-lock.json BEFORE
+    // scoring. A reclone at a different commit (or a missing clone) is a
+    // protocol error, not a silent re-score of different code.
+    let lock = load_blind_lock(&root)?;
+    for (name, entry) in &lock {
+        let clone = blind_corpus.join(name);
+        let actual = git_head(&clone)
+            .map_err(|e| format!("blind-test repo {name} missing or not a git checkout: {e}"))?;
+        verify_head(name, &actual, &entry.commit)?;
+    }
 
     let validation = score_protocol_corpus(&validation_corpus, &validation_gt, resolve, "validation")?;
     let blind = score_protocol_corpus(&blind_corpus, &blind_gt, resolve, "blind-test")?;
@@ -2965,7 +3102,10 @@ mod tests {
         assert!(r3.failures.iter().any(|f| f.contains("generalization efficiency")));
     }
 
+// trace:exempt reason=internal-detail
+
     #[test]
+// trace:exempt reason=internal-detail
     fn blind_manifest_hash_roundtrip_detects_change() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
@@ -2978,6 +3118,11 @@ mod tests {
         std::fs::write(blind.join("README.md"), "# manifest\n| axum | url |\n").unwrap();
         std::fs::create_dir_all(blind.join("axum")).unwrap();
         std::fs::create_dir_all(blind.join("echo")).unwrap();
+        std::fs::write(
+            root.join("benchmarks/blind-lock.json"),
+            r#"{"blind-test": {"axum": {"url": "https://github.com/tokio-rs/axum", "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "echo": {"url": "https://github.com/labstack/echo", "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}"#,
+        )
+        .unwrap();
 
         let m1 = blind_manifest(root).unwrap();
         assert_eq!(m1.ground_truth_files, 2);
@@ -2985,6 +3130,17 @@ mod tests {
         assert_eq!(m1.sha256.len(), 64);
         assert!(m1.text.contains("ground-truth axum.md"), "{}", m1.text);
         assert!(m1.text.contains("clone axum"), "{}", m1.text);
+        // Wave 13: the manifest carries the pinned commits from the lock
+        assert!(
+            m1.text.contains("lock axum aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "{}",
+            m1.text
+        );
+        assert!(
+            m1.text.contains("lock echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "{}",
+            m1.text
+        );
         // deterministic roundtrip
         let m2 = blind_manifest(root).unwrap();
         assert_eq!(m1.sha256, m2.sha256);
@@ -2997,6 +3153,13 @@ mod tests {
         let m4 = blind_manifest(root).unwrap();
         assert_ne!(m1.sha256, m4.sha256);
         assert_eq!(m4.repos, 1);
+        // re-pin one commit -> the digest covers the pinned commits
+        std::fs::write(
+            root.join("benchmarks/blind-lock.json"),
+            r#"{"blind-test": {"axum": {"url": "https://github.com/tokio-rs/axum", "commit": "cccccccccccccccccccccccccccccccccccccccc"}, "echo": {"url": "https://github.com/labstack/echo", "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}"#,
+        )
+        .unwrap();
+        assert_ne!(m1.sha256, blind_manifest(root).unwrap().sha256);
         // header roundtrip: the recorded hash is exactly what verification reads
         let header = format!("blind manifest sha256: {}\n", m1.sha256);
         assert_eq!(manifest_hash_from_header(&header).as_deref(), Some(m1.sha256.as_str()));
@@ -3004,6 +3167,29 @@ mod tests {
         // missing ground-truth dir is an error, not a silent empty manifest
         std::fs::remove_dir_all(&gt).unwrap();
         assert!(blind_manifest(root).is_err());
+        // a missing lock is an error too — skipping it would silently
+        // disable the commit-pin guard
+        std::fs::create_dir_all(&gt).unwrap();
+        std::fs::write(gt.join("axum.md"), "## architecture\n- axum\n").unwrap();
+        std::fs::remove_file(root.join("benchmarks/blind-lock.json")).unwrap();
+        let err = blind_manifest(root).unwrap_err();
+        assert!(err.contains("blind-lock.json"), "{err}");
+    }
+
+// trace:exempt reason=internal-detail
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn blind_head_lock_verifies_pinned_commit() {
+        // Pure HEAD-vs-lock check (no git needed): a matching commit passes,
+        // a mismatch is a hard error naming the repo, the actual commit, and
+        // the pin.
+        assert!(verify_head("axum", "abc123", "abc123").is_ok());
+        let err = verify_head("axum", "abc123", "def456").unwrap_err();
+        assert!(
+            err.contains("blind-test repo axum at abc123, lock pins def456"),
+            "{err}"
+        );
     }
 
     #[test]

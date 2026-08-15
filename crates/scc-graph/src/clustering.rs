@@ -1,11 +1,16 @@
 //! Semantic hierarchical clustering (generalization wave).
 //!
 //! Files belong to architecture because of BEHAVIOR, not directories. The
-//! clustering graph is built over **atomic regions** — the finest
-//! evidence-backed file groups: authoritative candidate dirs (declared /
-//! package / deployment / cli boundaries — never split) and the immediate
-//! sub-directories of bare code-region dirs. Weighted edges from graph
-//! evidence drive a greedy agglomerative merge:
+//! clustering graph is built over **regions** — the finest evidence-backed
+//! file groups. Authoritative boundaries (declared / package / deployment /
+//! cli dirs) are EVIDENCE AND CONSTRAINTS, not indivisible atoms: the
+//! region hierarchy starts one level below them — sub-directories holding
+//! files become regions, and a flat boundary dir's direct files split per
+//! file (one region per module, so a flat library package like click can
+//! split into core/parser/termui-style components). Code-region top dirs
+//! split the same way (sub-dirs + one dir region for direct files), and
+//! the synthetic `root` stays atomic. Weighted edges from graph evidence
+//! drive a greedy agglomerative merge:
 //!
 //! | signal | weight |
 //! |---|---|
@@ -17,19 +22,28 @@
 //! | invocation-surface cohesion (same framework family) | +2 |
 //! | type hierarchy (shared base) | +2 |
 //! | co-change | +1 (capped at 5) |
-//! | deployment boundary | +5 (constraint, not decoration) |
+//! | deployment containment | +5 (constraint, not decoration) |
+//! | package containment (same package's subregions) | +5 (deployment-style cohesion, NOT a hard atom) |
 //! | archetype prior (CLI/Framework/Service/Compiler) | +2 |
 //!
-//! The merge may SPLIT a top-level directory into several components (its
-//! sub-regions land in different clusters when intra-dir cohesion is low)
-//! and may MERGE regions across directories when behavior says so — the
-//! longest-prefix path assignment is replaced by the clustering result.
-//! Path/package/deployment remain as constraints and priors: authoritative
-//! boundaries are atomic, and merging ACROSS deployment units requires
-//! weight > [`SERVICE_THRESHOLD`].
+//! The merge may SPLIT a top-level directory or a package into several
+//! components (its sub-regions land in different clusters when intra-dir
+//! cohesion is low) and may MERGE regions across directories when behavior
+//! says so — the longest-prefix path assignment is replaced by the
+//! clustering result. Path/package/deployment remain as constraints and
+//! priors: package membership is a +5 cohesion signal between a package's
+//! subregions (a pair still needs further evidence to reach
+//! `MERGE_THRESHOLD`), and merging ACROSS deployment units requires weight
+//! > [`SERVICE_THRESHOLD`].
 //!
-//! Layers: atomic region → component (merge ≥ `MERGE_THRESHOLD`) → service
-//! (pass-2 sum-linkage ≥ `SERVICE_THRESHOLD`). Determinism is the contract:
+//! Layers: region → component (greedy merge ≥ `MERGE_THRESHOLD` with
+//! cohesion-aware acceptance) → service (pass-2 sum-linkage ≥
+//! `SERVICE_THRESHOLD`). The merge is not pure max-linkage: the strongest
+//! pairwise edge selects the candidate, but the union is accepted only when
+//! the average linkage across ALL cross pairs is at least
+//! [`COHESION_FRACTION`] of the max edge (or the edge is absolute-strong,
+//! ≥ [`SERVICE_THRESHOLD`]) — a lone strong edge can no longer drag two
+//! clusters together (single-link chaining). Determinism is the contract:
 //! every iteration is over sorted collections and ties break on the
 //! smallest index pair.
 
@@ -40,8 +54,9 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::components::{
-    boundary_rank, component_for_path, BOUNDARY_CODE_REGION, BOUNDARY_ROOT, ComponentCandidate,
-    LAYER_CODE_REGION, LAYER_COMPONENT, LAYER_SERVICE, MERGE_THRESHOLD, SERVICE_THRESHOLD,
+    boundary_rank, component_for_path, BOUNDARY_CODE_REGION, BOUNDARY_PACKAGE, BOUNDARY_ROOT,
+    ComponentCandidate, LAYER_CODE_REGION, LAYER_COMPONENT, LAYER_SERVICE, MERGE_THRESHOLD,
+    SERVICE_THRESHOLD,
 };
 
 // ---- signal weights (the clustering graph edge list) ----
@@ -68,8 +83,18 @@ pub const W_SURFACE_FAMILY: i32 = 2;
 pub const W_TYPE_HIERARCHY: i32 = 2;
 /// Deployment boundary containment: same deployment unit (+5).
 pub const W_DEPLOYMENT: i32 = 5;
+/// Package containment: subregions of the same package cohere (+5 — the
+/// same value as the deployment signal; package membership is a
+/// deployment-style cohesion prior, not a hard atom).
+pub const W_PACKAGE: i32 = 5;
 /// Co-change cap: a change-heavy region pair never dominates the graph.
 pub const COCHANGE_CAP: i32 = 5;
+
+/// Cohesion-aware merge acceptance (single-link chaining guard): a
+/// candidate pair — the strongest pairwise edge — merges only when the
+/// average linkage over ALL cross pairs is at least this fraction of the
+/// max edge, unless the edge is absolute-strong (≥ [`SERVICE_THRESHOLD`]).
+pub const COHESION_FRACTION: f64 = 0.4;
 
 /// One clustered component: the merge result over a set of atomic regions.
 #[derive(Debug, Clone)]
@@ -113,9 +138,19 @@ pub struct ClusteringResult {
     pub cross_unit: Vec<Vec<bool>>,
 }
 
-/// Build the atomic regions from the path candidates:
-/// 1. every authoritative boundary (declared / package / deployment / cli /
-///    root) is ONE region — these never split internally;
+/// Build the region hierarchy from the path candidates:
+///
+/// 1. authoritative boundaries (declared / package / deployment / cli) are
+///    EVIDENCE, not indivisible atoms: the region hierarchy starts one
+///    level below the boundary dir — each immediate sub-directory that
+///    holds files becomes a region, and a boundary dir's direct files
+///    split per file when there are several (one region per module, so a
+///    flat library package can split into per-module components). A
+///    boundary dir with a single direct file keeps the boundary-named
+///    region (there is nothing to split). Every split region carries the
+///    parent's evidence class. The synthetic `root` (and any boundary
+///    candidate rooted at `root`) stays atomic — root-level files always
+///    map to the root region.
 /// 2. each code-region top-level dir becomes one region per immediate
 ///    sub-directory that holds files, plus one region for the dir's own
 ///    direct files;
@@ -124,7 +159,8 @@ pub struct ClusteringResult {
 /// Regions that end up with zero assigned files are pruned afterwards by
 /// the caller (a code-region dir whose every file belongs to an
 /// authoritative boundary is not a region). Deterministic: candidates are
-/// processed in sorted name order and every file list is sorted.
+/// processed in sorted name order, dirs in sorted order, and every file
+/// list is sorted.
 // trace:v1 id=impl.scc.clustering work=WORK-SCC-005 satisfies=REQ-SCC-IR
 pub fn build_regions(
     graph: &RealityGraph,
@@ -132,17 +168,117 @@ pub fn build_regions(
 ) -> Vec<ComponentCandidate> {
     let mut regions: Vec<ComponentCandidate> = Vec::new();
     let mut by_name: HashSet<String> = HashSet::new();
+    let push = |regions: &mut Vec<ComponentCandidate>,
+                by_name: &mut HashSet<String>,
+                c: ComponentCandidate| {
+        if by_name.insert(c.name.clone()) {
+            regions.push(c);
+        }
+    };
 
-    // 1. authoritative boundaries (sorted for determinism)
+    // test files (files referenced by TEST entities): verification code.
+    // A test file never forms its own component — when its package dir
+    // splits per-file, it rides along with a module region (the module it
+    // verifies), and its calls/flows stay excluded from clustering.
+    let mut test_files: HashSet<String> = HashSet::new();
+    for t in graph.entities_of_kind(kinds::TEST) {
+        if let Some(f) = t.attributes.get("file").and_then(|v| v.as_str()) {
+            test_files.insert(f.to_string());
+        }
+    }
+
+    // 1. authoritative boundaries, split one level below (sorted names).
+    //    PACKAGE dirs are the architecture leaf — a flat package's direct
+    //    modules ARE its sub-architecture, so they split per file (one
+    //    region per module); declared/deployment/cli dirs are coarser
+    //    containers: their direct files keep one dir-named region (the
+    //    sub-directories still split).
     let mut auth: Vec<ComponentCandidate> = candidates
         .iter()
         .filter(|c| c.boundary_kind != BOUNDARY_CODE_REGION)
         .cloned()
         .collect();
     auth.sort_by(|a, b| a.name.cmp(&b.name));
-    for c in auth {
-        if by_name.insert(c.name.clone()) {
-            regions.push(c);
+    for c in &auth {
+        if c.boundary_kind == BOUNDARY_ROOT || c.name == "root" {
+            // the root fallback stays one region (root-level files)
+            push(&mut regions, &mut by_name, c.clone());
+            continue;
+        }
+        let is_package = c.boundary_kind == BOUNDARY_PACKAGE;
+        let mut dirs = c.dirs.clone();
+        dirs.sort();
+        dirs.dedup();
+        // dirs of this candidate holding exactly one direct file keep the
+        // boundary-named region (a package shell with a single module)
+        let mut dir_region_dirs: Vec<String> = Vec::new();
+        for dir in &dirs {
+            let dir = dir.trim_end_matches('/');
+            if dir.is_empty() {
+                continue;
+            }
+            let prefix = format!("{dir}/");
+            let mut subs: BTreeSet<String> = BTreeSet::new();
+            let mut direct: Vec<String> = Vec::new();
+            for f in graph.entities_of_kind(kinds::FILE) {
+                if f.name == *dir || f.name.starts_with(&prefix) {
+                    let rest = &f.name[dir.len() + 1..];
+                    if let Some(slash) = rest.find('/') {
+                        subs.insert(format!("{dir}/{}", &rest[..slash]));
+                    } else {
+                        direct.push(f.name.clone());
+                    }
+                }
+            }
+            direct.sort();
+            for sub in subs {
+                push(&mut regions, &mut by_name, ComponentCandidate {
+                    name: sub.clone(),
+                    dirs: vec![sub.clone()],
+                    boundary_kind: c.boundary_kind.clone(),
+                    intent: c.intent.clone(),
+                });
+            }
+            if is_package && direct.len() >= 2 {
+                // flat package: the direct modules ARE the sub-architecture
+                // — one region per non-test file; test files ride along
+                // with the first module region (deterministic: sorted)
+                let code: Vec<&String> = direct
+                    .iter()
+                    .filter(|f| !test_files.contains(*f))
+                    .collect();
+                if code.len() >= 2 {
+                    for (k, f) in code.iter().enumerate() {
+                        let mut dirs = vec![(*f).clone()];
+                        if k == 0 {
+                            for t in direct.iter().filter(|t| test_files.contains(*t)) {
+                                dirs.push(t.clone());
+                            }
+                        }
+                        push(&mut regions, &mut by_name, ComponentCandidate {
+                            name: (**f).clone(),
+                            dirs,
+                            boundary_kind: c.boundary_kind.clone(),
+                            intent: c.intent.clone(),
+                        });
+                    }
+                } else {
+                    dir_region_dirs.push(dir.to_string());
+                }
+            } else if !direct.is_empty() {
+                // a boundary dir with a single direct file (any kind), or a
+                // non-package boundary dir with several direct files, keeps
+                // the boundary-named region for its direct files
+                dir_region_dirs.push(dir.to_string());
+            }
+        }
+        if !dir_region_dirs.is_empty() {
+            push(&mut regions, &mut by_name, ComponentCandidate {
+                name: c.name.clone(),
+                dirs: dir_region_dirs,
+                boundary_kind: c.boundary_kind.clone(),
+                intent: c.intent.clone(),
+            });
         }
     }
 
@@ -177,7 +313,7 @@ pub fn build_regions(
             regions.push(ComponentCandidate {
                 name: dir.clone(),
                 dirs: vec![dir.clone()],
-                boundary_kind: BOUNDARY_CODE_REGION.to_string(),
+                boundary_kind: BOUNDARY_CODE_REGION.to_string(), intent: None,
             });
         }
         for sub in subs {
@@ -188,7 +324,7 @@ pub fn build_regions(
             regions.push(ComponentCandidate {
                 name: sub.clone(),
                 dirs: vec![sub.clone()],
-                boundary_kind: BOUNDARY_CODE_REGION.to_string(),
+                boundary_kind: BOUNDARY_CODE_REGION.to_string(), intent: None,
             });
         }
     }
@@ -198,7 +334,7 @@ pub fn build_regions(
         regions.push(ComponentCandidate {
             name: "root".to_string(),
             dirs: vec!["root".to_string()],
-            boundary_kind: BOUNDARY_ROOT.to_string(),
+            boundary_kind: BOUNDARY_ROOT.to_string(), intent: None,
         });
     }
     regions
@@ -516,6 +652,39 @@ pub fn cluster_components(
         }
     }
 
+    // ---- signal (i2): package containment (+5, same package) ----
+    // Package membership is a deployment-style cohesion prior, NOT a hard
+    // atom: subregions of the same package cohere (+5 per pair), but a
+    // pair still needs further evidence to reach MERGE_THRESHOLD — so a
+    // flat package with unrelated modules SPLITS into separate components,
+    // while modules that call/flow together merge back into the package.
+    let mut pkg_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (i, r) in regions.iter().enumerate() {
+        for cand in candidates {
+            if cand.boundary_kind != BOUNDARY_PACKAGE {
+                continue;
+            }
+            let inside = cand.dirs.iter().any(|cd| {
+                let cd = cd.trim_end_matches('/');
+                r.dirs.iter().any(|d| {
+                    let d = d.trim_end_matches('/');
+                    d == cd || d.starts_with(&format!("{cd}/"))
+                })
+            });
+            if inside {
+                pkg_groups
+                    .entry(cand.name.clone())
+                    .or_default()
+                    .insert(regions[i].name.clone());
+            }
+        }
+    }
+    for set in pkg_groups.values() {
+        if set.len() >= 2 {
+            add_pair_weight(&mut w, &idx, set, W_PACKAGE);
+        }
+    }
+
     // ---- signal (j): archetype emphasis (+2, one region trait) ----
     if let Some(prior) = crate::archetype::cluster_prior(archetype) {
         let mut set: BTreeSet<String> = BTreeSet::new();
@@ -722,7 +891,18 @@ fn build_cluster(regions: &[ComponentCandidate], members: &[usize]) -> ClusterCo
 /// member region names when they share one (and it is not another region's
 /// name — that would collide), otherwise the sorted member names joined
 /// with `+`.
+// trace:exempt reason=internal-detail
 fn cluster_name(regions: &[ComponentCandidate], members: &[usize]) -> String {
+    // declared intent names architecture: when every member region
+    // descends from the same declared component, the cluster keeps the
+    // declared name (the clusterer decided membership; intent names it).
+    let intents: BTreeSet<&str> = members
+        .iter()
+        .filter_map(|&i| regions[i].intent.as_deref())
+        .collect();
+    if intents.len() == 1 {
+        return intents.into_iter().next().unwrap().to_string();
+    }
     if members.len() == 1 {
         return regions[members[0]].name.clone();
     }
@@ -769,7 +949,7 @@ fn add_pair_weight(w: &mut [Vec<i32>], idx: &HashMap<&str, usize>, set: &BTreeSe
 }
 
 /// Disjoint-set union-find with path compression.
-// # trace:exempt — union-find helper, data container with no behavior
+// trace:exempt reason=internal-helper
 pub(crate) struct Dsu {
     parent: Vec<usize>,
 }
@@ -825,8 +1005,50 @@ fn cluster_weight(w: &[Vec<i32>], dsu: &mut Dsu, a: usize, b: usize, cross_unit:
     m
 }
 
-/// Greedy merge: repeatedly union the highest-weight pair while the weight
-/// is >= threshold. Deterministic: on weight ties the smallest (i, j) wins.
+/// Average-linkage weight between two DSU clusters: mean effective weight
+/// over ALL cross region pairs (zero-weight pairs included) — the
+/// cohesion guard against single-link chaining. Effective weights apply
+/// the cross-unit rule (pairs ≤ `SERVICE_THRESHOLD` across deployment
+/// units count 0).
+// trace:exempt reason=internal-helper
+fn cluster_avg(w: &[Vec<i32>], dsu: &mut Dsu, a: usize, b: usize, cross_unit: &[Vec<bool>]) -> f64 {
+    let (ra, rb) = (dsu.find(a), dsu.find(b));
+    let mut sum = 0i64;
+    let mut count = 0i64;
+    for (i, row) in w.iter().enumerate() {
+        if dsu.find(i) != ra {
+            continue;
+        }
+        for (j, cell) in row.iter().enumerate() {
+            if dsu.find(j) != rb {
+                continue;
+            }
+            let cell = if cross_unit[i][j] && *cell <= SERVICE_THRESHOLD {
+                0
+            } else {
+                *cell
+            };
+            sum += cell as i64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    sum as f64 / count as f64
+}
+
+/// Greedy merge: repeatedly union the highest-weight candidate pair whose
+/// merge passes the cohesion acceptance. Candidate selection is still the
+/// strongest pairwise edge (max-linkage, [`cluster_weight`]), but the
+/// union is accepted only when the average linkage across ALL cross pairs
+/// is at least [`COHESION_FRACTION`] of the max edge, OR the edge is
+/// absolute-strong (≥ [`SERVICE_THRESHOLD`]) — a lone strong edge can no
+/// longer drag two clusters together (single-link chaining). Pairs that
+/// cross deployment units only count their weight when it exceeds
+/// `SERVICE_THRESHOLD`. Deterministic: on weight ties the smallest (i, j)
+/// wins.
+// trace:exempt reason=internal-helper
 fn greedy_merge(
     dsu: &mut Dsu,
     w: &[Vec<i32>],
@@ -842,6 +1064,14 @@ fn greedy_merge(
                     continue;
                 }
                 let wi = cluster_weight(w, dsu, i, j, cross_unit);
+                if wi < threshold {
+                    continue;
+                }
+                let accepted = wi >= SERVICE_THRESHOLD
+                    || cluster_avg(w, dsu, i, j, cross_unit) >= COHESION_FRACTION * wi as f64;
+                if !accepted {
+                    continue;
+                }
                 match best {
                     Some((bw, bi, bj)) => {
                         if wi > bw || (wi == bw && (i < bi || (i == bi && j < bj))) {
@@ -853,7 +1083,7 @@ fn greedy_merge(
             }
         }
         match best {
-            Some((wi, i, j)) if wi >= threshold => dsu.union(i, j),
+            Some((_, i, j)) => dsu.union(i, j),
             _ => break,
         }
     }
@@ -1080,6 +1310,133 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=unit-test
+    fn flat_library_package_splits_into_unrelated_modules() {
+        // Wave 13: a FLAT library package (workspace member whose direct
+        // files are its modules — no subdirectories) is no longer an
+        // indivisible atom. The region hierarchy starts one level below
+        // the package dir: each direct module becomes its own region, and
+        // package membership is only a +5 cohesion signal — below
+        // MERGE_THRESHOLD — so modules with NO cross evidence stay split.
+        let (store, _t) = store_for();
+        let repo = store.repo_id.clone();
+        let mut pkg = Entity::new(entity_id(&repo, kinds::PACKAGE, "src"), kinds::PACKAGE, "src");
+        pkg.attr("path", serde_json::json!("src"));
+        store
+            .insert_entity(&pkg, &["src/core.py".into()])
+            .unwrap();
+        // three modules, NO cross calls / state / exports — the only
+        // evidence between them is package containment (+5 < 6)
+        let _ = insert_file_with_symbols(&store, "src/core.py", &["core_fn"]);
+        let _ = insert_file_with_symbols(&store, "src/parser.py", &["parse_arg"]);
+        let _ = insert_file_with_symbols(&store, "src/termui.py", &["render_line"]);
+
+        let comps = compile(&store);
+        let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
+        for n in ["src/core.py", "src/parser.py", "src/termui.py"] {
+            assert!(names.contains(&n), "module {n} split out: {names:?}");
+        }
+        assert!(
+            !names.contains(&"src"),
+            "no fused package blob: {names:?}"
+        );
+        // the split modules stay evidence-backed package components
+        for n in ["src/core.py", "src/parser.py", "src/termui.py"] {
+            let c = comps.iter().find(|c| c.name == n).unwrap();
+            assert_eq!(
+                c.attributes["boundary_kind"],
+                serde_json::json!(crate::components::BOUNDARY_PACKAGE),
+                "{n}"
+            );
+            assert_eq!(c.attributes["layer"], serde_json::json!(LAYER_COMPONENT), "{n}");
+        }
+    }
+
+    #[test]
+    // trace:exempt reason=unit-test
+    fn single_link_chaining_is_blocked() {
+        // Wave 13: four regions A-B-C-D with ONE strong edge (call+state
+        // = 6) between consecutive regions only. Pure max-linkage would
+        // collapse the whole chain into one component; the cohesion-aware
+        // acceptance (avg >= 0.4 * max over ALL cross pairs) stops the
+        // chain at the third link: {A,B,C} vs {D} has avg 6/3 = 2 < 2.4.
+        let (store, _t) = store_for();
+        let repo = store.repo_id.clone();
+        let sa = insert_file_with_symbols(&store, "a/x.py", &["a_run"]);
+        let sb = insert_file_with_symbols(&store, "b/x.py", &["b_run"]);
+        let sc = insert_file_with_symbols(&store, "c/x.py", &["c_run"]);
+        let sd = insert_file_with_symbols(&store, "d/x.py", &["d_run"]);
+        // consecutive shared stores: a-b -> db1, b-c -> db2, c-d -> db3
+        for (i, (syms, db)) in [
+            ([sa[0].clone(), sb[0].clone()].to_vec(), "db1"),
+            ([sb[0].clone(), sc[0].clone()].to_vec(), "db2"),
+            ([sc[0].clone(), sd[0].clone()].to_vec(), "db3"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store_ent = entity_id(&repo, kinds::DATA_STORE, db);
+            store
+                .insert_entity(
+                    &Entity::new(store_ent.clone(), kinds::DATA_STORE, db),
+                    &["a/x.py".into()],
+                )
+                .unwrap();
+            for (k, sym) in syms.iter().enumerate() {
+                store
+                    .insert_relationship(
+                        &Relationship::new(
+                            format!("rel:w:{i}:{k}"),
+                            sym.clone(),
+                            predicates::WRITES,
+                            store_ent.clone(),
+                            Provenance::Extracted,
+                        ),
+                        "a/x.py",
+                    )
+                    .unwrap();
+            }
+        }
+        // one call per consecutive pair: each edge = 4 (state) + 2 (call)
+        for (i, (from, to)) in [
+            (sa[0].clone(), sb[0].clone()),
+            (sb[0].clone(), sc[0].clone()),
+            (sc[0].clone(), sd[0].clone()),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        format!("rel:call:{i}"),
+                        from.clone(),
+                        predicates::CALLS,
+                        to.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "a/x.py",
+                )
+                .unwrap();
+        }
+
+        let comps = compile(&store);
+        let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"a+b+c"),
+            "the first three links cohere (avg 3 >= 2.4): {names:?}"
+        );
+        assert!(
+            names.contains(&"d"),
+            "the tail link must NOT chain on a single edge: {names:?}"
+        );
+        assert!(
+            !names.contains(&"a+b+c+d"),
+            "the chain must not collapse into one component: {names:?}"
+        );
+    }
+
+    #[test]
     fn code_region_dir_splits_into_low_cohesion_modules() {
         // Two modules in the SAME top-level directory with no behavioral
         // evidence between them: the clusterer must SPLIT the dir into two
@@ -1248,7 +1605,7 @@ mod tests {
     /// signal (2) = 7 >= MERGE_THRESHOLD. The surface signal is decisive —
     /// without it the pair sits at 5 < 6 and stays split.
     #[test]
-    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    // trace:exempt reason=unit-test
     fn queue_consumer_regions_cohere_on_surface_family() {
         let (store, _t) = store_for();
         let repo = store.repo_id.clone();
