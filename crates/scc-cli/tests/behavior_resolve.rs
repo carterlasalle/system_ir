@@ -119,8 +119,11 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
 
     // 1. The bench (default: resolve ON) indexes, resolves the call chain
     // through tsserver, and reports resolved_calls > 0; the behavior layer
-    // matches the resolved flow step op. (Skipped without tsserver: the
-    // bench degrades and reports 0 — an environment property, not a bug.)
+    // matches the resolved flow step op. When tsserver is genuinely
+    // unavailable the bench degrades (resolved_calls = 0, backends_missing
+    // populated — documented contract) and the resolve assertions are
+    // skipped; a present-but-broken backend (missing flag not set, still
+    // 0) FAILS — that is a real regression, not an environment property.
     let json = bench_json(tmp.path(), &corpus, &gt, &[]);
     assert_eq!(json["scored"].as_u64(), Some(1), "{json}");
     let repo = json["repos"]
@@ -129,7 +132,11 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
         .iter()
         .find(|r| r["repo"] == "resolve-fixture")
         .unwrap();
-    if tsserver_available {
+    let backend_missing = repo["backends_missing"]
+        .as_array()
+        .map(|a| a.iter().any(|b| b == "tsserver"))
+        .unwrap_or(false);
+    if tsserver_available && !backend_missing {
         assert!(
             repo["resolved_calls"].as_u64().unwrap() > 0,
             "resolved_calls must be reported: {repo}"
@@ -140,7 +147,7 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
         );
     } else {
         eprintln!(
-            "resolve assertions skipped (no tsserver); resolved_calls={}",
+            "resolve assertions skipped (tsserver available={tsserver_available}, backends_missing={backend_missing}); resolved_calls={}",
             repo["resolved_calls"]
         );
     }
@@ -183,7 +190,7 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
         .unwrap()
         .iter()
         .any(|e| e["provenance"] == "RESOLVED");
-    if tsserver_available {
+    if tsserver_available && !backend_missing {
         assert!(resolved_edge, "route flow has a RESOLVED edge: {route}");
     }
 

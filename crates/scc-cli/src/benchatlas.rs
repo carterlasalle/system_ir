@@ -347,6 +347,14 @@ pub struct RepoRecall {
     /// Number of call edges upgraded to RESOLVED by the semantic backends
     /// (pyright/tsserver) before scoring; 0 when `--no-resolve`.
     pub resolved_calls: usize,
+    /// Semantic backends that were available and used for resolution
+    /// (pyright/tsserver); empty when unavailable or `--no-resolve`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends_used: Vec<String>,
+    /// Semantic backends unavailable (not installed) — resolution degraded,
+    /// not fatal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends_missing: Vec<String>,
     /// Number of ground-truth items in the (informational) landmarks layer.
     pub landmark_items: usize,
     /// When set, the repo was not scored (missing dir / missing ground
@@ -390,6 +398,8 @@ impl Default for RepoRecall {
             density: 0.0,
             atlas_tokens: 0,
             resolved_calls: 0,
+            backends_used: Vec::new(),
+            backends_missing: Vec::new(),
             landmark_items: 0,
             skipped_reason: None,
             missed: Vec::new(),
@@ -808,9 +818,15 @@ pub fn score_repo(
     resolve: bool,
 ) -> Result<RepoRecall, String> {
     crate::commands::cmd_index(repo_dir, true).map_err(|e| format!("index failed: {e}"))?;
+    let mut backends_used: Vec<String> = Vec::new();
+    let mut backends_missing: Vec<String> = Vec::new();
     let resolved_calls = if resolve {
         match crate::resolve_and_recompile(repo_dir) {
-            Ok(rep) => rep.upgraded,
+            Ok(rep) => {
+                backends_used = rep.backends_used;
+                backends_missing = rep.backends_missing;
+                rep.upgraded
+            }
             Err(e) => {
                 eprintln!(
                     "benchatlas: semantic resolution skipped for {}: {e}",
@@ -928,6 +944,8 @@ pub fn score_repo(
         density,
         atlas_tokens: pack.tokens,
         resolved_calls,
+        backends_used,
+        backends_missing,
         landmark_items: gt.landmarks.len(),
         skipped_reason: None,
         missed,
