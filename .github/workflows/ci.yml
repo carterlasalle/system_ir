@@ -17,7 +17,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: |
+          # resolution-in-the-bench tests need the semantic backends
+          # (behavior_resolve drives tsserver through
+          # typescript-language-server); pyright is bundled via npm too.
+          npm install -g typescript-language-server typescript pyright
+          cargo test --workspace
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test
