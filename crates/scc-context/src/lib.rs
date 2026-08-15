@@ -14,6 +14,15 @@ pub mod startup;
 pub mod structural_source;
 pub mod surface;
 
+// The one authoritative surface service (Wave 15.1): re-exported at the
+// crate root so every consumer (CLI, MCP, plugin, benchmark ablations)
+// routes through `scc_context::build_surface` without reimplementing
+// ranking. The `scc_context::surface` module path works identically.
+pub use surface::{
+    build_surface, build_surface_staged, SurfaceMode, SurfacePipelineStages, SurfacePolicy,
+    SurfaceRequest,
+};
+
 use scc_core::estimate_tokens;
 use scc_graph::{RealityGraph, TrustedGraphView, TrustPolicy};
 use scc_store::Store;

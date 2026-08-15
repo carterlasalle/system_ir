@@ -113,6 +113,9 @@ impl<'a> ContextLedgerStore<'a> {
 /// ledger's component/flow sets) always re-inject at full weight: the task
 /// delta never re-dumps the Atlas, and architecture anchors must stay
 /// available to consumers that need them unconditionally.
+///
+/// Consumed by the one authoritative surface service
+/// (`surface::build_surface` Task mode) via `SurfaceMode::Task { visible }`.
 // trace:v1 id=impl.scc.context.ledger.novelty work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn novelty_penalty(visible: &ContextLedger, symbol_id: &str, changed: bool) -> f64 {
     let already_visible = visible.visible_symbols.contains(symbol_id)

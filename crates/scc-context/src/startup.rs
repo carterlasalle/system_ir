@@ -6,16 +6,11 @@
 //! `(epoch, renderer_version, trust_policy, budget)` — no timestamps — so
 //! the same epoch + config always yields byte-identical startup text.
 
-use crate::context_ledger::novelty_penalty;
-use crate::rank::{collect_lexical_candidates, entity_similarity, terms};
-use crate::surface::entry_lexical;
+use crate::surface::{build_surface, SurfaceMode, SurfacePolicy, SurfaceRequest};
 use crate::ContextCompiler;
 use scc_core::kinds;
-use scc_core::{
-    estimate_tokens, ContextArtifact, ContextBudget, ContextItem, ContextLedger, SurfaceEntry,
-    TaskSeed,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use scc_core::{ContextArtifact, ContextBudget, ContextLedger};
+use std::collections::BTreeSet;
 
 /// Renderer version: part of the artifact hash. Bump when the startup
 /// renderer's output format changes (invalidates prompt-cache keys).
@@ -53,9 +48,19 @@ pub fn build_startup(
     let atlas_pack = compiler.system_atlas(Some(budget.atlas));
     let atlas = atlas_pack.content.clone();
 
-    // Surface: the FULL production pipeline — heterogeneous global PPR,
-    // required coverage, MMR diversity, quotas, budget selection, render.
-    let render = crate::surface::select_and_render_global(compiler, budget.surface);
+    // Surface: the FULL production pipeline — the one authoritative
+    // [`build_surface`] service in Global mode (heterogeneous global PPR,
+    // required coverage, MMR diversity, token-aware quotas, soft/hard
+    // budget selection, render).
+    let render = build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Global,
+            budget: budget.surface,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget.surface),
+        },
+    );
     let surface = render.text.clone();
 
     // MODEL COVERAGE: the compiler's existing warnings + stale paths +
@@ -277,9 +282,18 @@ pub fn visible_ids_from_startup(
     // Cache-hit in the CLI flow (build_startup already ran system_atlas).
     let atlas_pack = compiler.system_atlas(Some(budget.atlas));
 
-    // Surface: rendered entries ONLY — the same production pipeline the
-    // startup artifact rendered, so the ledger matches the artifact text.
-    let render = crate::surface::select_and_render_global(compiler, budget.surface);
+    // Surface: rendered entries ONLY — the same one authoritative
+    // pipeline the startup artifact rendered, so the ledger matches the
+    // artifact text.
+    let render = build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Global,
+            budget: budget.surface,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget.surface),
+        },
+    );
     let map = crate::surface::compile_surface_map(compiler);
     let rendered_set: BTreeSet<String> = render.rendered_ids.iter().cloned().collect();
     for e in &map.entries {
@@ -315,9 +329,12 @@ pub fn visible_ids_from_startup(
     (symbols, files, components, flows)
 }
 
-/// The task delta: TASK-FOCUS seed resolution, task PPR over the surface
-/// map, and the *new* relevant APIs not already visible in the ledger,
-/// budget-capped. Never re-dumps the Atlas.
+/// The task delta: the task-personalized surface over the context ledger —
+/// only *new* relevant APIs (entries already visible AND unchanged this
+/// epoch are not re-injected), budget-capped. Routed through the one
+/// authoritative [`build_surface`] service in Task mode; never re-dumps
+/// the Atlas. The custom task/PPR selection implementation was deleted —
+/// [`build_surface`] is the only ranking pipeline.
 // trace:exempt reason=internal-detail
 pub fn task_delta(
     compiler: &ContextCompiler,
@@ -336,136 +353,34 @@ pub fn task_delta_with_ids(
     visible: &ContextLedger,
     budget_tokens: usize,
 ) -> (String, Vec<String>) {
-    let goal_terms = terms(goal);
-
-    // TASK-FOCUS seed resolution: the existing lexical ranker (FTS over
-    // entities + symbols; graph attributes when FTS is unavailable) matches
-    // goal terms against symbol names/signatures/components/flows/contracts.
-    let candidates = collect_lexical_candidates(compiler.store, &compiler.view, goal, &[], 16);
-    let seeds: Vec<TaskSeed> = candidates
-        .iter()
-        .map(|c| TaskSeed {
-            kind: c.kind.clone(),
-            id: c.id.clone(),
-            weight: c.score,
-        })
-        .collect();
-    let seed_ids: BTreeSet<String> = seeds.iter().map(|s| s.id.clone()).collect();
-
-    let map = crate::surface::compile_surface_map(compiler);
-    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
-    let global = ranker.global_vector();
-    let task = ranker.task_vector(&seeds);
-
-    let mut items: Vec<ContextItem> = Vec::new();
-    let mut line_of: BTreeMap<String, String> = BTreeMap::new();
-    let mut api_ids: BTreeSet<String> = BTreeSet::new();
-    for e in &map.entries {
-        let changed = compiler.is_stale_path(&e.path);
-        let novelty = novelty_penalty(visible, &e.symbol_id, changed);
-        if novelty < 1.0 {
-            // Already visible AND unchanged: not re-injected (spec).
-            continue;
-        }
-        let idx = ranker.index_of(&e.symbol_id);
-        let task_ppr = idx.and_then(|i| task.get(i).copied()).unwrap_or(0.0);
-        let global_ppr = idx.and_then(|i| global.get(i).copied()).unwrap_or(0.0);
-        let lexical = entry_lexical(e, &goal_terms);
-        let criticality = if seed_ids.contains(&e.symbol_id) { 1.0 } else { 0.0 };
-        let change_risk = if changed { 1.0 } else { 0.0 };
-        let importance = crate::pagerank::final_importance(
-            task_ppr,
-            global_ppr,
-            lexical,
-            0.0,
-            e.confidence as f64,
-            criticality,
-            change_risk,
-            novelty,
-            !seeds.is_empty(),
-        );
-        if importance <= 0.0 {
-            continue;
-        }
-        let line = api_line(e);
-        api_ids.insert(e.symbol_id.clone());
-        line_of.insert(e.symbol_id.clone(), line);
-        items.push(ContextItem {
-            id: e.symbol_id.clone(),
-            value: importance,
-            token_cost: estimate_tokens(line_of.get(&e.symbol_id).unwrap()),
-            required: criticality > 0.0,
-            group: Some("api".into()),
-        });
-    }
-
-    // Relevant test surfaces: symbols in test paths matched by the task
-    // (skipped when the symbol is already an API entry — no duplicate ids).
-    for e in compiler.view.entities_of_kind(kinds::SYMBOL) {
-        let path = e.attributes.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        if api_ids.contains(&e.id) || !is_test_path(path) {
-            continue;
-        }
-        let sim = entity_similarity(e, &goal_terms);
-        if sim <= 0.0 {
-            continue;
-        }
-        let line = format!("- {} ({path})", e.name);
-        let id = e.id.clone();
-        line_of.insert(id.clone(), line.clone());
-        items.push(ContextItem {
-            id,
-            value: sim,
-            token_cost: estimate_tokens(&line),
-            required: false,
-            group: Some("test".into()),
-        });
-    }
-
-    let selected = crate::selector::select_with_budget(&items, budget_tokens);
-
-    let mut api_lines: Vec<String> = Vec::new();
-    let mut test_lines: Vec<String> = Vec::new();
-    let mut rendered_ids: Vec<String> = Vec::new();
-    for &idx in &selected {
-        if idx >= items.len() {
-            continue; // defensive: never panic on a misbehaving selector
-        }
-        let item = &items[idx];
-        if let Some(line) = line_of.get(&item.id) {
-            if item.group.as_deref() == Some("test") {
-                test_lines.push(line.clone());
-            } else {
-                api_lines.push(line.clone());
-            }
-            rendered_ids.push(item.id.clone());
-        }
-    }
-
+    let render = build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Task {
+                goal,
+                visible: Some(visible),
+            },
+            budget: budget_tokens,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget_tokens),
+        },
+    );
     let mut out = String::new();
     out.push_str("# SCC TASK DELTA\n");
     out.push_str(&format!("TASK-FOCUS: {goal}\n"));
     out.push_str("Relevant APIs not already visible:\n");
-    if api_lines.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        for l in &api_lines {
-            out.push_str(l);
-            out.push('\n');
-        }
-    }
-    if !test_lines.is_empty() {
-        out.push_str("Relevant test surfaces:\n");
-        for l in &test_lines {
-            out.push_str(l);
-            out.push('\n');
-        }
-    }
-    (out, rendered_ids)
+    let body = render
+        .text
+        .strip_prefix("SCC SYSTEM SURFACE MAP\n\n")
+        .unwrap_or(&render.text);
+    out.push_str(body.trim_end());
+    out.push('\n');
+    (out, render.rendered_ids)
 }
 
-/// Task-personalized surface map: entries re-ranked by task PPR +
-/// importance (no novelty filter — this is a full map, not a delta).
+/// Task-personalized surface map (full map, no novelty filter — this is a
+/// map, not a delta): entries re-ranked by task PPR + importance via the
+/// one authoritative [`build_surface`] service in Task mode.
 // trace:exempt reason=internal-detail
 pub fn task_surface(
     compiler: &ContextCompiler,
@@ -484,117 +399,27 @@ pub fn task_surface_with_ids(
     budget_tokens: usize,
     explain: bool,
 ) -> (String, Vec<String>) {
-    let goal_terms = terms(goal);
-    let candidates = collect_lexical_candidates(compiler.store, &compiler.view, goal, &[], 16);
-    let seeds: Vec<TaskSeed> = candidates
-        .iter()
-        .map(|c| TaskSeed {
-            kind: c.kind.clone(),
-            id: c.id.clone(),
-            weight: c.score,
-        })
-        .collect();
-    let seed_ids: BTreeSet<String> = seeds.iter().map(|s| s.id.clone()).collect();
-
-    let map = crate::surface::compile_surface_map(compiler);
-    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
-    let global = ranker.global_vector();
-    let task = ranker.task_vector(&seeds);
-
-    // (importance, entry) pairs, ties broken lexicographically.
-    let mut ranked: Vec<(f64, &SurfaceEntry)> = Vec::new();
-    for e in &map.entries {
-        let idx = ranker.index_of(&e.symbol_id);
-        let task_ppr = idx.and_then(|i| task.get(i).copied()).unwrap_or(0.0);
-        let global_ppr = idx.and_then(|i| global.get(i).copied()).unwrap_or(0.0);
-        let lexical = entry_lexical(e, &goal_terms);
-        let criticality = if seed_ids.contains(&e.symbol_id) { 1.0 } else { 0.0 };
-        let importance = crate::pagerank::final_importance(
-            task_ppr,
-            global_ppr,
-            lexical,
-            0.0,
-            e.confidence as f64,
-            criticality,
-            0.0,
-            1.0,
-            !seeds.is_empty(),
-        );
-        if importance <= 0.0 {
-            continue;
-        }
-        ranked.push((importance, e));
-    }
-    ranked.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.qualified_name.cmp(&b.1.qualified_name))
-    });
-
-    // Budget: keep top-ranked entries while the token cost fits.
-    let mut used = 0usize;
-    let mut by_component: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut rendered_ids: Vec<String> = Vec::new();
-    for (importance, e) in ranked {
-        let mut line = api_line(e);
-        if explain {
-            line.push_str(&format!(" [importance {importance:.3}]"));
-            if !e.rank.reasons.is_empty() {
-                line.push_str(&format!(" reasons: {}", e.rank.reasons.join("; ")));
-            }
-        }
-        let cost = estimate_tokens(&line);
-        if used + cost > budget_tokens && !by_component.is_empty() {
-            break;
-        }
-        used += cost;
-        by_component
-            .entry(e.component.clone().unwrap_or_else(|| "uncategorized".into()))
-            .or_default()
-            .push(line);
-        rendered_ids.push(e.symbol_id.clone());
-    }
-
+    let render = build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Task {
+                goal,
+                visible: None,
+            },
+            budget: budget_tokens,
+            explain,
+            policy: SurfacePolicy::defaults(budget_tokens),
+        },
+    );
     let mut out = String::new();
     out.push_str(&format!("# SYSTEM SURFACE MAP (task-personalized: {goal})\n"));
-    if by_component.is_empty() {
-        out.push_str("(no task-matched APIs)\n");
-        return (out, rendered_ids);
-    }
-    for (component, lines) in &by_component {
-        out.push_str(&format!("\n## COMPONENT: {component}\n"));
-        for l in lines {
-            out.push_str(l);
-            out.push('\n');
-        }
-    }
-    (out, rendered_ids)
-}
-
-// trace:exempt reason=internal-detail
-fn api_line(e: &SurfaceEntry) -> String {
-    format!(
-        "- {} [{}] {}:L{}-L{} — {}",
-        e.qualified_name,
-        e.kind.as_str(),
-        e.path,
-        e.range.start_line,
-        e.range.end_line,
-        e.source_signature
-    )
-}
-
-// trace:exempt reason=internal-detail
-fn is_test_path(path: &str) -> bool {
-    path.split(['/', '\\', '.']).any(|seg| {
-        seg == "test"
-            || seg == "tests"
-            || seg == "spec"
-            || seg.starts_with("test_")
-            || seg.ends_with("_test")
-            || seg.ends_with("_spec")
-            || seg.ends_with(".spec")
-    })
+    let body = render
+        .text
+        .strip_prefix("SCC SYSTEM SURFACE MAP\n\n")
+        .unwrap_or(&render.text);
+    out.push_str(body.trim_end());
+    out.push('\n');
+    (out, render.rendered_ids)
 }
 
 #[cfg(test)]

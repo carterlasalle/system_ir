@@ -85,6 +85,10 @@ fn mcp_server_exposes_ten_semantic_tools() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"structural_source","arguments":{"files":["main.py"]}}}"#,
     );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"surface_map","arguments":{}}}"#,
+    );
     drop(stdin);
 
     let mut stdout = String::new();
@@ -102,7 +106,7 @@ fn mcp_server_exposes_ten_semantic_tools() {
             by_id.insert(id, v);
         }
     }
-    assert_eq!(by_id.len(), 8, "all requests answered: {stdout}");
+    assert_eq!(by_id.len(), 9, "all requests answered: {stdout}");
 
     let tools = &by_id[&2]["result"]["tools"];
     let names: Vec<&str> = tools
@@ -142,8 +146,13 @@ fn mcp_server_exposes_ten_semantic_tools() {
     assert!(startup_text.contains("## SYSTEM SURFACE MAP"), "{startup_text}");
     assert!(startup_text.contains("## OMISSIONS"), "{startup_text}");
     let surface_text = by_id[&7]["result"]["content"][0]["text"].as_str().unwrap();
+    // Wave 15.1: `surface_map` with a goal routes to build_surface Task
+    // mode — the response must actually differ from the global render on
+    // this fixture (task PPR re-ranking is not a no-op).
+    let global_surface = by_id[&9]["result"]["content"][0]["text"].as_str().unwrap();
+    assert_ne!(surface_text, global_surface, "task surface must differ from global");
     assert!(
-        surface_text.contains("task-personalized: transcript normalization"),
+        surface_text.contains("transcript normalization"),
         "{surface_text}"
     );
     assert!(surface_text.contains("handle_transcripts"), "{surface_text}");

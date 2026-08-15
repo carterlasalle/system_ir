@@ -25,3 +25,24 @@ title = "Wave 13: occurrence identity, blind lock, package!=atom clustering"
 
 [work."WORK-SCC-014"]
 title = "Wave 14: full context stack (surface map, ranker, structural source, startup fusion)"
+
+[work."WORK-SCC-015"]
+title = "Wave 15.1: pipeline unification (one build_surface service, Claude fused startup, rank edges, honest ablations)"
+[work."WORK-rank-edge-ontology-c-o-n-t-a-i-n-s-p-a-r-t-i-c-i-p-a-t-e-s-i-n-h-a-n-d-l-e-s-d-e-f-i-n-e-s-enter-the-p-p-r-adjacency"]
+title = "Rank-edge ontology: CONTAINS/PARTICIPATES_IN/HANDLES/DEFINES enter the PPR adjacency"
+status = "active"
+origin.source = "behavior-change"
+origin.intent = "Heterogeneous rankable nodes exist but membership/participation/invocation/definition predicates never enter the PageRank adjacency, leaving components/flows/routes/schemas disconnected from the rank graph. Add an explicit RankEdgeKind ontology (distinct from reference_kind) so CONTAINS (container->member 0.4, member->container ranking transition 0.8), PARTICIPATES_IN (symbol->flow 0.6, flow->participant 1.2), HANDLES (symbol->route 1.5), and DEFINES (symbol->schema 1.2) feed PPR with deliberate direction and weight."
+origin.session = "default"
+[work."WORK-wave-15-1-one-authoritative-surface-service-build-surface"]
+title = "Wave 15.1: one authoritative Surface service (build_surface)"
+status = "active"
+origin.source = "behavior-change"
+origin.intent = "Unify every surface consumer (production, CLI, MCP, plugin, benchmark ablations, startup) on ONE authoritative surface pipeline: build_surface(Global|Task) with token-aware quotas, soft budget + hard max with structural compression, and build_surface_staged ablation toggles; route startup.rs through build_surface and delete its duplicate task/PPR selection implementations."
+origin.session = "default"
+[work."WORK-implement-the-one-authoritative-surface-service-in-scc-context-build-su"]
+title = "Implement the one authoritative Surface service in scc-context: build_su\u2026"
+status = "active"
+origin.source = "new_feature"
+origin.intent = "Implement the one authoritative Surface service in scc-context: build_surface(Global|Task) with token-aware quotas, soft budget + hard max with structural compression, build_surface_staged ablation toggles, route startup through build_surface, delete duplicate task/PPR selection in startup.rs"
+origin.session = "default"

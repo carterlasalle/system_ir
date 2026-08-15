@@ -8,6 +8,12 @@
 //! Structure:
 //! - [`build_reference_graph`] normalizes existing trusted relationships into
 //!   [`ReferenceEdge`]s (never invents new relationships).
+//! - [`RankEdgeKind`] is the rank-edge ontology: CONTAINS/PARTICIPATES_IN/
+//!   HANDLES/DEFINES enter the PageRank adjacency with deliberate direction
+//!   and weight (membership evidence, the member→container and flow→
+//!   participant RANKING TRANSITIONS, invocation/definition edges) — the
+//!   mechanism that connects components, flows, routes and schemas to the
+//!   rank graph.
 //! - [`SystemRanker`] runs personalized PageRank (power iteration, damping
 //!   0.85, 50 iterations) over a HETEROGENEOUS node universe — every
 //!   rankable entity (symbol, component, subsystem, service, flow,
@@ -71,8 +77,23 @@ pub const DEPENDS_ON: f64 = 1.0;
 pub const CALLS_EXTRACTED: f64 = 0.9;
 /// Weight category for `imports` edges.
 pub const IMPORTS: f64 = 0.6;
-/// Weight category for containment edges (`contains`).
-pub const CONTAINS: f64 = 0.4;
+/// Rank-edge ontology weights — deliberate direction/weight pairs for the
+/// predicates that carry membership/participation/invocation/definition
+/// evidence into PageRank (see [`RankEdgeKind`]): `contains` container →
+/// member membership evidence (0.4); the reverse member → container
+/// RANKING TRANSITION (0.8) that derives container importance from its
+/// members; `participates_in` symbol → flow (0.6) plus the reverse flow →
+/// participant RANKING TRANSITION (1.2) that lets flow importance reach
+/// the participants (the mechanism that connects flow nodes into the rank
+/// graph); `handles` symbol → route (1.5, invocation-strong); `defines`
+/// symbol → schema (1.2). The reverse directions are pure ranking edges —
+/// NEVER Reality Graph relationships.
+pub const RANK_MEMBERSHIP: f64 = 0.4;
+pub const RANK_MEMBER_OF: f64 = 0.8;
+pub const RANK_PARTICIPATES: f64 = 0.6;
+pub const RANK_FLOW_REACHES_PARTICIPANT: f64 = 1.2;
+pub const RANK_HANDLES: f64 = 1.5;
+pub const RANK_DEFINES: f64 = 1.2;
 
 /// Provenance weights (spec §2): STALE facts weigh zero (the trusted view
 /// already excludes them; the zero is a belt-and-suspenders floor).
@@ -200,7 +221,7 @@ pub fn predicate_weight(predicate: &str, provenance: Provenance) -> f64 {
         predicates::REGISTERS => CONTRACT_PARTICIPATION,
         predicates::PUBLISHES | predicates::SUBSCRIBES => SUBSCRIBES_PUBLISHES,
         predicates::IMPORTS => IMPORTS,
-        predicates::CONTAINS => CONTAINS,
+        predicates::CONTAINS => RANK_MEMBERSHIP,
         _ => DEPENDS_ON,
     }
 }
@@ -335,6 +356,119 @@ pub fn build_reference_graph(view: &TrustedGraphView) -> Vec<ReferenceEdge> {
 }
 
 // ---------------------------------------------------------------------------
+// Rank-edge ontology
+// ---------------------------------------------------------------------------
+
+/// A directed rank edge in the heterogeneous PageRank adjacency: which
+/// trusted predicates enter the rank graph and in which direction/with
+/// which weight. Distinct from [`ReferenceKind`] (the normalized
+/// reference surface — these edges are the RANK-edge ontology, never
+/// `reference_kind` doubling). Every edge traces to one trusted
+/// relationship; the reverse directions of `contains`/`participates_in`
+/// are explicit RANKING TRANSITIONS — edges that exist only so
+/// container/flow importance reaches its members/participants — and are
+/// labeled as such, never as Reality Graph relationships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// trace:v1 id=impl.crates-scc-context-src-pagerank.rank-edge-kind work=WORK-rank-edge-ontology-c-o-n-t-a-i-n-s-p-a-r-t-i-c-i-p-a-t-e-s-i-n-h-a-n-d-l-e-s-d-e-f-i-n-e-s-enter-the-p-p-r-adjacency satisfies=REQ-rank-edges-heterogeneous-predicates-enter-page-rank
+pub enum RankEdgeKind {
+    /// Container → member: `Component`/`Subsystem`/`Service` CONTAINS a
+    /// `File`/`Symbol` (membership evidence, weight 0.4).
+    Contains,
+    /// RANKING TRANSITION (never a Reality Graph relationship): member
+    /// symbol/file → its container, so container importance is derived
+    /// from the members' aggregate (weight 0.8).
+    MemberOf,
+    /// `Symbol` PARTICIPATES_IN a `Flow` (weight 0.6).
+    ParticipatesIn,
+    /// RANKING TRANSITION: `Flow` → its participant symbol, so flow
+    /// importance reaches the participants — the mechanism that connects
+    /// flow nodes into the rank graph (weight 1.2).
+    FlowReachesParticipant,
+    /// `Symbol` HANDLES a `Route` (invocation-strong, weight 1.5).
+    Handles,
+    /// `Symbol` DEFINES a `Schema` (weight 1.2).
+    Defines,
+}
+
+// trace:exempt reason=internal-detail
+impl RankEdgeKind {
+    /// The reverse ranking transition of this edge, when one exists:
+    /// `Contains` ↔ `MemberOf`, `ParticipatesIn` ↔
+    /// `FlowReachesParticipant`. `None` for single-direction evidence
+    /// edges (`Handles`, `Defines`) and for the transitions themselves.
+    /// The reverse is a pure RANKING edge — it propagates container/flow
+    /// importance back to members/participants and NEVER claims a
+    /// Reality Graph relationship.
+    // trace:exempt reason=internal-detail
+    pub fn reverse_ranking_transition(self) -> Option<RankEdgeKind> {
+        match self {
+            RankEdgeKind::Contains => Some(RankEdgeKind::MemberOf),
+            RankEdgeKind::MemberOf => Some(RankEdgeKind::Contains),
+            RankEdgeKind::ParticipatesIn => Some(RankEdgeKind::FlowReachesParticipant),
+            RankEdgeKind::FlowReachesParticipant => Some(RankEdgeKind::ParticipatesIn),
+            RankEdgeKind::Handles | RankEdgeKind::Defines => None,
+        }
+    }
+
+    /// Base weight of the rank edge (before provenance × confidence).
+    // trace:exempt reason=internal-detail
+    pub fn weight(self) -> f64 {
+        match self {
+            RankEdgeKind::Contains => RANK_MEMBERSHIP,
+            RankEdgeKind::MemberOf => RANK_MEMBER_OF,
+            RankEdgeKind::ParticipatesIn => RANK_PARTICIPATES,
+            RankEdgeKind::FlowReachesParticipant => RANK_FLOW_REACHES_PARTICIPANT,
+            RankEdgeKind::Handles => RANK_HANDLES,
+            RankEdgeKind::Defines => RANK_DEFINES,
+        }
+    }
+}
+
+/// Map a (predicate, subject kind, target kind) triple to its rank-edge
+/// kind, when the relationship is one of the explicit rank-edge
+/// predicates (real strings from `scc_core::predicates`). Direction is
+/// deliberate: only the documented endpoint kinds fire — `contains`
+/// only between a container (Component/Subsystem/Service) and a member
+/// (File/Symbol), `participates_in` only between a symbol and a flow,
+/// `handles` only symbol → route, `defines` only symbol → schema.
+// trace:exempt reason=internal-detail
+pub fn rank_edge_kind(
+    predicate: &str,
+    subject_kind: &str,
+    target_kind: &str,
+) -> Option<RankEdgeKind> {
+    let is_container = |k: &str| {
+        k == kinds::COMPONENT || k == kinds::SUBSYSTEM || k == kinds::SERVICE
+    };
+    let is_member = |k: &str| k == kinds::SYMBOL || k == kinds::FILE;
+    match predicate {
+        predicates::CONTAINS if is_container(subject_kind) && is_member(target_kind) => {
+            Some(RankEdgeKind::Contains)
+        }
+        predicates::CONTAINS if is_member(subject_kind) && is_container(target_kind) => {
+            Some(RankEdgeKind::MemberOf)
+        }
+        predicates::PARTICIPATES_IN
+            if subject_kind == kinds::SYMBOL && target_kind == kinds::FLOW =>
+        {
+            Some(RankEdgeKind::ParticipatesIn)
+        }
+        predicates::PARTICIPATES_IN
+            if subject_kind == kinds::FLOW && target_kind == kinds::SYMBOL =>
+        {
+            Some(RankEdgeKind::FlowReachesParticipant)
+        }
+        predicates::HANDLES if subject_kind == kinds::SYMBOL && target_kind == kinds::ROUTE => {
+            Some(RankEdgeKind::Handles)
+        }
+        predicates::DEFINES if subject_kind == kinds::SYMBOL && target_kind == kinds::SCHEMA => {
+            Some(RankEdgeKind::Defines)
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SystemRanker
 // ---------------------------------------------------------------------------
 
@@ -390,25 +524,55 @@ impl<'a> SystemRanker<'a> {
         // Pass 1: collect edges + per-target distinct sources. An edge
         // survives when BOTH endpoints are rankable entities (the universe
         // is heterogeneous: non-symbol endpoints are first-class nodes) and
-        // the predicate normalizes to a reference kind.
+        // the predicate normalizes to a reference kind OR carries a
+        // rank-edge transition (the deliberate direction/weight ontology —
+        // CONTAINS/PARTICIPATES_IN/HANDLES/DEFINES; see [`RankEdgeKind`]).
         let mut edges: Vec<(usize, usize, f64)> = Vec::new();
         let mut in_sources: Vec<HashSet<usize>> = vec![HashSet::new(); n];
         for rel in view.all_rels() {
             let (Some(&si), Some(&ti)) = (index.get(&rel.subject), index.get(&rel.object)) else {
                 continue;
             };
+            let subject_kind = view
+                .entity(&rel.subject)
+                .map(|e| e.kind.as_str())
+                .unwrap_or("");
             let target_kind = view
                 .entity(&rel.object)
                 .map(|e| e.kind.as_str())
                 .unwrap_or("");
-            if reference_kind(&rel.predicate, target_kind).is_none() {
-                continue;
+            // Normalized reference-surface edges (the existing surface:
+            // calls/reads/writes/owns/…).
+            let reference_weight = if reference_kind(&rel.predicate, target_kind).is_some() {
+                Some(
+                    predicate_weight(&rel.predicate, rel.provenance)
+                        * provenance_weight(rel.provenance)
+                        * rel.confidence.clamp(0.0, 1.0),
+                )
+            } else {
+                None
+            };
+            // Rank-edge transitions (the deliberate direction/weight
+            // ontology): the stored direction plus the reverse ranking
+            // transition when the ontology defines one.
+            if let Some(kind) = rank_edge_kind(&rel.predicate, subject_kind, target_kind) {
+                let w = kind.weight()
+                    * provenance_weight(rel.provenance)
+                    * rel.confidence.clamp(0.0, 1.0);
+                in_sources[ti].insert(si);
+                edges.push((si, ti, w));
+                if let Some(rev) = kind.reverse_ranking_transition() {
+                    let rw = rev.weight()
+                        * provenance_weight(rel.provenance)
+                        * rel.confidence.clamp(0.0, 1.0);
+                    in_sources[si].insert(ti);
+                    edges.push((ti, si, rw));
+                }
             }
-            in_sources[ti].insert(si);
-            let w = predicate_weight(&rel.predicate, rel.provenance)
-                * provenance_weight(rel.provenance)
-                * rel.confidence.clamp(0.0, 1.0);
-            edges.push((si, ti, w));
+            if let Some(w) = reference_weight {
+                in_sources[ti].insert(si);
+                edges.push((si, ti, w));
+            }
         }
         let in_degree: Vec<usize> = in_sources.iter().map(|s| s.len()).collect();
 
@@ -1423,5 +1587,193 @@ mod tests {
         // Deterministic: same input → identical output.
         let again = ranker.project_to_symbols(&g);
         assert_eq!(again, projected);
+    }
+
+    // ---- (e) rank-edge ontology: CONTAINS/PARTICIPATES_IN/HANDLES/DEFINES ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn rank_edge_kind_direction_and_weights() {
+        // Deliberate direction mapping (real predicate strings):
+        // contains only between a container and a member, in either
+        // stored direction; participates_in only symbol ↔ flow; handles
+        // only symbol → route; defines only symbol → schema.
+        assert_eq!(
+            rank_edge_kind(predicates::CONTAINS, kinds::COMPONENT, kinds::SYMBOL),
+            Some(RankEdgeKind::Contains)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::CONTAINS, kinds::SUBSYSTEM, kinds::FILE),
+            Some(RankEdgeKind::Contains)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::CONTAINS, kinds::SERVICE, kinds::SYMBOL),
+            Some(RankEdgeKind::Contains)
+        );
+        // Stored member → container direction maps to the ranking transition.
+        assert_eq!(
+            rank_edge_kind(predicates::CONTAINS, kinds::SYMBOL, kinds::COMPONENT),
+            Some(RankEdgeKind::MemberOf)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::PARTICIPATES_IN, kinds::SYMBOL, kinds::FLOW),
+            Some(RankEdgeKind::ParticipatesIn)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::PARTICIPATES_IN, kinds::FLOW, kinds::SYMBOL),
+            Some(RankEdgeKind::FlowReachesParticipant)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::HANDLES, kinds::SYMBOL, kinds::ROUTE),
+            Some(RankEdgeKind::Handles)
+        );
+        assert_eq!(
+            rank_edge_kind(predicates::DEFINES, kinds::SYMBOL, kinds::SCHEMA),
+            Some(RankEdgeKind::Defines)
+        );
+
+        // Non-target endpoint kinds never fire (no `reference_kind` drift).
+        assert_eq!(rank_edge_kind(predicates::CONTAINS, kinds::COMPONENT, kinds::FLOW), None);
+        assert_eq!(rank_edge_kind(predicates::CONTAINS, kinds::FILE, kinds::SYMBOL), None);
+        assert_eq!(rank_edge_kind(predicates::PARTICIPATES_IN, kinds::SYMBOL, kinds::CONTRACT), None);
+        assert_eq!(rank_edge_kind(predicates::HANDLES, kinds::SYMBOL, kinds::ENDPOINT), None);
+        assert_eq!(rank_edge_kind(predicates::DEFINES, kinds::SYMBOL, kinds::CONTRACT), None);
+        assert_eq!(rank_edge_kind(predicates::CALLS, kinds::SYMBOL, kinds::SYMBOL), None);
+        assert_eq!(rank_edge_kind(predicates::CONTAINS, kinds::SYMBOL, kinds::FLOW), None);
+
+        // Deliberate weights.
+        assert_eq!(RankEdgeKind::Contains.weight(), RANK_MEMBERSHIP);
+        assert_eq!(RankEdgeKind::MemberOf.weight(), RANK_MEMBER_OF);
+        assert_eq!(RankEdgeKind::ParticipatesIn.weight(), RANK_PARTICIPATES);
+        assert_eq!(RankEdgeKind::FlowReachesParticipant.weight(), RANK_FLOW_REACHES_PARTICIPANT);
+        assert_eq!(RankEdgeKind::Handles.weight(), RANK_HANDLES);
+        assert_eq!(RankEdgeKind::Defines.weight(), RANK_DEFINES);
+
+        // The reverse edges are RANKING transitions (explicitly labeled,
+        // never Reality Graph relationships); handles/defines are
+        // single-direction evidence edges.
+        assert_eq!(RankEdgeKind::Contains.reverse_ranking_transition(), Some(RankEdgeKind::MemberOf));
+        assert_eq!(RankEdgeKind::MemberOf.reverse_ranking_transition(), Some(RankEdgeKind::Contains));
+        assert_eq!(RankEdgeKind::ParticipatesIn.reverse_ranking_transition(), Some(RankEdgeKind::FlowReachesParticipant));
+        assert_eq!(RankEdgeKind::FlowReachesParticipant.reverse_ranking_transition(), Some(RankEdgeKind::ParticipatesIn));
+        assert_eq!(RankEdgeKind::Handles.reverse_ranking_transition(), None);
+        assert_eq!(RankEdgeKind::Defines.reverse_ranking_transition(), None);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn contains_edges_spread_component_importance_both_ways() {
+        // A component with two members: the membership edges (comp → m1,
+        // comp → m2) spread component importance DOWN to the members, and
+        // the reverse RANKING TRANSITIONS (m1 → comp, m2 → comp) derive
+        // the component's importance UP from its members. An isolated
+        // symbol (x) sits at the dangling floor for contrast.
+        let comp_id = entity_id("r", kinds::COMPONENT, "orders");
+        let m1 = scc_core::symbol_id("r", "src/orders/a.ts", "OrderService");
+        let m2 = scc_core::symbol_id("r", "src/orders/b.ts", "OrderRepo");
+        let x = scc_core::symbol_id("r", "src/other.ts", "Unrelated");
+
+        let entities = vec![
+            entity(&comp_id, kinds::COMPONENT, "orders"),
+            sym("r", "src/orders/a.ts", "OrderService"),
+            sym("r", "src/orders/b.ts", "OrderRepo"),
+            sym("r", "src/other.ts", "Unrelated"),
+        ];
+        let rels = vec![
+            rel(1, &comp_id, predicates::CONTAINS, &m1, Provenance::Extracted),
+            rel(2, &comp_id, predicates::CONTAINS, &m2, Provenance::Extracted),
+        ];
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+        let g = ranker.global_vector();
+
+        let c = g[ranker.index_of(&comp_id).unwrap()];
+        let s1 = g[ranker.index_of(&m1).unwrap()];
+        let s2 = g[ranker.index_of(&m2).unwrap()];
+        let sx = g[ranker.index_of(&x).unwrap()];
+
+        // Both ways: the component ranks above its members (derived from
+        // them via the ranking transitions — a dangling-only component
+        // would sit at the uniform floor), and the members rank above the
+        // isolated symbol (component importance reaches them via the
+        // membership edges).
+        assert!(c > 0.3, "component importance derived from members: {c}");
+        assert!(s1 > sx && s2 > sx, "members lifted above the isolated symbol");
+        assert!(c > s1 && c > s2, "component spreads importance down to members");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn participates_in_connects_flow_nodes() {
+        // A flow with a participant symbol becomes CONNECTED: the
+        // symbol → flow edge feeds the flow node, and the reverse
+        // flow → participant RANKING TRANSITION carries flow importance
+        // back to the participant. A bare flow (no participants) stays at
+        // the dangling floor.
+        let s = scc_core::symbol_id("r", "src/a.ts", "A");
+        let f1 = entity_id("r", kinds::FLOW, "signup");
+        let f2 = entity_id("r", kinds::FLOW, "checkout");
+
+        let entities = vec![
+            sym("r", "src/a.ts", "A"),
+            entity(&f1, kinds::FLOW, "signup"),
+            entity(&f2, kinds::FLOW, "checkout"),
+        ];
+        let rels = vec![rel(1, &s, predicates::PARTICIPATES_IN, &f1, Provenance::Extracted)];
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+        let g = ranker.global_vector();
+
+        let f1v = g[ranker.index_of(&f1).unwrap()];
+        let f2v = g[ranker.index_of(&f2).unwrap()];
+        let sv = g[ranker.index_of(&s).unwrap()];
+
+        // Previously the flow node was disconnected (no adjacency) and sat
+        // at the dangling floor; with the rank edges it receives directed
+        // mass from its participant.
+        assert!(f1v > 0.3, "flow with a participant receives PPR mass: {f1v}");
+        assert!(f1v > f2v, "connected flow ranks above the bare flow");
+        // Flow importance reaches the participant (reverse transition).
+        assert!(sv > f2v, "flow importance reaches the participant: {sv} vs {f2v}");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn handles_and_defines_edges_feed_ppr() {
+        // HANDLES (symbol → route) and DEFINES (symbol → schema) edges
+        // feed PageRank: the route and schema nodes receive directed mass
+        // from their handling/defining symbols, above the isolated
+        // baseline. (The handler is also an invocation-surface seed, which
+        // strengthens the route's intake — exactly the production shape.)
+        let h = scc_core::symbol_id("r", "src/api.ts", "OrderHandler");
+        let route = entity_id("r", kinds::ROUTE, "/orders");
+        let d = scc_core::symbol_id("r", "src/models.ts", "Order");
+        let schema = entity_id("r", kinds::SCHEMA, "order");
+        let x = scc_core::symbol_id("r", "src/util.ts", "Helper");
+
+        let entities = vec![
+            sym("r", "src/api.ts", "OrderHandler"),
+            entity(&route, kinds::ROUTE, "/orders"),
+            sym("r", "src/models.ts", "Order"),
+            entity(&schema, kinds::SCHEMA, "order"),
+            sym("r", "src/util.ts", "Helper"),
+        ];
+        let rels = vec![
+            rel(1, &h, predicates::HANDLES, &route, Provenance::Extracted),
+            rel(2, &d, predicates::DEFINES, &schema, Provenance::Extracted),
+        ];
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+        let g = ranker.global_vector();
+
+        let rv = g[ranker.index_of(&route).unwrap()];
+        let sv = g[ranker.index_of(&schema).unwrap()];
+        let xv = g[ranker.index_of(&x).unwrap()];
+
+        assert!(rv > xv, "route receives mass via the HANDLES edge: {rv} vs {xv}");
+        assert!(sv > xv, "schema receives mass via the DEFINES edge: {sv} vs {xv}");
     }
 }

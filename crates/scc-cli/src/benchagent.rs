@@ -10,14 +10,14 @@
 //! present the recorder falls back to the portable layer: wall time, exit
 //! status, output size, and per-task pass/fail localization.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use scc_core::{estimate_tokens, ContextItem, SurfaceEntry, TaskSeed};
+use scc_core::estimate_tokens;
 use serde_json::Value;
 
 use crate::benchctx::{locate_fixtures_dir, BenchmarkCorpus};
@@ -695,30 +695,29 @@ pub fn print_agent_summary(s: &AgentBenchSummary) {
 // Wave-15 PPR ablation matrix + leakage-free structural selection
 // ---------------------------------------------------------------------------
 
-/// Harness-level surface ranking modes for the PPR ablation matrix
-/// (lexical → global PPR → task PPR → +MMR → +quotas → +optimizer).
-///
-/// `global-ppr` and `task-ppr` map onto the `scc surface --budget N` /
-/// `scc surface --task "<goal>" --budget N` CLI flag combinations; the
-/// remaining modes are harness-level mode flags that run the same public
-/// ranker/selector pipeline (`pagerank`, `selector`, `rank`) with one
-/// stage substituted, added, or disabled, so every mode yields a real
-/// ablation artifact. See benchmarks/external/README.md.
+/// Harness-level surface ranking modes for the PPR ablation matrix. Every
+/// mode runs the PRODUCTION surface pipeline ([`render_ablation_surface`]
+/// → `build_surface_staged`) with exactly one stage toggled — never a
+/// harness reimplementation of ranking. `lexical` switches every stage
+/// off (lexical-only); `global-ppr` disables task PPR; `task-ppr` is the
+/// full task pipeline; `ppr-mmr`/`ppr-quotas`/`ppr-optimizer` disable the
+/// MMR/quotas/optimizer tail stages respectively. The ablation rows are
+/// the production rows with one stage removed. See
+/// benchmarks/external/README.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // trace:exempt reason=internal-detail  # harness-level ablation mode flags (impl.scc.bench.ablation)
 pub enum SurfaceAblation {
-    /// Lexical goal match only — no PPR, no graph signal.
+    /// Lexical goal match only — every pipeline stage off.
     Lexical,
-    /// Global PPR + lexical (no task seeds): `scc surface --budget N`.
+    /// Global PPR + lexical (no task seeds): task-PPR stage off.
     GlobalPpr,
-    /// Task PPR + global PPR + lexical + criticality: the production
-    /// `scc surface --task "<goal>"` ranking.
+    /// The production task surface pipeline (every stage on).
     TaskPpr,
-    /// Task-ppr ranking + MMR diversification before the budget cut.
+    /// Production pipeline with the MMR diversity stage off.
     PprMmr,
-    /// Task-ppr + MMR + per-kind quota caps (spec global surface budget).
+    /// Production pipeline with the token-aware quota stage off.
     PprQuotas,
-    /// Task-ppr + MMR + quotas + value/token budget optimizer.
+    /// Production pipeline with the value/token budget optimizer off.
     PprOptimizer,
 }
 
@@ -749,14 +748,64 @@ impl SurfaceAblation {
             SurfaceAblation::PprOptimizer => "ppr-optimizer",
         }
     }
+
+    /// The pipeline-stage toggle for this ablation: each mode disables
+    /// exactly one stage of the production pipeline (`lexical` disables
+    /// everything — lexical-only); every other stage runs exactly as
+    /// production runs it.
+    // trace:exempt reason=internal-detail  # harness-level ablation mode flags (impl.scc.bench.ablation)
+    pub fn stages(&self) -> scc_context::surface::SurfacePipelineStages {
+        use scc_context::surface::SurfacePipelineStages;
+        let all_on = SurfacePipelineStages {
+            lexical: true,
+            global_ppr: true,
+            task_ppr: true,
+            mmr: true,
+            quotas: true,
+            optimizer: true,
+        };
+        match self {
+            SurfaceAblation::Lexical => SurfacePipelineStages {
+                lexical: false,
+                global_ppr: false,
+                task_ppr: false,
+                mmr: false,
+                quotas: false,
+                optimizer: false,
+            },
+            SurfaceAblation::GlobalPpr => {
+                let mut s = all_on;
+                s.task_ppr = false;
+                s
+            }
+            SurfaceAblation::TaskPpr => all_on,
+            SurfaceAblation::PprMmr => {
+                let mut s = all_on;
+                s.mmr = false;
+                s
+            }
+            SurfaceAblation::PprQuotas => {
+                let mut s = all_on;
+                s.quotas = false;
+                s
+            }
+            SurfaceAblation::PprOptimizer => {
+                let mut s = all_on;
+                s.optimizer = false;
+                s
+            }
+        }
+    }
 }
 
 /// Render one ablation-mode task surface for `goal` under `budget_tokens`
-/// (the chars/4 estimate). Mirrors the production `startup::task_surface`
-/// pipeline — task-PPR seeds → `final_importance` → rank → budget — with
-/// the mode's stage substitution, reusing the same public ranker/selector
-/// APIs and the same line format, so ablation artifacts are comparable to
-/// the production task surface.
+/// (the chars/4 estimate) through the PRODUCTION surface pipeline
+/// (`build_surface_staged`) with the mode's stage toggle — the ablation
+/// rows are the production rows with one stage removed, never a harness
+/// reimplementation of ranking. A one-line mode label prefixes the
+/// production render so artifacts stay identifiable; the label's token
+/// cost is subtracted from the budget (equal-token discipline: the final
+/// artifact never exceeds the cap).
 // trace:v1 id=impl.scc.bench.ablation work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn render_ablation_surface(
     root: &Path,
@@ -768,291 +817,82 @@ pub fn render_ablation_surface(
     let config = crate::load_config(root).map_err(|e| e.to_string())?;
     let stale = crate::stale_paths(&store).map_err(|e| e.to_string())?;
     let comp = crate::compiler(&store, &config, stale).map_err(|e| e.to_string())?;
-    Ok(rank_surface(&comp.ctx(), mode, goal, budget_tokens))
+    let ctx = comp.ctx();
+    let label = format!("# SYSTEM SURFACE MAP (ablation {}: {})\n\n", mode.as_str(), goal);
+    let label_tokens = estimate_tokens(&label);
+    let budget = budget_tokens.saturating_sub(label_tokens);
+    let request = scc_context::surface::SurfaceRequest {
+        mode: scc_context::surface::SurfaceMode::Task {
+            goal,
+            visible: None,
+        },
+        budget,
+        explain: false,
+        // Ablation policy: the same quotas/MMR/coverage knobs as
+        // production, but a strict hard max = the budget — the ablation
+        // artifact never exceeds the cap (equal-token discipline; the
+        // required-coverage headroom production grants is not part of the
+        // ablation contract).
+        policy: scc_context::surface::SurfacePolicy {
+            quotas: true,
+            mmr: true,
+            coverage: true,
+            hard_max: budget,
+        },
+    };
+    let result = scc_context::surface::build_surface_staged(&ctx, request, &mode.stages());
+    let mut out = label;
+    out.push_str(&result.text);
+    Ok(out)
 }
 
-/// The spec's global surface budget shares (selector::enforce_quotas).
-const QUOTA_SPLIT: &[(&str, f64)] = &[
-    ("public", 0.30),
-    ("core", 0.25),
-    ("types", 0.15),
-    ("state", 0.10),
-    ("contract", 0.10),
-    ("flow", 0.10),
-];
-
-// trace:exempt reason=internal-detail  # ablation ranking internals (impl.scc.bench.ablation)
-fn rank_surface(
-    ctx: &scc_context::ContextCompiler,
-    mode: SurfaceAblation,
-    goal: &str,
-    budget_tokens: usize,
-) -> String {
-    use std::cmp::Ordering;
-
-    let goal_terms = scc_context::rank::terms(goal);
-    let candidates =
-        scc_context::rank::collect_lexical_candidates(ctx.store, &ctx.view, goal, &[], 16);
-    let seeds: Vec<TaskSeed> = candidates
-        .iter()
-        .map(|c| TaskSeed {
-            kind: c.kind.clone(),
-            id: c.id.clone(),
-            weight: c.score,
-        })
-        .collect();
-    let seed_ids: BTreeSet<String> = seeds.iter().map(|s| s.id.clone()).collect();
-
-    let map = scc_context::surface::compile_surface_map(ctx);
-    let ranker = scc_context::pagerank::SystemRanker::new(&ctx.view);
-    let global = ranker.global_vector();
-    let task = ranker.task_vector(&seeds);
-
-    // (importance, entry) pairs; importance is the mode's score.
-    let mut ranked: Vec<(f64, &SurfaceEntry)> = Vec::new();
-    for e in &map.entries {
-        let idx = ranker.index_of(&e.symbol_id);
-        let task_ppr = idx.and_then(|i| task.get(i).copied()).unwrap_or(0.0);
-        let global_ppr = idx.and_then(|i| global.get(i).copied()).unwrap_or(0.0);
-        let lexical = ablation_lexical(e, &goal_terms);
-        let criticality = if seed_ids.contains(&e.symbol_id) { 1.0 } else { 0.0 };
-        let confidence = e.confidence as f64;
-        let importance = match mode {
-            SurfaceAblation::Lexical => lexical,
-            SurfaceAblation::GlobalPpr => scc_context::pagerank::final_importance(
-                0.0, global_ppr, lexical, 0.0, confidence, 0.0, 0.0, 1.0, false,
-            ),
-            _ => scc_context::pagerank::final_importance(
-                task_ppr, global_ppr, lexical, 0.0, confidence, criticality, 0.0, 1.0, true,
-            ),
-        };
-        if importance <= 0.0 {
-            continue;
-        }
-        ranked.push((importance, e));
-    }
-    ranked.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.1.qualified_name.cmp(&b.1.qualified_name))
-    });
-
-    let score_of: BTreeMap<String, f64> = ranked
-        .iter()
-        .map(|(s, e)| (e.symbol_id.clone(), *s))
-        .collect();
-    let group_of: BTreeMap<String, String> = map
-        .entries
-        .iter()
-        .map(|e| (e.symbol_id.clone(), e.component.clone().unwrap_or_default()))
-        .collect();
-    let bucket_of: BTreeMap<String, &'static str> = map
-        .entries
-        .iter()
-        .map(|e| (e.symbol_id.clone(), quota_bucket(e)))
-        .collect();
-    let by_id: BTreeMap<&str, &SurfaceEntry> = ranked
-        .iter()
-        .map(|(_, e)| (e.symbol_id.as_str(), *e))
-        .collect();
-
-    // Pipeline tail: MMR diversify -> enforce_quotas -> budget selection.
-    let mut ordered: Vec<&SurfaceEntry> = ranked.iter().map(|(_, e)| *e).collect();
-    if matches!(
-        mode,
-        SurfaceAblation::PprMmr | SurfaceAblation::PprQuotas | SurfaceAblation::PprOptimizer
-    ) {
-        let scored: Vec<(String, f64)> = ranked
-            .iter()
-            .map(|(s, e)| (e.symbol_id.clone(), *s))
-            .collect();
-        let sim = |a: &str, b: &str| match (group_of.get(a), group_of.get(b)) {
-            (Some(ga), Some(gb)) if !ga.is_empty() && ga == gb => 1.0,
-            _ => 0.0,
-        };
-        let diversified = scc_context::selector::mmr_diversify_default(&scored, sim, scored.len());
-        ordered = diversified
-            .iter()
-            .filter_map(|id| by_id.get(id.as_str()).copied())
-            .collect();
-    }
-    if matches!(
-        mode,
-        SurfaceAblation::PprQuotas | SurfaceAblation::PprOptimizer
-    ) {
-        let scored: Vec<(String, f64)> = ordered
-            .iter()
-            .map(|e| (e.symbol_id.clone(), score_of[&e.symbol_id]))
-            .collect();
-        let quotas: Vec<(String, f64)> = QUOTA_SPLIT
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect();
-        // Inline closure literal so the `impl Fn(&str) -> &str` expected
-        // type drives the signature (a let-bound closure would fix the
-        // return lifetime to 'static and fail the HRTB bound).
-        let quoted = scc_context::selector::enforce_quotas(
-            &scored,
-            |id| bucket_of.get(id).copied().unwrap_or("other"),
-            &quotas,
-        );
-        ordered = quoted
-            .iter()
-            .filter_map(|id| by_id.get(id.as_str()).copied())
-            .collect();
-    }
-
-    let lines: BTreeMap<String, String> = ranked
-        .iter()
-        .map(|(_, e)| (e.symbol_id.clone(), ablation_api_line(e)))
-        .collect();
-
-    // Budget selection: the optimizer uses the value/token knapsack; the
-    // other modes keep rank order greedily (required seed-critical entries
-    // are never dropped).
-    let mut selected: Vec<String> = Vec::new();
-    if mode == SurfaceAblation::PprOptimizer {
-        let items: Vec<ContextItem> = ordered
-            .iter()
-            .map(|e| ContextItem {
-                id: e.symbol_id.clone(),
-                value: score_of.get(&e.symbol_id).copied().unwrap_or(0.0),
-                token_cost: estimate_tokens(lines.get(&e.symbol_id).map(String::as_str).unwrap_or("")),
-                required: seed_ids.contains(&e.symbol_id),
-                group: Some("api".into()),
-            })
-            .collect();
-        let chosen = scc_context::selector::select_with_budget(&items, budget_tokens);
-        for &i in &chosen {
-            if i < items.len() {
-                selected.push(items[i].id.clone());
-            }
-        }
-    } else {
-        let mut used = 0usize;
-        for e in ordered {
-            let line = &lines[&e.symbol_id];
-            let cost = estimate_tokens(line);
-            if used + cost > budget_tokens && !selected.is_empty() {
-                break;
-            }
-            used += cost;
-            selected.push(e.symbol_id.clone());
-        }
-    }
-
-    // Render: component-grouped, same format as the production task surface.
-    let mut by_component: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for id in &selected {
-        if let Some(line) = lines.get(id) {
-            let comp = group_of.get(id).cloned().unwrap_or_default();
-            let comp = if comp.is_empty() { "uncategorized".into() } else { comp };
-            by_component.entry(comp).or_default().push(line.clone());
-        }
-    }
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# SYSTEM SURFACE MAP (ablation {}: {})\n",
-        mode.as_str(),
-        goal
-    ));
-    if by_component.is_empty() {
-        out.push_str("(no task-matched APIs)\n");
-        return out;
-    }
-    for (component, ls) in &by_component {
-        out.push_str(&format!("\n## COMPONENT: {component}\n"));
-        for l in ls {
-            out.push_str(l);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Lexical similarity of a surface entry to the goal terms (same rule as
-/// the production task surface: name hits double-weighted, signature hits
-/// count).
-// trace:exempt reason=internal-detail  # ablation scoring internals (impl.scc.bench.ablation)
-fn ablation_lexical(e: &SurfaceEntry, goal_terms: &BTreeSet<String>) -> f64 {
-    if goal_terms.is_empty() {
-        return 0.0;
-    }
-    let name_terms = scc_context::rank::terms(&e.qualified_name);
-    let sig_terms = scc_context::rank::terms(&e.source_signature);
-    let name_hits = goal_terms
-        .iter()
-        .filter(|g| name_terms.iter().any(|n| scc_context::rank::term_match(g, n)))
-        .count();
-    let sig_hits = goal_terms
-        .iter()
-        .filter(|g| sig_terms.iter().any(|n| scc_context::rank::term_match(g, n)))
-        .count();
-    (name_hits * 2 + sig_hits) as f64
-}
-
-/// Map a surface entry to its quota bucket (spec global surface budget):
-/// contract APIs first, then flow-critical, state owners, public/
-/// entrypoint, core implementation, types/interfaces.
-// trace:exempt reason=internal-detail  # ablation quota bucketing (impl.scc.bench.ablation)
-fn quota_bucket(e: &SurfaceEntry) -> &'static str {
-    if !e.contracts.is_empty() {
-        "contract"
-    } else if !e.flows.is_empty() {
-        "flow"
-    } else if !e.state_authorities.is_empty() {
-        "state"
-    } else {
-        match e.kind.as_str() {
-            "function" | "method" | "constructor" => "public",
-            "class" => "core",
-            _ => "types",
-        }
-    }
-}
-
-/// One ranked surface line (the production task-surface line format).
-// trace:exempt reason=internal-detail  # ablation render internals (impl.scc.bench.ablation)
-fn ablation_api_line(e: &SurfaceEntry) -> String {
-    format!(
-        "- {} [{}] {}:L{}-L{} — {}",
-        e.qualified_name,
-        e.kind.as_str(),
-        e.path,
-        e.range.start_line,
-        e.range.end_line,
-        e.source_signature
-    )
-}
-
-/// Parse repo-relative file paths from a task-personalized surface render
-/// (the `- <name> [<kind>] <path>:L<start>-L<end> — <sig>` entry lines).
-/// Order preserved, deduped. This is the harness's file-selection oracle
-/// for the scc-full structural section: selection comes from the rendered
+/// Parse repo-relative file paths from a rendered surface — the
+/// PRODUCTION format: groups headed by an uppercased component line, a
+/// blank line, then the group's path line (`<path>` or `<path>  [<sub>]`),
+/// then blank-line-separated `  <kind> <name>` entry blocks. Order
+/// preserved, deduped. This is the harness's file-selection oracle for
+/// the scc-full structural section: selection comes from the rendered
 /// surface (task PPR + lexical), NEVER from ground-truth `task.files`.
 // trace:exempt reason=internal-detail  # leakage-free selection oracle (impl.scc.bench.structural-select)
 pub fn parse_surface_paths(surface_text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for raw in surface_text.lines() {
-        let line = raw.trim();
-        if !line.starts_with("- ") {
+    let lines: Vec<&str> = surface_text.lines().collect();
+    // A group path line sits between two blank lines with a non-blank
+    // component line above the first blank: `<COMPONENT>\n\n<path>\n\n`.
+    // Path lines are left-aligned (entry lines are indented `  <kind>
+    // <name>`); component headers are uppercased by the renderer and
+    // carry no path punctuation; paths carry '/' or '.', so the filters
+    // keep component lines and entries out of the selection.
+    for i in 0..lines.len() {
+        let path = lines[i].trim();
+        if path.is_empty() || lines[i].starts_with(' ') {
+            continue; // entries and signatures are indented, never paths
+        }
+        let prev_blank = i
+            .checked_sub(1)
+            .map(|j| lines[j].trim().is_empty())
+            .unwrap_or(false);
+        let next_blank = lines
+            .get(i + 1)
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(false);
+        let above_component = i
+            .checked_sub(2)
+            .map(|j| !lines[j].trim().is_empty())
+            .unwrap_or(false);
+        if !(prev_blank && next_blank && above_component) {
             continue;
         }
-        let head = line[2..].split(" — ").next().unwrap_or(&line[2..]);
-        // head: "<qualified> [<kind>] <path>:L<start>-L<end>"
-        let Some((_, after_bracket)) = head.rsplit_once('[') else {
-            continue;
-        };
-        let Some((_, after_close)) = after_bracket.split_once(']') else {
-            continue;
-        };
-        let path = after_close.trim_start().split(':').next().unwrap_or("").trim();
-        if path.is_empty() {
+        if !(path.contains('/') || path.contains('.')) {
             continue;
         }
-        if seen.insert(path.to_string()) {
-            out.push(path.to_string());
+        if path.chars().all(|c| !c.is_lowercase()) {
+            continue; // uppercased component headers never name a path
+        }
+        let path = path.split('[').next().unwrap_or(path).trim().to_string();
+        if seen.insert(path.clone()) {
+            out.push(path);
         }
     }
     out
@@ -1333,16 +1173,49 @@ fn run_variant_tasks_filters_and_first_plan() {
 
     #[test]
     // trace:exempt reason=unit-test  # ablation matrix tests (impl.scc.bench.ablation)
-    fn surface_paths_parse_from_task_render() {
-        let text = "# SYSTEM SURFACE MAP (task-personalized: x)\n\
-\n\
-## COMPONENT: CLI\n\
-- Cli.serve [method] cli.rs:L10-L30 — def serve() -> None\n\
-- build_router [function] router.py:L5-L8 — def build_router()\n\
-- Deploy.deploy [method] deploy.go:L1-L9 — func (d *Deploy) deploy()\n\
-\n\
-## COMPONENT: X\n\
-- Util.helper [function] util.rs:L2-L4 — fn helper()\n";
+    fn surface_paths_parse_from_production_render() {
+        // The PRODUCTION surface format: `SCC SYSTEM SURFACE MAP` header,
+        // then per-group `<COMPONENT>\n\n<path>[  [<sub>]]\n\n  <kind> <name>`
+        // blocks. The path comes from the group header line, not the
+        // entries. (concat! preserves the entry indentation that a `\`
+        // line-continuation would strip.)
+        let text = concat!(
+            "SCC SYSTEM SURFACE MAP\n",
+            "\n",
+            "CLI\n",
+            "\n",
+            "cli.rs\n",
+            "\n",
+            "  method Cli.serve\n",
+            "\n",
+            "    def serve() -> None\n",
+            "  Used by:\n",
+            "    main\n",
+            "\n",
+            "ROUTER\n",
+            "\n",
+            "router.py  [routing]\n",
+            "\n",
+            "  function build_router\n",
+            "\n",
+            "    def build_router()\n",
+            "\n",
+            "DEPLOY\n",
+            "\n",
+            "deploy.go\n",
+            "\n",
+            "  method Deploy.deploy\n",
+            "\n",
+            "    func (d *Deploy) deploy()\n",
+            "\n",
+            "UTIL\n",
+            "\n",
+            "util.rs\n",
+            "\n",
+            "  function helper\n",
+            "\n",
+            "    fn helper()\n",
+        );
         assert_eq!(
             parse_surface_paths(text),
             vec!["cli.rs", "router.py", "deploy.go", "util.rs"]
@@ -1351,19 +1224,50 @@ fn run_variant_tasks_filters_and_first_plan() {
 
     #[test]
     // trace:exempt reason=unit-test  # ablation matrix tests (impl.scc.bench.ablation)
-    fn surface_paths_skip_non_entry_lines_and_dedupe() {
-        // Headers, OMITTED lines, and bracket-free lines carry no paths;
-        // duplicate paths collapse.
-        let text = "# SYSTEM SURFACE MAP (task-personalized: x)\n\
-\n\
-## COMPONENT: CLI\n\
-- Cli.serve [method] cli.rs:L10-L30 — def serve() -> None\n\
-- Cli.serve [method] cli.rs:L10-L30 — def serve() -> None\n\
-OMITTED (token budget exceeded):\n\
-  2 lower-ranked function definitions\n\
-- plain entry without brackets\n\
-- Weird [method] cli.py:L1-L2 — def w()\n";
-        assert_eq!(parse_surface_paths(text), vec!["cli.rs", "cli.py"]);
+    fn surface_paths_skip_headers_omitted_and_dedupe() {
+        // Headers (including the uppercased component lines and the
+        // OMITTED section), non-path lines, and duplicate groups carry no
+        // paths; duplicate paths collapse. concat! preserves the entry
+        // indentation a `\` line-continuation would strip.
+        let text = concat!(
+            "SCC SYSTEM SURFACE MAP\n",
+            "\n",
+            "CLI\n",
+            "\n",
+            "cli.rs\n",
+            "\n",
+            "  method Cli.serve\n",
+            "\n",
+            "    def serve() -> None\n",
+            "\n",
+            "CLI\n",
+            "\n",
+            "cli.rs\n",
+            "\n",
+            "  method Cli.serve\n",
+            "\n",
+            "    def serve() -> None\n",
+            "OMITTED (token budget exceeded):\n",
+            "  2 lower-ranked function definitions\n",
+            "\n",
+            "MY.SERVICE\n",
+            "\n",
+            "  method Thing.run\n",
+            "\n",
+            "    def run()\n",
+            "\n",
+            "DATA\n",
+            "\n",
+            "src/data/store.ts\n",
+            "\n",
+            "  class Store\n",
+            "\n",
+            "    export class Store {}\n",
+        );
+        assert_eq!(
+            parse_surface_paths(text),
+            vec!["cli.rs", "src/data/store.ts"]
+        );
     }
 
     #[test]
@@ -1419,10 +1323,14 @@ OMITTED (token budget exceeded):\n\
             8000,
         )
         .unwrap();
-        let lines: Vec<&str> = out
+        let serve_lines: Vec<&str> = out
             .lines()
-            .filter(|l| l.starts_with("- ") && l.contains("serve"))
+            .filter(|l| {
+                // Entry lines are 2-space indented `  <kind> <name>`; the
+                // label/headers/signatures are excluded.
+                l.starts_with("  ") && !l.starts_with("    ") && l.contains("serve")
+            })
             .collect();
-        assert!(!lines.is_empty(), "serve symbols surface lexically: {out}");
+        assert!(!serve_lines.is_empty(), "serve symbols surface lexically: {out}");
     }
 }

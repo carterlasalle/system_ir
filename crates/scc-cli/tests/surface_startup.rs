@@ -65,6 +65,27 @@ fn surface_task_personalizes_the_map() {
 
 #[test]
 // trace:exempt reason=unit-test
+fn surface_explain_appends_rank_reasons() {
+    // Wave 15.1: `--explain` flows through build_surface (request.explain)
+    // and appends per-entry importance/reasons to the rendered blocks.
+    let repo = golden::copy_fixture("cli-service");
+    let dir = golden::workdir(repo.path());
+    golden::run_ok(&dir, &["index", "--quiet"]);
+
+    let plain = golden::run_ok(&dir, &["surface"]);
+    let explained = golden::run_ok(&dir, &["surface", "--explain"]);
+    assert!(
+        explained.contains("importance:"),
+        "--explain must append per-entry importance: {explained}"
+    );
+    assert_ne!(
+        plain, explained,
+        "--explain output must differ from the plain render"
+    );
+}
+
+#[test]
+// trace:exempt reason=unit-test
 fn context_task_appends_task_delta_when_goal_matches() {
     let repo = golden::copy_fixture("cli-service");
     let dir = golden::workdir(repo.path());

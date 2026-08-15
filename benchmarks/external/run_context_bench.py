@@ -37,7 +37,10 @@ variants (aider/repomix) are driven by this harness directly with the same
 event protocol; when the tool is not installed the adapter exits 2 and the
 variant is reported SKIPPED-UNINSTALLED; when the installed tool does not
 match the pinned commit the adapter exits 3 and the variant is reported
-PIN-MISMATCH.
+PIN-MISMATCH; when the tool's commit cannot be proven (no gitHead, no
+pinned checkout — a version-only match is NOT proof) the adapter exits 4
+and the variant is reported PIN-UNVERIFIED, excluded from the official
+showdown metric rows.
 
 Usage:
     run_context_bench.py [--variant V] [--budget N] [--repo R]
@@ -460,6 +463,14 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir):
             if proc.returncode == 3:
                 skipped = {"status": "PIN-MISMATCH", "error": payload.get("error", "installed tool does not match the lock")}
                 return rows, skipped
+            if proc.returncode == 4:
+                # PIN-UNVERIFIED: the tool is installed and its version
+                # matches the lock but the COMMIT cannot be proven (no
+                # gitHead, no pinned checkout). Reported as a distinct
+                # status, never as a passing pin; excluded from the
+                # official showdown metric rows.
+                skipped = {"status": "PIN-UNVERIFIED", "error": payload.get("error", "installed tool commit cannot be proven against the lock")}
+                return rows, skipped
             if not payload.get("ok"):
                 skipped = {"status": "FAILED", "error": payload.get("error", "adapter failed")}
                 return rows, skipped
@@ -617,7 +628,9 @@ def main(argv):
                     skipped_status = {"variant": variant, "budget": budget, "status": status, "detail": skipped.get("error", "")}
                     if args.single:
                         print(json.dumps(skipped_status))
-                        return 3 if status == "PIN-MISMATCH" else 2
+                        # Distinct exit codes: 2 = missing tool,
+                        # 3 = demonstrable pin mismatch, 4 = unprovable pin.
+                        return {"PIN-MISMATCH": 3, "PIN-UNVERIFIED": 4}.get(status, 2)
                     all_rows.append(skipped_status)
                     continue
                 if args.single:

@@ -7,16 +7,21 @@ equal-token mode: complete files are kept in repomix's own ordering until
 the budget is reached (a file is never truncated mid-file).
 
 The installed repomix MUST be the pinned commit. The adapter verifies the
-pin against the lock and hard-errors with `PIN-MISMATCH` (exit 3) when it
-cannot be confirmed — no silent floating versions. Verification sources,
-in order of strength:
+pin against the lock and hard-errors with `PIN-MISMATCH` (exit 3) when a
+mismatch is demonstrable, or `PIN-UNVERIFIED` (exit 4) when the commit
+cannot be proven — no silent floating versions and no version-only
+acceptance. Verification sources, in order of strength:
   1. the installed package.json `gitHead` (npm records the resolved commit
      for git-ref installs) — must equal the locked commit;
   2. the npm global install's `resolved` path pointing at the pinned source
-     checkout (~/.scc-bench/repomix) whose git HEAD is the locked commit —
-     the documented install provenance;
-  3. the version mapping: the version declared at the pinned commit (locked
-     `version` field) must equal the installed version.
+     checkout (~/.scc-bench/repomix, override SCC_REPOMIX_SRC_DIR) whose
+     git HEAD is the locked commit AND whose declared version equals the
+     installed version — the documented install provenance.
+
+A version that merely matches the locked `version` field is NOT proof of
+the commit: an install whose commit cannot be proven from gitHead or the
+pinned checkout is classified PIN-UNVERIFIED (exit 4) and excluded from
+the official showdown output.
 
 Usage:
     python3 repomix_adapter.py <repo> <token_budget> <out_dir> [--compress]
@@ -33,8 +38,12 @@ Exit codes:
     0  success
     2  SKIPPED-UNINSTALLED — repomix is not installed; prints
        {"ok": false, "error": "SKIPPED-UNINSTALLED: ..."}
-    3  PIN-MISMATCH — repomix is installed but its commit/version does not
-       match the lock; prints {"ok": false, "error": "PIN-MISMATCH: ..."}
+    3  PIN-MISMATCH — repomix is installed but demonstrably not the
+       pinned commit (wrong gitHead / wrong checkout / wrong version);
+       prints {"ok": false, "error": "PIN-MISMATCH: ..."}
+    4  PIN-UNVERIFIED — repomix is installed and its version matches the
+       lock but the commit cannot be proven (no gitHead, no pinned
+       checkout); prints {"ok": false, "error": "PIN-UNVERIFIED: ..."}
     1  other failure
 
 Installation (pinned; builds the exact commit, see README):
@@ -58,7 +67,9 @@ LOCKED_REPOMIX_COMMIT = "e3b15a406ed78d8a463620a032a059ce911bfc0e"
 LOCKED_REPOMIX_VERSION = "1.18.0"  # version declared at the pinned commit
 
 # The documented pinned source checkout (built + globally installed).
-PINNED_SOURCE_DIR = Path.home() / ".scc-bench" / "repomix"
+# Overridable via SCC_REPOMIX_SRC_DIR (test seam: makes the pin check
+# deterministic regardless of the local machine's checkout state).
+PINNED_SOURCE_DIR = Path(os.environ.get("SCC_REPOMIX_SRC_DIR", str(Path.home() / ".scc-bench" / "repomix")))
 
 FILE_RE = re.compile(r'<file path="([^"]+)"[^>]*>([\s\S]*?)</file>')
 
@@ -131,7 +142,12 @@ def locate_repomix_package():
 
 
 def verify_repomix_pin():
-    """Raise PinMismatch unless the installed repomix matches the lock."""
+    """Raise PinMismatch / PinUnverified unless the installed repomix's
+    COMMIT is proven against the lock. A version that merely matches the
+    locked `version` is never proof of the commit: an install whose commit
+    cannot be proven from gitHead or the pinned checkout is classified
+    PIN-UNVERIFIED (the harness reports it as a distinct status, not a
+    passing pin)."""
     pkg_dir = locate_repomix_package()
     if pkg_dir is None:
         raise PinMismatch("no repomix install found to verify against the lock")
@@ -152,7 +168,8 @@ def verify_repomix_pin():
 
     # The documented install: global install of the pinned source checkout.
     # Verify the source checkout's git HEAD is the locked commit AND the
-    # installed version matches the source version (transitive pin).
+    # installed version matches the source version (transitive pin: the
+    # installed copy is built from the pinned checkout).
     try:
         out = subprocess.run(
             ["git", "-C", str(PINNED_SOURCE_DIR), "rev-parse", "HEAD"],
@@ -172,18 +189,27 @@ def verify_repomix_pin():
     if src_head == LOCKED_REPOMIX_COMMIT and src_version and src_version == version:
         return
 
-    # Version mapping: the version declared at the pinned commit.
-    if version == LOCKED_REPOMIX_VERSION:
-        return
-
-    raise PinMismatch(
-        f"installed repomix {version or '(unknown version)'} does not match the lock "
-        f"(commit {LOCKED_REPOMIX_COMMIT}, version {LOCKED_REPOMIX_VERSION}); "
-        "reinstall from the pinned source checkout (see benchmarks/external/README.md)"
+    # Version-only coincidence is NOT commit proof. A version that differs
+    # from the lock is a demonstrable mismatch; a matching version with an
+    # unprovable commit is PIN-UNVERIFIED.
+    if version != LOCKED_REPOMIX_VERSION:
+        raise PinMismatch(
+            f"installed repomix {version or '(unknown version)'} does not match the lock "
+            f"(commit {LOCKED_REPOMIX_COMMIT}, version {LOCKED_REPOMIX_VERSION}); "
+            "reinstall from the pinned source checkout (see benchmarks/external/README.md)"
+        )
+    raise PinUnverified(
+        f"installed repomix version {version} matches the lock, but the commit cannot be "
+        f"proven: no gitHead and no pinned checkout ({PINNED_SOURCE_DIR}) at "
+        f"{LOCKED_REPOMIX_COMMIT}; refusing to treat a version-only match as a pin"
     )
 
 
 class PinMismatch(Exception):
+    pass
+
+
+class PinUnverified(Exception):
     pass
 
 
@@ -205,9 +231,13 @@ def run_repomix(argv):
         }, 2
 
     # Hard pin verification before running anything: the installed repomix
-    # must match the locked commit (no silent floating versions).
+    # must match the locked COMMIT (no silent floating versions, no
+    # version-only acceptance). An unprovable commit is PIN-UNVERIFIED,
+    # never a passing pin.
     try:
         verify_repomix_pin()
+    except PinUnverified as exc:
+        return {"ok": False, "error": f"PIN-UNVERIFIED: {exc}"}, 4
     except PinMismatch as exc:
         return {"ok": False, "error": f"PIN-MISMATCH: {exc}"}, 3
 

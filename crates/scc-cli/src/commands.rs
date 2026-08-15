@@ -2,7 +2,7 @@
 
 use crate::{checkpoint, compiler, config_path, load_config, open_store, recompile, scc_dir};
 use scc_core::kinds;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -174,7 +174,10 @@ fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
 
 /// `scc surface [--task "<goal>"] [--budget N] [--explain]` — the System
 /// Surface Map: the actual callable API layer, global or task-personalized.
-/// The rendered entries are recorded in the context ledger.
+/// BOTH modes run the ONE authoritative service — `build_surface` (Global
+/// or Task) — so the CLI, MCP, hermes, and the SDKs render the same
+/// artifact for the same request (no parallel pipelines). The rendered
+/// entries are recorded in the context ledger.
 // trace:exempt reason=internal-detail
 pub fn cmd_surface(
     root: &Path,
@@ -187,31 +190,45 @@ pub fn cmd_surface(
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
     let ctx = comp.ctx();
-    let budget_tokens = budget.unwrap_or(scc_core::ContextBudget::default().surface);
-    let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
-    match task {
-        Some(goal) => {
-            let (out, ids) =
-                scc_context::startup::task_surface_with_ids(&ctx, goal, budget_tokens, explain);
-            print!("{out}");
-            if !ids.is_empty() {
-                let mut led = ledger_store.load();
-                record_visible_ids(&mut led, &ctx, &ids);
-                ledger_store.save(&led);
-            }
-        }
-        None => {
-            let map = scc_context::surface::compile_surface_map(&ctx);
-            print!(
-                "{}",
-                scc_context::surface::render_surface_map(&map, Some(budget_tokens))
-            );
-            let mut led = ledger_store.load();
-            record_visible_surface(&mut led, &map);
-            ledger_store.save(&led);
-        }
+    let tokens = budget.unwrap_or(scc_core::ContextBudget::default().surface);
+    let request = scc_context::surface::SurfaceRequest {
+        mode: match task {
+            Some(goal) => scc_context::surface::SurfaceMode::Task { goal, visible: None },
+            None => scc_context::surface::SurfaceMode::Global,
+        },
+        budget: tokens,
+        explain,
+        policy: scc_context::surface::SurfacePolicy::defaults(tokens),
+    };
+    let result = scc_context::surface::build_surface(&ctx, request);
+    let text = match task {
+        Some(goal) => task_surface_text(goal, &result),
+        None => result.text,
+    };
+    print!("{text}");
+
+    // Record what the session just showed (novelty-suppression source):
+    // rendered entry ids resolve to logical symbol ids/files/components.
+    if !result.rendered_ids.is_empty() {
+        let map = scc_context::surface::compile_surface_map(&ctx);
+        let mut led = scc_context::context_ledger::ContextLedgerStore::new(&store).load();
+        record_rendered_surface(&mut led, &map, &result.rendered_ids);
+        scc_context::context_ledger::ContextLedgerStore::new(&store).save(&led);
     }
     Ok(())
+}
+
+/// Task-mode surface framing: replace the generic surface header with the
+/// task-personalized marker. `build_surface` renders the standard
+/// `SCC SYSTEM SURFACE MAP` header; the goal framing lives at the transport
+/// boundary (CLI + MCP emit the same text for the same request).
+// trace:exempt reason=internal-detail
+pub(crate) fn task_surface_text(goal: &str, result: &scc_core::SurfaceRenderResult) -> String {
+    let body = result
+        .text
+        .strip_prefix("SCC SYSTEM SURFACE MAP")
+        .unwrap_or(result.text.as_str());
+    format!("# SYSTEM SURFACE MAP (task-personalized: {goal}){body}")
 }
 
 /// Mark entity ids as visible, classifying them into the ledger's
@@ -241,15 +258,25 @@ fn record_visible_ids(
     }
 }
 
-/// Mark a surface map's entries visible (symbols, files, components).
+/// Mark the RENDERED surface entries visible (symbols, files, components),
+/// resolving overload-sensitive entry ids (`{symbol}#overload{N}`) through
+/// the compiled map so the ledger always records the logical symbol id.
 // trace:exempt reason=internal-detail
-fn record_visible_surface(led: &mut scc_core::ContextLedger, map: &scc_core::SystemSurfaceMap) {
-    for e in &map.entries {
-        led.visible_entities.insert(e.symbol_id.clone());
-        led.visible_symbols.insert(e.symbol_id.clone());
-        led.visible_files.insert(e.path.clone());
-        if let Some(c) = &e.component {
-            led.visible_components.insert(c.clone());
+fn record_rendered_surface(
+    led: &mut scc_core::ContextLedger,
+    map: &scc_core::SystemSurfaceMap,
+    rendered_ids: &[String],
+) {
+    let by_id: BTreeMap<&str, &scc_core::SurfaceEntry> =
+        map.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+    for id in rendered_ids {
+        if let Some(e) = by_id.get(id.as_str()) {
+            led.visible_entities.insert(e.symbol_id.clone());
+            led.visible_symbols.insert(e.symbol_id.clone());
+            led.visible_files.insert(e.path.clone());
+            if let Some(c) = &e.component {
+                led.visible_components.insert(c.clone());
+            }
         }
     }
 }
@@ -285,7 +312,7 @@ pub fn cmd_context_structural(
         if goal.is_empty() {
             return Ok(STRUCTURAL_HELP.to_string());
         }
-        structural_task_files(&ctx, goal, max_units)
+        surface_task_files(&ctx, goal, max_units, tokens)
     } else {
         return Ok(STRUCTURAL_HELP.to_string());
     };
@@ -309,50 +336,38 @@ pub fn cmd_context_structural(
 
 const STRUCTURAL_HELP: &str = "# STRUCTURAL SOURCE\n\nPass --files <paths...> or --task \"<goal>\".";
 
-/// Task -> files resolution for `scc context structural --task` (fixwave
-/// Item 7 fallback): rank the goal's lexical candidates (FTS over entities
-/// and symbols — the same source `task_surface_with_ids` seeds from) and
-/// map each to a repository-relative path: FILE entities by name, symbols
-/// via their `file` attribute. Deterministic: candidates are score-sorted
-/// with id tie-breaks; files deduped in first-seen order.
-// ponytail: lexical fallback — upgrade to task PPR -> Surface entries ->
-// files once surface.rs exposes the task->files resolution (fixwave Item 2).
+/// Task -> files resolution for `scc context structural --task`: the REAL
+/// PPR->Surface path — `build_surface(Task{goal, visible: None})` ->
+/// rendered entry ids -> `SurfaceEntry.path` (the overload-sensitive entry
+/// ids resolve through the compiled map, never the entity view). Files are
+/// deduped in first-seen (importance) order and capped at `limit`.
+/// Deterministic: the surface pipeline is deterministic per epoch.
 // trace:exempt reason=internal-detail
-fn structural_task_files(
+fn surface_task_files(
     ctx: &scc_context::ContextCompiler,
     goal: &str,
     limit: usize,
+    tokens: usize,
 ) -> Vec<String> {
-    let mut candidates = scc_context::rank::collect_lexical_candidates(
-        ctx.store,
-        &ctx.view,
-        goal,
-        &[],
-        limit.saturating_mul(4),
-    );
-    candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    let budget = tokens.max(1);
+    let request = scc_context::surface::SurfaceRequest {
+        mode: scc_context::surface::SurfaceMode::Task { goal, visible: None },
+        budget,
+        explain: false,
+        policy: scc_context::surface::SurfacePolicy::defaults(budget),
+    };
+    let result = scc_context::surface::build_surface(ctx, request);
+    let map = scc_context::surface::compile_surface_map(ctx);
+    let by_id: BTreeMap<&str, &scc_core::SurfaceEntry> =
+        map.entries.iter().map(|e| (e.id.as_str(), e)).collect();
     let mut files: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for c in candidates {
-        let path = if c.kind == kinds::FILE {
-            c.name.clone()
-        } else {
-            ctx.view
-                .entity(&c.id)
-                .and_then(|e| e.attributes.get("file"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        };
-        if path.is_empty() || !seen.insert(path.clone()) {
+    for id in &result.rendered_ids {
+        let path = by_id.get(id.as_str()).map(|e| e.path.as_str()).unwrap_or("");
+        if path.is_empty() || !seen.insert(path.to_string()) {
             continue;
         }
-        files.push(path);
+        files.push(path.to_string());
         if files.len() >= limit {
             break;
         }

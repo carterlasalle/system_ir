@@ -110,12 +110,12 @@ fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "structural_source",
-            description: "Structural Source representation of files: exact declaration headers plus per-symbol call/write evidence (deep) or signatures and imports (fallback). Pass files or a goal (a goal selects the lexically matching files).",
+            description: "Structural Source representation of files: exact declaration headers plus per-symbol call/write evidence (deep) or signatures and imports (fallback). Pass files or a goal (a goal selects the task-matched files via the PPR->Surface pipeline).",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "files": {"type": "array", "items": {"type": "string"}, "description": "Repository-relative file paths"},
-                    "goal": {"type": "string", "description": "Task goal; resolves to the lexically matching files"},
+                    "goal": {"type": "string", "description": "Task goal; resolves to the task-matched files (build_surface Task mode)"},
                     "token_budget": {"type": "integer", "description": "Optional token budget (default context.structural_source, 6000)"}
                 }
             }),
@@ -333,13 +333,28 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .map(|b| b as usize)
                 .unwrap_or(scc_core::ContextBudget::default().surface);
             let ctx = comp.ctx();
+            // One authoritative pipeline: `build_surface` in Global or Task
+            // mode — the same service the CLI (`scc surface`) runs. The
+            // goal framing (task-personalized header) is shared with the
+            // CLI so both transports render the same artifact.
+            let request = scc_context::surface::SurfaceRequest {
+                mode: if goal.is_empty() {
+                    scc_context::surface::SurfaceMode::Global
+                } else {
+                    scc_context::surface::SurfaceMode::Task {
+                        goal: &goal,
+                        visible: None,
+                    }
+                },
+                budget: tokens,
+                explain: false,
+                policy: scc_context::surface::SurfacePolicy::defaults(tokens),
+            };
+            let result = scc_context::surface::build_surface(&ctx, request);
             if goal.is_empty() {
-                // Same pipeline as `scc surface` (no task): global map.
-                let map = scc_context::surface::compile_surface_map(&ctx);
-                Ok(scc_context::surface::render_surface_map(&map, Some(tokens)))
+                Ok(result.text)
             } else {
-                // Same pipeline as `scc surface --task "<goal>"`.
-                Ok(scc_context::startup::task_surface_with_ids(&ctx, &goal, tokens, false).0)
+                Ok(crate::commands::task_surface_text(&goal, &result))
             }
         }
         "structural_source" => {

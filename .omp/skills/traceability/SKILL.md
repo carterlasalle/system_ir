@@ -7,9 +7,11 @@ description: >-
   requirement, PRD, ADR, or plan that has downstream traces; creating,
   deleting, or refactoring traced symbols; adding or removing verification
   tests; changing deployment/config/runbook behavior tied to requirements;
-  reviewing a PR with trace diagnostics; or fixing a trace verify failure. Do
-  not use for repositories without trace markers or .trace/ config, or for
-  prose/documentation edits unrelated to traced artifacts.
+  reviewing a PR with trace diagnostics; or fixing a trace verify failure.
+  Use for ALL software-development work when TraceLayer is available
+  globally or locally — including completely new/unconfigured repositories,
+  which TraceLayer bootstraps automatically (Ambient mode). Prose edits
+  unrelated to traced artifacts are the only clear miss.
 ---
 
 # Traceability Skill
@@ -42,12 +44,13 @@ Use this skill when:
 - reviewing a PR with trace diagnostics;
 - fixing a `trace verify` failure.
 
-Do not use it for repositories without TraceLayer installed (no `trace`
-CLI, no `.trace/` config), or for prose edits unrelated to traced
-artifacts. Use it for any mutation that may create, modify, move, test,
-configure, document, or remove trace-worthy behavior — **whether or not
-the target artifact is already traced** (new untraced behavior is exactly
-when the skill matters most).
+Use it for any mutation that may create, modify, move, test, configure,
+document, or remove trace-worthy behavior — **whether or not the target
+artifact is already traced** (new untraced behavior is exactly when the
+skill matters most). In a repository with no `.trace/` config at all, the
+hooks initialize TraceLayer silently on their first fire and the Ambient
+intake loop (below) bootstraps tasks from the user's prose — never skip
+the skill there; that is where it matters most.
 
 ## Mental model
 
@@ -77,25 +80,36 @@ TraceLayer is ambient: the USER speaks only prose. You — the agent — do all
 TraceLayer ceremony internally. Never ask the user for a TraceLayer ID,
 command, or concept during normal development.
 
-At the start of every development turn:
+The prompt hook already does step 2-3 for you at every UserPromptSubmit
+(resolve + activate strong matches, or record pending bootstrap). At the
+start of every development turn:
 
-1. Read the user request.
-2. Ask TraceLayer for current/resolved task context
-   (`trace task context`, or `trace task resolve --prompt "<request>"`).
-3. Search for related existing requirements (`trace search`).
-4. Decide whether the request continues current intent, changes existing
-   intent, creates new intent, or is implementation-only.
-5. If causal context is missing, bootstrap it automatically:
-   `trace task bootstrap --json < <bundle>` (title, kind, intent,
-   requirements with titles + statements, optional plan steps) — never
-   `trace task begin` with a user-facing ID, and never ask the user.
-6. Update or create specs before behavior implementation where the request
-   changes product intent.
-7. Proceed with coding; the hooks enforce per-boundary tracing.
+1. Read the user request; the prompt hook has already resolved it
+   (`trace task context` shows the result).
+2. If the intake says `needs_bootstrap` (or a gate blocks with NEW INTENT,
+   NO CAUSAL CONTEXT), bootstrap from the user's request immediately:
+   `trace task bootstrap --prompt "<the user's request>"` — the engine
+   derives work/spec/requirement/plan deterministically — or author a
+   richer semantic bundle (`trace task bootstrap --json < <bundle>`:
+   title, kind, intent, requirements with titles + statements, optional
+   plan steps).
+3. If the request CHANGES an existing requirement's contract, classify it:
+   `trace task intake --kind behavior-change <WORK-ID> --requirements REQ-x`
+   — implementation edits are then gated until the requirement text
+   actually changes (spec evolution is enforced, not voluntary).
+4. If the request is a refactor/maintenance/non-behavioral edit:
+   `trace task intake --kind refactor` (clears pending intake state).
+5. Proceed with coding; the hooks enforce per-boundary tracing. With more
+   than one active requirement the authoring gate lists the candidates and
+   YOU choose the correct `satisfies=` per boundary — TraceLayer validates
+   the IDs.
+6. On completion: run the verification, ingest evidence, and let the Stop
+   hook finalize — or run `trace task finish` yourself. Work becomes
+   `done` only under merge-grade policy (requirement ancestry, verifying
+   test, passed evidence, no stale blockers); stopping early leaves it
+   active with the missing items named.
 
-If a pre-edit gate blocks with AMBIENT TRACE BOOTSTRAP REQUIRED, follow its
-four steps internally (search, bootstrap from the user's request, activate,
-retry) — the user never sees or types an ID.
+The user never sees or types a TraceLayer ID.
 
 ## Mandatory workflow
 
@@ -141,6 +155,11 @@ retry) — the user never sees or types an ID.
 12. **Resolve blocking diagnostics before declaring completion.** Every
     failure carries a rule ID and a remediation action (NFR-008) — follow
     it, then re-verify.
+13. **Finalize the active work** — the Stop hook does this automatically
+    when everything passes (`Ambient: work <id> finalized`), or run
+    `trace task finish` yourself. Under the merge gate a bare bootstrap
+    with no test/evidence does NOT finalize: the work stays active and the
+    missing merge-grade items are named.
 
 ## Anti-patterns (prohibited)
 
@@ -171,8 +190,9 @@ TraceLayer actively coaches, then enforces. Expect these at edit time:
   Run the command, confirm the behavior still satisfies its requirement,
   then retry.
 - **Post-edit**: changed traced behavior marks linked verification dirty and
-  names exactly what to re-run. New files get judgment guidance (does a
-  marker belong?); new symbols in tracked files get a marker reminder.
+  names exactly what to re-run. New untraced behavior (new or existing
+  files) is held to the same hard authoring gate as every other mutation —
+  the guidance names the exact marker to add.
 - **Requirement/ADR/plan edits**: downstream artifacts are flagged stale —
   prior evidence is historical, not current. Review before completion.
 - **Deletion**: removing traced behavior that others still reference is
@@ -202,14 +222,19 @@ Write the understanding first; the marker is the one line that records it.
 ## Commands cheat sheet
 
 ```bash
-trace search <query>                 # find existing traces
-trace context <id>                   # full context for one trace (pre-edit)
-trace why <id>                       # causal path back to a root
-trace impact <id>                    # what a change to <id> affects
-trace graph <id> --depth 2           # local subgraph
-trace web                            # 3D web UI of the marker graph (markers only)
+trace search <query>                  # find existing traces
+trace context <id>                    # full context for one trace (pre-edit)
+trace why <id>                        # causal path back to a root
+trace impact <id>                     # what a change to <id> affects
+trace graph <id> --depth 2            # local subgraph
+trace web                             # 3D web UI of the marker graph (markers only)
 trace marker suggest <path>[:<line>]  # exact marker for a boundary (uses session context)
-trace verify --changed               # required before completion
-trace status                         # repository health
-trace new <type> --name NAME         # mint a fresh stable ID
+trace task context                    # session intake state (work/reqs/plan/pending)
+trace task bootstrap --prompt "<prose>"  # zero-ceremony bootstrap from the request
+trace task intake --kind behavior-change <WORK-ID> --requirements REQ-x  # classify intent
+trace task resolve-obligation <path> --symbol <name>  # confirm a renamed boundary
+trace task finish                     # merge-grade finalization (auto-bound receipts)
+trace verify --changed                # required before completion
+trace status                          # repository health
+trace new <type> --name NAME          # mint a fresh stable ID
 ```

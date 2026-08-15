@@ -39,15 +39,25 @@ against it; it never crosses into context construction.
 
 ### PPR ablation matrix
 
-`global-ppr` and `task-ppr` map onto the `scc surface --budget N` /
-`--task "<goal>"` CLI flag combinations. `lexical`, `ppr-mmr`,
-`ppr-quotas`, and `ppr-optimizer` are **harness-level mode flags**: the
-CLI does not yet expose ranker-stage knobs, so the harness implements the
-same public ranker/selector pipeline (`pagerank`, `selector`, `rank` in
-scc-context) with one stage substituted, added, or disabled
-(`scc_cli::benchagent::SurfaceAblation`). Every mode produces a real,
-distinct artifact; when the surface CLI grows the stage knobs, the
-harness switches from the mode flags to the flag combinations.
+Every ablation mode runs the **production surface pipeline**
+(`build_surface_staged` in scc-context — the same service the production
+`surface`/`startup` paths route through) with exactly one stage toggled;
+the ablation rows are the production rows with one stage removed, never a
+harness reimplementation of ranking. The stage toggles
+(`scc_cli::benchagent::SurfaceAblation::stages`):
+
+| mode | stage toggle |
+|------|--------------|
+| `lexical` | every stage off (lexical-only) |
+| `global-ppr` | task PPR off (global PPR + lexical) |
+| `task-ppr` | full task pipeline (all stages on) |
+| `ppr-mmr` | MMR diversity off |
+| `ppr-quotas` | token-aware quotas off |
+| `ppr-optimizer` | value/token budget optimizer off |
+
+The artifact is the production render prefixed with a one-line mode label
+(its token cost is subtracted from the budget, so equal-token discipline
+holds).
 
 ## Fairness rules (equal-token mode)
 
@@ -101,8 +111,8 @@ The harness resolves the bench venv for the python adapters
 
 ### Pin verification (no silent floating)
 
-The adapters verify the installed tool against the lock and hard-error with
-exit **3** `PIN-MISMATCH` on any mismatch or unverifiable install:
+The adapters verify the installed tool against the lock and hard-error on
+any mismatch or unprovable install — a version-only match is never a pin:
 
 - **aider**: the pip git install's `direct_url.json`
   `vcs_info.commit_id` (or the package's own `.git` HEAD for editable
@@ -112,12 +122,14 @@ exit **3** `PIN-MISMATCH` on any mismatch or unverifiable install:
   locked commit; otherwise the documented install provenance is verified
   (global install of the pinned source checkout at
   `~/.scc-bench/repomix`, whose git HEAD is the locked commit, with the
-  installed version equal to the source version); otherwise the version
-  mapping (locked `version` == installed version) is the fallback. Test
-  seam: `SCC_REPOMIX_PKG_DIR` overrides the installed package dir.
+  installed version equal to the source version). An install whose commit
+  cannot be proven from either source — even one reporting the locked
+  version — is **PIN-UNVERIFIED** (exit 4), never accepted as a pin.
+  Test seams: `SCC_REPOMIX_PKG_DIR` overrides the installed package dir;
+  `SCC_REPOMIX_SRC_DIR` overrides the pinned checkout dir.
 
 Exit 2 `SKIPPED-UNINSTALLED` is only for a completely missing tool. The
-harness reports both statuses in the variant row and continues the matrix.
+harness reports each status in the variant row and continues the matrix.
 
 ## What runs natively vs. needs the external tools
 
@@ -127,8 +139,10 @@ harness reports both statuses in the variant row and continues the matrix.
   `ppr-quotas`, `ppr-optimizer`). Artifacts are generated through the
   production CLI itself (`scc context startup --budget N`, `scc atlas
   --budget N`, `scc surface [--task]`, structural source) into the
-  workdir, then each task runs the benchagent protocol. No python or
-  external tool needed.
+  workdir, then each task runs the benchagent protocol; the ablation
+  matrix renders through the same production `build_surface_staged`
+  service with one stage toggled (see the PPR ablation matrix section).
+  No python or external tool needed.
 - **Python harness (`run_context_bench.py`)** drives the full matrix; for
   the native variants it shells out to `scc bench external --json` per
   (variant, budget, repo), for the external-tool variants it calls the
@@ -138,13 +152,18 @@ harness reports both statuses in the variant row and continues the matrix.
   pinned aider/repomix installs. `scc bench external --variant
   aider-repomap` delegates to the python harness.
 
-## SKIPPED-UNINSTALLED / PIN-MISMATCH
+## SKIPPED-UNINSTALLED / PIN-MISMATCH / PIN-UNVERIFIED
 
 When an external tool is missing, its adapter exits **2** with
 `{"ok": false, "error": "SKIPPED-UNINSTALLED: ..."}` on stdout. When it is
-installed but does not match the lock, the adapter exits **3** with
-`{"ok": false, "error": "PIN-MISMATCH: ..."}`. The harness reports the
-variant row with that status and continues with the other variants; the
+installed but demonstrably does not match the lock, the adapter exits **3**
+with `{"ok": false, "error": "PIN-MISMATCH: ..."}`. When the installed
+tool's commit cannot be proven against the lock (no gitHead, no pinned
+checkout — a version-only match is NOT proof), the adapter exits **4**
+with `{"ok": false, "error": "PIN-UNVERIFIED: ..."}`; the harness reports
+it as a distinct status row, excluded from the official showdown metric
+rows — it is never treated as a passing pin. The harness reports each
+status in the variant row and continues with the other variants; the
 delegated `scc bench external` arm exits 0 with that status in the row (so
 a matrix run missing aider still completes).
 

@@ -414,7 +414,8 @@ enum ContextSub {
         /// Repository-relative file paths to render structurally
         #[arg(long, value_delimiter = ' ', required_unless_present = "task")]
         files: Vec<String>,
-        /// Task goal: resolve to the matching files (lexical fallback)
+        /// Task goal: resolve to the matching files via the PPR->Surface
+        /// pipeline (build_surface Task mode)
         #[arg(long)]
         task: Option<String>,
         /// Token budget (default: context.structural_source, 6000; scales
@@ -1325,6 +1326,18 @@ fn run_external_python_delegation(
             print!("{stdout}");
         } else {
             println!("{variant}  PIN-MISMATCH");
+            eprintln!("{stdout}");
+        }
+        return Ok(());
+    }
+    if out.status.code() == Some(4) {
+        // PIN-UNVERIFIED: the installed tool's commit cannot be proven to
+        // match the pin — never treated as a passing pin, excluded from
+        // the official showdown.
+        if json {
+            print!("{stdout}");
+        } else {
+            println!("{variant}  PIN-UNVERIFIED");
             eprintln!("{stdout}");
         }
         return Ok(());

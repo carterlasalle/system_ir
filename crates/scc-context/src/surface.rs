@@ -132,6 +132,21 @@ fn render_entry_groups(
     entries: &[SurfaceEntry],
     budget_chars: Option<usize>,
 ) -> (String, BTreeMap<String, usize>) {
+    group_and_render(entries, budget_chars, false, None)
+}
+
+/// [`render_entry_groups`] with the pipeline's render options: optional
+/// structural compression (hard-max overflow) and per-entry importance
+/// scores (explain mode). `budget_chars` is the char ceiling for the
+/// plain map render; the selected-subset render passes `None` (the
+/// selection already enforced the token budget).
+// trace:exempt reason=internal-detail
+fn group_and_render(
+    entries: &[SurfaceEntry],
+    budget_chars: Option<usize>,
+    compress: bool,
+    importance_of: Option<&BTreeMap<String, f64>>,
+) -> (String, BTreeMap<String, usize>) {
     let mut groups: BTreeMap<(String, String, String), Vec<&SurfaceEntry>> = BTreeMap::new();
     for e in entries {
         let comp = e.component.clone().unwrap_or_else(|| "(unattributed)".to_string());
@@ -154,7 +169,8 @@ fn render_entry_groups(
                 *omitted.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
                 continue;
             }
-            let block = render_entry(e);
+            let importance = importance_of.and_then(|m| m.get(&e.id)).copied();
+            let block = render_entry_opt(e, compress, importance);
             let bc = block.chars().count();
             if fits(total_chars + header.chars().count() + block_chars + bc, budget_chars) {
                 blocks.push(block);
@@ -293,11 +309,26 @@ fn required_ids(map: &SystemSurfaceMap, compiler: &ContextCompiler) -> BTreeSet<
 
 /// Render the selected subset. No budget cut here — the selection already
 /// enforced the budget, and every selected entry must render so
-/// `rendered_ids` matches the text exactly.
+/// `rendered_ids` matches the text exactly. `compress` applies the
+/// hard-max structural compression (never drops entries); `explain`
+/// appends each entry's importance score.
 // trace:exempt reason=internal-detail
-fn render_selected(entries: &[SurfaceEntry]) -> String {
-    let (body, _) = render_entry_groups(entries, None);
+fn render_selected(
+    entries: &[SurfaceEntry],
+    compress: bool,
+    explain: bool,
+    importance_of: &BTreeMap<String, f64>,
+) -> String {
+    let (body, _) = group_and_render(
+        entries,
+        None,
+        compress,
+        if explain { Some(importance_of) } else { None },
+    );
     let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
+    if explain {
+        out.push_str("selection scores shown per entry\n\n");
+    }
     out.push_str(&body);
     out
 }
@@ -322,140 +353,159 @@ pub(crate) fn entry_lexical(e: &SurfaceEntry, goal_terms: &BTreeSet<String>) -> 
     (name_hits * 2 + sig_hits) as f64
 }
 
-/// The shared pipeline tail (MMR → quotas → budget selection → render) over
-/// ranked candidates. Required entries bypass MMR/quotas (never dropped)
-/// but still pay their token cost in the final budget selection; the
-/// remaining pool is diversified by component/path similarity, balanced by
-/// the spec's per-kind quotas, then cut by the token budget. Returns the
-/// render result with rendered/omitted ids and per-kind omission summaries.
+/// The shared pipeline tail (MMR → token-aware quotas → soft/hard budget
+/// selection → render) over ranked candidates. Required entries bypass
+/// MMR/quotas (never dropped within the hard max — `policy.coverage`) but
+/// still pay their token cost in the final budget selection; when
+/// required entries alone exceed `policy.hard_max` the render is
+/// structurally compressed (annotations/modifiers/doc lines dropped,
+/// entries never dropped). Returns the render result with rendered/
+/// omitted ids and per-kind omission summaries.
 // trace:exempt reason=internal-detail
 fn finish_selection(
     map: &SystemSurfaceMap,
     ranked: Vec<(String, f64)>,
     required: &BTreeSet<String>,
     budget: usize,
+    policy: &SurfacePolicy,
+    stages: &SurfacePipelineStages,
+    explain: bool,
 ) -> scc_core::SurfaceRenderResult {
     let entry_of: BTreeMap<String, &SurfaceEntry> =
         map.entries.iter().map(|e| (e.id.clone(), e)).collect();
 
-    // Partition: required entries survive MMR/quotas unconditionally.
+    // Partition: required entries survive MMR/quotas unconditionally when
+    // coverage is on; with coverage off they are ordinary candidates.
     let mut required_items: Vec<(String, f64)> = Vec::new();
     let mut pool: Vec<(String, f64)> = Vec::new();
     for (id, imp) in ranked {
-        if required.contains(&id) {
+        if policy.coverage && required.contains(&id) {
             required_items.push((id, imp));
         } else {
             pool.push((id, imp));
         }
     }
 
-    let required_tokens: usize = required_items
+    // Compression decision: required entries alone exceeding the hard max
+    // render structurally compressed (never dropped). Once triggered, the
+    // whole render uses the compressed form so token accounting matches
+    // the delivered text.
+    let required_tokens_full: usize = required_items
         .iter()
         .filter_map(|(id, _)| entry_of.get(id))
         .map(|e| estimate_tokens(&render_entry(e)))
         .sum();
-    let pool_tokens: usize = pool
-        .iter()
-        .filter_map(|(id, _)| entry_of.get(id))
-        .map(|e| estimate_tokens(&render_entry(e)))
-        .sum();
-    let avg_pool = if pool.is_empty() {
-        1
-    } else {
-        (pool_tokens / pool.len()).max(1)
-    };
-    // MMR budget: how many average-pool entries the remaining tokens afford
-    // (diversity caps same-component crowding before the exact token cut).
-    let mmr_budget = budget
-        .saturating_sub(required_tokens)
-        .saturating_div(avg_pool)
-        .max(1)
-        .min(pool.len());
+    let compress = policy.coverage && required_tokens_full > policy.hard_max;
 
-    let sim = |a: &str, b: &str| -> f64 {
-        let (Some(ea), Some(eb)) = (entry_of.get(a), entry_of.get(b)) else {
-            return 0.0;
-        };
-        let same_comp = ea.component.is_some() && ea.component == eb.component;
-        let same_path = !ea.path.is_empty() && ea.path == eb.path;
-        if same_comp || same_path {
-            1.0
-        } else {
-            0.0
+    let cost_of = |id: &str| -> usize {
+        match (entry_of.get(id), compress) {
+            (Some(e), true) => estimate_tokens(&render_entry_compressed(e)),
+            (Some(e), false) => estimate_tokens(&render_entry(e)),
+            _ => 1,
         }
     };
-    let pool_by_id: BTreeMap<String, f64> = pool.iter().cloned().collect();
-    let diversified: Vec<(String, f64)> = crate::selector::mmr_diversify(&pool, sim, 0.5, mmr_budget)
-        .into_iter()
-        .filter_map(|id| pool_by_id.get(&id).map(|v| (id.clone(), *v)))
-        .collect();
+    let required_spent: usize = required_items.iter().map(|(id, _)| cost_of(id)).sum();
+    // The pool's soft token room: what the budget leaves after required.
+    let available = budget.saturating_sub(required_spent);
 
-    // Quotas: the spec's percentages describe the candidate surface, so the
-    // caps derive from the FULL candidate count (enforce_quotas over the
-    // full ranked list) — a tiny post-MMR pool must never zero a kind's cap
-    // (rounding 10% of one candidate to 0 would drop the only state owner).
-    // Required entries consume quota share (they are part of the shown
-    // composition) but are never dropped — the filter only cuts pool
-    // entries whose kind quota is exhausted.
-    let kind_of: BTreeMap<String, &'static str> = map
-        .entries
-        .iter()
-        .map(|e| (e.id.clone(), quota_kind(e)))
-        .collect();
-    let mut full_ranked: Vec<(String, f64)> = Vec::new();
-    full_ranked.extend(required_items.iter().cloned());
-    full_ranked.extend(pool.iter().cloned());
-    let quota_ids = crate::selector::enforce_quotas(
-        &full_ranked,
-        |id| kind_of.get(id).copied().unwrap_or("core"),
-        &surface_quotas(),
-    );
-    let quota_set: BTreeSet<String> = quota_ids.into_iter().collect();
-    let quota_out: Vec<(String, f64)> = diversified
-        .into_iter()
-        .filter(|(id, _)| quota_set.contains(id))
-        .collect();
+    // MMR budget: how many average-pool entries the remaining tokens afford
+    // (diversity caps same-component crowding before the exact token cut).
+    let pool_avg = if pool.is_empty() {
+        1
+    } else {
+        (pool.iter().map(|(id, _)| cost_of(id)).sum::<usize>() / pool.len()).max(1)
+    };
+    let mmr_budget = available
+        .saturating_div(pool_avg)
+        .max(1)
+        .min(pool.len());
+    let diversified: Vec<(String, f64)> = if stages.mmr && policy.mmr {
+        let sim = |a: &str, b: &str| -> f64 {
+            let (Some(ea), Some(eb)) = (entry_of.get(a), entry_of.get(b)) else {
+                return 0.0;
+            };
+            let same_comp = ea.component.is_some() && ea.component == eb.component;
+            let same_path = !ea.path.is_empty() && ea.path == eb.path;
+            if same_comp || same_path {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let pool_by_id: BTreeMap<String, f64> = pool.iter().cloned().collect();
+        crate::selector::mmr_diversify(&pool, sim, 0.5, mmr_budget)
+            .into_iter()
+            .filter_map(|id| pool_by_id.get(&id).map(|v| (id.clone(), *v)))
+            .collect()
+    } else {
+        pool.clone()
+    };
 
-    // Budget selection: required first (never dropped, even when they alone
-    // exceed the budget), then the quota-balanced pool by value/token.
+    // Token-aware quotas: caps are fractions of the pool's available
+    // tokens, so the composition adapts to the budget (reviewer item 6).
+    // Required entries were partitioned out and may exceed their group
+    // allocation; the leftover room rebalances across the pool.
+    let quota_filtered: Vec<(String, f64)> = if stages.quotas && policy.quotas {
+        let kind_of: BTreeMap<String, &'static str> = map
+            .entries
+            .iter()
+            .map(|e| (e.id.clone(), quota_kind(e)))
+            .collect();
+        let ids = crate::selector::enforce_quotas(
+            &diversified,
+            |id| kind_of.get(id).copied().unwrap_or("core"),
+            &surface_quotas(),
+            available,
+            |id| cost_of(id),
+        );
+        let id_set: BTreeSet<String> = ids.into_iter().collect();
+        diversified
+            .into_iter()
+            .filter(|(id, _)| id_set.contains(id))
+            .collect()
+    } else {
+        diversified
+    };
+
+    // Budget selection: required first (never dropped, even when they
+    // alone exceed the budget), then the quota-balanced pool by
+    // value/token (or rank order with the optimizer stage off).
     let mut items: Vec<ContextItem> = Vec::new();
     for (id, imp) in &required_items {
-        let cost = entry_of
-            .get(id)
-            .map(|e| estimate_tokens(&render_entry(e)))
-            .unwrap_or(1);
         items.push(ContextItem {
             id: id.clone(),
             value: *imp,
-            token_cost: cost,
+            token_cost: cost_of(id),
             required: true,
             group: Some("api".into()),
         });
     }
-    for (id, imp) in &quota_out {
-        let cost = entry_of
-            .get(id)
-            .map(|e| estimate_tokens(&render_entry(e)))
-            .unwrap_or(1);
+    for (id, imp) in &quota_filtered {
         items.push(ContextItem {
             id: id.clone(),
             value: *imp,
-            token_cost: cost,
+            token_cost: cost_of(id),
             required: false,
             group: Some("api".into()),
         });
     }
-    let selected = crate::selector::select_with_budget(&items, budget);
+    let selected = if stages.optimizer {
+        crate::selector::select_with_budget(&items, budget, policy.hard_max)
+    } else {
+        crate::selector::select_in_order(&items, budget, policy.hard_max)
+    };
 
     let mut rendered_ids: Vec<String> = Vec::new();
     let mut selected_entries: Vec<SurfaceEntry> = Vec::new();
+    let mut importance_of: BTreeMap<String, f64> = BTreeMap::new();
     for &idx in &selected {
         if idx >= items.len() {
             continue; // defensive: never panic on a misbehaving selector
         }
         let id = items[idx].id.clone();
         if let Some(e) = entry_of.get(&id) {
-            rendered_ids.push(id);
+            rendered_ids.push(id.clone());
+            importance_of.insert(id.clone(), items[idx].value);
             selected_entries.push((*e).clone());
         }
     }
@@ -481,7 +531,7 @@ fn finish_selection(
         })
         .collect();
 
-    let text = render_selected(&selected_entries);
+    let text = render_selected(&selected_entries, compress, explain, &importance_of);
     let token_count = estimate_tokens(&text);
     scc_core::SurfaceRenderResult {
         text,
@@ -492,95 +542,199 @@ fn finish_selection(
     }
 }
 
-/// The FULL production global surface pipeline: compile candidates → global
-/// heterogeneous PPR → [`pagerank::SystemRanker::project_to_symbols`] →
-/// per-entry importance (`final_importance`, no task focus) → required
-/// coverage → MMR diversify → quotas → budget selection → render. Returns
-/// the rendered subset with rendered/omitted ids and omission summaries.
-// trace:v1 id=impl.scc.surface.select-and-render-global work=WORK-SCC-014 satisfies=REQ-SCC-IR
-pub fn select_and_render_global(
-    compiler: &ContextCompiler,
-    budget: usize,
-) -> scc_core::SurfaceRenderResult {
-    let map = compile_surface_map(compiler);
-    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
-    let projected = ranker.project_to_symbols(&ranker.global_vector());
-    let score_of: BTreeMap<String, f64> = projected.into_iter().collect();
+// ---------------------------------------------------------------------------
+// The one authoritative surface service (Wave 15.1)
+// ---------------------------------------------------------------------------
 
-    let required = required_ids(&map, compiler);
-    let mut ranked: Vec<(String, f64)> = Vec::new();
-    for e in &map.entries {
-        let global_ppr = score_of.get(&e.symbol_id).copied().unwrap_or(0.0);
-        let changed = compiler.is_stale_path(&e.path);
-        let importance = crate::pagerank::final_importance(
-            0.0,
-            global_ppr,
-            0.0,
-            0.0,
-            e.confidence as f64,
-            if required.contains(&e.id) { 1.0 } else { 0.0 },
-            if changed { 1.0 } else { 0.0 },
-            0.0,
-            false,
-        );
-        if importance <= 0.0 {
-            continue;
-        }
-        ranked.push((e.id.clone(), importance));
-    }
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    finish_selection(&map, ranked, &required, budget)
+/// The surface mode: global (the historical production pipeline) or task
+/// (task PPR + novelty suppression with the same pipeline tail).
+#[derive(Debug, Clone, Copy)]
+// trace:v1 id=impl.scc.surface.mode work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub enum SurfaceMode<'a> {
+    Global,
+    Task {
+        goal: &'a str,
+        /// The context ledger for novelty suppression: entries already
+        /// visible AND unchanged are not re-injected. `None` disables
+        /// suppression (full task-personalized map).
+        visible: Option<&'a ContextLedger>,
+    },
 }
 
-/// The FULL production task surface pipeline: task PPR (task seeds, warm
-/// global start) + novelty suppression against the context ledger + the
-/// same pipeline tail (MMR/quotas/selector) as the global render. Entries
-/// already visible and unchanged this epoch are not re-injected.
-// trace:v1 id=impl.scc.surface.select-and-render-task work=WORK-SCC-014 satisfies=REQ-SCC-IR
-pub fn select_and_render_task(
+/// One surface render request: the mode, the token budget, whether to
+/// explain selection scores, and the pipeline policy.
+#[derive(Debug, Clone, Copy)]
+// trace:v1 id=impl.scc.surface.request work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub struct SurfaceRequest<'a> {
+    pub mode: SurfaceMode<'a>,
+    pub budget: usize,
+    pub explain: bool,
+    pub policy: SurfacePolicy,
+}
+
+/// Pipeline policy knobs for one surface render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// trace:v1 id=impl.scc.surface.policy work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub struct SurfacePolicy {
+    /// Token-aware per-kind quotas (default true).
+    pub quotas: bool,
+    /// MMR diversity across components/paths (default true).
+    pub mmr: bool,
+    /// Required coverage never dropped within the hard max (default true).
+    pub coverage: bool,
+    /// Absolute token ceiling: required facts may exceed `budget` but
+    /// never `hard_max`; required entries alone over the hard max are
+    /// structurally compressed (annotations/modifiers/doc lines dropped —
+    /// the entry is never dropped).
+    pub hard_max: usize,
+}
+
+// trace:exempt reason=internal-detail  # impl grouping; the constructor below is traced
+impl SurfacePolicy {
+    /// The default policy for a soft `budget`: quotas/MMR/coverage on and
+    /// `hard_max` = budget + 20% (min +500).
+    // trace:v1 id=impl.scc.surface.policy.defaults work=WORK-SCC-015 satisfies=REQ-SCC-IR
+    pub fn defaults(budget: usize) -> Self {
+        SurfacePolicy {
+            quotas: true,
+            mmr: true,
+            coverage: true,
+            hard_max: budget
+                .saturating_add(budget / 5)
+                .max(budget.saturating_add(500)),
+        }
+    }
+}
+
+/// Stage toggles for the ablation matrix ([`build_surface_staged`]): the
+/// same pipeline with one stage switched off. All on = [`build_surface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// trace:v1 id=impl.scc.surface.stages work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub struct SurfacePipelineStages {
+    /// Lexical stage: on = PPR-blended importance; off = pure lexical
+    /// scores, no PPR at all.
+    pub lexical: bool,
+    /// Global PPR stage: off = no global vector in the blend.
+    pub global_ppr: bool,
+    /// Task PPR stage: off = no task seeds (global-only blend).
+    pub task_ppr: bool,
+    /// MMR diversity stage: off = rank order preserved, no diversification.
+    pub mmr: bool,
+    /// Quota stage: off = no per-kind caps.
+    pub quotas: bool,
+    /// Optimizer stage: off = rank-order budget cut, no value/token
+    /// reordering.
+    pub optimizer: bool,
+}
+
+// trace:exempt reason=internal-detail  # Default impl grouping; the fn below is traced
+impl Default for SurfacePipelineStages {
+    /// All stages on: `build_surface_staged(.., &SurfacePipelineStages::default())`
+    /// is exactly [`build_surface`].
+    // trace:v1 id=impl.scc.surface.stages.default work=WORK-SCC-015 satisfies=REQ-SCC-IR
+    fn default() -> Self {
+        SurfacePipelineStages {
+            lexical: true,
+            global_ppr: true,
+            task_ppr: true,
+            mmr: true,
+            quotas: true,
+            optimizer: true,
+        }
+    }
+}
+
+/// THE one authoritative surface pipeline: compile candidates →
+/// heterogeneous PPR (global or task) →
+/// [`pagerank::SystemRanker::project_to_symbols`] → per-entry importance
+/// (`final_importance`) → required coverage → MMR diversify → token-aware
+/// quotas → soft/hard budget selection → render. Global mode is the
+/// historical `select_and_render_global` pipeline; Task mode adds task
+/// PPR (lexical seeds, warm global start), novelty suppression against
+/// the ledger, and the same MMR/quotas/selector/render tail. Every
+/// surface consumer (production, CLI, MCP, plugin, benchmark ablations)
+/// routes through this service — no consumer reimplements ranking.
+/// Deterministic and no-panic.
+// trace:v1 id=impl.scc.surface.build work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub fn build_surface(
     compiler: &ContextCompiler,
-    goal: &str,
-    budget: usize,
-    visible: &ContextLedger,
+    request: SurfaceRequest<'_>,
 ) -> scc_core::SurfaceRenderResult {
-    let goal_terms = terms(goal);
-    let candidates = crate::rank::collect_lexical_candidates(
-        compiler.store,
-        &compiler.view,
-        goal,
-        &[],
-        16,
-    );
-    let seeds: Vec<TaskSeed> = candidates
-        .iter()
-        .map(|c| TaskSeed {
-            kind: c.kind.clone(),
-            id: c.id.clone(),
-            weight: c.score,
-        })
-        .collect();
-    let seed_ids: BTreeSet<String> = seeds.iter().map(|s| s.id.clone()).collect();
+    build_surface_staged(compiler, request, &SurfacePipelineStages::default())
+}
+
+/// [`build_surface`] with stage toggles for the ablation matrix
+/// (benchmark ablations toggle stages here — they never reimplement
+/// ranking). `lexical` off skips PPR entirely and scores by lexical
+/// match; `global_ppr` off drops the global vector; `task_ppr` off seeds
+/// no task vector; `mmr` off skips diversification; `quotas` off skips
+/// per-kind caps; `optimizer` off renders in importance order up to the
+/// budget. Deterministic and no-panic.
+// trace:v1 id=impl.scc.surface.build-staged work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub fn build_surface_staged(
+    compiler: &ContextCompiler,
+    request: SurfaceRequest<'_>,
+    stages: &SurfacePipelineStages,
+) -> scc_core::SurfaceRenderResult {
+    let (goal, visible): (Option<&str>, Option<&ContextLedger>) = match &request.mode {
+        SurfaceMode::Global => (None, None),
+        SurfaceMode::Task { goal, visible } => (Some(goal), *visible),
+    };
+    let goal_terms = goal.map(terms).unwrap_or_default();
+
+    // Task seeds: lexical candidate resolution (task mode only, and only
+    // while the task-ppr stage is on).
+    let mut seeds: Vec<TaskSeed> = Vec::new();
+    let mut seed_ids: BTreeSet<String> = BTreeSet::new();
+    if stages.task_ppr {
+        if let Some(g) = goal {
+            let candidates = crate::rank::collect_lexical_candidates(
+                compiler.store,
+                &compiler.view,
+                g,
+                &[],
+                16,
+            );
+            seeds = candidates
+                .iter()
+                .map(|c| TaskSeed {
+                    kind: c.kind.clone(),
+                    id: c.id.clone(),
+                    weight: c.score,
+                })
+                .collect();
+            seed_ids = seeds.iter().map(|s| s.id.clone()).collect();
+        }
+    }
 
     let map = compile_surface_map(compiler);
     let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
-    let global_of: BTreeMap<String, f64> = ranker
-        .project_to_symbols(&ranker.global_vector())
-        .into_iter()
-        .collect();
-    let task_of: BTreeMap<String, f64> = ranker
-        .project_to_symbols(&ranker.task_vector(&seeds))
-        .into_iter()
-        .collect();
+    let global_of: BTreeMap<String, f64> = if stages.global_ppr {
+        ranker
+            .project_to_symbols(&ranker.global_vector())
+            .into_iter()
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let task_of: BTreeMap<String, f64> = if stages.task_ppr && !seeds.is_empty() {
+        ranker
+            .project_to_symbols(&ranker.task_vector(&seeds))
+            .into_iter()
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
 
     let required = required_ids(&map, compiler);
+    let has_task = !seeds.is_empty();
     let mut ranked: Vec<(String, f64)> = Vec::new();
     for e in &map.entries {
         let changed = compiler.is_stale_path(&e.path);
-        let novelty = novelty_penalty(visible, &e.symbol_id, changed);
+        let novelty = match visible {
+            Some(ledger) => novelty_penalty(ledger, &e.symbol_id, changed),
+            None => 1.0,
+        };
         if novelty < 1.0 {
             // already visible AND unchanged: not re-injected (spec)
             continue;
@@ -593,18 +747,23 @@ pub fn select_and_render_task(
         } else {
             0.0
         };
-        let importance = crate::pagerank::final_importance(
-            task_ppr,
-            global_ppr,
-            lexical,
-            0.0,
-            e.confidence as f64,
-            criticality,
-            if changed { 1.0 } else { 0.0 },
-            novelty,
-            !seeds.is_empty(),
-        );
-        if importance <= 0.0 {
+        let importance = if stages.lexical {
+            crate::pagerank::final_importance(
+                task_ppr,
+                global_ppr,
+                lexical,
+                0.0,
+                e.confidence as f64,
+                criticality,
+                if changed { 1.0 } else { 0.0 },
+                novelty,
+                has_task,
+            )
+        } else {
+            // lexical stage off: pure lexical scores, no PPR blend
+            lexical
+        };
+        if importance <= 0.0 && !required.contains(&e.id) {
             continue;
         }
         ranked.push((e.id.clone(), importance));
@@ -614,7 +773,60 @@ pub fn select_and_render_task(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    finish_selection(&map, ranked, &required, budget)
+    finish_selection(
+        &map,
+        ranked,
+        &required,
+        request.budget,
+        &request.policy,
+        stages,
+        request.explain,
+    )
+}
+
+/// The FULL production global surface pipeline (historical entry point —
+/// kept as a thin wrapper over [`build_surface`] so the traced contract
+/// and legacy callers stay stable): global heterogeneous PPR, required
+/// coverage, MMR, quotas, budget selection, render.
+// trace:v1 id=impl.scc.surface.select-and-render-global work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn select_and_render_global(
+    compiler: &ContextCompiler,
+    budget: usize,
+) -> scc_core::SurfaceRenderResult {
+    build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Global,
+            budget,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget),
+        },
+    )
+}
+
+/// The FULL production task surface pipeline (historical entry point —
+/// kept as a thin wrapper over [`build_surface`] so the traced contract
+/// and legacy callers stay stable): task PPR + novelty suppression
+/// against the ledger + the same MMR/quotas/selector/render tail.
+// trace:v1 id=impl.scc.surface.select-and-render-task work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn select_and_render_task(
+    compiler: &ContextCompiler,
+    goal: &str,
+    budget: usize,
+    visible: &ContextLedger,
+) -> scc_core::SurfaceRenderResult {
+    build_surface(
+        compiler,
+        SurfaceRequest {
+            mode: SurfaceMode::Task {
+                goal,
+                visible: Some(visible),
+            },
+            budget,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,28 +1568,62 @@ fn entry_order(a: &SurfaceEntry, b: &SurfaceEntry) -> std::cmp::Ordering {
 
 // trace:exempt reason=internal-detail
 fn render_entry(e: &SurfaceEntry) -> String {
+    render_entry_opt(e, false, None)
+}
+
+/// The structurally compressed entry block (hard-max overflow, never drops
+/// the entry): kind + name + the first signature line only. The metadata
+/// sections (Used by / Calls / Participates in / Contracts / Owns /
+/// Invocation — the lines that carry annotation/modifier-rich detail) and
+/// multi-line signature continuations / doc lines are dropped, so the
+/// required set fits under the hard max.
+// trace:exempt reason=internal-detail
+fn render_entry_compressed(e: &SurfaceEntry) -> String {
+    render_entry_opt(e, true, None)
+}
+
+/// One entry block with the pipeline's render options. `compress` drops
+/// the metadata sections and the signature continuation/doc lines;
+/// `importance` (explain mode) appends the selection score.
+// trace:exempt reason=internal-detail
+fn render_entry_opt(e: &SurfaceEntry, compress: bool, importance: Option<f64>) -> String {
     let mut out = String::new();
     let name = e.qualified_name.rsplit('.').next().unwrap_or(&e.qualified_name);
     out.push_str(&format!("  {} {}\n\n", e.kind.as_str(), name));
-    for line in e.source_signature.split('\n') {
-        out.push_str("    ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    let sections: [(&str, &[String]); 6] = [
-        ("Used by", &e.callers),
-        ("Calls", &e.callees),
-        ("Participates in", &e.flows),
-        ("Contracts", &e.contracts),
-        ("Owns", &e.state_authorities),
-        ("Invocation", &e.invocation_surfaces),
-    ];
-    for (label, vals) in sections {
-        if vals.is_empty() {
-            continue;
+    let sig_lines: Vec<&str> = e.source_signature.split('\n').collect();
+    if compress {
+        if let Some(first) = sig_lines.first() {
+            out.push_str("    ");
+            out.push_str(first);
+            out.push('\n');
         }
+    } else {
+        for line in &sig_lines {
+            out.push_str("    ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !compress {
+        let sections: [(&str, &[String]); 6] = [
+            ("Used by", &e.callers),
+            ("Calls", &e.callees),
+            ("Participates in", &e.flows),
+            ("Contracts", &e.contracts),
+            ("Owns", &e.state_authorities),
+            ("Invocation", &e.invocation_surfaces),
+        ];
+        for (label, vals) in sections {
+            if vals.is_empty() {
+                continue;
+            }
+            out.push('\n');
+            out.push_str(&format!("  {label}:\n    {}\n", vals.join(", ")));
+        }
+    }
+    if let Some(imp) = importance {
         out.push('\n');
-        out.push_str(&format!("  {label}:\n    {}\n", vals.join(", ")));
+        out.push_str(&format!("  importance: {imp:.3}\n"));
     }
     out.push('\n');
     out
@@ -1831,6 +2077,61 @@ mod tests {
         ContextCompiler::new(store, graph, crate::ContextSettings::default(), Vec::new())
     }
 
+    /// 40 private functions: 20 lexically matched by the goal term
+    /// (`zeta_*` in `a/mod.py`) + 20 unmatched (`alpha_*` in `b/mod.py`),
+    /// so MMR/path diversity and lexical vs PPR blending are observable.
+// trace:exempt reason=internal-detail
+    fn zeta_alpha_fixture() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        for (path, prefix) in [("a/mod.py", "zeta"), ("b/mod.py", "alpha")] {
+            for i in 0..20 {
+                let name = format!("{prefix}_{i:02}");
+                let id = symbol_id(&repo, path, &name);
+                let mut e = Entity::new(id.clone(), kinds::SYMBOL, name);
+                e.attr("kind", serde_json::json!("function"));
+                e.attr("file", serde_json::json!(path));
+                e.attr("signature", serde_json::json!("def f(x): ..."));
+                e.attr("exported", serde_json::json!(false));
+                e.attr("start_line", serde_json::json!(1u32));
+                e.attr("end_line", serde_json::json!(10u32));
+                store.insert_entity(&e, &[path.to_string()]).unwrap();
+            }
+        }
+        (dir, store)
+    }
+
+    /// One required entry (exported → public-api invocation surface) with a
+    /// 400-line declaration header — its full render alone exceeds any
+    /// realistic hard max, so compression is observable.
+// trace:exempt reason=internal-detail
+    fn huge_signature_fixture() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        let id = symbol_id(&repo, path, "big_fn");
+        let mut e = Entity::new(id.clone(), kinds::SYMBOL, "big_fn".to_string());
+        e.attr("kind", serde_json::json!("function"));
+        e.attr("file", serde_json::json!(path));
+        let mut decl = String::from("def big_fn(\n");
+        for i in 0..400 {
+            decl.push_str(&format!("    arg_{i:03}: str,\n"));
+        }
+        decl.push_str(") -> None:\n");
+        e.attr("decl_header", serde_json::json!(decl));
+        e.attr("exported", serde_json::json!(true));
+        e.attr("start_line", serde_json::json!(1u32));
+        e.attr("end_line", serde_json::json!(10u32));
+        store.insert_entity(&e, &[path.to_string()]).unwrap();
+        (dir, store)
+    }
+
     #[test]
 // trace:exempt reason=internal-detail
     fn compiles_surface_map_with_attribution() {
@@ -2062,6 +2363,319 @@ mod tests {
         for id in &out.omitted_ids {
             assert!(!rendered.contains(id));
         }
+    }
+
+    // ---- Wave 15.1: the one authoritative surface service ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn build_surface_global_matches_historical_pipeline() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let n = map.entries.len();
+        assert!(n >= 5);
+
+        let req = |budget: usize| SurfaceRequest {
+            mode: SurfaceMode::Global,
+            budget,
+            explain: false,
+            policy: SurfacePolicy::defaults(budget),
+        };
+
+        // Huge budget: the service renders exactly the historical global
+        // pipeline output — every candidate, byte-identical to the full
+        // map render (the old select_and_render_global invariant).
+        let big = build_surface(&ctx, req(100_000));
+        let legacy = select_and_render_global(&ctx, 100_000);
+        assert_eq!(big.text, legacy.text);
+        assert_eq!(big.rendered_ids, legacy.rendered_ids);
+        assert_eq!(big.omitted_ids, legacy.omitted_ids);
+        assert_eq!(big.rendered_ids.len(), n);
+        assert!(big.omitted_ids.is_empty());
+        assert_eq!(big.text, render_surface_map(&map, None));
+
+        // Tiny budget: required coverage survives; byte-identical across
+        // runs (deterministic).
+        let tiny = build_surface(&ctx, req(1));
+        assert!(!tiny.rendered_ids.is_empty());
+        assert_eq!(tiny.rendered_ids.len() + tiny.omitted_ids.len(), n);
+        let tiny2 = build_surface(&ctx, req(1));
+        assert_eq!(tiny.text, tiny2.text);
+        assert_eq!(tiny.rendered_ids, tiny2.rendered_ids);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn build_surface_task_applies_novelty_suppression() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let create = entry(&map, "create_user");
+
+        let mut visible = ContextLedger::default();
+        visible.visible_symbols.insert(create.symbol_id.clone());
+        let out = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Task {
+                    goal: "create user",
+                    visible: Some(&visible),
+                },
+                budget: 100_000,
+                explain: false,
+                policy: SurfacePolicy::defaults(100_000),
+            },
+        );
+        // The already-visible-and-unchanged entry is not re-injected; the
+        // rest render (huge budget); omitted ids are honest.
+        assert!(!out.rendered_ids.contains(&create.id));
+        assert_eq!(out.rendered_ids.len(), map.entries.len() - 1);
+        assert!(out.omitted_ids.contains(&create.id));
+        // Routing parity with the historical task entry point.
+        let legacy = select_and_render_task(&ctx, "create user", 100_000, &visible);
+        assert_eq!(out.text, legacy.text);
+        assert_eq!(out.rendered_ids, legacy.rendered_ids);
+
+        // No ledger → the full task-personalized map (nothing suppressed).
+        let full = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Task {
+                    goal: "create user",
+                    visible: None,
+                },
+                budget: 100_000,
+                explain: false,
+                policy: SurfacePolicy::defaults(100_000),
+            },
+        );
+        assert_eq!(full.rendered_ids.len(), map.entries.len());
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn token_aware_quotas_cap_the_dominant_kind() {
+        // 1000 private functions: 900 plain "core" + 100 state owners. The
+        // naive value/token pick fills the budget with the dominant kind;
+        // token-aware quotas cap it at its share of the available TOKENS
+        // and let the under-represented state kind in.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        let mut rel_id: u64 = 10_000;
+        for i in 0..900 {
+            let name = format!("core_fn_{i:04}");
+            let id = symbol_id(&repo, path, &name);
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, name);
+            e.attr("kind", serde_json::json!("function"));
+            e.attr("file", serde_json::json!(path));
+            e.attr("signature", serde_json::json!("def f(x): ..."));
+            e.attr("exported", serde_json::json!(false));
+            e.attr("start_line", serde_json::json!(1u32));
+            e.attr("end_line", serde_json::json!(10u32));
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+        }
+        for i in 0..100 {
+            let name = format!("state_fn_{i:04}");
+            let id = symbol_id(&repo, path, &name);
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, name);
+            e.attr("kind", serde_json::json!("function"));
+            e.attr("file", serde_json::json!(path));
+            e.attr("signature", serde_json::json!("def f(x): ..."));
+            e.attr("exported", serde_json::json!(false));
+            e.attr("start_line", serde_json::json!(1u32));
+            e.attr("end_line", serde_json::json!(10u32));
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+            let state_id = entity_id(&repo, kinds::STATE, &format!("st{i:04}"));
+            store
+                .insert_entity(
+                    &Entity::new(state_id.clone(), kinds::STATE, format!("st{i:04}")),
+                    &[path.to_string()],
+                )
+                .unwrap();
+            rel_id += 1;
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        relationship_id(rel_id),
+                        id,
+                        predicates::OWNS,
+                        state_id,
+                        Provenance::Extracted,
+                    ),
+                    path,
+                )
+                .unwrap();
+        }
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        assert_eq!(map.entries.len(), 1000);
+
+        let budget = 2000usize;
+        let hard_max = SurfacePolicy::defaults(budget).hard_max;
+        let req = |quotas: bool| SurfaceRequest {
+            mode: SurfaceMode::Global,
+            budget,
+            explain: false,
+            policy: SurfacePolicy {
+                quotas,
+                mmr: false,
+                coverage: true,
+                hard_max,
+            },
+        };
+        let naive = build_surface(&ctx, req(false));
+        let balanced = build_surface(&ctx, req(true));
+        let count = |r: &scc_core::SurfaceRenderResult, prefix: &str| {
+            r.rendered_ids.iter().filter(|id| id.contains(prefix)).count()
+        };
+        let naive_core = count(&naive, "core_fn_");
+        let bal_core = count(&balanced, "core_fn_");
+        let bal_state = count(&balanced, "state_fn_");
+        assert!(
+            bal_core < naive_core,
+            "quotas must cut the dominant kind: {bal_core} !< {naive_core}"
+        );
+        assert!(bal_state > 0, "quotas must admit the under-represented kind");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn hard_max_soft_overflow_renders_but_required_overflow_compresses() {
+        // Soft overflow: required entries exceed the budget but stay under
+        // the hard max → they render in FULL (metadata sections intact,
+        // entries never dropped).
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let soft = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 5,
+                explain: false,
+                policy: SurfacePolicy::defaults(5), // hard_max = 505
+            },
+        );
+        assert!(!soft.rendered_ids.is_empty());
+        assert!(
+            soft.text.contains("Used by:"),
+            "under the hard max the full entry blocks must render"
+        );
+        assert!(soft.token_count > 5, "required may exceed the soft budget");
+        assert!(soft.token_count <= 505, "required never exceeds the hard max");
+
+        // Hard overflow: the required entry alone exceeds the hard max →
+        // structurally compressed: the entry stays, metadata/annotation
+        // lines are dropped.
+        let (_dir2, store2) = huge_signature_fixture();
+        let ctx2 = make_ctx(&store2);
+        let hard = build_surface(
+            &ctx2,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 100,
+                explain: false,
+                policy: SurfacePolicy::defaults(100), // hard_max = 600
+            },
+        );
+        assert_eq!(hard.rendered_ids.len(), 1, "the required entry is never dropped");
+        assert!(
+            hard.text.contains("function big_fn"),
+            "the compressed entry keeps its identity"
+        );
+        assert!(!hard.text.contains("Used by:"), "metadata sections are dropped");
+        assert!(hard.token_count <= 600, "the compressed render fits the hard max");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn staged_toggles_change_output_deterministically() {
+        let (_dir, store) = zeta_alpha_fixture();
+        let ctx = make_ctx(&store);
+
+        // Tight budget: MMR on vs off changes the selection.
+        let budget = 80usize;
+        let hard_max = SurfacePolicy::defaults(budget).hard_max;
+        let req = |_stages: &SurfacePipelineStages| SurfaceRequest {
+            mode: SurfaceMode::Task {
+                goal: "zeta",
+                visible: None,
+            },
+            budget,
+            explain: false,
+            policy: SurfacePolicy {
+                quotas: false,
+                mmr: true,
+                coverage: true,
+                hard_max,
+            },
+        };
+        let render =
+            |stages: &SurfacePipelineStages| build_surface_staged(&ctx, req(stages), stages);
+        let has_b = |r: &scc_core::SurfaceRenderResult| {
+            r.rendered_ids.iter().any(|id| id.contains("b/mod.py"))
+        };
+
+        let full = render(&SurfacePipelineStages::default());
+        // Determinism: identical stages → byte-identical output.
+        let full2 = render(&SurfacePipelineStages::default());
+        assert_eq!(full.text, full2.text);
+        assert_eq!(full.rendered_ids, full2.rendered_ids);
+
+        // MMR off: the rank-order cut stays on the first path. MMR on:
+        // diversity pulls the second path in.
+        let no_mmr_stages = SurfacePipelineStages {
+            mmr: false,
+            ..SurfacePipelineStages::default()
+        };
+        let no_mmr = render(&no_mmr_stages);
+        assert_ne!(full.text, no_mmr.text);
+        assert!(has_b(&full), "MMR must diversify across paths");
+        assert!(!has_b(&no_mmr), "rank-order cut must stay on the first path");
+
+        // Lexical stage off (skip PPR entirely): only lexically matched
+        // entries rank; the PPR blend also admits low-lexical entries.
+        let no_lex_stages = SurfacePipelineStages {
+            lexical: false,
+            ..SurfacePipelineStages::default()
+        };
+        let no_lex = build_surface_staged(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Task {
+                    goal: "zeta",
+                    visible: None,
+                },
+                budget: 100_000,
+                explain: false,
+                policy: SurfacePolicy::defaults(100_000),
+            },
+            &no_lex_stages,
+        );
+        let lex_on = build_surface_staged(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Task {
+                    goal: "zeta",
+                    visible: None,
+                },
+                budget: 100_000,
+                explain: false,
+                policy: SurfacePolicy::defaults(100_000),
+            },
+            &SurfacePipelineStages::default(),
+        );
+        assert_eq!(
+            no_lex.rendered_ids.len(),
+            20,
+            "pure lexical skips unmatched entries"
+        );
+        assert_eq!(lex_on.rendered_ids.len(), 40, "the PPR blend ranks the full pool");
+        assert_ne!(no_lex.text, lex_on.text);
     }
 
     // ---- overload-sensitive entries + decl_header ----

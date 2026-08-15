@@ -25,6 +25,8 @@ Node-defining markers require `id=<trace-id>`.
 - `type` — optional artifact type; inferred from the ID namespace when absent.
 - `title` — optional descriptive metadata; not a graph edge.
 - `policy` — rare policy override reference, not an arbitrary exemption.
+- `expects` — plan-only: comma-separated artifact IDs the plan commits
+  to producing; TL014 enforces each exists and links back via `implements`.
 
 ## Convenience keys
 
@@ -43,7 +45,8 @@ def rotate_refresh_token(...):
 
 ```python
 # trace:v1 id=test.auth.refresh-reuse verifies=REQ-AUTH-017 exercises=impl.auth.refresh
-def test_reused_refresh_token_is_rejected(): ...
+def test_reused_refresh_token_is_rejected():
+    ...
 ```
 
 ```markdown

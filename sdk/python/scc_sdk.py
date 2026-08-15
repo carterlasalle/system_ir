@@ -170,7 +170,8 @@ class SCC:
         budget: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Compile the Structural Source representation of files (explicit
-        ``files`` or the files lexically matched to a ``goal``).
+        ``files`` or the files matched to a ``goal`` via the PPR->Surface
+        pipeline).
 
         ``scc context structural`` has no JSON mode, so the pack is
         synthesized from its markdown output.

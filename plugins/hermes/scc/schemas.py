@@ -197,7 +197,8 @@ STRUCTURAL_SOURCE = {
         "Get the Structural Source representation of files: exact declaration "
         "headers plus per-symbol call/write evidence (deep) or signatures and "
         "imports (fallback). Pass either files or a goal (a goal selects the "
-        "lexically matching files). Use when you need the implementation-level "
+        "task-matched files via the PPR->Surface pipeline). Use when you need the "
+        "implementation-level "
         "API shape of a file without reading its whole body."
     ),
     "parameters": {
@@ -210,7 +211,7 @@ STRUCTURAL_SOURCE = {
             },
             "goal": {
                 "type": "string",
-                "description": "Task goal: resolve to the matching files (lexical fallback)",
+                "description": "Task goal: resolve to the matching files (build_surface Task mode)",
             },
             "token_budget": {
                 "type": "integer",

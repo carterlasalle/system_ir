@@ -514,19 +514,41 @@ fn scc_full_structural_section_is_goal_selected_not_ground_truth() {
     );
     assert!(surface.status.success());
     let surface_text = String::from_utf8_lossy(&surface.stdout);
+    // The production render: `SCC SYSTEM SURFACE MAP`, then per-group
+    // `<COMPONENT>\n\n<path>[  [<sub>]]\n\n  <kind> <name>` blocks. The
+    // path comes from the group header line (between two blank lines,
+    // above a non-blank component line; component headers are uppercased
+    // and carry no path punctuation).
     let mut oracle_paths: Vec<String> = Vec::new();
-    for line in surface_text.lines() {
-        let line = line.trim();
-        if !line.starts_with("- ") {
+    let s_lines: Vec<&str> = surface_text.lines().collect();
+    for i in 0..s_lines.len() {
+        let path = s_lines[i].trim();
+        if path.is_empty() || s_lines[i].starts_with(' ') {
+            continue; // entries and signatures are indented, never paths
+        }
+        let prev_blank = i
+            .checked_sub(1)
+            .map(|j| s_lines[j].trim().is_empty())
+            .unwrap_or(false);
+        let next_blank = s_lines
+            .get(i + 1)
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(false);
+        let above_component = i
+            .checked_sub(2)
+            .map(|j| !s_lines[j].trim().is_empty())
+            .unwrap_or(false);
+        if !(prev_blank && next_blank && above_component) {
             continue;
         }
-        let head = line[2..].split(" — ").next().unwrap_or(&line[2..]);
-        let Some((_, after)) = head.rsplit_once('[') else { continue };
-        let Some((_, after_close)) = after.split_once(']') else { continue };
-        let path = after_close.trim_start().split(':').next().unwrap_or("").trim();
-        if !path.is_empty() {
-            oracle_paths.push(path.to_string());
+        if !(path.contains('/') || path.contains('.')) {
+            continue;
         }
+        if path.chars().all(|c| !c.is_lowercase()) {
+            continue;
+        }
+        let path = path.split('[').next().unwrap_or(path).trim().to_string();
+        oracle_paths.push(path);
     }
     assert!(
         !oracle_paths.is_empty(),
@@ -604,6 +626,7 @@ fn repomix_adapter_pin_mismatch_exits_3() {
         .arg(out_dir.path())
         .arg("--compress")
         .env("SCC_REPOMIX_PKG_DIR", fake_pkg.path())
+        .env("SCC_REPOMIX_SRC_DIR", "/nonexistent-scc-bench-repomix")
         .output()
         .expect("adapter runs");
     assert_eq!(out.status.code(), Some(3), "exit 3 = PIN-MISMATCH");
@@ -618,4 +641,85 @@ fn repomix_adapter_pin_mismatch_exits_3() {
         "error names the mismatch: {}",
         payload["error"]
     );
+}
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn repomix_adapter_pin_unverified_exits_4() {
+    // A fake installed repomix reporting the LOCKED version but with NO
+    // provable commit (no gitHead, no pinned checkout): exit 4
+    // PIN-UNVERIFIED — a version-only match is never a passing pin.
+    let py = python3();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let fake_pkg = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fake_pkg.path().join("package.json"),
+        r#"{"name": "repomix", "version": "1.18.0"}"#,
+    )
+    .unwrap();
+    let out = Command::new(&py)
+        .arg(benchmarks_dir().join("external").join("repomix_adapter.py"))
+        .arg(repo_root().join("fixtures").join("cli-service"))
+        .arg("8000")
+        .arg(out_dir.path())
+        .arg("--compress")
+        .env("SCC_REPOMIX_PKG_DIR", fake_pkg.path())
+        .env("SCC_REPOMIX_SRC_DIR", "/nonexistent-scc-bench-repomix")
+        .output()
+        .expect("adapter runs");
+    assert_eq!(out.status.code(), Some(4), "exit 4 = PIN-UNVERIFIED");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("error JSON on stdout");
+    assert_eq!(payload["ok"], false);
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("PIN-UNVERIFIED"),
+        "error names the unverified pin: {}",
+        payload["error"]
+    );
+}
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn repomix_adapter_pin_passes_on_githead_match() {
+    // Positive control: an install whose gitHead IS the locked commit
+    // verifies, and the adapter then packs through a fake `repomix`
+    // binary that emits the pinned XML shape — exit 0 with ok:true.
+    let py = python3();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let fake_pkg = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fake_pkg.path().join("package.json"),
+        r#"{"name": "repomix", "version": "1.18.0", "gitHead": "e3b15a406ed78d8a463620a032a059ce911bfc0e"}"#,
+    )
+    .unwrap();
+    let bin_dir = tempfile::TempDir::new().unwrap();
+    let fake_repomix = bin_dir.path().join("repomix");
+    std::fs::write(
+        &fake_repomix,
+        "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nprintf '<repository><file path=\"main.py\">print(1)</file></repository>' > \"$out\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake_repomix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(&py)
+        .arg(benchmarks_dir().join("external").join("repomix_adapter.py"))
+        .arg(repo_root().join("fixtures").join("cli-service"))
+        .arg("8000")
+        .arg(out_dir.path())
+        .arg("--compress")
+        .env("SCC_REPOMIX_PKG_DIR", fake_pkg.path())
+        .env("SCC_REPOMIX_SRC_DIR", "/nonexistent-scc-bench-repomix")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.path().display()))
+        .output()
+        .expect("adapter runs");
+    assert_eq!(out.status.code(), Some(0), "gitHead match packs successfully");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["pinned"], "e3b15a406ed78d8a463620a032a059ce911bfc0e");
+    let artifact = PathBuf::from(payload["artifact"].as_str().unwrap());
+    assert!(artifact.is_file(), "artifact written: {}", artifact.display());
 }

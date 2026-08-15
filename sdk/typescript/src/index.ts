@@ -217,7 +217,8 @@ export class SCC {
 
   /**
    * Compile the Structural Source representation of files: pass `files`
-   * explicitly, or a `goal` to select the lexically matching files.
+   * explicitly, or a `goal` to select the task-matched files via the
+   * PPR->Surface pipeline.
    * `scc context structural` has no JSON mode, so the pack is synthesized
    * from its markdown output.
    */

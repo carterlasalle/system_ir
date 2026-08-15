@@ -5,7 +5,8 @@
 //! - SessionStart: inject startup capsule + verify warnings + checkpoint
 //! - UserPromptSubmit: inject a task pack for repository-changing prompts
 //! - PostToolUse (Edit|Write|MultiEdit|NotebookEdit): incremental refresh
-//! - PreCompact: persist a task checkpoint (docs §126)
+//! - PreCompact: re-inject the fused startup capsule + persist a task
+//!   checkpoint so the architecture survives compaction (docs §126)
 //!
 //! Normal usage requires no slash command.
 
@@ -22,8 +23,9 @@ SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
 "$SCC_BIN" verify --warnings 2>/dev/null
 "$SCC_BIN" checkpoint load --inject 2>/dev/null
 echo ""
-# Wave 2: the FULL System Atlas is the startup architecture injection.
-"$SCC_BIN" atlas 2>/dev/null
+# Wave 14: the fused startup capsule (Atlas + Surface + coverage +
+# omissions) is the startup architecture injection.
+"$SCC_BIN" context startup 2>/dev/null
 "#;
 
 const USER_PROMPT_SUBMIT: &str = r#"#!/usr/bin/env bash
@@ -91,8 +93,8 @@ PYEOF
 "#;
 
 const PRE_COMPACT: &str = r#"#!/usr/bin/env bash
-# SCC PreCompact: re-inject the System Atlas + task checkpoint so the
-# architecture survives compaction (Wave 2 §38).
+# SCC PreCompact: re-inject the fused startup capsule + task checkpoint so
+# the architecture survives compaction (Wave 14 §126).
 SCC_BIN="${SCC_BIN:-scc}"
 command -v "$SCC_BIN" >/dev/null 2>&1 || exit 0
 SCC_STATE="$("$SCC_BIN" state-path 2>/dev/null)" || exit 0
@@ -110,10 +112,10 @@ try:
     checkpoint = run(["checkpoint", "load", "--inject"], 10)
     if not checkpoint.strip():
         checkpoint = save if save.strip() else "SCC checkpoint unavailable at compaction time."
-    atlas = run(["atlas"])
-    if not atlas.strip():
-        atlas = "SCC atlas unavailable at compaction time."
-    content = "SYSTEM ATLAS (re-injected after compaction)\n\n" + atlas
+    startup = run(["context", "startup"])
+    if not startup.strip():
+        startup = "SCC startup capsule unavailable at compaction time."
+    content = "SCC CONTEXT (re-injected after compaction)\n\n" + startup
     if checkpoint.strip():
         content += "\n\nTASK CHECKPOINT\n\n" + checkpoint
 except Exception:
@@ -198,6 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // trace:exempt reason=unit-test
     fn scripts_are_valid_bash() {
         for (_, _, content) in [
             ("", "", SESSION_START),
@@ -208,6 +211,27 @@ mod tests {
             assert!(content.starts_with("#!/usr/bin/env bash"));
             assert!(content.contains("scc"));
         }
+        // Wave 14: the startup capsule (Atlas + Surface + coverage +
+        // omissions) is the architecture injection — never Atlas-only.
+        assert!(
+            SESSION_START.contains("context startup"),
+            "SessionStart must run the fused startup capsule: {SESSION_START}"
+        );
+        assert!(
+            PRE_COMPACT.contains("\"context\", \"startup\""),
+            "PreCompact must run the fused startup capsule: {PRE_COMPACT}"
+        );
+        for script in [SESSION_START, PRE_COMPACT] {
+            assert!(
+                !script.contains("$SCC_BIN\" atlas") && !script.contains("run([\"atlas\"])"),
+                "no Atlas-only injection: {script}"
+            );
+        }
+        assert!(SESSION_START.contains("context startup 2>/dev/null"));
+        assert!(
+            PRE_COMPACT.contains("SCC CONTEXT (re-injected after compaction)"),
+            "rehydration header must name the fused capsule"
+        );
     }
 
     #[test]

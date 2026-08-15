@@ -1,15 +1,18 @@
-//! Token-budget selection over ranked context candidates (Wave 14B).
+//! Token-budget selection over ranked context candidates (Wave 14B/15.1).
 //!
-//! Three deterministic, no-panic selectors:
+//! Four deterministic, no-panic selectors:
 //! - [`select_with_budget`]: greedy value/token knapsack over
-//!   [`ContextItem`]s; required items are always kept.
+//!   [`ContextItem`]s with a soft budget + hard maximum; required items
+//!   are always kept (the caller compresses them when they alone exceed
+//!   the hard max).
+//! - [`select_in_order`]: the `optimizer`-off variant — rank-order cut,
+//!   no value/token reordering.
 //! - [`mmr_diversify`]: Maximal Marginal Relevance — penalizes candidates
 //!   similar to already-selected ones so one component/owner group cannot
 //!   crowd out the rest.
-//! - [`enforce_quotas`]: the spec's global surface budget (30% public/
-//!   entrypoint, 25% core impl, 15% types/interfaces, 10% state owners,
-//!   10% contract APIs, 10% flow-critical) as per-kind caps over a ranked
-//!   list, preserving rank order.
+//! - [`enforce_quotas`]: TOKEN-aware per-kind caps (fraction × available
+//!   tokens, adapted to the pool's running average token cost) over a
+//!   ranked list, preserving rank order.
 
 use scc_core::ContextItem;
 use std::collections::HashMap;
@@ -19,8 +22,15 @@ use std::collections::HashMap;
 /// required context is never silently cut); the remaining budget is filled
 /// greedily by value/token, highest first. Deterministic: ties break on
 /// index order.
-// trace:v1 id=impl.scc.selector work=WORK-SCC-014 satisfies=REQ-SCC-IR
-pub fn select_with_budget(items: &[ContextItem], budget: usize) -> Vec<usize> {
+///
+/// `hard_max` is the absolute token ceiling (soft target + 20% by default):
+/// required items may push the total over `budget` but the caller
+/// structurally compresses them when they alone exceed `hard_max` (the
+/// item costs then already reflect the compressed render); pool items are
+/// only added while the total stays within both the soft budget and the
+/// hard maximum.
+// trace:v1 id=impl.scc.selector work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub fn select_with_budget(items: &[ContextItem], budget: usize, hard_max: usize) -> Vec<usize> {
     let mut selected: Vec<usize> = Vec::new();
     let mut spent: usize = 0;
     for (i, item) in items.iter().enumerate() {
@@ -39,9 +49,34 @@ pub fn select_with_budget(items: &[ContextItem], budget: usize) -> Vec<usize> {
     });
     for i in rest {
         let cost = items[i].token_cost;
-        if spent.saturating_add(cost) <= budget {
+        let next = spent.saturating_add(cost);
+        if next <= budget && next <= hard_max {
             selected.push(i);
-            spent += cost;
+            spent = next;
+        }
+    }
+    selected
+}
+
+/// Budget selection in list order (the `optimizer`-off ablation of
+/// [`select_with_budget`]): walk items in importance order, keep required
+/// items unconditionally, and accept pool items while the total token
+/// spend stays within both the soft `budget` and the `hard_max` ceiling.
+/// No value/token reordering — a candidate's rank order decides.
+// trace:v1 id=impl.scc.selector.select-in-order work=WORK-SCC-015 satisfies=REQ-SCC-IR
+pub fn select_in_order(items: &[ContextItem], budget: usize, hard_max: usize) -> Vec<usize> {
+    let mut selected: Vec<usize> = Vec::new();
+    let mut spent: usize = 0;
+    for (i, item) in items.iter().enumerate() {
+        if item.required {
+            selected.push(i);
+            spent = spent.saturating_add(item.token_cost);
+            continue;
+        }
+        let next = spent.saturating_add(item.token_cost);
+        if next <= budget && next <= hard_max {
+            selected.push(i);
+            spent = next;
         }
     }
     selected
@@ -104,35 +139,48 @@ pub fn mmr_diversify_default(
     mmr_diversify(ranked, similarity, 0.5, budget)
 }
 
-/// Enforce per-kind quotas over a ranked list, preserving rank order: a
-/// candidate is kept only while its kind has quota left. `quotas` maps a
-/// kind to its share of the ranked length (clamped to [0, 1], applied via
-/// rounding); kinds without a quota entry are uncapped. This implements the
-/// spec's global surface budget — 30% public/entrypoint, 25% core impl,
-/// 15% types/interfaces, 10% state owners, 10% contract APIs, 10%
-/// flow-critical (quota keys `public`, `core`, `types`, `state`,
-/// `contract`, `flow`).
+/// Enforce per-kind quotas over a ranked list, preserving rank order —
+/// TOKEN-aware (reviewer item 6): each kind's cap is a token budget
+/// `fraction * available_tokens`; a candidate is accepted only while
+/// accepting it would not push its kind's accumulated spend over that
+/// cap. Because the cap is a token budget applied over actual per-
+/// candidate costs, the effective entry allowance adapts to the selected
+/// pool's running average token cost (expensive candidates exhaust a
+/// kind's allocation faster, cheap ones admit more entries). A candidate
+/// that would exceed its group cap is skipped — the next candidate of
+/// another group takes its place, so the remaining groups rebalance.
+///
+/// This implements the spec's global surface budget — 30% public/
+/// entrypoint, 25% core impl, 15% types/interfaces, 10% state owners,
+/// 10% contract APIs, 10% flow-critical (quota keys `public`, `core`,
+/// `types`, `state`, `contract`, `flow`) — scaled to the tokens actually
+/// available to the pool (`available_tokens` = budget minus required
+/// spend; required entries are partitioned out before this stage and may
+/// exceed their group allocation).
 // trace:exempt reason=internal-detail
 pub fn enforce_quotas(
     ranked: &[(String, f64)],
     kind_of: impl Fn(&str) -> &str,
     quotas: &[(String, f64)],
+    available_tokens: usize,
+    token_cost: impl Fn(&str) -> usize,
 ) -> Vec<String> {
-    let n = ranked.len();
     let mut caps: HashMap<&str, usize> = HashMap::new();
     for (kind, frac) in quotas {
-        caps.insert(kind.as_str(), (frac.clamp(0.0, 1.0) * n as f64).round() as usize);
+        let cap = (frac.clamp(0.0, 1.0) * available_tokens as f64).round() as usize;
+        caps.insert(kind.as_str(), cap);
     }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut spent: HashMap<&str, usize> = HashMap::new();
     let mut out: Vec<String> = Vec::new();
     for (id, _) in ranked {
         let k = kind_of(id);
         let take = match caps.get(k) {
             None => true,
             Some(&cap) => {
-                let cnt = counts.entry(k).or_insert(0);
-                if *cnt < cap {
-                    *cnt += 1;
+                let s = spent.entry(k).or_insert(0);
+                let next = s.saturating_add(token_cost(id));
+                if next <= cap {
+                    *s = next;
                     true
                 } else {
                     false
@@ -173,27 +221,58 @@ mod tests {
             item("low", 0.1, 50, false),
         ];
         // Budget 170: required (120) + highest value/token (high, 50).
-        let sel = select_with_budget(&items, 170);
+        let sel = select_with_budget(&items, 170, 204);
         assert_eq!(sel, vec![0, 1]);
         // Mid/low are dropped; required is present.
         assert!(sel.contains(&0));
         assert!(!sel.contains(&2) && !sel.contains(&3));
 
         // Budget exhausted by required alone: still never drops required.
-        let sel = select_with_budget(&items, 50);
+        let sel = select_with_budget(&items, 50, 204);
         assert_eq!(sel, vec![0]);
 
         // Budget 0: only required.
-        let sel = select_with_budget(&items, 0);
+        let sel = select_with_budget(&items, 0, 204);
         assert_eq!(sel, vec![0]);
 
         // Empty input.
-        assert!(select_with_budget(&[], 100).is_empty());
+        assert!(select_with_budget(&[], 100, 100).is_empty());
 
         // No required: pure value/token greedy.
         let no_req = vec![item("a", 0.1, 100, false), item("b", 0.9, 10, false)];
-        let sel = select_with_budget(&no_req, 100);
+        let sel = select_with_budget(&no_req, 100, 100);
         assert_eq!(sel, vec![1]);
+
+        // Hard max never drops required — a ceiling below the required
+        // spend still selects it (the caller compresses the render
+        // instead); pool items must fit the soft budget AND the hard max.
+        let sel = select_with_budget(&items, 50, 60);
+        assert_eq!(sel, vec![0]);
+        let sel = select_with_budget(&items, 10, 5);
+        assert_eq!(sel, vec![0]);
+    }
+
+    // ---- optimizer-off: rank-order selection ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn select_in_order_keeps_rank_order() {
+        let items = vec![
+            item("required", 0.1, 120, true),
+            item("high", 0.9, 50, false),
+            item("mid", 0.5, 50, false),
+            item("low", 0.1, 50, false),
+        ];
+        // Rank-order cut: required first, then items in list order while
+        // the total fits — no value/token reordering.
+        let sel = select_in_order(&items, 170, 204);
+        assert_eq!(sel, vec![0, 1]);
+        // One token less: required alone; mid/low are cut by budget.
+        let sel = select_in_order(&items, 169, 204);
+        assert_eq!(sel, vec![0]);
+        // Required is never dropped, even at a zero budget.
+        let sel = select_in_order(&items, 0, 204);
+        assert_eq!(sel, vec![0]);
     }
 
     // ---- (e) MMR diversity: same-owner DTOs are capped ----
@@ -248,85 +327,77 @@ mod tests {
         assert!(mmr_diversify_default(&ranked, distinct, 0).is_empty());
     }
 
-    // ---- (f) quota enforcement keeps type balance ----
+    // ---- (f) token-aware quota enforcement ----
 
     #[test]
 // trace:exempt reason=internal-detail
-    fn quotas_keep_type_balance() {
-        // 60 ranked items; counts per kind deliberately over-represent the
-        // first three kinds.
+    fn quotas_are_token_aware() {
+        // One kind dominates the candidate pool (100 of 140 candidates);
+        // caps derive from available TOKENS, not candidate counts.
         let mut ranked: Vec<(String, f64)> = Vec::new();
-        for i in 0..25 {
-            ranked.push((format!("pub:{i}"), 1.0 - i as f64 / 100.0));
+        for i in 0..100 {
+            ranked.push((format!("pub:{i}"), 1.0 - i as f64 / 200.0));
         }
         for i in 0..20 {
-            ranked.push((format!("core:{i}"), 1.0 - i as f64 / 100.0));
+            ranked.push((format!("core:{i}"), 1.0 - i as f64 / 200.0));
         }
-        for i in 0..12 {
-            ranked.push((format!("types:{i}"), 1.0 - i as f64 / 100.0));
+        for i in 0..20 {
+            ranked.push((format!("types:{i}"), 1.0 - i as f64 / 200.0));
         }
-        for i in 0..4 {
-            ranked.push((format!("state:{i}"), 1.0 - i as f64 / 100.0));
-        }
-        for i in 0..4 {
-            ranked.push((format!("contract:{i}"), 1.0 - i as f64 / 100.0));
-        }
-        for i in 0..4 {
-            ranked.push((format!("flow:{i}"), 1.0 - i as f64 / 100.0));
-        }
-        assert_eq!(ranked.len(), 69);
 
         fn kind_of(id: &str) -> &str {
             if id.starts_with("pub:") {
                 "public"
             } else if id.starts_with("core:") {
                 "core"
-            } else if id.starts_with("types:") {
-                "types"
-            } else if id.starts_with("state:") {
-                "state"
-            } else if id.starts_with("contract:") {
-                "contract"
-            } else if id.starts_with("flow:") {
-                "flow"
             } else {
-                "other"
+                "types"
             }
         }
         fn other_kind(_: &str) -> &str {
             "other"
         }
         let quotas = vec![
-            ("public".to_string(), 0.30),
+            ("public".to_string(), 0.50),
             ("core".to_string(), 0.25),
-            ("types".to_string(), 0.15),
-            ("state".to_string(), 0.10),
-            ("contract".to_string(), 0.10),
-            ("flow".to_string(), 0.10),
+            ("types".to_string(), 0.25),
         ];
-        let sel = enforce_quotas(&ranked, kind_of, &quotas);
+        // 1400 tokens available: caps 700/350/350. At 10 tokens each the
+        // dominant kind is capped at 70 entries (not its 100-candidate
+        // count share); the under-represented kinds keep all 20 entries.
+        let cost10 = |_: &str| 10usize;
+        let sel = enforce_quotas(&ranked, kind_of, &quotas, 1400, cost10);
         let count = |k: &str| sel.iter().filter(|id| kind_of(id.as_str()) == k).count();
-        // Caps: 30%·69≈20.7→21, 25%·69≈17.3→17, 15%·69≈10.4→10,
-        // 10%·69≈6.9→7 each; under-represented kinds keep their counts.
-        assert_eq!(count("public"), 21);
-        assert_eq!(count("core"), 17);
-        assert_eq!(count("types"), 10);
-        assert_eq!(count("state"), 4);
-        assert_eq!(count("contract"), 4);
-        assert_eq!(count("flow"), 4);
-        assert_eq!(sel.len(), 60);
-
-        // Rank order is preserved: the first accepted public item is the
-        // first public item in the ranked list.
+        assert_eq!(count("public"), 70);
+        assert_eq!(count("core"), 20);
+        assert_eq!(count("types"), 20);
+        // Rank order is preserved: the first accepted per kind is the
+        // first candidate of that kind in the ranked list.
         assert_eq!(sel[0], "pub:0");
-        assert_eq!(sel[17], "pub:17");
-        assert_eq!(sel[21], "core:0");
+        assert_eq!(sel[70], "core:0");
 
-        // Kinds without a quota are uncapped.
+        // Expensive candidates exhaust a kind's allocation faster: at 50
+        // tokens each the public cap (700) admits 14 entries, not 70.
+        let cost50 = |_: &str| 50usize;
+        let sel50 = enforce_quotas(&ranked, kind_of, &quotas, 1400, cost50);
+        assert_eq!(
+            sel50.iter().filter(|id| kind_of(id.as_str()) == "public").count(),
+            14
+        );
+
+        // A capped-out dominant kind rebalances to the next group: the
+        // first core candidate follows the last accepted public one.
+        let sel = enforce_quotas(&ranked, kind_of, &quotas, 1400, cost10);
+        let core_first = sel.iter().position(|id| kind_of(id.as_str()) == "core").unwrap();
+        assert_eq!(sel[core_first], "core:0");
+
+        // Kinds without a quota entry are uncapped.
         let sel_other = enforce_quotas(
             &[("x".to_string(), 0.5), ("y".to_string(), 0.5)],
             other_kind,
             &[],
+            100,
+            |_: &str| 10,
         );
         assert_eq!(sel_other.len(), 2);
     }
