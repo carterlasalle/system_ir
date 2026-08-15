@@ -17,6 +17,7 @@ pub struct PythonExtractor {
     language: tree_sitter::Language,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for PythonExtractor {
     fn default() -> Self {
         PythonExtractor {
@@ -25,6 +26,7 @@ impl Default for PythonExtractor {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl LanguageExtractor for PythonExtractor {
     fn language(&self) -> &'static str {
         "python"
@@ -499,6 +501,7 @@ struct Scope {
 }
 
 #[derive(Default)]
+// trace:exempt reason=internal-detail
 struct Ctx {
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
@@ -535,12 +538,14 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn has_framework(&self, root: &str) -> bool {
         self.imported_modules.contains(root)
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().map(|s| s.name.clone())
@@ -551,6 +556,7 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
+// trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
@@ -611,6 +617,7 @@ impl Ctx {
                 name: self.module_name.clone(),
                 kind: SymbolKind::Module,
                 signature: None,
+                decl_header: None,
                 start_line: 1,
                 end_line: 1,
                 exported: false,
@@ -777,6 +784,7 @@ fn fact_sort_key(f: &SemanticFact) -> (String, String, String) {
 // Walker
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 impl PythonExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
@@ -823,6 +831,7 @@ impl PythonExtractor {
         }
     }
 
+// trace:exempt reason=internal-detail
     fn walk_function(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         let in_class = ctx.top_is_class();
@@ -837,10 +846,12 @@ impl PythonExtractor {
         let end_line = node.end_position().row as u32 + 1;
         let doc = first_docstring(node.child_by_field_name("body"), src);
         let sig = signature(&name, node, src, in_class);
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: sym_name.clone(),
             kind,
             signature: Some(sig),
+            decl_header: header,
             start_line,
             end_line,
             exported,
@@ -890,16 +901,19 @@ impl PythonExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_class(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         let exported = ctx.scopes.is_empty();
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
         let doc = first_docstring(node.child_by_field_name("body"), src);
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: name.clone(),
             kind: SymbolKind::Class,
             signature: None,
+            decl_header: header,
             start_line,
             end_line,
             exported,
@@ -1907,6 +1921,40 @@ fn attribute_segments(mut node: Node, out: &mut Vec<String>, src: &[u8]) {
         }
     }
     out.extend(stack.into_iter().rev());
+}
+
+// trace:exempt reason=internal-detail
+/// Body / comment node kinds excluded from the declaration-header span.
+// trace:exempt reason=internal-detail
+fn is_body_kind(kind: &str) -> bool {
+    matches!(kind, "block" | "comment" | "line_comment" | "multiline_comment")
+}
+
+// trace:exempt reason=internal-detail
+/// Exact declaration header as written: the source byte span from the
+/// declaration keyword (`def` / `async def` / `class`) through the furthest
+/// header-bearing child (return annotation, parameter list, superclass
+/// clause, name), excluding the body. Multi-line preserved.
+// trace:exempt reason=internal-detail
+fn decl_header(node: Node, src: &[u8]) -> Option<String> {
+    let mut end = node.start_byte();
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        if is_body_kind(c.kind()) {
+            continue;
+        }
+        end = end.max(c.end_byte());
+    }
+    if end <= node.start_byte() {
+        return None;
+    }
+    let h = std::str::from_utf8(&src[node.start_byte()..end]).ok()?;
+    let h = h.trim_end();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_string())
+    }
 }
 
 fn signature(name: &str, fn_node: Node, src: &[u8], is_method: bool) -> String {
@@ -3291,5 +3339,63 @@ mod tests {
             "no schema/reactive facts: {:?}",
             ef.facts
         );
+    }
+
+    // trace:v1 id=test.scc.extract.python.decl-header verifies=REQ-SCC-IR exercises=impl.scc.extract.python
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_is_exact_source_span() {
+        let ef = extract(
+            r#"from typing import List, Optional
+
+
+async def fetch_all(
+    endpoint: str,
+    limit: int = 20,
+    retries: Optional[int] = None,
+) -> List[dict]:
+    return []
+
+
+class QueryBuilder:
+    def build(
+        self,
+        fields: List[str],
+        where: Optional[str] = None,
+        order_by: str = "id",
+    ) -> "QueryBuilder":
+        return self
+"#,
+        );
+        let f = find_symbol(&ef, "fetch_all");
+        assert_eq!(
+            f.decl_header.as_deref(),
+            Some(
+                "async def fetch_all(\n\
+                 \x20   endpoint: str,\n\
+                 \x20   limit: int = 20,\n\
+                 \x20   retries: Optional[int] = None,\n\
+                 ) -> List[dict]"
+            )
+        );
+        // The lossy signature collapses to one line and drops `async`.
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("def fetch_all(endpoint: str, limit: int = 20, retries: Optional[int] = None) -> List[dict]")
+        );
+        let m = find_symbol(&ef, "QueryBuilder.build");
+        assert_eq!(
+            m.decl_header.as_deref(),
+            Some(
+                "def build(\n\
+                 \x20       self,\n\
+                 \x20       fields: List[str],\n\
+                 \x20       where: Optional[str] = None,\n\
+                 \x20       order_by: str = \"id\",\n\
+                 \x20   ) -> \"QueryBuilder\""
+            )
+        );
+        let c = find_symbol(&ef, "QueryBuilder");
+        assert_eq!(c.decl_header.as_deref(), Some("class QueryBuilder"));
     }
 }

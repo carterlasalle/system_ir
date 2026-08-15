@@ -19,6 +19,7 @@ pub struct GoExtractor {
     language: tree_sitter::Language,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for GoExtractor {
     fn default() -> Self {
         GoExtractor {
@@ -27,6 +28,7 @@ impl Default for GoExtractor {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl LanguageExtractor for GoExtractor {
     fn language(&self) -> &'static str {
         "go"
@@ -440,6 +442,7 @@ fn call_returns_value(node: tree_sitter::Node) -> bool {
 
 /// Enclosing symbol names; the last entry is the current caller.
 #[derive(Default)]
+// trace:exempt reason=internal-detail
 struct Ctx {
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
@@ -466,6 +469,7 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().cloned()
@@ -495,6 +499,7 @@ impl Ctx {
             .and_then(|i| i.names.first())
             .map(|(n, _)| n.as_str())
     }
+// trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
@@ -552,6 +557,7 @@ impl Ctx {
                 name: self.module_name.clone(),
                 kind: SymbolKind::Module,
                 signature: None,
+                decl_header: None,
                 start_line: 1,
                 end_line: 1,
                 exported: false,
@@ -576,6 +582,7 @@ impl Ctx {
 // Walker
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 impl GoExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
@@ -606,6 +613,7 @@ impl GoExtractor {
         }
     }
 
+// trace:exempt reason=internal-detail
     fn walk_function(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -614,10 +622,12 @@ impl GoExtractor {
         }
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: name.clone(),
             kind: SymbolKind::Function,
             signature: Some(signature(&name, node, src)),
+            decl_header: header,
             start_line,
             end_line,
             exported: is_exported(&name),
@@ -652,6 +662,7 @@ impl GoExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_method(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -665,10 +676,12 @@ impl GoExtractor {
         };
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: sym_name.clone(),
             kind: SymbolKind::Method,
             signature: Some(signature(&name, node, src)),
+            decl_header: header,
             start_line,
             end_line,
             exported: is_exported(&name),
@@ -704,6 +717,7 @@ impl GoExtractor {
     }
 
     /// `type_declaration` → one `type` symbol per `type_spec`.
+// trace:exempt reason=internal-detail
     fn walk_type_decl(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let mut specs: Vec<Node> = Vec::new();
         let mut cursor = node.walk();
@@ -726,10 +740,12 @@ impl GoExtractor {
             if name.is_empty() {
                 continue;
             }
+            let header = type_decl_header(node, spec, src);
             ctx.symbols.push(Symbol {
                 name: name.clone(),
                 kind: SymbolKind::Type,
                 signature: None,
+                decl_header: header,
                 start_line: spec.start_position().row as u32 + 1,
                 end_line: spec.end_position().row as u32 + 1,
                 exported: is_exported(&name),
@@ -825,6 +841,7 @@ impl GoExtractor {
     }
 
     /// `const_declaration` / `var_declaration` → one symbol per spec.
+// trace:exempt reason=internal-detail
     fn walk_value_decl(
         &self,
         node: Node,
@@ -875,6 +892,7 @@ impl GoExtractor {
                     name: name.clone(),
                     kind,
                     signature: None,
+                    decl_header: None,
                     start_line: spec.start_position().row as u32 + 1,
                     end_line: spec.end_position().row as u32 + 1,
                     exported: is_exported(&name),
@@ -1889,6 +1907,74 @@ fn attribute_segments(mut node: Node, out: &mut Vec<String>, src: &[u8]) {
     out.extend(stack.into_iter().rev());
 }
 
+// trace:exempt reason=internal-detail
+/// Body / comment node kinds excluded from the declaration-header span.
+// trace:exempt reason=internal-detail
+fn is_body_kind(kind: &str) -> bool {
+    matches!(kind, "block" | "comment" | "line_comment" | "multiline_comment")
+}
+
+// trace:exempt reason=internal-detail
+/// Exact declaration header as written: the source byte span from the
+/// `func` keyword through the furthest header-bearing child (result
+/// clause, parameter list), excluding the body. Multi-line preserved; the
+/// receiver is included verbatim.
+// trace:exempt reason=internal-detail
+fn decl_header(node: Node, src: &[u8]) -> Option<String> {
+    let mut end = node.start_byte();
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        if is_body_kind(c.kind()) {
+            continue;
+        }
+        end = end.max(c.end_byte());
+    }
+    if end <= node.start_byte() {
+        return None;
+    }
+    let h = std::str::from_utf8(&src[node.start_byte()..end]).ok()?;
+    let h = h.trim_end();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_string())
+    }
+}
+
+// trace:exempt reason=internal-detail
+/// Length of the first whitespace-delimited word of `s` (byte length).
+// trace:exempt reason=internal-detail
+fn first_word_len(s: &str) -> usize {
+    s.find(char::is_whitespace).unwrap_or(s.len())
+}
+
+// trace:exempt reason=internal-detail
+/// Exact declaration header of a Go type declaration as written: from the
+/// `type` keyword through the type keyword (`struct` / `interface`), e.g.
+/// `type Incident struct`. Only struct/interface types are captured (the
+/// class/interface analogs); plain aliases get `None`.
+// trace:exempt reason=internal-detail
+fn type_decl_header(decl: Node, spec: Node, src: &[u8]) -> Option<String> {
+    let ty = spec.child_by_field_name("type")?;
+    if !matches!(ty.kind(), "struct_type" | "interface_type") {
+        return None;
+    }
+    let start = decl.start_byte();
+    let ty_text = node_text(Some(ty), src);
+    let kw_len = first_word_len(ty_text);
+    let end = ty.start_byte() + kw_len;
+    if end <= start {
+        return None;
+    }
+    let h = std::str::from_utf8(&src[start..end]).ok()?;
+    let h = h.trim_end();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_string())
+    }
+}
+
 /// One-line signature: `func name(args) result`.
 fn signature(name: &str, fn_node: Node, src: &[u8]) -> String {
     let mut sig = format!("func {name}(");
@@ -2661,6 +2747,40 @@ mod tests {
             regs(&ef3).iter().any(|(_, k, t)| k == "plugin" && t == "widgets.so"),
             "plugin.Open missing: {:?}",
             regs(&ef3)
+        );
+    }
+
+    // trace:v1 id=test.scc.extract.go.decl-header verifies=REQ-SCC-IR exercises=impl.scc.extract.go
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_is_exact_source_span() {
+        let ef = extract(
+            "package surface\n\ntype Incident struct {\n\tID string `json:\"id\"`\n}\n\ntype Notifier interface {\n\tNotify(message string) error\n}\n\nfunc (r *Reporter) Summarize(\n\tincidents []*Incident,\n\tlimit int,\n) ([]string, error) {\n\treturn nil, nil\n}\n\nfunc (r *Reporter) Merge(values ...string) string {\n\treturn \"\"\n}\n",
+        );
+        let inc = find_symbol(&ef, "Incident");
+        assert_eq!(inc.decl_header.as_deref(), Some("type Incident struct"));
+        let n = find_symbol(&ef, "Notifier");
+        assert_eq!(n.decl_header.as_deref(), Some("type Notifier interface"));
+        // Receiver, multi-return, and line breaks preserved verbatim.
+        let m = find_symbol(&ef, "Reporter.Summarize");
+        assert_eq!(
+            m.decl_header.as_deref(),
+            Some(
+                "func (r *Reporter) Summarize(\n\
+                 \x09incidents []*Incident,\n\
+                 \x09limit int,\n\
+                 ) ([]string, error)"
+            )
+        );
+        // The lossy signature drops the receiver.
+        assert_eq!(
+            m.signature.as_deref(),
+            Some("func Summarize(incidents []*Incident, limit int) ([]string, error)")
+        );
+        let v = find_symbol(&ef, "Reporter.Merge");
+        assert_eq!(
+            v.decl_header.as_deref(),
+            Some("func (r *Reporter) Merge(values ...string) string")
         );
     }
 }

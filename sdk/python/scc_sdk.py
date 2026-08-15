@@ -12,11 +12,14 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional
 
+# trace:v1 id=impl.scc.sdk.python work=WORK-SCC-014 satisfies=REQ-SCC-IR
+
 
 class SCCError(Exception):
     """Raised when the ``scc`` CLI exits with a non-zero status."""
 
 
+# trace:exempt reason=internal-detail  # thin CLI subprocess wrapper, not repo behavior
 class SCC:
     """Client for the ``scc`` CLI (thin subprocess wrapper)."""
 
@@ -105,6 +108,90 @@ class SCC:
             "warnings": [],
             "tokens": 0,
             "budget": 0,
+            "truncated": False,
+        }
+
+    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    def contextStartup(self, budget: Optional[int] = None) -> Dict[str, Any]:
+        """Compile the fused session-startup artifact (Atlas + Surface +
+        coverage + omissions).
+
+        ``scc context startup`` has no JSON mode, so the pack is synthesized
+        from its markdown output.
+        """
+        args = ["context", "startup"]
+        if budget is not None:
+            args.extend(["--budget", str(budget)])
+        proc = self._run(args)
+        return {
+            "kind": "startup",
+            "repository_revision": "",
+            "content": proc.stdout,
+            "entity_ids": [],
+            "evidence_summary": {},
+            "warnings": [],
+            "tokens": 0,
+            "budget": budget or 0,
+            "truncated": False,
+        }
+
+    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    def surfaceMap(
+        self, goal: Optional[str] = None, budget: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Compile the System Surface Map, global or task-personalized.
+
+        ``scc surface`` has no JSON mode, so the pack is synthesized from
+        its markdown output.
+        """
+        args = ["surface"]
+        if goal:
+            args.extend(["--task", goal])
+        if budget is not None:
+            args.extend(["--budget", str(budget)])
+        proc = self._run(args)
+        return {
+            "kind": "surface",
+            "repository_revision": "",
+            "content": proc.stdout,
+            "entity_ids": [],
+            "evidence_summary": {},
+            "warnings": [],
+            "tokens": 0,
+            "budget": budget or 0,
+            "truncated": False,
+        }
+
+    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    def structuralSource(
+        self,
+        files: Optional[List[str]] = None,
+        goal: Optional[str] = None,
+        budget: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Compile the Structural Source representation of files (explicit
+        ``files`` or the files lexically matched to a ``goal``).
+
+        ``scc context structural`` has no JSON mode, so the pack is
+        synthesized from its markdown output.
+        """
+        args = ["context", "structural"]
+        if files:
+            args.extend(["--files", " ".join(files)])
+        if goal:
+            args.extend(["--task", goal])
+        if budget is not None:
+            args.extend(["--budget", str(budget)])
+        proc = self._run(args)
+        return {
+            "kind": "structural",
+            "repository_revision": "",
+            "content": proc.stdout,
+            "entity_ids": [],
+            "evidence_summary": {},
+            "warnings": [],
+            "tokens": 0,
+            "budget": budget or 0,
             "truncated": False,
         }
 

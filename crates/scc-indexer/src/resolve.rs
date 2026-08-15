@@ -56,6 +56,7 @@ pub struct ResolvedImport {
 }
 
 /// All files' symbols keyed by repo-relative path.
+// trace:exempt reason=internal-detail
 pub struct SymbolIndex {
     pub files: HashMap<String, FileSymbols>,
     /// All internal file paths (for module resolution).
@@ -199,6 +200,7 @@ fn normalize_module_path(p: &str) -> String {
 
 /// Resolve all calls in one file against the full symbol index.
 /// `self_caller` maps `self`/`this` calls to the enclosing class.
+// trace:v1 id=impl.scc.resolve work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn resolve_calls(
     path: &str,
     calls: &[Call],
@@ -470,11 +472,13 @@ mod tests {
     use super::*;
     use crate::model::{Import, ImportType};
 
+// trace:exempt reason=internal-detail
     fn mk_symbol(name: &str, kind: SymbolKind) -> Symbol {
         Symbol {
             name: name.into(),
             kind,
             signature: None,
+            decl_header: None,
             start_line: 1,
             end_line: 2,
             exported: true,

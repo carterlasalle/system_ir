@@ -1,0 +1,170 @@
+## File: cli.py
+
+"""cli-service: demo CLI with two subcommands, flags, and store writes."""
+⋮----
+def build_parser()
+⋮----
+"""Construct the argparse CLI surface."""
+parser = argparse.ArgumentParser(prog="cli-service")
+⋮----
+sub = parser.add_subparsers(dest="command")
+serve = sub.add_parser("serve", help="serve requests")
+⋮----
+deploy = sub.add_parser("deploy", help="deploy the build")
+⋮----
+def serve(args)
+⋮----
+"""Serve requests; records each invocation."""
+conn = sqlite3.connect("cli.db")
+⋮----
+def deploy(args)
+⋮----
+"""Deploy the build; persists the deployment."""
+session = Session()
+⋮----
+def main()
+⋮----
+"""Entrypoint: parse and dispatch."""
+args = build_parser().parse_args()
+
+
+## File: cli.rs
+
+//! cli-service: demo CLI with two subcommands, flags, and store writes.
+use axum::Router;
+⋮----
+/// Re-exported type for the public API surface.
+pub use std::time::Duration;
+⋮----
+pub use std::time::Duration;
+⋮----
+/// Greet a user by name.
+pub fn greet(name: &str) -> String {
+⋮----
+pub fn greet(name: &str) -> String {
+format!("Hello, {name}!")
+⋮----
+/// Server state shared across request handlers.
+#[derive(Clone)]
+pub struct ServerState {
+⋮----
+/// Read the service port from the environment.
+fn service_port() -> String {
+⋮----
+fn service_port() -> String {
+std::env::var("PORT").unwrap_or_else(|_| "8080".to_string())
+⋮----
+/// Build the axum HTTP router.
+pub fn build_router() -> Router {
+⋮----
+pub fn build_router() -> Router {
+⋮----
+.route("/health", get(health))
+.route("/users", get(list_users))
+.layer(tower_http::trace::TraceLayer::new())
+⋮----
+fn health() {}
+⋮----
+fn list_users() {}
+⋮----
+/// cli-service: demo CLI service.
+#[derive(Parser)]
+⋮----
+struct Cli {
+/// Enable paged output.
+    #[arg(long)]
+⋮----
+/// Output format.
+    #[arg(short, long)]
+⋮----
+/// Subcommands of cli-service.
+#[derive(Subcommand)]
+enum Command {
+/// Serve requests.
+    Serve {
+/// Port to listen on.
+        #[arg(long = "port", default_value_t = 8080)]
+⋮----
+/// Deploy the build.
+    Deploy {
+/// Target environment.
+        #[arg(short, long)]
+⋮----
+/// Builder-style CLI (clap builder API, alongside the derive example).
+fn build_cli() -> Command {
+⋮----
+fn build_cli() -> Command {
+⋮----
+.about("demo CLI service")
+.arg(Arg::new("paging").long("paging").help("Enable paged output."))
+.arg(Arg::new("theme").short('t').long("theme").help("Color theme."))
+.arg(Arg::new("FILE"))
+.subcommand(
+⋮----
+.about("Start the service")
+.arg(Arg::new("port").short('p').long("port").default_value("8080")),
+⋮----
+.subcommand(Command::new("stop").about("Stop the service"))
+⋮----
+fn main() {
+⋮----
+Command::Serve { port } => println!("{port}"),
+Command::Deploy { env } => println!("{env}"),
+⋮----
+let _app = build_cli();
+
+
+## File: main.go
+
+// cli-service: demo CLI with two subcommands, flags, and store writes.
+⋮----
+package main
+⋮----
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
+⋮----
+"fmt"
+⋮----
+"github.com/spf13/cobra"
+⋮----
+var rootCmd = &cobra.Command{Use: "cli-service", Short: "demo CLI service"}
+⋮----
+var serveCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "serve requests",
+	Run: func(cmd *cobra.Command, args []string) {
+		port, _ := cmd.Flags().GetInt("port")
+		fmt.Println(port)
+	},
+}
+⋮----
+var deployCmd = &cobra.Command{
+	Use:   "deploy",
+	Short: "deploy the build",
+	Run: func(cmd *cobra.Command, args []string) {
+		env, _ := cmd.Flags().GetString("env")
+		fmt.Println(env)
+	},
+}
+⋮----
+func init()
+⋮----
+func main()
+
+
+## File: package.json
+
+{
+  "name": "cli-service",
+  "version": "1.0.0",
+  "bin": {
+    "cli-service": "bin/cli.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js"
+  }
+}

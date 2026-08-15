@@ -9,10 +9,13 @@
 //! invocation surfaces, callers/callees). Deterministic and no-panic:
 //! unparseable signatures degrade to name-only [`SemanticSignature`]s.
 
+use crate::context_ledger::novelty_penalty;
+use crate::rank::{term_match, terms};
 use crate::ContextCompiler;
 use scc_core::{
-    estimate_tokens, kinds, predicates, Provenance, SemanticParameter, SemanticSignature,
-    SourceRange, SurfaceEntry, SurfaceKind, SurfaceRank, SystemSurfaceMap, Visibility,
+    estimate_tokens, kinds, predicates, ContextItem, ContextLedger, Provenance,
+    SemanticParameter, SemanticSignature, SourceRange, SurfaceEntry, SurfaceKind,
+    SurfaceOmission, SurfaceRank, SystemSurfaceMap, TaskSeed, Visibility,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,16 +110,37 @@ pub fn compile_surface_map(compiler: &ContextCompiler) -> SystemSurfaceMap {
 // trace:exempt reason=internal-detail
 pub fn render_surface_map(map: &SystemSurfaceMap, budget_tokens: Option<usize>) -> String {
     let budget_chars = budget_tokens.map(|t| t.saturating_mul(4));
+    let (body, omitted) = render_entry_groups(&map.entries, budget_chars);
+    let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
+    out.push_str(&body);
+    if !omitted.is_empty() {
+        out.push('\n');
+        out.push_str("OMITTED (token budget exceeded):\n");
+        for (kind, count) in &omitted {
+            out.push_str(&format!("  {count} lower-ranked {kind} definitions\n"));
+        }
+    }
+    out
+}
 
+/// Render a set of entries grouped by (component, subsystem, path) — the
+/// shared core of [`render_surface_map`] and the budget-selected subset
+/// renderer. Returns the body text plus per-kind counts of entries cut by
+/// the char budget (empty when no budget or nothing was cut).
+// trace:exempt reason=internal-detail
+fn render_entry_groups(
+    entries: &[SurfaceEntry],
+    budget_chars: Option<usize>,
+) -> (String, BTreeMap<String, usize>) {
     let mut groups: BTreeMap<(String, String, String), Vec<&SurfaceEntry>> = BTreeMap::new();
-    for e in &map.entries {
+    for e in entries {
         let comp = e.component.clone().unwrap_or_else(|| "(unattributed)".to_string());
         let sub = e.subsystem.clone().unwrap_or_default();
         groups.entry((comp, sub, e.path.clone())).or_default().push(e);
     }
 
-    let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
-    let mut total_chars = out.chars().count();
+    let mut out = String::new();
+    let mut total_chars = 0usize;
     let mut omitted: BTreeMap<String, usize> = BTreeMap::new();
     let mut cut = false;
 
@@ -148,15 +172,449 @@ pub fn render_surface_map(map: &SystemSurfaceMap, budget_tokens: Option<usize>) 
             total_chars += header.chars().count() + block_chars;
         }
     }
+    (out, omitted)
+}
 
-    if !omitted.is_empty() {
-        out.push('\n');
-        out.push_str("OMITTED (token budget exceeded):\n");
-        for (kind, count) in &omitted {
-            out.push_str(&format!("  {count} lower-ranked {kind} definitions\n"));
+// ---------------------------------------------------------------------------
+// Production selection pipeline (Wave 14F)
+// ---------------------------------------------------------------------------
+
+/// The spec's global surface budget quotas (keys consumed by
+/// `selector::enforce_quotas`): 30% public/entrypoint, 25% core impl, 15%
+/// types/interfaces, 10% state owners, 10% contract APIs, 10% flow-critical.
+// trace:exempt reason=internal-detail
+pub fn surface_quotas() -> Vec<(String, f64)> {
+    vec![
+        ("public".to_string(), 0.30),
+        ("core".to_string(), 0.25),
+        ("types".to_string(), 0.15),
+        ("state".to_string(), 0.10),
+        ("contract".to_string(), 0.10),
+        ("flow".to_string(), 0.10),
+    ]
+}
+
+/// The quota bucket of an entry: public/entrypoint surfaces first, then
+/// architectural meaning (state owners, contract APIs, flow participants),
+/// then types, then core implementation.
+// trace:exempt reason=internal-detail
+fn quota_kind(e: &SurfaceEntry) -> &'static str {
+    if e.exported || e.visibility == Visibility::Public || !e.invocation_surfaces.is_empty() {
+        "public"
+    } else if !e.state_authorities.is_empty() {
+        "state"
+    } else if !e.contracts.is_empty() {
+        "contract"
+    } else if !e.flows.is_empty() {
+        "flow"
+    } else if matches!(
+        e.kind,
+        SurfaceKind::Class
+            | SurfaceKind::Interface
+            | SurfaceKind::Trait
+            | SurfaceKind::Enum
+            | SurfaceKind::Type
+    ) {
+        "types"
+    } else {
+        "core"
+    }
+}
+
+/// Entries the pipeline MUST never omit: critical invocation surfaces
+/// (non-empty `invocation_surfaces`), invariant-enforcing APIs (contracts
+/// containing an invariant name), primary flow entrypoints (entrypoint of a
+/// triggered flow), and state owners of critical (invariant-scoped) state.
+// trace:exempt reason=internal-detail
+fn required_ids(map: &SystemSurfaceMap, compiler: &ContextCompiler) -> BTreeSet<String> {
+    let view = &compiler.view;
+    let mut required: BTreeSet<String> = BTreeSet::new();
+
+    // Invariant names + critical state ids (state entities named in an
+    // invariant's scope are guarded by the invariant → critical).
+    let mut inv_names: Vec<String> = Vec::new();
+    let mut critical_state: BTreeSet<String> = BTreeSet::new();
+    for inv in view.invariants() {
+        let name = inv.id.rsplit('/').next().unwrap_or(&inv.id).to_string();
+        inv_names.push(name);
+        inv_names.push(inv.statement.clone());
+        for scope_id in &inv.scope {
+            if let Some(e) = view.entity(scope_id) {
+                if e.kind == kinds::STATE {
+                    critical_state.insert(scope_id.clone());
+                }
+            }
         }
     }
+    let state_name_to_id: BTreeMap<String, String> = view
+        .entities_of_kind(kinds::STATE)
+        .into_iter()
+        .map(|e| (e.name.clone(), e.id.clone()))
+        .collect();
+
+    // Primary flow entrypoints: entrypoint symbol of a triggered flow
+    // (externally initiated flows are the user-facing entry flows).
+    let mut primary_eps: BTreeSet<String> = BTreeSet::new();
+    for f in view.flows() {
+        let triggered = f.trigger.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+        if triggered {
+            if let Some(ep) = f.attributes.get("entrypoint").and_then(|v| v.as_str()) {
+                primary_eps.insert(ep.to_string());
+            }
+        }
+    }
+
+    for e in &map.entries {
+        let mut req = !e.invocation_surfaces.is_empty();
+        if !req && primary_eps.contains(&e.symbol_id) {
+            req = true;
+        }
+        if !req {
+            req = e.contracts.iter().any(|c| {
+                inv_names
+                    .iter()
+                    .any(|n| !n.is_empty() && c.to_lowercase().contains(&n.to_lowercase()))
+            });
+        }
+        if !req {
+            req = e.state_authorities.iter().any(|auth| {
+                state_name_to_id
+                    .get(auth)
+                    .map(|id| critical_state.contains(id))
+                    .unwrap_or(false)
+            });
+        }
+        if req {
+            required.insert(e.id.clone());
+        }
+    }
+    required
+}
+
+/// Render the selected subset. No budget cut here — the selection already
+/// enforced the budget, and every selected entry must render so
+/// `rendered_ids` matches the text exactly.
+// trace:exempt reason=internal-detail
+fn render_selected(entries: &[SurfaceEntry]) -> String {
+    let (body, _) = render_entry_groups(entries, None);
+    let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
+    out.push_str(&body);
     out
+}
+
+/// Lexical relevance of an entry to the goal terms: name hits count double,
+/// signature hits count single (shared with the task-delta pipeline).
+// trace:exempt reason=internal-detail
+pub(crate) fn entry_lexical(e: &SurfaceEntry, goal_terms: &BTreeSet<String>) -> f64 {
+    if goal_terms.is_empty() {
+        return 0.0;
+    }
+    let name_terms = terms(&e.qualified_name);
+    let sig_terms = terms(&e.source_signature);
+    let name_hits = goal_terms
+        .iter()
+        .filter(|g| name_terms.iter().any(|n| term_match(g, n)))
+        .count();
+    let sig_hits = goal_terms
+        .iter()
+        .filter(|g| sig_terms.iter().any(|n| term_match(g, n)))
+        .count();
+    (name_hits * 2 + sig_hits) as f64
+}
+
+/// The shared pipeline tail (MMR → quotas → budget selection → render) over
+/// ranked candidates. Required entries bypass MMR/quotas (never dropped)
+/// but still pay their token cost in the final budget selection; the
+/// remaining pool is diversified by component/path similarity, balanced by
+/// the spec's per-kind quotas, then cut by the token budget. Returns the
+/// render result with rendered/omitted ids and per-kind omission summaries.
+// trace:exempt reason=internal-detail
+fn finish_selection(
+    map: &SystemSurfaceMap,
+    ranked: Vec<(String, f64)>,
+    required: &BTreeSet<String>,
+    budget: usize,
+) -> scc_core::SurfaceRenderResult {
+    let entry_of: BTreeMap<String, &SurfaceEntry> =
+        map.entries.iter().map(|e| (e.id.clone(), e)).collect();
+
+    // Partition: required entries survive MMR/quotas unconditionally.
+    let mut required_items: Vec<(String, f64)> = Vec::new();
+    let mut pool: Vec<(String, f64)> = Vec::new();
+    for (id, imp) in ranked {
+        if required.contains(&id) {
+            required_items.push((id, imp));
+        } else {
+            pool.push((id, imp));
+        }
+    }
+
+    let required_tokens: usize = required_items
+        .iter()
+        .filter_map(|(id, _)| entry_of.get(id))
+        .map(|e| estimate_tokens(&render_entry(e)))
+        .sum();
+    let pool_tokens: usize = pool
+        .iter()
+        .filter_map(|(id, _)| entry_of.get(id))
+        .map(|e| estimate_tokens(&render_entry(e)))
+        .sum();
+    let avg_pool = if pool.is_empty() {
+        1
+    } else {
+        (pool_tokens / pool.len()).max(1)
+    };
+    // MMR budget: how many average-pool entries the remaining tokens afford
+    // (diversity caps same-component crowding before the exact token cut).
+    let mmr_budget = budget
+        .saturating_sub(required_tokens)
+        .saturating_div(avg_pool)
+        .max(1)
+        .min(pool.len());
+
+    let sim = |a: &str, b: &str| -> f64 {
+        let (Some(ea), Some(eb)) = (entry_of.get(a), entry_of.get(b)) else {
+            return 0.0;
+        };
+        let same_comp = ea.component.is_some() && ea.component == eb.component;
+        let same_path = !ea.path.is_empty() && ea.path == eb.path;
+        if same_comp || same_path {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let pool_by_id: BTreeMap<String, f64> = pool.iter().cloned().collect();
+    let diversified: Vec<(String, f64)> = crate::selector::mmr_diversify(&pool, sim, 0.5, mmr_budget)
+        .into_iter()
+        .filter_map(|id| pool_by_id.get(&id).map(|v| (id.clone(), *v)))
+        .collect();
+
+    // Quotas: the spec's percentages describe the candidate surface, so the
+    // caps derive from the FULL candidate count (enforce_quotas over the
+    // full ranked list) — a tiny post-MMR pool must never zero a kind's cap
+    // (rounding 10% of one candidate to 0 would drop the only state owner).
+    // Required entries consume quota share (they are part of the shown
+    // composition) but are never dropped — the filter only cuts pool
+    // entries whose kind quota is exhausted.
+    let kind_of: BTreeMap<String, &'static str> = map
+        .entries
+        .iter()
+        .map(|e| (e.id.clone(), quota_kind(e)))
+        .collect();
+    let mut full_ranked: Vec<(String, f64)> = Vec::new();
+    full_ranked.extend(required_items.iter().cloned());
+    full_ranked.extend(pool.iter().cloned());
+    let quota_ids = crate::selector::enforce_quotas(
+        &full_ranked,
+        |id| kind_of.get(id).copied().unwrap_or("core"),
+        &surface_quotas(),
+    );
+    let quota_set: BTreeSet<String> = quota_ids.into_iter().collect();
+    let quota_out: Vec<(String, f64)> = diversified
+        .into_iter()
+        .filter(|(id, _)| quota_set.contains(id))
+        .collect();
+
+    // Budget selection: required first (never dropped, even when they alone
+    // exceed the budget), then the quota-balanced pool by value/token.
+    let mut items: Vec<ContextItem> = Vec::new();
+    for (id, imp) in &required_items {
+        let cost = entry_of
+            .get(id)
+            .map(|e| estimate_tokens(&render_entry(e)))
+            .unwrap_or(1);
+        items.push(ContextItem {
+            id: id.clone(),
+            value: *imp,
+            token_cost: cost,
+            required: true,
+            group: Some("api".into()),
+        });
+    }
+    for (id, imp) in &quota_out {
+        let cost = entry_of
+            .get(id)
+            .map(|e| estimate_tokens(&render_entry(e)))
+            .unwrap_or(1);
+        items.push(ContextItem {
+            id: id.clone(),
+            value: *imp,
+            token_cost: cost,
+            required: false,
+            group: Some("api".into()),
+        });
+    }
+    let selected = crate::selector::select_with_budget(&items, budget);
+
+    let mut rendered_ids: Vec<String> = Vec::new();
+    let mut selected_entries: Vec<SurfaceEntry> = Vec::new();
+    for &idx in &selected {
+        if idx >= items.len() {
+            continue; // defensive: never panic on a misbehaving selector
+        }
+        let id = items[idx].id.clone();
+        if let Some(e) = entry_of.get(&id) {
+            rendered_ids.push(id);
+            selected_entries.push((*e).clone());
+        }
+    }
+
+    // Omissions: every candidate not rendered, summarized per kind (honest —
+    // the artifact never silently implies completeness).
+    let rendered_set: BTreeSet<String> = rendered_ids.iter().cloned().collect();
+    let mut omitted_ids: Vec<String> = Vec::new();
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for e in &map.entries {
+        if rendered_set.contains(&e.id) {
+            continue;
+        }
+        omitted_ids.push(e.id.clone());
+        *by_kind.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
+    }
+    let omissions: Vec<SurfaceOmission> = by_kind
+        .into_iter()
+        .map(|(kind, count)| SurfaceOmission {
+            count,
+            kind,
+            reason: "not selected within budget (diversity/quotas/token budget)".into(),
+        })
+        .collect();
+
+    let text = render_selected(&selected_entries);
+    let token_count = estimate_tokens(&text);
+    scc_core::SurfaceRenderResult {
+        text,
+        rendered_ids,
+        omitted_ids,
+        omissions,
+        token_count,
+    }
+}
+
+/// The FULL production global surface pipeline: compile candidates → global
+/// heterogeneous PPR → [`pagerank::SystemRanker::project_to_symbols`] →
+/// per-entry importance (`final_importance`, no task focus) → required
+/// coverage → MMR diversify → quotas → budget selection → render. Returns
+/// the rendered subset with rendered/omitted ids and omission summaries.
+// trace:v1 id=impl.scc.surface.select-and-render-global work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn select_and_render_global(
+    compiler: &ContextCompiler,
+    budget: usize,
+) -> scc_core::SurfaceRenderResult {
+    let map = compile_surface_map(compiler);
+    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
+    let projected = ranker.project_to_symbols(&ranker.global_vector());
+    let score_of: BTreeMap<String, f64> = projected.into_iter().collect();
+
+    let required = required_ids(&map, compiler);
+    let mut ranked: Vec<(String, f64)> = Vec::new();
+    for e in &map.entries {
+        let global_ppr = score_of.get(&e.symbol_id).copied().unwrap_or(0.0);
+        let changed = compiler.is_stale_path(&e.path);
+        let importance = crate::pagerank::final_importance(
+            0.0,
+            global_ppr,
+            0.0,
+            0.0,
+            e.confidence as f64,
+            if required.contains(&e.id) { 1.0 } else { 0.0 },
+            if changed { 1.0 } else { 0.0 },
+            0.0,
+            false,
+        );
+        if importance <= 0.0 {
+            continue;
+        }
+        ranked.push((e.id.clone(), importance));
+    }
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    finish_selection(&map, ranked, &required, budget)
+}
+
+/// The FULL production task surface pipeline: task PPR (task seeds, warm
+/// global start) + novelty suppression against the context ledger + the
+/// same pipeline tail (MMR/quotas/selector) as the global render. Entries
+/// already visible and unchanged this epoch are not re-injected.
+// trace:v1 id=impl.scc.surface.select-and-render-task work=WORK-SCC-014 satisfies=REQ-SCC-IR
+pub fn select_and_render_task(
+    compiler: &ContextCompiler,
+    goal: &str,
+    budget: usize,
+    visible: &ContextLedger,
+) -> scc_core::SurfaceRenderResult {
+    let goal_terms = terms(goal);
+    let candidates = crate::rank::collect_lexical_candidates(
+        compiler.store,
+        &compiler.view,
+        goal,
+        &[],
+        16,
+    );
+    let seeds: Vec<TaskSeed> = candidates
+        .iter()
+        .map(|c| TaskSeed {
+            kind: c.kind.clone(),
+            id: c.id.clone(),
+            weight: c.score,
+        })
+        .collect();
+    let seed_ids: BTreeSet<String> = seeds.iter().map(|s| s.id.clone()).collect();
+
+    let map = compile_surface_map(compiler);
+    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
+    let global_of: BTreeMap<String, f64> = ranker
+        .project_to_symbols(&ranker.global_vector())
+        .into_iter()
+        .collect();
+    let task_of: BTreeMap<String, f64> = ranker
+        .project_to_symbols(&ranker.task_vector(&seeds))
+        .into_iter()
+        .collect();
+
+    let required = required_ids(&map, compiler);
+    let mut ranked: Vec<(String, f64)> = Vec::new();
+    for e in &map.entries {
+        let changed = compiler.is_stale_path(&e.path);
+        let novelty = novelty_penalty(visible, &e.symbol_id, changed);
+        if novelty < 1.0 {
+            // already visible AND unchanged: not re-injected (spec)
+            continue;
+        }
+        let task_ppr = task_of.get(&e.symbol_id).copied().unwrap_or(0.0);
+        let global_ppr = global_of.get(&e.symbol_id).copied().unwrap_or(0.0);
+        let lexical = entry_lexical(e, &goal_terms);
+        let criticality = if seed_ids.contains(&e.symbol_id) || required.contains(&e.id) {
+            1.0
+        } else {
+            0.0
+        };
+        let importance = crate::pagerank::final_importance(
+            task_ppr,
+            global_ppr,
+            lexical,
+            0.0,
+            e.confidence as f64,
+            criticality,
+            if changed { 1.0 } else { 0.0 },
+            novelty,
+            !seeds.is_empty(),
+        );
+        if importance <= 0.0 {
+            continue;
+        }
+        ranked.push((e.id.clone(), importance));
+    }
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    finish_selection(&map, ranked, &required, budget)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +641,16 @@ fn build_entry(
     let start = attr_u32(e, "start_line");
     let end = attr_u32(e, "end_line");
 
-    let source_sig = attr_str(e, "signature").unwrap_or_default();
+    // Exact declaration header wins: the indexer's `decl_header` attr is
+    // the full header as written (untruncated, multi-line preserved);
+    // falls back to the legacy `signature` attr, then a synthesized
+    // name-only signature.
+    let decl = attr_str(e, "decl_header").unwrap_or_default();
+    let source_sig = if decl.trim().is_empty() {
+        attr_str(e, "signature").unwrap_or_default()
+    } else {
+        decl
+    };
     let source_signature = if source_sig.trim().is_empty() {
         synthesized_signature(kind_str, &simple)
     } else {
@@ -191,6 +658,29 @@ fn build_entry(
     };
     let parsed_inner = parse_sig_inner(&source_signature);
     let parsed_sig = parse_signature(&source_signature, &name, parent.as_deref());
+
+    // Overload-sensitive entry id: when the indexer recorded an
+    // `overload_index` attr (0-based per same-name-in-file), the entry id
+    // carries `#overload<N>` so same-name overloads stay separate entries;
+    // `symbol_id` keeps pointing at the logical symbol (indexer overload
+    // entity ids are `{symbol_id}` for index 0 and `{symbol_id}#{N}` for
+    // N >= 1, so the suffix is stripped to recover the logical id).
+    let overload = e
+        .attributes
+        .get("overload_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let (entry_id, symbol_id) = match overload {
+        Some(n) => {
+            let logical = if n >= 1 {
+                e.id.trim_end_matches(&format!("#{n}")).to_string()
+            } else {
+                e.id.clone()
+            };
+            (format!("{}#overload{}", logical, n), logical)
+        }
+        None => (e.id.clone(), e.id.clone()),
+    };
 
     let kind = map_kind(kind_str, &name, parent.as_deref());
     let qualified = if kind_str == "method" {
@@ -358,8 +848,8 @@ fn build_entry(
         .cloned();
 
     SurfaceEntry {
-        id: e.id.clone(),
-        symbol_id: e.id.clone(),
+        id: entry_id,
+        symbol_id,
         qualified_name: qualified,
         kind,
         path: file.clone(),
@@ -1183,7 +1673,8 @@ fn receiver_owner(group: &str) -> Option<String> {
 mod tests {
     use super::*;
     use scc_core::{
-        entity_id, relationship_id, symbol_id, Entity, Flow, FlowKind, FlowStep, Relationship,
+        entity_id, relationship_id, symbol_id, ContextLedger, Entity, Flow, FlowKind,
+        FlowStep, Relationship,
     };
     use scc_store::Store;
 
@@ -1486,5 +1977,165 @@ mod tests {
         assert_eq!(g.owner.as_deref(), Some("Store"));
         assert_eq!(g.parameters[0].ty.as_deref(), Some("context.Context"));
         assert_eq!(g.returns.as_deref(), Some("User, error"));
+    }
+
+    // ---- production selection pipeline ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn global_render_selects_within_budget_and_reports_omissions() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let n = map.entries.len();
+        assert!(n >= 5);
+
+        // Huge budget: everything renders; nothing omitted.
+        let big = select_and_render_global(&ctx, 100_000);
+        assert_eq!(big.rendered_ids.len(), n);
+        assert!(big.omitted_ids.is_empty());
+        assert!(big.omissions.is_empty());
+        assert!(big.text.starts_with("SCC SYSTEM SURFACE MAP"));
+        assert!(big.token_count > 0);
+
+        // Tiny budget: required entries survive; the rest are honestly
+        // omitted with per-kind summaries.
+        let tiny = select_and_render_global(&ctx, 1);
+        assert!(
+            !tiny.rendered_ids.is_empty(),
+            "required (invocation-surface) entries must survive a tiny budget"
+        );
+        for id in &tiny.rendered_ids {
+            assert!(map.entries.iter().any(|e| &e.id == id), "{id} must be a candidate");
+        }
+        // rendered + omitted == all candidates, disjoint
+        assert_eq!(tiny.rendered_ids.len() + tiny.omitted_ids.len(), n);
+        for id in &tiny.omitted_ids {
+            assert!(!tiny.rendered_ids.contains(id), "{id} both rendered and omitted");
+        }
+        let omitted_total: usize = tiny.omissions.iter().map(|o| o.count).sum();
+        assert_eq!(omitted_total, tiny.omitted_ids.len());
+
+        // Deterministic: same input → byte-identical text and ids.
+        let tiny2 = select_and_render_global(&ctx, 1);
+        assert_eq!(tiny2.text, tiny.text);
+        assert_eq!(tiny2.rendered_ids, tiny.rendered_ids);
+        assert_eq!(tiny2.omitted_ids, tiny.omitted_ids);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn task_render_skips_visible_unchanged_entries() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let n = map.entries.len();
+
+        let create = entry(&map, "create_user");
+        let mut visible = ContextLedger::default();
+        visible.visible_symbols.insert(create.symbol_id.clone());
+
+        let out = select_and_render_task(&ctx, "create user", 100_000, &visible);
+        // The already-visible-and-unchanged entry is not re-injected.
+        assert!(
+            !out.rendered_ids.contains(&create.id),
+            "visible unchanged entries must not be re-injected"
+        );
+        // Everything else (novel) renders under a huge budget.
+        assert_eq!(out.rendered_ids.len(), n - 1);
+        assert_eq!(out.omitted_ids.len(), 1);
+        assert!(out.omitted_ids.contains(&create.id));
+        assert!(out.text.starts_with("SCC SYSTEM SURFACE MAP"));
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn task_render_never_omits_required_even_at_zero_budget() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let out = select_and_render_task(&ctx, "user", 0, &ContextLedger::default());
+        // required (invocation-surface) entries survive a zero budget;
+        // the rest are omitted honestly.
+        assert!(!out.rendered_ids.is_empty());
+        assert!(!out.omissions.is_empty() || out.omitted_ids.is_empty());
+        let rendered: BTreeSet<String> = out.rendered_ids.iter().cloned().collect();
+        for id in &out.omitted_ids {
+            assert!(!rendered.contains(id));
+        }
+    }
+
+    // ---- overload-sensitive entries + decl_header ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn overload_entries_get_distinct_ids_and_logical_symbol_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        let base = symbol_id(&repo, path, "handle");
+        for (n, id) in [(0u64, base.clone()), (1, format!("{}#1", base))] {
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, "handle");
+            e.attr("kind", serde_json::json!("function"));
+            e.attr("file", serde_json::json!(path));
+            e.attr("signature", serde_json::json!("def handle(x): ..."));
+            e.attr("exported", serde_json::json!(true));
+            e.attr("start_line", serde_json::json!(1u32));
+            e.attr("end_line", serde_json::json!(10u32));
+            e.attr("overload_index", serde_json::json!(n));
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+        }
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let handles: Vec<&SurfaceEntry> = map
+            .entries
+            .iter()
+            .filter(|e| e.qualified_name == "handle")
+            .collect();
+        assert_eq!(handles.len(), 2, "same-name overloads stay separate entries");
+        let mut ids: Vec<String> = handles.iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![format!("{}#overload0", base), format!("{}#overload1", base)]
+        );
+        for e in handles {
+            assert_eq!(e.symbol_id, base, "symbol_id stays the logical symbol");
+        }
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_wins_over_legacy_signature() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        let id = symbol_id(&repo, path, "process");
+        let mut e = Entity::new(id.clone(), kinds::SYMBOL, "process");
+        e.attr("kind", serde_json::json!("function"));
+        e.attr("file", serde_json::json!(path));
+        e.attr("signature", serde_json::json!("def process(x) -> str"));
+        e.attr(
+            "decl_header",
+            serde_json::json!("async def process(\n    x: int,\n) -> str:"),
+        );
+        e.attr("exported", serde_json::json!(true));
+        e.attr("start_line", serde_json::json!(1u32));
+        e.attr("end_line", serde_json::json!(10u32));
+        store.insert_entity(&e, &[path.to_string()]).unwrap();
+        let ctx = make_ctx(&store);
+        let map = compile_surface_map(&ctx);
+        let proc = entry(&map, "process");
+        assert_eq!(
+            proc.source_signature,
+            "async def process(\n    x: int,\n) -> str:",
+            "decl_header (exact header) must win over the legacy signature attr"
+        );
+        assert_eq!(proc.modifiers, vec!["async"]);
     }
 }

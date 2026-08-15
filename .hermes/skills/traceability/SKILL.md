@@ -70,6 +70,33 @@ Three kinds of truth stay separate:
 A passing test that never executed the implementation is `UNPROVEN`, not
 green.
 
+## Ambient operation (zero-ceremony)
+<!-- trace:v1 id=doc.ambient.section -->
+
+TraceLayer is ambient: the USER speaks only prose. You — the agent — do all
+TraceLayer ceremony internally. Never ask the user for a TraceLayer ID,
+command, or concept during normal development.
+
+At the start of every development turn:
+
+1. Read the user request.
+2. Ask TraceLayer for current/resolved task context
+   (`trace task context`, or `trace task resolve --prompt "<request>"`).
+3. Search for related existing requirements (`trace search`).
+4. Decide whether the request continues current intent, changes existing
+   intent, creates new intent, or is implementation-only.
+5. If causal context is missing, bootstrap it automatically:
+   `trace task bootstrap --json < <bundle>` (title, kind, intent,
+   requirements with titles + statements, optional plan steps) — never
+   `trace task begin` with a user-facing ID, and never ask the user.
+6. Update or create specs before behavior implementation where the request
+   changes product intent.
+7. Proceed with coding; the hooks enforce per-boundary tracing.
+
+If a pre-edit gate blocks with AMBIENT TRACE BOOTSTRAP REQUIRED, follow its
+four steps internally (search, bootstrap from the user's request, activate,
+retry) — the user never sees or types an ID.
+
 ## Mandatory workflow
 
 ### Before implementation

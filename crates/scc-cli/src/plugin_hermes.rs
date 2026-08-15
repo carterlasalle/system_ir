@@ -1,9 +1,8 @@
 //! Hermes plugin (M10) — native Hermes plugin package per
 //! https://hermes-agent.nousresearch.com/docs/developer-guide/plugins:
-//! `plugin.yaml` + `register(ctx)` exposing the six semantic tools as native
+//! `plugin.yaml` + `register(ctx)` exposing the ten semantic tools as native
 //! Hermes tools, plus a bundled skill. `scc setup hermes` installs it into
 //! `~/.hermes/plugins/scc/` and enables it.
-
 use std::path::Path;
 
 const PLUGIN_FILES: &[(&str, &str)] = &[
@@ -17,6 +16,7 @@ const PLUGIN_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+// trace:v1 id=impl.scc.hermes.installer work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn hermes_home() -> std::path::PathBuf {
     match std::env::var("HERMES_HOME") {
         Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
@@ -27,6 +27,7 @@ pub fn hermes_home() -> std::path::PathBuf {
 }
 
 /// `scc setup hermes` — install and enable the Hermes plugin.
+// trace:exempt reason=internal-detail  # installer glue; behavior traced at impl.scc.hermes
 pub fn cmd_setup_hermes(root: &Path) -> crate::Result<()> {
     let home = hermes_home();
     let plugin_dir = home.join("plugins/scc");
@@ -67,8 +68,9 @@ pub fn cmd_setup_hermes(root: &Path) -> crate::Result<()> {
     println!("  hermes plugins list          # confirm 'scc' appears");
     println!("  hermes plugins enable scc    # if not enabled");
     println!("  hermes chat");
-    println!("The seven semantic tools (system_overview, system_atlas, task_context,");
-    println!("component_context, flow_context, impact_context, verify_context) plus the");
+    println!("The ten semantic tools (system_overview, system_atlas, task_context,");
+    println!("component_context, flow_context, impact_context, verify_context,");
+    println!("system_context, surface_map, structural_source) plus the");
     println!("bundled skill 'scc-system-context' are available. The `scc` binary must be");
     println!("on PATH (or set SCC_BIN).");
     println!();
@@ -103,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail  # installer unit test; behavior traced at impl.scc.hermes
     fn plugin_files_are_valid_python() {
         // syntax-check the embedded python via py_compile
         for (rel, _) in PLUGIN_FILES {
@@ -128,7 +131,7 @@ mod tests {
             assert!(schemas.contains(tool), "missing {tool}");
         }
         let init = include_str!("../../../plugins/hermes/scc/__init__.py");
-        assert_eq!(init.matches("ctx.register_tool(").count(), 7);
+        assert_eq!(init.matches("ctx.register_tool(").count(), 10);
         assert!(init.contains("register_skill"));
     }
 }

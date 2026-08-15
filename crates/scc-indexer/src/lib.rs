@@ -9,6 +9,7 @@
 //! 5. write facts + evidence into the store
 //! 6. record snapshot; caller rebuilds the derived layer (scc-graph)
 
+// trace:exempt reason=module-facade  # pub mod re-exports only; behavior traced per module
 pub mod adapters;
 pub mod config;
 pub mod configrefs;
@@ -69,6 +70,7 @@ pub struct IndexReport {
     pub duration_ms: u64,
 }
 
+// trace:exempt reason=internal-detail
 pub struct Indexer {
     pub store: Store,
     pub config: Config,
@@ -79,6 +81,7 @@ pub struct Indexer {
     pub rust: Box<dyn LanguageExtractor>,
 }
 
+// trace:exempt reason=internal-detail
 impl Indexer {
     pub fn new(store: Store, config: Config) -> Self {
         Indexer {
@@ -356,6 +359,7 @@ impl Indexer {
         }
     }
 
+// trace:exempt reason=internal-detail
     fn load_symbols(&self, path: &str) -> Result<Vec<model::Symbol>, scc_store::StoreError> {
         let rows = self.store.symbols_in_file(path)?;
         Ok(rows
@@ -374,6 +378,7 @@ impl Indexer {
                         _ => model::SymbolKind::Module,
                     },
                     signature: sig,
+                    decl_header: None,
                     start_line: sl,
                     end_line: el,
                     exported,

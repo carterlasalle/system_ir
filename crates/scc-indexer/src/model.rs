@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 /// A source file handed to an extractor.
 #[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail
 pub struct SourceFile {
     /// Repository-relative path, `/`-separated.
     pub path: String,
@@ -27,6 +28,8 @@ impl SourceFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:exempt reason=internal-detail
+// trace:v1 id=impl.scc.model work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub enum SymbolKind {
     Function,
     Method,
@@ -62,12 +65,22 @@ impl SymbolKind {
 
 /// A declared symbol (function, class, interface, type, const...).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
     /// One-line signature, e.g. `def normalize(text: str) -> str`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Exact declaration header as written in source: the byte span from
+    /// the declaration keyword (`def` / `pub fn` / `func` / `public ...` /
+    /// `class` ...) through the end of the header (parameter list closing
+    /// `)`, return type, `where` clause, `throws` clause, or heritage
+    /// clause). Multi-line preserved byte-for-byte; NOT truncated and NOT
+    /// reconstructed. `None` when the extractor does not capture it (const,
+    /// module, aliases).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decl_header: Option<String>,
     /// 1-based inclusive line range.
     pub start_line: u32,
     pub end_line: u32,
@@ -201,6 +214,7 @@ pub struct StoreRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:exempt reason=internal-detail
 pub enum StoreOp {
     Read,
     Write,

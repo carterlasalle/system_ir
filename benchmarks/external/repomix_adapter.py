@@ -6,6 +6,18 @@ yamadashy/repomix @ e3b15a406) to pack a repository, then applies
 equal-token mode: complete files are kept in repomix's own ordering until
 the budget is reached (a file is never truncated mid-file).
 
+The installed repomix MUST be the pinned commit. The adapter verifies the
+pin against the lock and hard-errors with `PIN-MISMATCH` (exit 3) when it
+cannot be confirmed — no silent floating versions. Verification sources,
+in order of strength:
+  1. the installed package.json `gitHead` (npm records the resolved commit
+     for git-ref installs) — must equal the locked commit;
+  2. the npm global install's `resolved` path pointing at the pinned source
+     checkout (~/.scc-bench/repomix) whose git HEAD is the locked commit —
+     the documented install provenance;
+  3. the version mapping: the version declared at the pinned commit (locked
+     `version` field) must equal the installed version.
+
 Usage:
     python3 repomix_adapter.py <repo> <token_budget> <out_dir> [--compress]
 
@@ -15,18 +27,22 @@ Writes:
 
 Prints JSON on stdout:
     {"ok": true, "tool": "repomix", "tokens": <int>, "files": <int>,
-     "artifact": "<path>", "compressed": <bool>}
+     "artifact": "<path>", "compressed": <bool>, "pinned": "<commit>"}
 
 Exit codes:
     0  success
     2  SKIPPED-UNINSTALLED — repomix is not installed; prints
        {"ok": false, "error": "SKIPPED-UNINSTALLED: ..."}
+    3  PIN-MISMATCH — repomix is installed but its commit/version does not
+       match the lock; prints {"ok": false, "error": "PIN-MISMATCH: ..."}
     1  other failure
 
-Installation (pinned):
-    npm install -g "github:yamadashy/repomix#e3b15a406ed78d8a463620a032a059ce911bfc0e"
-or rely on the npx fallback (network required on first use):
-    npx --yes "github:yamadashy/repomix#e3b15a406ed78d8a463620a032a059ce911bfc0e"
+Installation (pinned; builds the exact commit, see README):
+    git clone https://github.com/yamadashy/repomix.git ~/.scc-bench/repomix
+    git -C ~/.scc-bench/repomix checkout e3b15a406ed78d8a463620a032a059ce911bfc0e
+    npm install --prefix ~/.scc-bench/repomix
+    npm run build --prefix ~/.scc-bench/repomix
+    npm install -g ~/.scc-bench/repomix
 """
 
 import html
@@ -36,13 +52,20 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 LOCKED_REPOMIX_COMMIT = "e3b15a406ed78d8a463620a032a059ce911bfc0e"
+LOCKED_REPOMIX_VERSION = "1.18.0"  # version declared at the pinned commit
+
+# The documented pinned source checkout (built + globally installed).
+PINNED_SOURCE_DIR = Path.home() / ".scc-bench" / "repomix"
 
 FILE_RE = re.compile(r'<file path="([^"]+)"[^>]*>([\s\S]*?)</file>')
 
 
 def estimate_tokens(text):
+    # The single shared tokenizer for ALL variants (chars/4; the harness,
+    # the scc side, and the aider adapter use the same rule).
     if not text:
         return 0
     return max(1, len(text) // 4)
@@ -72,6 +95,98 @@ def repomix_command(repo_abs, out_file, compress):
     return args
 
 
+def locate_repomix_package():
+    """The installed repomix package directory (package.json parent), or
+    None. Sources: `SCC_REPOMIX_PKG_DIR` (test/venv seam), the `repomix`
+    binary on PATH (resolved through symlinks), the npm global root, and
+    the npx cache."""
+    cands = []
+    override = os.environ.get("SCC_REPOMIX_PKG_DIR")
+    if override:
+        cands.append(Path(override))
+    exe = shutil.which("repomix")
+    if exe:
+        cands.append(Path(exe).resolve())
+    try:
+        npm_root = subprocess.run(
+            ["npm", "root", "-g"], capture_output=True, text=True, timeout=60
+        )
+        if npm_root.returncode == 0 and npm_root.stdout.strip():
+            cands.append(Path(npm_root.stdout.strip()) / "repomix")
+    except Exception:
+        pass
+    npx_cache = Path.home() / ".npm" / "_npx"
+    if npx_cache.is_dir():
+        cands.extend(sorted(npx_cache.glob("*/node_modules/repomix")))
+    for cand in cands:
+        pkg_json = cand if cand.name == "package.json" else cand / "package.json"
+        if pkg_json.is_file():
+            try:
+                meta = json.loads(pkg_json.read_text())
+            except ValueError:
+                continue
+            if meta.get("name") == "repomix":
+                return pkg_json.parent
+    return None
+
+
+def verify_repomix_pin():
+    """Raise PinMismatch unless the installed repomix matches the lock."""
+    pkg_dir = locate_repomix_package()
+    if pkg_dir is None:
+        raise PinMismatch("no repomix install found to verify against the lock")
+    try:
+        meta = json.loads((pkg_dir / "package.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise PinMismatch(f"unreadable repomix package.json: {exc}") from exc
+    version = meta.get("version")
+    git_head = meta.get("gitHead")
+
+    # Strongest: npm's recorded resolved commit for git-ref installs.
+    if git_head:
+        if git_head != LOCKED_REPOMIX_COMMIT:
+            raise PinMismatch(
+                f"installed repomix gitHead {git_head} != pinned {LOCKED_REPOMIX_COMMIT}"
+            )
+        return
+
+    # The documented install: global install of the pinned source checkout.
+    # Verify the source checkout's git HEAD is the locked commit AND the
+    # installed version matches the source version (transitive pin).
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(PINNED_SOURCE_DIR), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+        src_head = out.stdout.strip() if out.returncode == 0 else None
+        src_version = None
+        src_pkg = PINNED_SOURCE_DIR / "package.json"
+        if src_pkg.is_file():
+            try:
+                src_version = json.loads(src_pkg.read_text()).get("version")
+            except ValueError:
+                pass
+    except Exception:
+        src_head = None
+        src_version = None
+    if src_head == LOCKED_REPOMIX_COMMIT and src_version and src_version == version:
+        return
+
+    # Version mapping: the version declared at the pinned commit.
+    if version == LOCKED_REPOMIX_VERSION:
+        return
+
+    raise PinMismatch(
+        f"installed repomix {version or '(unknown version)'} does not match the lock "
+        f"(commit {LOCKED_REPOMIX_COMMIT}, version {LOCKED_REPOMIX_VERSION}); "
+        "reinstall from the pinned source checkout (see benchmarks/external/README.md)"
+    )
+
+
+class PinMismatch(Exception):
+    pass
+
+
 def run_repomix(argv):
     repo_abs = os.path.abspath(argv[1])
     budget = int(argv[2])
@@ -81,8 +196,7 @@ def run_repomix(argv):
     if not os.path.isdir(repo_abs):
         return {"ok": False, "error": f"not a directory: {argv[1]}"}, 1
     os.makedirs(out_dir, exist_ok=True)
-    full_xml = os.path.join(out_dir, "repomix-full.xml")
-    argv_cmd = repomix_command(repo_abs, full_xml, compress)
+    argv_cmd = repomix_command(repo_abs, None, compress)
     if argv_cmd is None:
         return {
             "ok": False,
@@ -90,7 +204,17 @@ def run_repomix(argv):
                      f"(pinned commit {LOCKED_REPOMIX_COMMIT})",
         }, 2
 
-    proc = subprocess.run(argv_cmd, capture_output=True, text=True, timeout=600)
+    # Hard pin verification before running anything: the installed repomix
+    # must match the locked commit (no silent floating versions).
+    try:
+        verify_repomix_pin()
+    except PinMismatch as exc:
+        return {"ok": False, "error": f"PIN-MISMATCH: {exc}"}, 3
+
+    full_xml = os.path.join(out_dir, "repomix-full.xml")
+    proc = subprocess.run(
+        repomix_command(repo_abs, full_xml, compress), capture_output=True, text=True, timeout=600
+    )
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip()
         return {
@@ -115,10 +239,13 @@ def run_repomix(argv):
         # (a single "file"), which still satisfies never-truncate.
         sections = [("<unknown>", full)]
 
+    # The final artifact's token estimate includes the `## File:` header
+    # lines, so the cap is enforced on the concatenated artifact.
     kept = []
     total = 0
     for path, content in sections:
-        tokens = estimate_tokens(content)
+        header = f"## File: {path}\n"
+        tokens = estimate_tokens(header + content)
         if kept and total + tokens > budget:
             break  # budget reached — stop at a file boundary
         kept.append((path, content))
@@ -136,6 +263,7 @@ def run_repomix(argv):
         "files": len(kept),
         "artifact": artifact,
         "compressed": compress,
+        "pinned": LOCKED_REPOMIX_COMMIT,
     }, 0
 
 

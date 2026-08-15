@@ -1,5 +1,6 @@
 """Tool schemas — what the LLM reads to decide when to call SCC tools."""
 
+# trace:exempt reason=internal-detail  # schema constants, not behavior
 SYSTEM_OVERVIEW = {
     "name": "system_overview",
     "description": (
@@ -145,4 +146,76 @@ VERIFY_CONTEXT = {
         "before declaring a task complete."
     ),
     "parameters": {"type": "object", "properties": {}},
+}
+
+SYSTEM_CONTEXT = {
+    "name": "system_context",
+    "description": (
+        "Get the fused session-startup artifact: the System Atlas plus the System "
+        "Surface Map (the actual callable API layer), model coverage and honest "
+        "omissions in one deterministic pack. Call this once at session start "
+        "instead of separate atlas + surface calls — it is the single startup "
+        "context a coding agent should see before its first task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "token_budget": {
+                "type": "integer",
+                "description": "Optional token budget (default 20000; the atlas:surface split is kept at 13:7)",
+            }
+        },
+    },
+}
+
+SURFACE_MAP = {
+    "name": "surface_map",
+    "description": (
+        "Get the System Surface Map: the repository's actual callable API layer "
+        "(entrypoints, routes, exported functions, contracts) ranked by global "
+        "importance — or, with a goal, personalized to that task. Use when you "
+        "need to know what can be called, or which APIs a task will touch."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "Optional task goal: personalize the map (task PPR re-ranking)",
+            },
+            "token_budget": {
+                "type": "integer",
+                "description": "Optional token budget (default context.surface_tokens, 7000)",
+            },
+        },
+    },
+}
+
+STRUCTURAL_SOURCE = {
+    "name": "structural_source",
+    "description": (
+        "Get the Structural Source representation of files: exact declaration "
+        "headers plus per-symbol call/write evidence (deep) or signatures and "
+        "imports (fallback). Pass either files or a goal (a goal selects the "
+        "lexically matching files). Use when you need the implementation-level "
+        "API shape of a file without reading its whole body."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Repository-relative file paths to render structurally",
+            },
+            "goal": {
+                "type": "string",
+                "description": "Task goal: resolve to the matching files (lexical fallback)",
+            },
+            "token_budget": {
+                "type": "integer",
+                "description": "Optional token budget (default context.structural_source, 6000)",
+            },
+        },
+    },
 }

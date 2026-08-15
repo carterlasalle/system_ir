@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """Wave 15 external benchmark suite — the A-H variant harness.
 
-Runs the seven context variants over the ground-truth tasks and prints the
+Runs the context variants over the ground-truth tasks and prints the
 spec §72 table (variant, success rate, mean exploration, first-plan
 accuracy, context tokens).
 
-Variants (A–H):
+Variants (A–H + the Wave-15 PPR ablation matrix):
     raw               no context artifact (the agent sees only the task)
-    aider-repomap     pinned aider RepoMap (@ external-lock.json)
+    aider-repomap     pinned aider RepoMap (@ external-lock.json),
+                      personalized with the task goal (mentioned_idents)
     repomix-compress  pinned repomix pack --compress, equal-token mode
-    scc-atlas         scc context startup --budget N, atlas section only
+    scc-atlas         `scc atlas --budget N` — the FULL budget goes to the
+                      Atlas (no 13:7 startup split handicap)
     scc-surface       scc surface
     scc-atlas-surface full scc context startup --budget N
     scc-full          startup + scc context task delta + structural source
-                      for the task's matched files
+                      for the task's GOAL-selected files (never task.files —
+                      ground truth is scoring-only)
+    lexical / global-ppr / task-ppr / ppr-mmr / ppr-quotas /
+    ppr-optimizer     PPR ablation matrix (harness-level mode flags; see
+                      scc_cli::benchagent::SurfaceAblation)
 
 Equal-token mode: budgets 4000/8000/16000/24000 apply to the CONTEXT
-ARTIFACTS, not the agent prompt.
+ARTIFACTS, not the agent prompt. ONE shared tokenizer counts every
+variant's artifact the same way: deterministic chars/4. scc-full enforces
+the FINAL artifact budget on the concatenated startup + task-delta +
+structural text (startup N/2, task N/4, structural the remainder), never
+per piece.
 
 Agent-run protocol (reuses benchagent.rs's runner): the scc-native variants
 delegate to `scc bench external`, which drives each task through the
@@ -25,7 +35,9 @@ event stream (files opened, search calls, graph queries, wrong-first,
 first-correct), and emits a metric row per variant. The external-tool
 variants (aider/repomix) are driven by this harness directly with the same
 event protocol; when the tool is not installed the adapter exits 2 and the
-variant is reported SKIPPED-UNINSTALLED.
+variant is reported SKIPPED-UNINSTALLED; when the installed tool does not
+match the pinned commit the adapter exits 3 and the variant is reported
+PIN-MISMATCH.
 
 Usage:
     run_context_bench.py [--variant V] [--budget N] [--repo R]
@@ -55,8 +67,28 @@ VARIANTS = [
     "scc-surface",
     "scc-atlas-surface",
     "scc-full",
+    # Wave-15 PPR ablation matrix (harness-level mode flags; see
+    # scc_cli::benchagent::SurfaceAblation)
+    "lexical",
+    "global-ppr",
+    "task-ppr",
+    "ppr-mmr",
+    "ppr-quotas",
+    "ppr-optimizer",
 ]
-NATIVE_VARIANTS = ["raw", "scc-atlas", "scc-surface", "scc-atlas-surface", "scc-full"]
+NATIVE_VARIANTS = [
+    "raw",
+    "scc-atlas",
+    "scc-surface",
+    "scc-atlas-surface",
+    "scc-full",
+    "lexical",
+    "global-ppr",
+    "task-ppr",
+    "ppr-mmr",
+    "ppr-quotas",
+    "ppr-optimizer",
+]
 EXTERNAL_VARIANTS = ["aider-repomap", "repomix-compress"]
 BUDGETS = [4000, 8000, 16000, 24000]
 DEFAULT_BUDGET = 8000
@@ -70,6 +102,19 @@ ROOT = Path(__file__).resolve().parent.parent.parent  # repo root
 BENCHMARKS = ROOT / "benchmarks"
 FIXTURES = ROOT / "fixtures"
 LOCK = BENCHMARKS / "external-lock.json"
+
+# The pinned-tools venv (see benchmarks/external/README.md): aider is
+# installed there (PEP 668 keeps it out of the Homebrew pythons). The
+# harness invokes the python adapters with this interpreter so `import
+# aider` resolves to the pinned install. Override with SCC_BENCH_VENV.
+BENCH_VENV = Path(os.environ.get("SCC_BENCH_VENV", str(Path.home() / ".scc-bench-venv")))
+
+
+def bench_python():
+    """The interpreter that has the pinned aider install (the bench venv),
+    falling back to the running interpreter when the venv is absent."""
+    py = BENCH_VENV / "bin" / "python"
+    return str(py) if py.exists() else sys.executable
 
 SOURCE_EXTS = (
     ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs",
@@ -383,7 +428,13 @@ def run_task_via_protocol(agent_cmd, artifact_path, goal, gt_files, plan_keys, r
 
 def run_external_variant(variant, tasks, budget, agent_cmd, workdir):
     """aider-repomap / repomix-compress over the tasks. Returns (rows,
-    skipped) where rows is a list of per-repo metric dicts."""
+    skipped) where rows is a list of per-repo metric dicts and skipped is
+    None, or a dict {"status": ..., "error": ...} for the first
+    SKIPPED-UNINSTALLED / PIN-MISMATCH outcome.
+
+    Artifacts are per-task: aider personalizes the repo map with the task
+    goal (mentioned_idents), the same goal the SCC task variants
+    personalize with — fair Aider-vs-task-SCC."""
     rows = []
     skipped = None
     artifacts_dir = workdir / "artifacts" / variant / str(budget)
@@ -391,41 +442,53 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir):
     for repo, repo_tasks in sorted(tasks.items()):
         fixture = FIXTURES / repo
         adapter = BENCHMARKS / "external" / ("aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
-        argv = [sys.executable, str(adapter), str(fixture), str(budget), str(artifacts_dir)]
-        if variant == "repomix-compress":
-            argv.append("--compress")
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
-        try:
-            payload = json.loads(proc.stdout or "{}")
-        except ValueError:
-            payload = {"ok": False, "error": f"adapter output not JSON: {proc.stdout[:200]}"}
-        if proc.returncode == 2:
-            skipped = payload.get("error", "tool not installed")
-            return rows, skipped
-        if not payload.get("ok"):
-            skipped = payload.get("error", "adapter failed")
-            return rows, skipped
-        artifact = Path(payload["artifact"])
-        tokens = int(payload.get("tokens", 0))
+        per_task = []
+        for task in repo_tasks:
+            argv = [bench_python(), str(adapter), str(fixture), str(budget), str(artifacts_dir)]
+            if variant == "aider-repomap":
+                argv += ["--goal", task["goal"]]
+            elif variant == "repomix-compress":
+                argv.append("--compress")
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+            try:
+                payload = json.loads(proc.stdout or "{}")
+            except ValueError:
+                payload = {"ok": False, "error": f"adapter output not JSON: {proc.stdout[:200]}"}
+            if proc.returncode == 2:
+                skipped = {"status": "SKIPPED-UNINSTALLED", "error": payload.get("error", "tool not installed")}
+                return rows, skipped
+            if proc.returncode == 3:
+                skipped = {"status": "PIN-MISMATCH", "error": payload.get("error", "installed tool does not match the lock")}
+                return rows, skipped
+            if not payload.get("ok"):
+                skipped = {"status": "FAILED", "error": payload.get("error", "adapter failed")}
+                return rows, skipped
+            per_task.append((Path(payload["artifact"]), int(payload.get("tokens", 0))))
 
-        row = _row_for(repo_tasks, artifact, tokens, agent_cmd, repo, variant, budget)
+        row = _row_for(repo_tasks, per_task, agent_cmd, repo, variant, budget)
         rows.append(row)
     return rows, skipped
 
 
-def _row_for(repo_tasks, artifact, tokens, agent_cmd, repo, variant, budget):
-    """Run the repo's tasks through the agent protocol in fixture copies."""
+def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget):
+    """Run the repo's tasks through the agent protocol in fixture copies,
+    one goal-personalized artifact per task. `artifacts` is a list of
+    (artifact_path, tokens) aligned with `repo_tasks`; the row's
+    context_tokens is the mean over tasks (scc-full-style)."""
     results = []
+    tokens = []
     with tempfile.TemporaryDirectory(prefix="scc-ext-") as tmp:
         tmp = Path(tmp)
-        for task in repo_tasks:
+        for task, (artifact, tok) in zip(repo_tasks, artifacts):
             root = tmp / task["id"]
             copy_tree(FIXTURES / repo, root)
             plan_keys = list(task["files"]) + list(task["symbols"])
             results.append(
                 run_task_via_protocol(agent_cmd, artifact, task["goal"], task["files"], plan_keys, root)
             )
+            tokens.append(tok)
     n = max(len(results), 1)
+    mean_tokens = sum(tokens) // max(len(tokens), 1) if tokens else 0
     return {
         "variant": variant,
         "budget": budget,
@@ -436,7 +499,7 @@ def _row_for(repo_tasks, artifact, tokens, agent_cmd, repo, variant, budget):
             r["files_opened"] + r["search_tool_calls"] + r["graph_tool_calls"] for r in results
         ) / n,
         "first_plan_accuracy": sum(1 for r in results if r["first_plan_correct"]) / n,
-        "context_tokens": tokens,
+        "context_tokens": mean_tokens,
         "mean_files_opened": sum(r["files_opened"] for r in results) / n,
         "mean_search_tool_calls": sum(r["search_tool_calls"] for r in results) / n,
         "mean_files_opened_before_first_correct": sum(r["wrong_first_locations"] for r in results) / n,
@@ -504,8 +567,9 @@ def print_table(rows, json_out):
         return
     print(f"{'variant':<18} {'success':>8} {'mean_exploration':>16} {'first_plan_acc':>14} {'tokens':>8}  status")
     for row in rows:
-        if row.get("status") == "SKIPPED-UNINSTALLED":
-            print(f"{row['variant']:<18} {'—':>8} {'—':>16} {'—':>14} {'—':>8}  SKIPPED-UNINSTALLED ({row.get('detail','')})")
+        status = row.get("status")
+        if status:
+            print(f"{row['variant']:<18} {'—':>8} {'—':>16} {'—':>14} {'—':>8}  {status} ({row.get('detail','')})")
             continue
         print(
             f"{row['variant']:<18} {row['success_rate']:>8.3f} {row['mean_exploration']:>16.2f} "
@@ -549,10 +613,11 @@ def main(argv):
             if variant in EXTERNAL_VARIANTS:
                 rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir)
                 if skipped is not None:
-                    skipped_status = {"variant": variant, "budget": budget, "status": "SKIPPED-UNINSTALLED", "detail": skipped}
+                    status = skipped.get("status", "SKIPPED-UNINSTALLED")
+                    skipped_status = {"variant": variant, "budget": budget, "status": status, "detail": skipped.get("error", "")}
                     if args.single:
                         print(json.dumps(skipped_status))
-                        return 2
+                        return 3 if status == "PIN-MISMATCH" else 2
                     all_rows.append(skipped_status)
                     continue
                 if args.single:

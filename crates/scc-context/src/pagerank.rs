@@ -9,9 +9,18 @@
 //! - [`build_reference_graph`] normalizes existing trusted relationships into
 //!   [`ReferenceEdge`]s (never invents new relationships).
 //! - [`SystemRanker`] runs personalized PageRank (power iteration, damping
-//!   0.85, 50 iterations) over symbol↔symbol reference edges, with an
-//!   architectural seed vector for the global vector and task-seed
-//!   personalization for task vectors.
+//!   0.85, 50 iterations) over a HETEROGENEOUS node universe — every
+//!   rankable entity (symbol, component, subsystem, service, flow,
+//!   contract, state, reactive, route, topic, queue, store, schema, file),
+//!   not symbols alone. Edges survive when either endpoint is a rankable
+//!   entity, so OWNS→STATE, REGISTERS→CONTRACT, PUBLISHES/SUBSCRIBES→TOPIC
+//!   and READS/WRITES→DATA_STORE feed PageRank directly. The global vector
+//!   is architecturally seeded; task vectors personalize from `TaskSeed`s.
+//! - [`SystemRanker::project_to_symbols`] projects the heterogeneous node
+//!   scores back to surface-relevant symbol scores (a symbol's score = its
+//!   own + 0.4 × the scores of the entities it owns/registers/publishes/
+//!   reads/writes/participates-in, bonus capped at 0.5) — the mechanism
+//!   that carries component/flow/contract/state importance to the surface.
 //! - [`architectural_specificity`] boosts public facades/entrypoints/state
 //!   owners/contract endpoints/flow participants and penalizes generic
 //!   utilities, generated/vendored code, and ubiquitous symbols — keeping
@@ -102,6 +111,45 @@ const INVOCATION_KINDS: [&str; 5] = [
 
 /// Entity kinds that count as contract endpoints for registration edges.
 const CONTRACT_KINDS: [&str; 2] = [kinds::CONTRACT, kinds::REGISTRY];
+
+/// The HETEROGENEOUS PageRank universe: every entity kind that can carry
+/// surface-relevant importance. Symbol-only ranking let component/flow/
+/// contract/state importance die at the boundary; these kinds participate
+/// as first-class nodes (real strings from `scc_core::kinds`).
+const RANKABLE_KINDS: [&str; 14] = [
+    kinds::SYMBOL,
+    kinds::COMPONENT,
+    kinds::SUBSYSTEM,
+    kinds::SERVICE,
+    kinds::FLOW,
+    kinds::CONTRACT,
+    kinds::STATE,
+    kinds::REACTIVE,
+    kinds::ROUTE,
+    kinds::TOPIC,
+    kinds::QUEUE,
+    kinds::DATA_STORE,
+    kinds::SCHEMA,
+    kinds::FILE,
+];
+
+/// Predicates whose non-symbol targets a symbol projects onto: the
+/// entities whose PageRank score lifts the owning symbol's surface score.
+const PROJECTION_PREDICATES: [&str; 6] = [
+    predicates::OWNS,
+    predicates::REGISTERS,
+    predicates::PUBLISHES,
+    predicates::READS,
+    predicates::WRITES,
+    predicates::PARTICIPATES_IN,
+];
+
+/// Projection factor: a symbol's score += 0.4 × the sum of the scores of
+/// the entities it OWNS/REGISTERS/PUBLISHES/READS/WRITES/PARTICIPATES_IN.
+pub const PROJECTION_BONUS_FACTOR: f64 = 0.4;
+/// The projection bonus is capped at 0.5 per symbol (a state-heavy symbol
+/// cannot accumulate an unbounded lift).
+pub const PROJECTION_BONUS_CAP: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Weight helpers
@@ -290,10 +338,12 @@ pub fn build_reference_graph(view: &TrustedGraphView) -> Vec<ReferenceEdge> {
 // SystemRanker
 // ---------------------------------------------------------------------------
 
-/// Personalized PageRank over the symbol reference graph.
+/// Personalized PageRank over the HETEROGENEOUS entity reference graph.
 ///
-/// Nodes are symbol entities (id-sorted for determinism). Edges are
-/// trusted relationships whose both endpoints are symbols and whose
+/// Nodes are every rankable entity (id-sorted for determinism): symbols,
+/// components, subsystems, services, flows, contracts, state, reactive,
+/// routes, topics, queues, stores, schemas and files. Edges are trusted
+/// relationships whose both endpoints are rankable entities and whose
 /// predicate normalizes to a reference kind; weights follow the spec
 /// formula. The global vector is computed once per epoch (Main caches the
 /// `SystemRanker`); task vectors personalize from `TaskSeed`s with a
@@ -301,13 +351,18 @@ pub fn build_reference_graph(view: &TrustedGraphView) -> Vec<ReferenceEdge> {
 // trace:exempt reason=internal-detail
 pub struct SystemRanker<'a> {
     view: &'a TrustedGraphView<'a>,
-    /// Sorted symbol entity ids; index i in every vector == `symbols[i]`.
-    symbols: Vec<String>,
+    /// Sorted rankable entity ids; index i in every vector == `nodes[i]`.
+    nodes: Vec<String>,
+    /// Entity kinds, parallel to `nodes`.
+    kinds: Vec<String>,
     index: HashMap<String, usize>,
     /// Row-normalized out-edge adjacency: (target index, weight).
     adjacency: Vec<Vec<(usize, f64)>>,
-    /// Distinct referencing sources per symbol (rarity/ubiquity input).
+    /// Distinct referencing sources per node (rarity/ubiquity input).
     in_degree: Vec<usize>,
+    /// For each node: indices of the non-symbol entities it projects onto
+    /// (OWNS/REGISTERS/PUBLISHES/READS/WRITES/PARTICIPATES_IN targets).
+    projection: Vec<Vec<usize>>,
     /// Precomputed global (architecturally seeded) PageRank vector.
     global: Vec<f64>,
 }
@@ -317,20 +372,25 @@ impl<'a> SystemRanker<'a> {
     /// Build the ranker from the trusted view. Deterministic; O(E) edges.
 // trace:exempt reason=internal-detail
     pub fn new(view: &'a TrustedGraphView<'a>) -> SystemRanker<'a> {
-        let mut symbols: Vec<String> = view
+        let mut pairs: Vec<(String, String)> = view
             .entities()
-            .filter(|e| e.kind == kinds::SYMBOL)
-            .map(|e| e.id.clone())
+            .filter(|e| RANKABLE_KINDS.contains(&e.kind.as_str()))
+            .map(|e| (e.id.clone(), e.kind.clone()))
             .collect();
-        symbols.sort();
-        let index: HashMap<String, usize> = symbols
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let nodes: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+        let kinds: Vec<String> = pairs.iter().map(|(_, k)| k.clone()).collect();
+        let index: HashMap<String, usize> = nodes
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-        let n = symbols.len();
+        let n = nodes.len();
 
-        // Pass 1: collect symbol↔symbol edges + per-target distinct sources.
+        // Pass 1: collect edges + per-target distinct sources. An edge
+        // survives when BOTH endpoints are rankable entities (the universe
+        // is heterogeneous: non-symbol endpoints are first-class nodes) and
+        // the predicate normalizes to a reference kind.
         let mut edges: Vec<(usize, usize, f64)> = Vec::new();
         let mut in_sources: Vec<HashSet<usize>> = vec![HashSet::new(); n];
         for rel in view.all_rels() {
@@ -369,12 +429,34 @@ impl<'a> SystemRanker<'a> {
             }
         }
 
+        // Projection edges: non-symbol targets of the symbol's
+        // OWNS/REGISTERS/PUBLISHES/READS/WRITES/PARTICIPATES_IN rels.
+        let mut projection: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for rel in view.all_rels() {
+            if !PROJECTION_PREDICATES.contains(&rel.predicate.as_str()) {
+                continue;
+            }
+            let (Some(&si), Some(&ti)) = (index.get(&rel.subject), index.get(&rel.object)) else {
+                continue;
+            };
+            if kinds[ti] == kinds::SYMBOL {
+                continue; // the bonus carries entity importance, not symbol
+            }
+            projection[si].push(ti);
+        }
+        for p in projection.iter_mut() {
+            p.sort_unstable();
+            p.dedup();
+        }
+
         let ranker = SystemRanker {
             view,
-            symbols,
+            nodes,
+            kinds,
             index,
             adjacency,
             in_degree,
+            projection,
             global: Vec::new(),
         };
         let global = Self::ppr(&ranker.adjacency, &ranker.global_personalization());
@@ -383,20 +465,33 @@ impl<'a> SystemRanker<'a> {
         ranker
     }
 
-    /// Symbol entity ids in rank order (index i in every vector maps to
-    /// `symbols()[i]`).
+    /// Rankable entity ids in rank order (index i in every vector maps to
+    /// `nodes()[i]`; symbols are a subset).
 // trace:exempt reason=internal-detail
-    pub fn symbols(&self) -> &[String] {
-        &self.symbols
+    pub fn nodes(&self) -> &[String] {
+        &self.nodes
     }
 
-    /// Symbol index for an entity id, if it is a ranked symbol.
+    /// Ranked symbol entity ids (subset of [`SystemRanker::nodes`]),
+    /// id-sorted. Symbol-only callers use this to walk the symbol slice of
+    /// the heterogeneous vectors.
+// trace:exempt reason=internal-detail
+    pub fn symbols(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .zip(self.kinds.iter())
+            .filter(|(_, k)| k.as_str() == kinds::SYMBOL)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Node index for a rankable entity id, if it is in the universe.
 // trace:exempt reason=internal-detail
     pub fn index_of(&self, id: &str) -> Option<usize> {
         self.index.get(id).copied()
     }
 
-    /// Distinct referencing sources of a symbol id (0 when absent).
+    /// Distinct referencing sources of a node id (0 when absent).
 // trace:exempt reason=internal-detail
     pub fn in_degree(&self, id: &str) -> usize {
         self.index
@@ -413,13 +508,42 @@ impl<'a> SystemRanker<'a> {
         self.global.clone()
     }
 
+    /// Project the heterogeneous node scores to surface-relevant symbol
+    /// scores: a symbol's score = its own score + 0.4 × the sum of the
+    /// scores of the entities it OWNS/REGISTERS/PUBLISHES/READS/WRITES/
+    /// PARTICIPATES_IN, with the total bonus capped at 0.5. This is how
+    /// component/flow/contract/state importance reaches the surface.
+    /// Deterministic: nodes and projection edges are id-sorted.
+    ///
+    /// Returns `(symbol id, projected score)` pairs, id-sorted.
+// trace:v1 id=impl.scc.pagerank.project-to-symbols work=WORK-SCC-014 satisfies=REQ-SCC-IR
+    pub fn project_to_symbols(&self, vector: &[f64]) -> Vec<(String, f64)> {
+        let mut scores: Vec<f64> = Vec::with_capacity(self.nodes.len());
+        for (i, _id) in self.nodes.iter().enumerate() {
+            let own = vector.get(i).copied().unwrap_or(0.0);
+            let mut bonus = 0.0;
+            for &j in self.projection[i].iter() {
+                bonus += vector.get(j).copied().unwrap_or(0.0);
+            }
+            scores.push(own + (PROJECTION_BONUS_FACTOR * bonus).min(PROJECTION_BONUS_CAP));
+        }
+        let mut out: Vec<(String, f64)> = Vec::new();
+        for (i, id) in self.nodes.iter().enumerate() {
+            if self.kinds[i] == kinds::SYMBOL {
+                out.push((id.clone(), scores[i]));
+            }
+        }
+        out
+    }
+
     /// Task-personalized PageRank vector. Seeds come from `TaskSeed`s whose
-    /// `id` is a symbol entity id; the seed vector carries `weight` at each
-    /// matched index. Warm start: 0.3 × global + 0.7 × normalized seeds.
-    /// Unresolvable seed sets fall back to the global vector (never panic).
+    /// `id` is a rankable entity id; the seed vector carries `weight` at
+    /// each matched index. Warm start: 0.3 × global + 0.7 × normalized
+    /// seeds. Unresolvable seed sets fall back to the global vector (never
+    /// panic).
 // trace:exempt reason=internal-detail
     pub fn task_vector(&self, seeds: &[TaskSeed]) -> Vec<f64> {
-        let n = self.symbols.len();
+        let n = self.nodes.len();
         if n == 0 {
             return Vec::new();
         }
@@ -449,10 +573,11 @@ impl<'a> SystemRanker<'a> {
     /// Architectural seed vector (weight 1.0 per seed): exported symbols,
     /// symbols with entrypoint attributes, invocation-surface handlers,
     /// primary entrypoints, state owners, contract producers, and flow
-    /// entrypoints.
+    /// entrypoints. Applied to every node id (non-symbol nodes simply do
+    /// not carry symbol attributes).
 // trace:exempt reason=internal-detail
     fn global_personalization(&self) -> Vec<f64> {
-        let n = self.symbols.len();
+        let n = self.nodes.len();
         let mut seeds = vec![0.0; n];
         // Flow entrypoints: flows record the entry symbol id in attributes.
         let mut flow_eps: HashSet<String> = HashSet::new();
@@ -461,7 +586,7 @@ impl<'a> SystemRanker<'a> {
                 flow_eps.insert(ep.to_string());
             }
         }
-        for (i, id) in self.symbols.iter().enumerate() {
+        for (i, id) in self.nodes.iter().enumerate() {
             let mut seed = false;
             if let Some(e) = self.view.entity(id) {
                 let exported = e
@@ -742,7 +867,7 @@ pub fn final_importance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scc_core::{Entity, Relationship, Visibility};
+    use scc_core::{entity_id, Entity, Relationship, Visibility};
     use scc_graph::{RealityGraph, TrustPolicy};
     use scc_store::Store;
     use std::collections::HashMap;
@@ -1164,5 +1289,139 @@ mod tests {
         // Plain exported facade with no penalties hits the cap.
         let facade = surface_entry("s5", "OrderApi", "src/api/order.ts", true);
         assert_eq!(architectural_specificity(&facade, &view), 1.25);
+    }
+
+    // ---- heterogeneous universe: non-symbol entities participate ----
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn ranker_universe_is_heterogeneous() {
+        let owner = scc_core::symbol_id("r", "src/a.ts", "A");
+        let state_id = entity_id("r", kinds::STATE, "sessions");
+        let contract_id = entity_id("r", kinds::CONTRACT, "c1");
+        let topic_id = entity_id("r", kinds::TOPIC, "orders");
+        let store_id = entity_id("r", kinds::DATA_STORE, "pg");
+        let flow_id = entity_id("r", kinds::FLOW, "signup");
+        let file_id = entity_id("r", kinds::FILE, "src/a.ts");
+
+        let mut owner_ent = sym("r", "src/a.ts", "A");
+        owner_ent.attr("exported", serde_json::json!(true));
+        owner_ent.attr("entrypoints", serde_json::json!(["http"]));
+        let entities = vec![
+            owner_ent,
+            entity(&state_id, kinds::STATE, "sessions"),
+            entity(&contract_id, kinds::CONTRACT, "c1"),
+            entity(&topic_id, kinds::TOPIC, "orders"),
+            entity(&store_id, kinds::DATA_STORE, "pg"),
+            entity(&flow_id, kinds::FLOW, "signup"),
+            entity(&file_id, kinds::FILE, "src/a.ts"),
+        ];
+        let n = 1u64;
+        let rels = vec![
+            rel(n, &owner, predicates::OWNS, &state_id, Provenance::Extracted),
+            rel(n + 1, &owner, predicates::REGISTERS, &contract_id, Provenance::Extracted),
+            rel(n + 2, &owner, predicates::PUBLISHES, &topic_id, Provenance::Extracted),
+            rel(n + 3, &owner, predicates::READS, &store_id, Provenance::Extracted),
+            rel(n + 4, &owner, predicates::WRITES, &store_id, Provenance::Extracted),
+            rel(n + 5, &owner, predicates::PARTICIPATES_IN, &flow_id, Provenance::Extracted),
+        ];
+
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+
+        // Every rankable entity kind is a node.
+        for id in [
+            owner.as_str(),
+            state_id.as_str(),
+            contract_id.as_str(),
+            topic_id.as_str(),
+            store_id.as_str(),
+            flow_id.as_str(),
+            file_id.as_str(),
+        ] {
+            assert!(ranker.index_of(id).is_some(), "{id} must be a node");
+        }
+        // Non-rankable kinds (module) are not nodes.
+        assert!(ranker.index_of(&entity_id("r", kinds::MODULE, "m")).is_none());
+
+        // The heterogeneous vectors are indexed over all nodes.
+        let g = ranker.global_vector();
+        assert_eq!(g.len(), ranker.nodes().len());
+
+        // Non-symbol nodes carry real PPR mass (the edges feed them).
+        let owner_i = ranker.index_of(&owner).unwrap();
+        let state_i = ranker.index_of(&state_id).unwrap();
+        assert!(g[state_i] > 0.0, "state node must receive PPR mass");
+        assert!(g[owner_i] > 0.0);
+
+        // Symbols() returns exactly the symbol nodes.
+        let syms = ranker.symbols();
+        assert_eq!(syms, vec![owner.clone()]);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn project_to_symbols_lifts_owned_entity_scores() {
+        let owner = scc_core::symbol_id("r", "src/a.ts", "A");
+        let other = scc_core::symbol_id("r", "src/b.ts", "B");
+        let state_id = entity_id("r", kinds::STATE, "sessions");
+        let contract_id = entity_id("r", kinds::CONTRACT, "c1");
+
+        let mut owner_ent = sym("r", "src/a.ts", "A");
+        owner_ent.attr("exported", serde_json::json!(true));
+        owner_ent.attr("entrypoints", serde_json::json!(["http"]));
+        let entities = vec![
+            owner_ent,
+            sym("r", "src/b.ts", "B"),
+            entity(&state_id, kinds::STATE, "sessions"),
+            entity(&contract_id, kinds::CONTRACT, "c1"),
+        ];
+        let rels = vec![
+            rel(1, &owner, predicates::OWNS, &state_id, Provenance::Extracted),
+            rel(2, &owner, predicates::REGISTERS, &contract_id, Provenance::Extracted),
+            // B's OWNS of the same state also projects (both owners lift)
+            rel(3, &other, predicates::OWNS, &state_id, Provenance::Extracted),
+        ];
+        let (_dir, store, graph) = fixture(entities, rels);
+        let view = TrustedGraphView::new(&graph, &store, &[], TrustPolicy::default());
+        let ranker = SystemRanker::new(&view);
+
+        let g = ranker.global_vector();
+        let projected = ranker.project_to_symbols(&g);
+        let score_of = |id: &str| -> f64 {
+            projected
+                .iter()
+                .find(|(s, _)| s == id)
+                .map(|(_, v)| *v)
+                .unwrap_or(f64::NAN)
+        };
+
+        let own_a = score_of(&owner);
+        let own_b = score_of(&other);
+        let state_score = g[ranker.index_of(&state_id).unwrap()];
+        let contract_score = g[ranker.index_of(&contract_id).unwrap()];
+
+        // A owns state + registers contract → bonus = 0.4 × (state+contract),
+        // capped at 0.5. B only owns the state → smaller bonus.
+        let bonus_a = (0.4 * (state_score + contract_score)).min(0.5);
+        let bonus_b = (0.4 * state_score).min(0.5);
+        assert!((own_a - (g[ranker.index_of(&owner).unwrap()] + bonus_a)).abs() < 1e-9);
+        assert!((own_b - (g[ranker.index_of(&other).unwrap()] + bonus_b)).abs() < 1e-9);
+        // The owner with the richer entity set ranks above the plain owner.
+        assert!(own_a > own_b);
+
+        // Cap: a symbol owning a huge-massed state cannot exceed own + 0.5.
+        let mut big_v = vec![0.0; g.len()];
+        big_v[ranker.index_of(&state_id).unwrap()] = 100.0;
+        big_v[ranker.index_of(&contract_id).unwrap()] = 100.0;
+        let capped = ranker.project_to_symbols(&big_v);
+        let cap_a = capped.iter().find(|(s, _)| s == &owner).unwrap().1;
+        let own_a0 = big_v[ranker.index_of(&owner).unwrap()];
+        assert!((cap_a - (own_a0 + 0.5)).abs() < 1e-9);
+
+        // Deterministic: same input → identical output.
+        let again = ranker.project_to_symbols(&g);
+        assert_eq!(again, projected);
     }
 }

@@ -50,6 +50,7 @@ def make_fixture_repo():
     return repo
 
 
+# trace:v1 id=test.scc.hermes.plugin verifies=REQ-SCC-IR exercises=impl.scc.hermes
 class HermesPluginTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,7 +61,8 @@ class HermesPluginTest(unittest.TestCase):
         except (FileNotFoundError, subprocess.CalledProcessError):
             cls.repo = None
 
-    def test_registers_seven_tools_and_skill(self):
+    # trace:exempt reason=internal-detail  # plugin contract test; behavior traced at impl.scc.cli
+    def test_registers_ten_tools_and_skill(self):
         self.assertEqual(
             set(self.ctx.tools),
             {
@@ -71,6 +73,9 @@ class HermesPluginTest(unittest.TestCase):
                 "flow_context",
                 "impact_context",
                 "verify_context",
+                "system_context",
+                "surface_map",
+                "structural_source",
             },
         )
         self.assertIn("scc-system-context", self.ctx.skills)

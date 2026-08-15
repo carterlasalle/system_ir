@@ -1455,6 +1455,42 @@ pub struct SystemSurfaceMap {
     pub omitted: Vec<SurfaceOmission>,
 }
 
+/// The production surface render: the budget-selected subset plus honest
+/// omission accounting (Wave 14F). `rendered_ids` are exactly the entries
+/// the agent sees (ledger recording MUST use only these — omitted
+/// candidates are never marked visible); `omitted_ids` are every candidate
+/// the pipeline cut. `omissions` summarizes the cuts by kind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct SurfaceRenderResult {
+    /// The rendered surface text (header + selected entry blocks).
+    pub text: String,
+    /// Entry ids actually rendered, in selection order.
+    pub rendered_ids: Vec<String>,
+    /// Candidate entry ids the pipeline omitted (budget/quotas/diversity).
+    pub omitted_ids: Vec<String>,
+    /// Per-kind omission summaries.
+    pub omissions: Vec<SurfaceOmission>,
+    /// Token estimate of `text`.
+    pub token_count: usize,
+}
+
+/// One node in the heterogeneous ranking universe (Wave 14B): any rankable
+/// entity — symbol, component, subsystem, service, flow, contract, state,
+/// reactive, route, topic, queue, store, schema, or file. The ranker walks
+/// edges whose endpoints are rankable entities, so architectural importance
+/// (flows, contracts, state) participates in PageRank directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct RankNode {
+    /// The entity id (`repo://{repo}/{kind}/{key}`).
+    pub id: String,
+    /// Entity kind (`scc_core::kinds::*`).
+    pub kind: String,
+    /// Entity display name.
+    pub name: String,
+}
+
 /// A normalized reference between two symbols (Wave 14): the graph the
 /// ranker walks. Many SCC relationships already express these concepts;
 /// this layer normalizes them for ranking.
@@ -1589,7 +1625,15 @@ pub struct ContextArtifact {
     pub renderer_version: String,
     pub trust_policy: String,
     pub budget: ContextBudget,
+    /// Deterministic config-only hash (epoch + renderer + policy + budget) —
+    /// the prompt-cache key, stable per epoch. Field name kept for the JSON
+    /// contract.
     pub sha256: String,
+    /// Hash over the *actual rendered content* (config preimage + rendered
+    /// text), so a content change that keeps the config identical still
+    /// changes the hash (the audit's name/content mismatch fix).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_hash: String,
     pub text: String,
 }
 
@@ -1794,5 +1838,72 @@ mod tests {
         assert_eq!(json, "\"public_api\"");
         let back: InvocationSurfaceKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back, InvocationSurfaceKind::PublicApi);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn surface_render_result_roundtrips_through_serde() {
+        let r = SurfaceRenderResult {
+            text: "SCC SYSTEM SURFACE MAP\n\n  function serve\n".into(),
+            rendered_ids: vec!["repo://r/symbol/api.py/serve".into()],
+            omitted_ids: vec!["repo://r/symbol/api.py/internal".into()],
+            omissions: vec![SurfaceOmission {
+                count: 1,
+                kind: "function".into(),
+                reason: "token budget".into(),
+            }],
+            token_count: 7,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: SurfaceRenderResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.rendered_ids[0], "repo://r/symbol/api.py/serve");
+        assert_eq!(back.omissions[0].count, 1);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn rank_node_carries_kind_and_name() {
+        let n = RankNode {
+            id: "repo://r/contract/c1".into(),
+            kind: kinds::CONTRACT.into(),
+            name: "c1".into(),
+        };
+        let json = serde_json::to_string(&n).unwrap();
+        let back: RankNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, "contract");
+        assert_eq!(back.name, "c1");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn context_artifact_content_hash_roundtrips_and_defaults() {
+        // new field roundtrips
+        let a = ContextArtifact {
+            kind: "startup".into(),
+            epoch: "e1".into(),
+            renderer_version: "0.1.0".into(),
+            trust_policy: "floor=0.85".into(),
+            budget: ContextBudget::default(),
+            sha256: "abc".into(),
+            content_hash: "def".into(),
+            text: "body".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: ContextArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.content_hash, "def");
+
+        // legacy JSON without content_hash deserializes (default empty)
+        let legacy = serde_json::json!({
+            "kind": "startup",
+            "epoch": "e1",
+            "renderer_version": "0.1.0",
+            "trust_policy": "floor=0.85",
+            "budget": ContextBudget::default(),
+            "sha256": "abc",
+            "text": "body",
+        });
+        let c: ContextArtifact = serde_json::from_value(legacy).unwrap();
+        assert_eq!(c.content_hash, "");
     }
 }

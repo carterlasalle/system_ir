@@ -1,0 +1,115 @@
+
+cli.py:
+⋮
+│def build_parser():
+⋮
+│def serve(args):
+⋮
+│def deploy(args):
+⋮
+│def main():
+⋮
+
+cli.rs:
+⋮
+│/// Greet a user by name.
+│pub fn greet(name: &str) -> String {
+│    format!("Hello, {name}!")
+⋮
+│pub struct ServerState {
+│    pub port: u16,
+│    cache: std::sync::RwLock<Vec<String>>,
+⋮
+│/// Read the service port from the environment.
+│fn service_port() -> String {
+│    std::env::var("PORT").unwrap_or_else(|_| "8080".to_string())
+⋮
+│/// Build the axum HTTP router.
+│pub fn build_router() -> Router {
+│    Router::new()
+│        .route("/health", get(health))
+│        .route("/users", get(list_users))
+│        .layer(tower_http::trace::TraceLayer::new())
+⋮
+│fn health() {}
+│
+│fn list_users() {}
+│
+⋮
+│struct Cli {
+│    /// Enable paged output.
+│    #[arg(long)]
+│    paging: bool,
+│
+│    /// Output format.
+│    #[arg(short, long)]
+│    format: String,
+│
+│    #[command(subcommand)]
+⋮
+│enum Command {
+│    /// Serve requests.
+│    Serve {
+│        /// Port to listen on.
+│        #[arg(long = "port", default_value_t = 8080)]
+│        port: u16,
+│    },
+│    /// Deploy the build.
+│    Deploy {
+│        /// Target environment.
+⋮
+│/// Builder-style CLI (clap builder API, alongside the derive example).
+│fn build_cli() -> Command {
+│    Command::new("cli-service")
+│        .about("demo CLI service")
+│        .arg(Arg::new("paging").long("paging").help("Enable paged output."))
+│        .arg(Arg::new("theme").short('t').long("theme").help("Color theme."))
+│        .arg(Arg::new("FILE"))
+│        .subcommand(
+│            Command::new("start")
+│                .about("Start the service")
+│                .arg(Arg::new("port").short('p').long("port").default_value("8080")),
+⋮
+│fn main() {
+│    let cli = Cli::parse();
+│    match cli.command {
+│        Command::Serve { port } => println!("{port}"),
+│        Command::Deploy { env } => println!("{env}"),
+│    }
+│    let _app = build_cli();
+⋮
+
+main.go:
+⋮
+│package main
+│
+⋮
+│var rootCmd = &cobra.Command{Use: "cli-service", Short: "demo CLI service"}
+│
+│var serveCmd = &cobra.Command{
+│	Use:   "serve",
+│	Short: "serve requests",
+│	Run: func(cmd *cobra.Command, args []string) {
+│		port, _ := cmd.Flags().GetInt("port")
+│		fmt.Println(port)
+│	},
+⋮
+│var deployCmd = &cobra.Command{
+│	Use:   "deploy",
+│	Short: "deploy the build",
+│	Run: func(cmd *cobra.Command, args []string) {
+│		env, _ := cmd.Flags().GetString("env")
+│		fmt.Println(env)
+│	},
+⋮
+│func init() {
+│	rootCmd.AddCommand(serveCmd, deployCmd)
+│	serveCmd.Flags().IntP("port", "p", 8080, "port to listen on")
+│	serveCmd.Flags().Bool("paging", false, "enable paged output")
+│	deployCmd.Flags().StringP("env", "e", "dev", "target environment")
+⋮
+│func main() {
+│	rootCmd.Execute()
+⋮
+
+package.json

@@ -1,0 +1,70 @@
+Wave-15 external benchmark showdown — cli-service (benchmarks/external/ground-truth.yaml, 3 tasks)
+Date: 2026-08-15
+Agent: deterministic mock agent (benchmarks/external/mock_agent.py) — the SAME command for every
+       variant (equal conditions): the only input that varies is the context artifact.
+Tools (pinned, verified by the adapters — no silent floating):
+  aider   Aider-AI/aider     @ 5dc9490bb35f9729ef2c95d00a19ccd30c26339c  (0.86.3.dev53+g5dc9490bb,
+          ~/.scc-bench-venv, direct_url.json commit_id verified)
+  repomix yamadashy/repomix  @ e3b15a406ed78d8a463620a032a059ce911bfc0e  (1.18.0, built from the
+          pinned checkout ~/.scc-bench/repomix, globally installed, version mapping verified)
+Tokenizer: chars/4 (len/4, min 1) — the single shared rule for ALL variants (harness, adapters,
+           scc native arm), so equal-token budgets mean the same thing everywhere.
+Fairness fixes in this run:
+  - scc-full structural section is GOAL-selected (production `scc context structural --task`
+    CLI), never ground-truth task.files (ground truth is scoring-only).
+  - scc-full FINAL artifact budget enforced on the concatenated startup + task delta +
+    structural text (startup N/2, task N/4, structural the remainder) — total <= N.
+  - scc-atlas gets the FULL budget for the Atlas (`scc atlas --budget N`, no 13:7 split).
+  - aider-repomap personalized with the same task goal (mentioned_idents) as the SCC task
+    variants; one goal-personalized artifact per task.
+
+Budget 16000
+-----------
+variant            success  mean_exploration  first_plan_acc  tokens
+raw                   1.000              1.00           0.000       0
+aider-repomap         1.000              5.00           0.667     678
+repomix-compress      1.000              7.00           0.667     907
+scc-atlas             1.000              2.00           0.000    1392
+scc-surface           1.000              4.00           0.667     618
+scc-atlas-surface     1.000              5.00           0.000    2147
+scc-full              1.000              5.00           0.000    2704
+lexical               1.000              3.00           1.000      60
+global-ppr            1.000              4.00           1.000     295
+task-ppr              1.000              4.00           1.000     295
+ppr-mmr               1.000              4.00           1.000     294
+ppr-quotas            1.000              4.00           1.000     195
+ppr-optimizer         1.000              4.00           1.000     196
+
+Budget 8000
+-----------
+variant            success  mean_exploration  first_plan_acc  tokens
+raw                   1.000              1.00           0.000       0
+aider-repomap         1.000              5.00           0.667     678
+repomix-compress      1.000              7.00           0.667     907
+scc-atlas             1.000              2.00           0.000    1412
+scc-surface           1.000              4.00           0.667     618
+scc-atlas-surface     1.000              5.00           0.000    2188
+scc-full              1.000              5.00           0.000    2670
+lexical               1.000              3.00           1.000      60
+global-ppr            1.000              4.00           1.000     295
+task-ppr              1.000              4.00           1.000     295
+ppr-mmr               1.000              4.00           1.000     294
+ppr-quotas            1.000              4.00           1.000     195
+ppr-optimizer         1.000              4.00           1.000     196
+
+Reading the table (mock-agent protocol; exploration = files opened + searches + graph queries):
+  - first_plan_acc = the plan names a ground-truth key before any tool event; the mock names
+    the FIRST source path its artifact surfaces, so it measures whether the artifact leads with
+    task-relevant files. The task-personalized PPR ablations (lexical/global-ppr/task-ppr/
+    ppr-mmr/ppr-quotas/ppr-optimizer) all lead with the task's APIs -> 1.000; the startup
+    framings (atlas first) do not -> 0.000.
+  - tokens = the artifact's chars/4 estimate (mean over tasks). Every artifact respects its
+    budget; scc-full's concatenated startup+delta+structural total is enforced <= N.
+  - equal conditions: same mock agent command, same fixture copies, same protocol for the
+    SCC-native and external-tool variants.
+
+Real-agent sanity row (codex-cli 0.146.0, `codex exec --json --sandbox read-only
+--skip-git-repo-check --ephemeral --color never -C . -`, 2026-08-15):
+  scc-full @ 8000: success 1.000, mean_exploration 7.33, first_plan_acc 1.000, tokens 2712
+  (3 tasks, ~77 s/task; the full codex matrix was not run — the mock-agent matrix above is
+  the reproducible equal-conditions table.)

@@ -8,6 +8,8 @@
 
 import { spawn } from "node:child_process";
 
+// trace:v1 id=impl.scc.sdk.typescript work=WORK-SCC-014 satisfies=REQ-SCC-IR
+
 /** A compiled context pack emitted by the scc CLI. */
 export interface ContextPack {
   kind: string;
@@ -44,6 +46,7 @@ export interface IndexResult {
  * resolves with the parsed JSON result; a non-zero exit rejects with an
  * Error carrying the process's stderr.
  */
+// trace:exempt reason=internal-detail  # thin CLI subprocess wrapper, not repo behavior
 export class SCC {
   constructor(private opts: SCCOptions = {}) {}
 
@@ -155,6 +158,91 @@ export class SCC {
       warnings: [],
       tokens: 0,
       budget: 0,
+      truncated: false,
+    };
+  }
+
+  /**
+   * Compile the fused session-startup artifact (Atlas + Surface + coverage +
+   * omissions). `scc context startup` has no JSON mode, so the pack is
+   * synthesized from its markdown output.
+   */
+  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  async contextStartup(budget?: number): Promise<ContextPack> {
+    const args = ["context", "startup"];
+    if (budget !== undefined) {
+      args.push("--budget", String(budget));
+    }
+    const { stdout } = await this.run(args);
+    return {
+      kind: "startup",
+      repository_revision: "",
+      content: stdout,
+      entity_ids: [],
+      evidence_summary: {},
+      warnings: [],
+      tokens: 0,
+      budget: budget ?? 0,
+      truncated: false,
+    };
+  }
+
+  /**
+   * Compile the System Surface Map, global or task-personalized. `scc
+   * surface` has no JSON mode, so the pack is synthesized from its markdown
+   * output.
+   */
+  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  async surfaceMap(goal?: string, budget?: number): Promise<ContextPack> {
+    const args: string[] = ["surface"];
+    if (goal) {
+      args.push("--task", goal);
+    }
+    if (budget !== undefined) {
+      args.push("--budget", String(budget));
+    }
+    const { stdout } = await this.run(args);
+    return {
+      kind: "surface",
+      repository_revision: "",
+      content: stdout,
+      entity_ids: [],
+      evidence_summary: {},
+      warnings: [],
+      tokens: 0,
+      budget: budget ?? 0,
+      truncated: false,
+    };
+  }
+
+  /**
+   * Compile the Structural Source representation of files: pass `files`
+   * explicitly, or a `goal` to select the lexically matching files.
+   * `scc context structural` has no JSON mode, so the pack is synthesized
+   * from its markdown output.
+   */
+  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  async structuralSource(files?: string[], goal?: string, budget?: number): Promise<ContextPack> {
+    const args: string[] = ["context", "structural"];
+    if (files && files.length > 0) {
+      args.push("--files", files.join(" "));
+    }
+    if (goal) {
+      args.push("--task", goal);
+    }
+    if (budget !== undefined) {
+      args.push("--budget", String(budget));
+    }
+    const { stdout } = await this.run(args);
+    return {
+      kind: "structural",
+      repository_revision: "",
+      content: stdout,
+      entity_ids: [],
+      evidence_summary: {},
+      warnings: [],
+      tokens: 0,
+      budget: budget ?? 0,
       truncated: false,
     };
   }

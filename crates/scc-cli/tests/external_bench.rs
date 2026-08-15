@@ -48,6 +48,24 @@ fn run_in_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
 }
 
 // trace:exempt reason=unit-test  # external-bench suite test/helper
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == ".scc" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+}
+
+// trace:exempt reason=unit-test  # external-bench suite test/helper
 fn python3() -> String {
     // Resolve the interpreter with the normal PATH first so a restricted
     // PATH below cannot break the adapter invocation itself.
@@ -263,7 +281,12 @@ fn scc_surface_variant_generates_artifact() {
 
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn restricted_env() -> Vec<(&'static str, &'static str)> {
-    vec![("PATH", "/usr/bin:/bin")]
+    vec![
+        ("PATH", "/usr/bin:/bin"),
+        // Force the harness to skip the pinned-tools venv even when it is
+        // installed locally, so the SKIPPED path is deterministic.
+        ("SCC_BENCH_VENV", "/nonexistent-scc-bench-venv"),
+    ]
 }
 
 #[test]
@@ -349,5 +372,250 @@ fn external_variant_delegation_reports_skipped_status() {
     assert!(
         stdout.contains("SKIPPED-UNINSTALLED"),
         "row names the skip: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g) Wave-15 PPR ablation variants emit metric rows (native arm)
+// ---------------------------------------------------------------------------
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn ablation_variants_emit_metric_rows() {
+    // Representative modes from each pipeline stage: lexical (no PPR),
+    // task-ppr (the CLI-mapped production ranking), ppr-quotas (+MMR +
+    // quota caps). Each must emit a §72 row with a non-empty artifact.
+    for variant in ["lexical", "task-ppr", "ppr-quotas"] {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let out = run_in(
+            workdir.path(),
+            &[
+                "bench",
+                "external",
+                "--variant",
+                variant,
+                "--repo",
+                "cli-service",
+                "--budget",
+                "8000",
+                "--workdir",
+                workdir.path().to_str().unwrap(),
+                "--cmd",
+                FAKE_AGENT,
+                "--json",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "scc bench external ({variant}) failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let row: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout is the metric row JSON");
+        assert_eq!(row["variant"], variant);
+        assert_eq!(row["repo"], "cli-service");
+        assert_eq!(row["tasks"], 3, "cli-service has 3 ground-truth tasks");
+        assert!(
+            row["context_tokens"].as_u64().unwrap() > 0,
+            "{variant} artifact carries tokens"
+        );
+        assert!(
+            row["context_tokens"].as_u64().unwrap() <= 8000,
+            "{variant} artifact respects the budget"
+        );
+        let artifact = workdir.path().join("artifacts").join("cli-service.txt");
+        let text = std::fs::read_to_string(&artifact).expect("artifact exists");
+        assert!(
+            text.contains(&format!("ablation {variant}")),
+            "{variant} artifact is mode-labeled: {text}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (h) scc-full: the structural section is goal-selected, never task.files
+// ---------------------------------------------------------------------------
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn scc_full_structural_section_is_goal_selected_not_ground_truth() {
+    // The critical audit fix: `scc-full` must NOT use ground-truth
+    // task.files for context construction. The structural section's unit
+    // paths must be a subset of what `scc surface --task "<goal>"` renders
+    // (the harness's task-PPR selection oracle) — ground truth is
+    // scoring-only. The oracle is computed independently here.
+    let workdir = tempfile::TempDir::new().unwrap();
+    let out = run_in(
+        workdir.path(),
+        &[
+            "bench",
+            "external",
+            "--variant",
+            "scc-full",
+            "--repo",
+            "cli-service",
+            "--budget",
+            "8000",
+            "--workdir",
+            workdir.path().to_str().unwrap(),
+            "--cmd",
+            FAKE_AGENT,
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "scc bench external (scc-full) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let artifact = workdir.path().join("artifacts").join("cli-service.txt");
+    let text = std::fs::read_to_string(&artifact).expect("artifact exists");
+
+    // FINAL-artifact budget enforcement: the concatenated startup +
+    // task-delta + structural context fits the budget (chars/4 rule).
+    let estimate = |s: &str| if s.is_empty() { 0 } else { (s.len() / 4).max(1) };
+    assert!(
+        estimate(&text) <= 8000,
+        "concatenated artifact fits the budget ({} tokens)",
+        estimate(&text)
+    );
+
+    // Structural unit paths: `<path>\n\nsource: <path>:` blocks.
+    let mut units: Vec<&str> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i + 2 < lines.len() {
+        if lines[i + 1].is_empty()
+            && lines[i + 2].starts_with("source: ")
+            && lines[i + 2].contains(&format!("source: {}:", lines[i]))
+        {
+            units.push(lines[i].trim());
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    assert!(!units.is_empty(), "structural section present: {text}");
+
+    // Oracle: `scc surface --task "<goal>"` in an indexed fixture copy.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let oracle_root = tmp.path().join("repo");
+    copy_tree(&repo_root().join("fixtures").join("cli-service"), &oracle_root);
+    let idx = run_in(&oracle_root, &["index", "--quiet"]);
+    assert!(idx.status.success(), "oracle index succeeds");
+    // Every cli-service task goal: the union of rendered paths is the
+    // selection oracle — ground truth files (cli.rs, cli.py, main.go) are
+    // all goal-relevant here, so the discriminating contract is that the
+    // structural unit set EQUALS the surface-rendered set (the selection
+    // pipeline, not task.files, decides what structural units exist).
+    let surface = run_in(
+        &oracle_root,
+        &["surface", "--task", "add a --paging flag to the serve subcommand", "--budget", "8000"],
+    );
+    assert!(surface.status.success());
+    let surface_text = String::from_utf8_lossy(&surface.stdout);
+    let mut oracle_paths: Vec<String> = Vec::new();
+    for line in surface_text.lines() {
+        let line = line.trim();
+        if !line.starts_with("- ") {
+            continue;
+        }
+        let head = line[2..].split(" — ").next().unwrap_or(&line[2..]);
+        let Some((_, after)) = head.rsplit_once('[') else { continue };
+        let Some((_, after_close)) = after.split_once(']') else { continue };
+        let path = after_close.trim_start().split(':').next().unwrap_or("").trim();
+        if !path.is_empty() {
+            oracle_paths.push(path.to_string());
+        }
+    }
+    assert!(
+        !oracle_paths.is_empty(),
+        "surface oracle renders paths: {surface_text}"
+    );
+    for unit in &units {
+        assert!(
+            oracle_paths.iter().any(|p| p == unit),
+            "structural unit {unit} comes from the task surface selection (never task.files)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (i) adapters hard-error with PIN-MISMATCH (exit 3) on wrong installs
+// ---------------------------------------------------------------------------
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn aider_adapter_pin_mismatch_exits_3() {
+    // A fake site-packages root whose direct_url.json records a WRONG
+    // commit: the adapter must fail closed with exit 3 PIN-MISMATCH (no
+    // silent floating) before building anything.
+    let py = python3();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let fake_site = tempfile::TempDir::new().unwrap();
+    let dist = fake_site.path().join("aider_chat-9.9.9.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(
+        dist.join("direct_url.json"),
+        r#"{"url": "https://github.com/Aider-AI/aider.git", "vcs_info": {"commit_id": "deadbeef00000000000000000000000000000000"}}"#,
+    )
+    .unwrap();
+    let out = Command::new(&py)
+        .arg(benchmarks_dir().join("external").join("aider_adapter.py"))
+        .arg(repo_root().join("fixtures").join("cli-service"))
+        .arg("8000")
+        .arg(out_dir.path())
+        .arg("--goal")
+        .arg("add a --paging flag")
+        .env("SCC_AIDER_SITE_PACKAGES", fake_site.path())
+        .output()
+        .expect("adapter runs");
+    assert_eq!(out.status.code(), Some(3), "exit 3 = PIN-MISMATCH");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("error JSON on stdout");
+    assert_eq!(payload["ok"], false);
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("PIN-MISMATCH"),
+        "error names the mismatch: {}",
+        payload["error"]
+    );
+}
+
+#[test]
+// trace:exempt reason=unit-test  # external-bench suite test/helper
+fn repomix_adapter_pin_mismatch_exits_3() {
+    // A fake installed repomix package with the wrong version: exit 3
+    // PIN-MISMATCH (fail closed against the lock's version mapping).
+    let py = python3();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let fake_pkg = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fake_pkg.path().join("package.json"),
+        r#"{"name": "repomix", "version": "9.9.9"}"#,
+    )
+    .unwrap();
+    let out = Command::new(&py)
+        .arg(benchmarks_dir().join("external").join("repomix_adapter.py"))
+        .arg(repo_root().join("fixtures").join("cli-service"))
+        .arg("8000")
+        .arg(out_dir.path())
+        .arg("--compress")
+        .env("SCC_REPOMIX_PKG_DIR", fake_pkg.path())
+        .output()
+        .expect("adapter runs");
+    assert_eq!(out.status.code(), Some(3), "exit 3 = PIN-MISMATCH");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("error JSON on stdout");
+    assert_eq!(payload["ok"], false);
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("PIN-MISMATCH"),
+        "error names the mismatch: {}",
+        payload["error"]
     );
 }

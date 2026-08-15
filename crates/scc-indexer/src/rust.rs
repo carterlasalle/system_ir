@@ -25,6 +25,7 @@ pub struct RustExtractor {
     language: tree_sitter::Language,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for RustExtractor {
     fn default() -> Self {
         RustExtractor {
@@ -33,6 +34,7 @@ impl Default for RustExtractor {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl LanguageExtractor for RustExtractor {
     fn language(&self) -> &'static str {
         "rust"
@@ -475,6 +477,7 @@ struct Scope {
 }
 
 #[derive(Default)]
+// trace:exempt reason=internal-detail
 struct Ctx {
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
@@ -502,6 +505,7 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().map(|s| s.name.clone())
@@ -512,6 +516,7 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
+// trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
@@ -560,6 +565,7 @@ impl Ctx {
                 name: self.module_name.clone(),
                 kind: SymbolKind::Module,
                 signature: None,
+                decl_header: None,
                 start_line: 1,
                 end_line: 1,
                 exported: false,
@@ -586,6 +592,7 @@ impl Ctx {
 // Walker
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 impl RustExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
@@ -665,6 +672,7 @@ impl RustExtractor {
         (doc, attrs)
     }
 
+// trace:exempt reason=internal-detail
     fn walk_function(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -683,10 +691,12 @@ impl RustExtractor {
         let end_line = node.end_position().row as u32 + 1;
         let (doc, attrs) = self.leading_annotations(node, src);
         let sig = signature(&name, node, src);
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: sym_name.clone(),
             kind,
             signature: Some(sig),
+            decl_header: header,
             start_line,
             end_line,
             exported,
@@ -756,6 +766,7 @@ impl RustExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_type_item(&self, node: Node, kind: SymbolKind, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -766,10 +777,12 @@ impl RustExtractor {
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
         let (doc, attrs) = self.leading_annotations(node, src);
+        let header = decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: name.clone(),
             kind,
             signature: None,
+            decl_header: header,
             start_line,
             end_line,
             exported,
@@ -909,6 +922,7 @@ impl RustExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_mod(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -923,6 +937,7 @@ impl RustExtractor {
             name: name.clone(),
             kind: SymbolKind::Module,
             signature: None,
+            decl_header: None,
             start_line,
             end_line,
             exported,
@@ -943,6 +958,7 @@ impl RustExtractor {
 
     /// `const` / `static` items → Const symbols; `static` items additionally
     /// become mutable crate-level STATE facts.
+// trace:exempt reason=internal-detail
     fn walk_const(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -957,6 +973,7 @@ impl RustExtractor {
             name: name.clone(),
             kind: SymbolKind::Const,
             signature: None,
+            decl_header: None,
             start_line,
             end_line,
             exported,
@@ -1622,6 +1639,65 @@ fn fn_returns_self_type(node: Node, src: &[u8]) -> bool {
         return false;
     };
     node_text(Some(rt), src).contains("Self")
+}
+
+// trace:exempt reason=internal-detail
+/// Body / comment node kinds excluded from the declaration-header span.
+// trace:exempt reason=internal-detail
+fn is_body_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "block"
+            | "field_declaration_list"
+            | "enum_variant_list"
+            | "declaration_list"
+            | "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "statement_block"
+            | "tuple_struct_body"
+            | "line_comment"
+            | "block_comment"
+            | "comment"
+            | "multiline_comment"
+    )
+}
+
+// trace:exempt reason=internal-detail
+/// Byte end of the exact declaration header: the furthest byte of any
+/// header-bearing named child (visibility, name, type parameters,
+/// parameters, return type, bounds, where clause), excluding the body and
+/// comments. Falls back to the declaration start when no header child
+/// extends beyond it.
+// trace:exempt reason=internal-detail
+fn header_end(node: Node) -> usize {
+    let mut end = node.start_byte();
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        if is_body_kind(c.kind()) {
+            continue;
+        }
+        end = end.max(c.end_byte());
+    }
+    end
+}
+
+// trace:exempt reason=internal-detail
+/// Exact declaration header as written: the source byte span from the
+/// declaration keyword through `header_end`, multi-line preserved.
+// trace:exempt reason=internal-detail
+fn decl_header(node: Node, src: &[u8]) -> Option<String> {
+    let end = header_end(node);
+    if end <= node.start_byte() {
+        return None;
+    }
+    let h = std::str::from_utf8(&src[node.start_byte()..end]).ok()?;
+    let h = h.trim_end();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_string())
+    }
 }
 
 fn signature(name: &str, fn_node: Node, src: &[u8]) -> String {
@@ -2704,5 +2780,56 @@ impl Builder {
             "no serde import → no schema facts: {:?}",
             ef2.facts
         );
+    }
+
+    // trace:v1 id=test.scc.extract.rust.decl-header verifies=REQ-SCC-IR exercises=impl.scc.extract.rust
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_is_exact_source_span() {
+        // Multi-line header with generics, receiver, where clause, and a
+        // trait with supertrait bounds: decl_header must reproduce the
+        // source bytes verbatim (including line breaks), NOT the lossy
+        // one-line `signature`.
+        let ef = extract(
+            r#"pub trait Event: Send + Sync {}
+
+pub struct Handler;
+
+impl Handler {
+    pub async fn process<T: Event>(
+        &self,
+        event: T,
+    ) -> Result<Incident, Box<dyn std::error::Error>>
+    where
+        T: Send + Sync,
+    {
+        Ok(Incident { id: String::new() })
+    }
+}
+"#,
+        );
+        let m = find_symbol(&ef, "Handler.process");
+        assert_eq!(
+            m.decl_header.as_deref(),
+            Some(
+                "pub async fn process<T: Event>(\n\
+                 \x20       &self,\n\
+                 \x20       event: T,\n\
+                 \x20   ) -> Result<Incident, Box<dyn std::error::Error>>\n\
+                 \x20   where\n\
+                 \x20       T: Send + Sync,"
+            )
+        );
+        // The lossy signature drops the receiver and collapses whitespace.
+        assert_eq!(
+            m.signature.as_deref(),
+            Some("fn process(event: T) -> Result<Incident, Box<dyn std::error::Error>>")
+        );
+        // Trait supertrait bounds are part of the header.
+        let t = find_symbol(&ef, "Event");
+        assert_eq!(t.decl_header.as_deref(), Some("pub trait Event: Send + Sync"));
+        // Struct header ends at the name (no body braces).
+        let h = find_symbol(&ef, "Handler");
+        assert_eq!(h.decl_header.as_deref(), Some("pub struct Handler"));
     }
 }

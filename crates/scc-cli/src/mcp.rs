@@ -1,9 +1,10 @@
 //! MCP server (docs/API_AND_INTEGRATIONS.md §2, EPIC-080).
 //!
-//! Exposes exactly six intent-level tools to agents — never analyzer-level
+//! Exposes exactly ten intent-level tools to agents — never analyzer-level
 //! graph operations:
-//!   system_overview, task_context, component_context, flow_context,
-//!   impact_context, verify_context
+//!   system_overview, system_atlas, task_context, component_context,
+//!   flow_context, impact_context, verify_context, system_context,
+//!   surface_map, structural_source
 //!
 //! Transport: stdio, newline-delimited JSON-RPC 2.0 (MCP stdio framing).
 //! Repository read-only by default (docs/SECURITY.md §10).
@@ -88,7 +89,61 @@ fn tools() -> Vec<Tool> {
             description: "Verification report: freshness, stale facts, conflicts, low-confidence dependencies, drift, missing evidence.",
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         },
+        Tool {
+            name: "system_context",
+            description: "Session-startup artifact: the System Atlas fused with the System Surface Map (the actual callable API layer), model coverage and honest omissions in one deterministic pack. The primary agent startup tool.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"token_budget": {"type": "integer", "description": "Optional token budget (default 20000; atlas:surface split kept at 13:7)"}}
+            }),
+        },
+        Tool {
+            name: "surface_map",
+            description: "The System Surface Map: the repository's actual callable API layer, ranked by global importance — or, with a goal, personalized to that task (task PPR re-ranking).",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Task goal to personalize the map"},
+                    "token_budget": {"type": "integer", "description": "Optional token budget (default context.surface_tokens, 7000)"}
+                }
+            }),
+        },
+        Tool {
+            name: "structural_source",
+            description: "Structural Source representation of files: exact declaration headers plus per-symbol call/write evidence (deep) or signatures and imports (fallback). Pass files or a goal (a goal selects the lexically matching files).",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Repository-relative file paths"},
+                    "goal": {"type": "string", "description": "Task goal; resolves to the lexically matching files"},
+                    "token_budget": {"type": "integer", "description": "Optional token budget (default context.structural_source, 6000)"}
+                }
+            }),
+        },
     ]
+}
+
+/// Wave 14 dynamic budgets: `--budget N` scales the total and keeps the
+/// default atlas:surface split (13:7); mirrors `commands::startup_budget`
+/// so MCP and CLI render the same startup artifact for the same budget.
+// ponytail: 8-line mirror of commands::startup_budget — promote to a shared
+// pub fn in scc-core when a third transport needs dynamic startup budgets.
+// trace:exempt reason=internal-detail
+fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
+    let def = scc_core::ContextBudget::default();
+    match tokens {
+        None => def,
+        Some(n) => {
+            let total = def.total.max(1) as f64;
+            scc_core::ContextBudget {
+                total: n,
+                atlas: ((n as f64) * (def.atlas as f64 / total)).round() as usize,
+                surface: ((n as f64) * (def.surface as f64 / total)).round() as usize,
+                task_delta: def.task_delta,
+                structural_source: def.structural_source,
+            }
+        }
+    }
 }
 
 fn send(msg: &serde_json::Value) {
@@ -185,6 +240,7 @@ pub fn serve_stdio(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:exempt reason=internal-detail
 fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result<String> {
     let store = crate::open_store(root)?;
     if !store.snapshot_status()?.is_some() {
@@ -256,6 +312,47 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .content)
         }
         "verify_context" => Ok(comp.ctx().verify_context().content),
+        "system_context" => {
+            let budget_tokens = args
+                .get("token_budget")
+                .and_then(|b| b.as_u64())
+                .map(|b| b as usize);
+            let budget = startup_budget(budget_tokens);
+            let startup = scc_context::startup::build_startup(
+                &comp.ctx(),
+                &budget,
+                scc_context::startup::RENDERER_VERSION,
+            );
+            Ok(scc_context::startup::render_startup(&startup))
+        }
+        "surface_map" => {
+            let goal = str_arg("goal");
+            let tokens = args
+                .get("token_budget")
+                .and_then(|v| v.as_u64())
+                .map(|b| b as usize)
+                .unwrap_or(scc_core::ContextBudget::default().surface);
+            let ctx = comp.ctx();
+            if goal.is_empty() {
+                // Same pipeline as `scc surface` (no task): global map.
+                let map = scc_context::surface::compile_surface_map(&ctx);
+                Ok(scc_context::surface::render_surface_map(&map, Some(tokens)))
+            } else {
+                // Same pipeline as `scc surface --task "<goal>"`.
+                Ok(scc_context::startup::task_surface_with_ids(&ctx, &goal, tokens, false).0)
+            }
+        }
+        "structural_source" => {
+            let goal = str_arg("goal");
+            let budget = args
+                .get("token_budget")
+                .and_then(|v| v.as_u64())
+                .map(|b| b as usize);
+            let files = arr_arg("files");
+            let task = if goal.is_empty() { None } else { Some(goal.as_str()) };
+            // P0 parity: the same implementation as the CLI command.
+            Ok(crate::commands::cmd_context_structural(root, &files, task, budget)?)
+        }
         other => Err(crate::CliError::Other(format!("unknown tool: {other}"))),
     }
 }
@@ -265,12 +362,13 @@ mod tests {
     use super::*;
 
     #[test]
+// trace:exempt reason=internal-detail
     fn tool_schemas_are_valid_json_schema() {
         for t in tools() {
             assert_eq!(t.input_schema["type"], "object");
             assert!(t.input_schema.get("properties").is_some());
         }
-        assert_eq!(tools().len(), 7, "the seven semantic tools only");
+        assert_eq!(tools().len(), 10, "the ten semantic tools only");
     }
 
     #[test]

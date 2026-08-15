@@ -19,6 +19,7 @@ pub struct JavaExtractor {
     language: tree_sitter::Language,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for JavaExtractor {
     fn default() -> Self {
         JavaExtractor {
@@ -27,6 +28,7 @@ impl Default for JavaExtractor {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl LanguageExtractor for JavaExtractor {
     fn language(&self) -> &'static str {
         "java"
@@ -412,6 +414,7 @@ struct Scope {
 }
 
 #[derive(Default)]
+// trace:exempt reason=internal-detail
 struct Ctx {
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
@@ -660,6 +663,7 @@ fn is_mockito_annotation(name: &str) -> bool {
     matches!(name, "Mock" | "InjectMocks" | "Spy" | "Captor" | "MockBean")
 }
 
+// trace:exempt reason=internal-detail
 impl JavaExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
@@ -686,6 +690,7 @@ impl JavaExtractor {
     }
 
     /// A type declaration (class/interface/enum) and everything in it.
+// trace:exempt reason=internal-detail
     fn walk_type(&self, node: Node, ctx: &mut Ctx, src: &[u8], kind: SymbolKind) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -694,10 +699,12 @@ impl JavaExtractor {
         }
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
+        let header = self.decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: name.clone(),
             kind,
             signature: None,
+            decl_header: header,
             start_line,
             end_line,
             exported: true,
@@ -772,6 +779,7 @@ impl JavaExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_method(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         if !ctx.top_is_class() {
             self.walk_children(node, ctx, src);
@@ -789,10 +797,12 @@ impl JavaExtractor {
         let modifiers = self.modifiers_text(node, src);
         let is_static = modifiers.split_whitespace().any(|w| w == "static");
         let sig = self.signature(node, src, false);
+        let header = self.decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: sym_name.clone(),
             kind: SymbolKind::Method,
             signature: Some(sig),
+            decl_header: header,
             start_line,
             end_line,
             exported: false,
@@ -856,6 +866,7 @@ impl JavaExtractor {
         ctx.scopes.pop();
     }
 
+// trace:exempt reason=internal-detail
     fn walk_constructor(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         if !ctx.top_is_class() {
             self.walk_children(node, ctx, src);
@@ -866,10 +877,12 @@ impl JavaExtractor {
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
         let sig = self.signature(node, src, true);
+        let header = self.decl_header(node, src);
         ctx.symbols.push(Symbol {
             name: sym_name.clone(),
             kind: SymbolKind::Method,
             signature: Some(sig),
+            decl_header: header,
             start_line,
             end_line,
             exported: false,
@@ -898,6 +911,7 @@ impl JavaExtractor {
     /// Field declarations → const symbols named `Class.field` plus Wave 9
     /// Field facts (mutable unless `final` / interface constant) and JUnit
     /// `@Rule` registrations.
+// trace:exempt reason=internal-detail
     fn walk_field(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         if !ctx.top_is_class() {
             self.walk_children(node, ctx, src);
@@ -931,6 +945,7 @@ impl JavaExtractor {
                 name: fq.clone(),
                 kind: SymbolKind::Const,
                 signature: None,
+                decl_header: None,
                 start_line,
                 end_line,
                 exported: false,
@@ -1266,6 +1281,7 @@ impl JavaExtractor {
         });
     }
 
+// trace:exempt reason=internal-detail
     fn record_package(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let line = node.start_position().row as u32 + 1;
         let text = clean(node_text(Some(node), src));
@@ -1282,6 +1298,7 @@ impl JavaExtractor {
             name: name.to_string(),
             kind: SymbolKind::Module,
             signature: None,
+            decl_header: None,
             start_line: line,
             end_line: line,
             exported: true,
@@ -1342,6 +1359,67 @@ impl JavaExtractor {
         find_named_child(node, "modifiers")
             .map(|c| collapse(node_text(Some(c), src)))
             .unwrap_or_default()
+    }
+
+    /// Byte offset where the declaration header starts: the first modifier
+    /// keyword after any annotations (`@Override public void foo` →
+    /// `public`; annotations are not part of the header).
+// trace:exempt reason=internal-detail
+    fn header_start(&self, node: Node) -> usize {
+        if let Some(mods) = find_named_child(node, "modifiers") {
+            let mut cursor = mods.walk();
+            for c in mods.named_children(&mut cursor) {
+                if matches!(c.kind(), "annotation" | "comment") {
+                    continue;
+                }
+                return c.start_byte();
+            }
+        }
+        node.start_byte()
+    }
+
+    // trace:exempt reason=internal-detail
+    /// Body / comment node kinds excluded from the declaration-header span.
+// trace:exempt reason=internal-detail
+    fn is_body_kind(&self, kind: &str) -> bool {
+        matches!(
+            kind,
+            "block"
+                | "class_body"
+                | "interface_body"
+                | "enum_body"
+                | "annotation_type_body"
+                | "line_comment"
+                | "block_comment"
+        )
+    }
+
+    // trace:exempt reason=internal-detail
+    /// Exact declaration header as written: from the first modifier keyword
+    /// (`public ...`) or the declaration keyword through the furthest
+    /// header-bearing child (throws clause, parameters, heritage, type
+    /// parameters), excluding the body. Multi-line preserved, untruncated.
+// trace:exempt reason=internal-detail
+    fn decl_header(&self, node: Node, src: &[u8]) -> Option<String> {
+        let start = self.header_start(node);
+        let mut end = start;
+        let mut cursor = node.walk();
+        for c in node.named_children(&mut cursor) {
+            if self.is_body_kind(c.kind()) {
+                continue;
+            }
+            end = end.max(c.end_byte());
+        }
+        if end <= start {
+            return None;
+        }
+        let h = std::str::from_utf8(&src[start..end]).ok()?;
+        let h = h.trim_end();
+        if h.is_empty() {
+            None
+        } else {
+            Some(h.to_string())
+        }
     }
 
     /// One-line signature: `public void storeOrder(String orderId)`.
@@ -2400,6 +2478,61 @@ public class Impl implements Local { public void run() {} }
                 SemanticFact::Registration { owner, kind, target } if owner == "Loader.load" && kind == "plugin" && target == "Widget"
             )),
             "ServiceLoader SPI plugin missing: {rs:?}"
+        );
+    }
+
+    // trace:v1 id=test.scc.extract.java.decl-header verifies=REQ-SCC-IR exercises=impl.scc.extract.java
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_is_exact_source_span() {
+        let ef = extract(
+            r#"package com.example;
+
+import java.io.IOException;
+import java.util.List;
+
+public interface Repository<T> {
+    List<T> find(String owner, int limit) throws IOException;
+}
+
+public class IncidentService<T> implements Repository<T> {
+    public List<T> findIncidents(
+        String owner,
+        int limit
+    ) throws IOException {
+        return List.of();
+    }
+}
+"#,
+        );
+        let i = find_symbol(&ef, "Repository");
+        assert_eq!(i.decl_header.as_deref(), Some("public interface Repository<T>"));
+        // Heritage clause included verbatim.
+        let c = find_symbol(&ef, "IncidentService");
+        assert_eq!(
+            c.decl_header.as_deref(),
+            Some("public class IncidentService<T> implements Repository<T>")
+        );
+        // throws clause + line breaks preserved; lossy signature drops both.
+        let m = find_symbol(&ef, "IncidentService.findIncidents");
+        assert_eq!(
+            m.decl_header.as_deref(),
+            Some(
+                "public List<T> findIncidents(\n\
+                 \x20       String owner,\n\
+                 \x20       int limit\n\
+                 \x20   ) throws IOException"
+            )
+        );
+        assert_eq!(
+            m.signature.as_deref(),
+            Some("public List<T> findIncidents(String owner, int limit)")
+        );
+        // Interface method without modifiers starts at the return type.
+        let im = find_symbol(&ef, "Repository.find");
+        assert_eq!(
+            im.decl_header.as_deref(),
+            Some("List<T> find(String owner, int limit) throws IOException")
         );
     }
 }

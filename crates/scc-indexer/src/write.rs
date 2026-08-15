@@ -144,13 +144,40 @@ impl<'a> Writer<'a> {
             tests: ef.tests.clone(),
             store_refs: ef.store_refs.clone(),
         };
+        // Overload index (Item 5/6): per (file, symbol-name) count
+        // same-name declarations in source order. Names declared more than
+        // once in the file (overloads) get `overload_index: N` (0-based) on
+        // every one of their entities; single-occurrence names carry no
+        // attr (missing == 0). Index-0 keeps the canonical id so existing
+        // `symbol_id` consumers (call resolution) stay valid; later
+        // occurrences get a `#N` suffix so each overload survives the
+        // store's INSERT OR REPLACE and surfaces as a separate entry.
+        let mut name_totals: BTreeMap<&str, u32> = BTreeMap::new();
         for sym in &ef.symbols {
-            let id = scc_core::symbol_id(self.repo_id, path, &sym.name);
+            *name_totals.entry(sym.name.as_str()).or_insert(0) += 1;
+        }
+        let mut name_seen: BTreeMap<&str, u32> = BTreeMap::new();
+        for sym in &ef.symbols {
+            let overload_index = name_seen.entry(sym.name.as_str()).or_insert(0);
+            let idx = *overload_index;
+            *overload_index += 1;
+            let base_id = scc_core::symbol_id(self.repo_id, path, &sym.name);
+            let id = if idx == 0 {
+                base_id
+            } else {
+                format!("{base_id}#{idx}")
+            };
             let mut se = scc_core::Entity::new(id.clone(), kinds::SYMBOL, sym.name.clone());
             se.attr("kind", serde_json::json!(core_symbol_kind(sym.kind)));
             se.attr("file", serde_json::json!(path));
             if let Some(sig) = &sym.signature {
                 se.attr("signature", serde_json::json!(sig));
+            }
+            if let Some(header) = &sym.decl_header {
+                se.attr("decl_header", serde_json::json!(header));
+            }
+            if name_totals.get(sym.name.as_str()).copied().unwrap_or(0) > 1 {
+                se.attr("overload_index", serde_json::json!(idx));
             }
             se.attr("exported", serde_json::json!(sym.exported));
             se.attr("start_line", serde_json::json!(sym.start_line));
@@ -1060,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=internal-detail
     fn semantic_facts_translate_to_entities_and_relationships() {
         // Wave 9: PublicExport + Field + Registration facts must produce
         // typed entities and relationships with the owning symbol's evidence.
@@ -1073,6 +1101,7 @@ mod tests {
             name: "serve".into(),
             kind: SymbolKind::Function,
             signature: None,
+            decl_header: None,
             start_line: 1,
             end_line: 2,
             exported: true,
@@ -1146,6 +1175,7 @@ mod tests {
             name: owner.into(),
             kind: SymbolKind::Function,
             signature: None,
+            decl_header: None,
             start_line: 1,
             end_line: 3,
             exported: true,
@@ -1304,6 +1334,7 @@ mod tests {
             name: "authStore".into(),
             kind: SymbolKind::Function,
             signature: None,
+            decl_header: None,
             start_line: 5,
             end_line: 9,
             exported: true,
@@ -1321,6 +1352,7 @@ mod tests {
             name: "editorStore".into(),
             kind: SymbolKind::Function,
             signature: None,
+            decl_header: None,
             start_line: 2,
             end_line: 6,
             exported: true,
@@ -1372,5 +1404,114 @@ mod tests {
 
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
         assert_eq!(scc_graph::state::occurrence_count(&graph, &reactives[0].id), 2);
+    }
+
+    // trace:v1 id=test.scc.write.overload-index verifies=REQ-SCC-IR exercises=impl.scc.write
+    #[test]
+// trace:exempt reason=internal-detail
+    fn overload_symbols_get_distinct_ids_and_indexes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = scc_store::Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let writer = Writer::new(&store, "r", "rev");
+
+        let mut ef = ExtractedFile::default();
+        ef.symbols.push(Symbol {
+            name: "Calc.foo".into(),
+            kind: SymbolKind::Method,
+            signature: Some("public int foo(int a)".into()),
+            decl_header: Some("public int foo(int a)".into()),
+            start_line: 4,
+            end_line: 6,
+            exported: false,
+            docstring: None,
+            parent: Some("Calc".into()),
+        });
+        ef.symbols.push(Symbol {
+            name: "Calc.foo".into(),
+            kind: SymbolKind::Method,
+            signature: Some("public int foo(int a, int b)".into()),
+            decl_header: Some("public int foo(int a, int b)".into()),
+            start_line: 8,
+            end_line: 10,
+            exported: false,
+            docstring: None,
+            parent: Some("Calc".into()),
+        });
+        writer
+            .write_source("Calc.java", "h1", &ef, &[], &[], &SymbolIndex::new("r"))
+            .unwrap();
+
+        let syms = store.entities_by_kind(scc_core::kinds::SYMBOL).unwrap();
+        let foos: Vec<&scc_core::Entity> = syms
+            .iter()
+            .filter(|e| e.attributes.get("kind").and_then(|v| v.as_str()) == Some("method"))
+            .collect();
+        assert_eq!(foos.len(), 2, "both overloads survive: {foos:?}");
+        // Index 0 keeps the canonical symbol id; index 1 is suffixed so the
+        // store's INSERT OR REPLACE cannot collapse them.
+        let base = scc_core::symbol_id("r", "Calc.java", "Calc.foo");
+        let ids: Vec<&str> = foos.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&base.as_str()), "index-0 id is canonical: {ids:?}");
+        assert!(
+            ids.contains(&format!("{base}#1").as_str()),
+            "index-1 id carries a #1 suffix: {ids:?}"
+        );
+        assert_ne!(ids[0], ids[1], "overload ids are distinct");
+
+        // Both carry overload_index (0-based, in source order) and their
+        // exact decl_header.
+        let idx0 = foos
+            .iter()
+            .find(|e| e.id == base)
+            .expect("index-0 entity");
+        assert_eq!(
+            idx0.attributes.get("overload_index").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            idx0.attributes.get("decl_header").and_then(|v| v.as_str()),
+            Some("public int foo(int a)")
+        );
+        let idx1 = foos
+            .iter()
+            .find(|e| e.id == format!("{base}#1"))
+            .expect("index-1 entity");
+        assert_eq!(
+            idx1.attributes.get("overload_index").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            idx1.attributes.get("decl_header").and_then(|v| v.as_str()),
+            Some("public int foo(int a, int b)")
+        );
+
+        // Single-occurrence names carry no overload_index attr.
+        let mut single = ExtractedFile::default();
+        single.symbols.push(Symbol {
+            name: "ping".into(),
+            kind: SymbolKind::Function,
+            signature: None,
+            decl_header: Some("fn ping()".into()),
+            start_line: 1,
+            end_line: 2,
+            exported: true,
+            docstring: None,
+            parent: None,
+        });
+        writer
+            .write_source("lib.rs", "h2", &single, &[], &[], &SymbolIndex::new("r"))
+            .unwrap();
+        let syms = store.entities_by_kind(scc_core::kinds::SYMBOL).unwrap();
+        let ping = syms
+            .iter()
+            .find(|e| e.name == "ping")
+            .expect("ping entity");
+        assert_eq!(
+            ping.attributes.get("overload_index"),
+            None,
+            "no overload_index for single-occurrence names"
+        );
     }
 }

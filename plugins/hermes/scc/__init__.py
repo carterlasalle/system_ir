@@ -1,7 +1,7 @@
 """SCC plugin — registration: wire schemas to handlers, bundle the skill.
 
 Hermes loads this via `register(ctx)` at startup. The plugin provides the
-seven semantic context tools backed by the local `scc` CLI.
+ten semantic context tools backed by the local `scc` CLI.
 """
 
 import logging
@@ -11,7 +11,10 @@ from . import schemas, tools
 
 logger = logging.getLogger(__name__)
 
+# trace:v1 id=impl.scc.hermes work=WORK-SCC-014 satisfies=REQ-SCC-IR
 
+
+# trace:exempt reason=internal-detail  # plugin registration glue; behavior traced at impl.scc.hermes.tools
 def register(ctx):
     """Wire schemas to handlers and register the bundled skill."""
     ctx.register_tool(
@@ -56,6 +59,24 @@ def register(ctx):
         schema=schemas.VERIFY_CONTEXT,
         handler=tools.verify_context,
     )
+    ctx.register_tool(
+        name="system_context",
+        toolset="scc",
+        schema=schemas.SYSTEM_CONTEXT,
+        handler=tools.system_context,
+    )
+    ctx.register_tool(
+        name="surface_map",
+        toolset="scc",
+        schema=schemas.SURFACE_MAP,
+        handler=tools.surface_map,
+    )
+    ctx.register_tool(
+        name="structural_source",
+        toolset="scc",
+        schema=schemas.STRUCTURAL_SOURCE,
+        handler=tools.structural_source,
+    )
 
     # Bundled skill: when to use which SCC operation.
     skills_dir = Path(__file__).parent / "skills"
@@ -64,4 +85,4 @@ def register(ctx):
         if child.is_dir() and skill_md.exists():
             ctx.register_skill(child.name, skill_md)
 
-    logger.info("scc plugin registered: 6 tools, 1 skill")
+    logger.info("scc plugin registered: 10 tools, 1 skill")

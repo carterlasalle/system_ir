@@ -25,6 +25,7 @@ pub struct TypeScriptExtractor {
     tsx_language: Language,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for TypeScriptExtractor {
     fn default() -> Self {
         TypeScriptExtractor {
@@ -34,11 +35,13 @@ impl Default for TypeScriptExtractor {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl LanguageExtractor for TypeScriptExtractor {
     fn language(&self) -> &'static str {
         "typescript"
     }
 
+// trace:exempt reason=internal-detail
     fn extract(&self, file: &SourceFile) -> ExtractedFile {
         let mut parser = Parser::new();
         let is_tsx = file.path.ends_with(".tsx") || file.path.ends_with(".jsx");
@@ -99,6 +102,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     name: name.clone(),
                                     kind: SymbolKind::Function,
                                     signature: signature_of(&node, src),
+                                    decl_header: decl_header_of(&node, src),
                                     start_line: start,
                                     end_line: end_line_of(&node),
                                     exported,
@@ -142,6 +146,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     name: name.clone(),
                                     kind: SymbolKind::Class,
                                     signature: None,
+                                    decl_header: decl_header_of(&node, src),
                                     start_line: line_of(&node),
                                     end_line: end_line_of(&node),
                                     exported: is_exported(&node),
@@ -171,6 +176,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                 name: full.clone(),
                                 kind: SymbolKind::Method,
                                 signature: signature_of(&node, src),
+                                decl_header: decl_header_of(&node, src),
                                 start_line: line_of(&node),
                                 end_line: end_line_of(&node),
                                 exported: false,
@@ -196,6 +202,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     name,
                                     kind: SymbolKind::Interface,
                                     signature: None,
+                                    decl_header: decl_header_of(&node, src),
                                     start_line: line_of(&node),
                                     end_line: end_line_of(&node),
                                     exported: is_exported(&node),
@@ -215,6 +222,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     name,
                                     kind: SymbolKind::Type,
                                     signature: None,
+                                    decl_header: None,
                                     start_line: line_of(&node),
                                     end_line: end_line_of(&node),
                                     exported: is_exported(&node),
@@ -234,6 +242,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     name,
                                     kind: SymbolKind::Enum,
                                     signature: None,
+                                    decl_header: decl_header_of(&node, src),
                                     start_line: line_of(&node),
                                     end_line: end_line_of(&node),
                                     exported: is_exported(&node),
@@ -296,6 +305,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                                 name: name.clone(),
                                 kind: SymbolKind::Const,
                                 signature: const_signature(&d, src),
+                                decl_header: None,
                                 start_line: start,
                                 end_line: end_line_of(&d),
                                 exported,
@@ -337,6 +347,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                         name: hname.clone(),
                         kind: SymbolKind::Function,
                         signature: None,
+                        decl_header: None,
                         start_line: line_of(hnode),
                         end_line: end_line_of(hnode),
                         exported: false,
@@ -429,6 +440,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                 name: module_name.clone(),
                 kind: SymbolKind::Module,
                 signature: None,
+                decl_header: None,
                 start_line: 1,
                 end_line: 1,
                 exported: false,
@@ -2468,6 +2480,61 @@ fn field_text(node: &Node, field: &str, src: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Signatures & docstrings
 // ---------------------------------------------------------------------------
+
+// trace:exempt reason=internal-detail
+/// Body / comment node kinds excluded from the declaration-header span.
+// trace:exempt reason=internal-detail
+fn is_body_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_block"
+            | "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "object_type"
+            | "comment"
+            | "line_comment"
+            | "multiline_comment"
+    )
+}
+
+// trace:exempt reason=internal-detail
+/// Exact declaration header as written: the source byte span from the
+/// declaration keyword (`function` / `async` / `class` / `interface` /
+/// `enum`) through the furthest header-bearing child (return type,
+/// parameters, heritage, type parameters), excluding the body. Leading
+/// decorators are skipped (they are not part of the header). Multi-line
+/// preserved, untruncated.
+// trace:exempt reason=internal-detail
+fn decl_header_of(decl: &Node, src: &[u8]) -> Option<String> {
+    let mut start = decl.start_byte();
+    let mut cursor = decl.walk();
+    for c in decl.named_children(&mut cursor) {
+        if c.kind() == "decorator" {
+            start = c.end_byte();
+        } else {
+            break;
+        }
+    }
+    let mut end = start;
+    let mut cursor = decl.walk();
+    for c in decl.named_children(&mut cursor) {
+        if is_body_kind(c.kind()) {
+            continue;
+        }
+        end = end.max(c.end_byte());
+    }
+    if end <= start {
+        return None;
+    }
+    let h = std::str::from_utf8(&src[start..end]).ok()?;
+    let h = h.trim_end();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h.to_string())
+    }
+}
 
 fn signature_of(decl: &Node, src: &[u8]) -> Option<String> {
     let name = field_text(decl, "name", src).unwrap_or_default();
@@ -4687,6 +4754,58 @@ export class M {}
             "no queue import → no consumers: {:?}",
             ef3.store_refs
         );
+    }
+
+    // trace:v1 id=test.scc.extract.ts.decl-header verifies=REQ-SCC-IR exercises=impl.scc.extract.typescript
+    #[test]
+// trace:exempt reason=internal-detail
+    fn decl_header_is_exact_source_span() {
+        let ef = extract(
+            "src/surface.ts",
+            r#"export interface Repo<T> {
+  find(id: string): Promise<T | null>;
+}
+
+export class IncidentRepo implements Repo<Incident> {
+  async findByOwner(
+    owner: string,
+    opts?: { limit?: number },
+  ): Promise<Incident[]> {
+    return [];
+  }
+}
+
+export type Incident = {
+  id: string;
+};
+"#,
+        );
+        let i = find(&ef.symbols, "Repo");
+        assert_eq!(i.decl_header.as_deref(), Some("interface Repo<T>"));
+        let c = find(&ef.symbols, "IncidentRepo");
+        assert_eq!(
+            c.decl_header.as_deref(),
+            Some("class IncidentRepo implements Repo<Incident>")
+        );
+        let m = find(&ef.symbols, "IncidentRepo.findByOwner");
+        assert_eq!(
+            m.decl_header.as_deref(),
+            Some(
+                "async findByOwner(\n\
+                 \x20   owner: string,\n\
+                 \x20   opts?: { limit?: number },\n\
+                 \x20 ): Promise<Incident[]>"
+            )
+        );
+        // The lossy signature collapses whitespace onto one line.
+        assert_eq!(
+            m.signature.as_deref(),
+            Some("findByOwner(owner: string, opts?: { limit?: number }): Promise<Incident[]>")
+        );
+        // Type aliases are not captured (Type kind, not a header-bearing
+        // declaration in the task scope).
+        let t = find(&ef.symbols, "Incident");
+        assert_eq!(t.decl_header, None);
     }
 }
 

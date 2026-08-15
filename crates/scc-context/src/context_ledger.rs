@@ -79,6 +79,27 @@ impl<'a> ContextLedgerStore<'a> {
             led.visible_flows,
         )
     }
+
+    /// Record what the agent actually saw this epoch. The caller MUST pass
+    /// kind-scoped sets derived from *rendered* ids only (audit fix: budget-
+    /// omitted candidates are never marked visible — the ledger describes
+    /// the delivered artifact, not the candidate pool). Merges into the
+    /// existing epoch ledger; best-effort persistence.
+    // trace:v1 id=impl.scc.context.ledger.record-visible work=WORK-SCC-014 satisfies=REQ-SCC-IR
+    pub fn record_visible(
+        &self,
+        symbols: &BTreeSet<String>,
+        files: &BTreeSet<String>,
+        components: &BTreeSet<String>,
+        flows: &BTreeSet<String>,
+    ) {
+        let mut led = self.load();
+        led.visible_symbols.extend(symbols.iter().cloned());
+        led.visible_files.extend(files.iter().cloned());
+        led.visible_components.extend(components.iter().cloned());
+        led.visible_flows.extend(flows.iter().cloned());
+        self.save(&led);
+    }
 }
 
 /// Novelty penalty for one symbol: how much re-injection should cost when
@@ -178,6 +199,37 @@ mod tests {
         assert_eq!(files, led.visible_files);
         assert_eq!(comps, led.visible_components);
         assert_eq!(flows, led.visible_flows);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn record_visible_persists_rendered_ids_only() {
+        let (_dir, store) = test_store();
+        let ls = ContextLedgerStore::new(&store);
+        let mut syms = BTreeSet::new();
+        syms.insert("repo://r/symbol/a.py/rendered".into());
+        let mut comps = BTreeSet::new();
+        comps.insert("repo://r/component/c".into());
+        let mut flows = BTreeSet::new();
+        flows.insert("repo://r/flow/f".into());
+
+        ls.record_visible(&syms, &BTreeSet::new(), &comps, &flows);
+        let led = ls.load();
+        assert!(led.visible_symbols.contains("repo://r/symbol/a.py/rendered"));
+        assert!(led.visible_components.contains("repo://r/component/c"));
+        assert!(led.visible_flows.contains("repo://r/flow/f"));
+        // only rendered ids were recorded — nothing else leaked in
+        assert_eq!(led.visible_symbols.len(), 1);
+        assert!(led.visible_files.is_empty());
+
+        // A second recording merges (rendered ids accumulate per epoch).
+        let mut more = BTreeSet::new();
+        more.insert("repo://r/symbol/b.py/new".into());
+        ls.record_visible(&more, &BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new());
+        let led = ls.load();
+        assert!(led.visible_symbols.contains("repo://r/symbol/a.py/rendered"));
+        assert!(led.visible_symbols.contains("repo://r/symbol/b.py/new"));
+        assert_eq!(led.visible_symbols.len(), 2);
     }
 
     #[test]

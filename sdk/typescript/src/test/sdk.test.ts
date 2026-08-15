@@ -109,6 +109,30 @@ test("verifyContext() content reports freshness", { skip: skip ? skipReason : fa
   assert.match(pack.content, /FRESHNESS/);
 });
 
+test("contextStartup() renders the fused startup artifact", { skip: skip ? skipReason : false }, async () => {
+  const pack = await scc().contextStartup();
+  assert.equal(pack.kind, "startup");
+  assert.match(pack.content, /# SCC SYSTEM CONTEXT/);
+  assert.match(pack.content, /## SYSTEM ATLAS/);
+  assert.match(pack.content, /## SYSTEM SURFACE MAP/);
+});
+
+test("surfaceMap() renders the global surface map", { skip: skip ? skipReason : false }, async () => {
+  const pack = await scc().surfaceMap();
+  assert.equal(pack.kind, "surface");
+  assert.match(pack.content, /SCC SYSTEM SURFACE MAP/);
+  const personalized = await scc().surfaceMap("add numbers");
+  assert.match(personalized.content, /task-personalized: add numbers/);
+});
+
+test("structuralSource() renders units for files and goals", { skip: skip ? skipReason : false }, async () => {
+  const pack = await scc().structuralSource(["a.py"]);
+  assert.equal(pack.kind, "structural");
+  assert.match(pack.content, /source: a\.py:L/);
+  const byGoal = await scc().structuralSource(undefined, "multiply calculator");
+  assert.match(byGoal.content, /representation:/);
+});
+
 test("non-zero scc exit rejects with stderr", { skip: skip ? skipReason : false }, async () => {
   // A fake binary that fails with a distinctive stderr message.
   const fakeBin = join(fixtureDir!, "fake-scc");

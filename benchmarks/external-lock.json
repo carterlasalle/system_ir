@@ -1,10 +1,12 @@
 {
   "aider": {
     "repository": "Aider-AI/aider",
-    "commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+    "commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+    "version": "0.86.3.dev53+g5dc9490bb"
   },
   "repomix": {
     "repository": "yamadashy/repomix",
-    "commit": "e3b15a406ed78d8a463620a032a059ce911bfc0e"
+    "commit": "e3b15a406ed78d8a463620a032a059ce911bfc0e",
+    "version": "1.18.0"
   }
 }

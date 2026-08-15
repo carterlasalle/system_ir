@@ -38,7 +38,8 @@ fn export_validates_against_json_schema() {
 }
 
 #[test]
-fn mcp_server_exposes_six_semantic_tools() {
+// trace:exempt reason=unit-test
+fn mcp_server_exposes_ten_semantic_tools() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
 
@@ -72,6 +73,18 @@ fn mcp_server_exposes_six_semantic_tools() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"impact_context","arguments":{"files":["main.py"]}}}"#,
     );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"system_context","arguments":{}}}"#,
+    );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"surface_map","arguments":{"goal":"transcript normalization"}}}"#,
+    );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"structural_source","arguments":{"files":["main.py"]}}}"#,
+    );
     drop(stdin);
 
     let mut stdout = String::new();
@@ -89,7 +102,7 @@ fn mcp_server_exposes_six_semantic_tools() {
             by_id.insert(id, v);
         }
     }
-    assert_eq!(by_id.len(), 5, "all requests answered: {stdout}");
+    assert_eq!(by_id.len(), 8, "all requests answered: {stdout}");
 
     let tools = &by_id[&2]["result"]["tools"];
     let names: Vec<&str> = tools
@@ -107,9 +120,12 @@ fn mcp_server_exposes_six_semantic_tools() {
             "component_context",
             "flow_context",
             "impact_context",
-            "verify_context"
+            "verify_context",
+            "system_context",
+            "surface_map",
+            "structural_source"
         ],
-        "the seven semantic tools"
+        "the ten semantic tools"
     );
     let overview_text = by_id[&3]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(overview_text.contains("IDENTITY"));
@@ -118,6 +134,21 @@ fn mcp_server_exposes_six_semantic_tools() {
     assert!(task_text.contains("Normalizer"));
     let impact_text = by_id[&5]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(impact_text.contains("AFFECTED COMPONENTS"));
+    // the three new tools: startup fusion renders atlas + surface; the
+    // task-personalized map renders the surface map; structural source
+    // renders the requested file's units.
+    let startup_text = by_id[&6]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(startup_text.contains("## SYSTEM ATLAS"), "{startup_text}");
+    assert!(startup_text.contains("## SYSTEM SURFACE MAP"), "{startup_text}");
+    assert!(startup_text.contains("## OMISSIONS"), "{startup_text}");
+    let surface_text = by_id[&7]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        surface_text.contains("task-personalized: transcript normalization"),
+        "{surface_text}"
+    );
+    assert!(surface_text.contains("handle_transcripts"), "{surface_text}");
+    let structural_text = by_id[&8]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(structural_text.contains("source: main.py:L"), "{structural_text}");
 }
 
 #[test]
@@ -281,6 +312,34 @@ fn context_parity_across_cli_http_mcp() {
     // parity: identical content on every transport
     assert_eq!(cli_content, http_content, "CLI and HTTP packs differ");
     assert_eq!(cli_content, mcp_content, "CLI and MCP packs differ");
+}
+
+#[test]
+// trace:exempt reason=unit-test
+fn structural_source_cli_renders_file_units() {
+    // Item 7: `scc context structural` is the product CLI for the
+    // Structural Source representation. --files renders the requested
+    // file's units; --task resolves matching files via the lexical
+    // fallback. Both must be non-empty on an indexed fixture.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+
+    let out = run_ok(&dir, &["context", "structural", "--files", "main.py"]);
+    assert!(out.contains("source: main.py:L"), "unit provenance: {out}");
+    assert!(out.contains("revision:"), "revision header: {out}");
+    assert!(out.contains("handle_transcripts"), "symbol rendered: {out}");
+
+    let task = run_ok(
+        &dir,
+        &["context", "structural", "--task", "transcript normalization"],
+    );
+    assert!(task.contains("representation:"), "task-matched units: {task}");
+    assert!(task.contains("transcripts.py"), "task matched the service file: {task}");
+
+    // budget caps the unit count without breaking rendering
+    let capped = run_ok(&dir, &["context", "structural", "--files", "main.py", "--budget", "1000"]);
+    assert!(capped.contains("source: main.py:L"), "budgeted render: {capped}");
 }
 
 #[test]

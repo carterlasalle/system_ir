@@ -37,6 +37,7 @@ def resolve_scc_bin():
 BIN = resolve_scc_bin()
 
 
+# trace:v1 id=test.scc.sdk.python verifies=REQ-SCC-IR exercises=impl.scc.sdk.python
 @unittest.skipUnless(BIN, "scc binary not found (set SCC_BIN or add scc to PATH)")
 class TestSCCSDK(unittest.TestCase):
     @classmethod
@@ -96,6 +97,30 @@ class TestSCCSDK(unittest.TestCase):
         pack = self.scc.verifyContext()
         self.assertEqual(pack["kind"], "verify")
         self.assertIn("FRESHNESS", pack["content"])
+
+    # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.scc.cli
+    def test_context_startup_renders_fused_artifact(self):
+        pack = self.scc.contextStartup()
+        self.assertEqual(pack["kind"], "startup")
+        self.assertIn("# SCC SYSTEM CONTEXT", pack["content"])
+        self.assertIn("## SYSTEM ATLAS", pack["content"])
+        self.assertIn("## SYSTEM SURFACE MAP", pack["content"])
+
+    # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.scc.cli
+    def test_surface_map_renders_global_and_personalized(self):
+        pack = self.scc.surfaceMap()
+        self.assertEqual(pack["kind"], "surface")
+        self.assertIn("SCC SYSTEM SURFACE MAP", pack["content"])
+        personalized = self.scc.surfaceMap(goal="add numbers")
+        self.assertIn("task-personalized: add numbers", personalized["content"])
+
+    # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.scc.cli
+    def test_structural_source_renders_files_and_goal(self):
+        pack = self.scc.structuralSource(files=["a.py"])
+        self.assertEqual(pack["kind"], "structural")
+        self.assertIn("source: a.py:L", pack["content"])
+        by_goal = self.scc.structuralSource(goal="multiply calculator")
+        self.assertIn("representation:", by_goal["content"])
 
     def test_nonzero_exit_raises_scc_error(self):
         fake_bin = Path(self.tmp) / "fake-scc"

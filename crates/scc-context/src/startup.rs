@@ -7,7 +7,8 @@
 //! the same epoch + config always yields byte-identical startup text.
 
 use crate::context_ledger::novelty_penalty;
-use crate::rank::{collect_lexical_candidates, entity_similarity, term_match, terms};
+use crate::rank::{collect_lexical_candidates, entity_similarity, terms};
+use crate::surface::entry_lexical;
 use crate::ContextCompiler;
 use scc_core::kinds;
 use scc_core::{
@@ -32,8 +33,10 @@ pub struct StartupContext {
 }
 
 /// Build the deterministic startup artifact: the existing System Atlas
-/// content (capped at `budget.atlas`) fused with the System Surface Map
-/// (capped at `budget.surface`), coverage warnings, and honest omissions.
+/// content (capped at `budget.atlas`) fused with the budget-selected
+/// System Surface Map (the production `select_and_render_global` pipeline),
+/// coverage warnings, and honest omissions. The surface's omitted ids
+/// populate the OMISSIONS section; the ledger records ONLY rendered ids.
 // trace:v1 id=impl.scc.context.startup work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn build_startup(
     compiler: &ContextCompiler,
@@ -50,9 +53,10 @@ pub fn build_startup(
     let atlas_pack = compiler.system_atlas(Some(budget.atlas));
     let atlas = atlas_pack.content.clone();
 
-    // Surface: Level 1 is task-agnostic; render at the budget cap.
-    let surface_map = crate::surface::compile_surface_map(compiler);
-    let surface = crate::surface::render_surface_map(&surface_map, Some(budget.surface));
+    // Surface: the FULL production pipeline — heterogeneous global PPR,
+    // required coverage, MMR diversity, quotas, budget selection, render.
+    let render = crate::surface::select_and_render_global(compiler, budget.surface);
+    let surface = render.text.clone();
 
     // MODEL COVERAGE: the compiler's existing warnings + stale paths +
     // a surface accounting line.
@@ -67,16 +71,24 @@ pub fn build_startup(
         coverage.push(format!("stale: {p}"));
     }
     coverage.push(format!(
-        "surface map: {} entries, {} tokens rendered (budget {})",
-        surface_map.entries.len(),
-        estimate_tokens(&surface),
+        "surface map: {} of {} entries rendered, {} tokens (budget {})",
+        render.rendered_ids.len(),
+        surface_candidates(compiler).len(),
+        render.token_count,
         budget.surface
     ));
 
-    // OMISSIONS: the surface map's omitted list + atlas dropped sections.
+    // OMISSIONS: the render result's per-kind cuts + omitted-id count + the
+    // atlas's dropped sections (honest: omitted ids are never silent).
     let mut omissions = Vec::new();
-    for o in &surface_map.omitted {
+    for o in &render.omissions {
         omissions.push(format!("surface: {} ({})", o.kind, o.reason));
+    }
+    if !render.omitted_ids.is_empty() {
+        omissions.push(format!(
+            "surface: {} lower-ranked definitions omitted",
+            render.omitted_ids.len()
+        ));
     }
     for d in &atlas_pack.dropped_sections {
         omissions.push(format!("atlas section dropped: {d}"));
@@ -108,6 +120,24 @@ pub fn build_startup(
     h.update(budget.structural_source.to_string().as_bytes());
     let sha256 = h.finalize().to_hex().to_string();
 
+    // CONTENT hash: the same config preimage PLUS the actual rendered text
+    // (atlas + surface + coverage + omissions, without the artifact metadata
+    // comment). A content change that keeps the config identical now
+    // changes the hash — the audit's name/content mismatch fix.
+    let body = assemble_body(&atlas, &surface, &coverage, &omissions);
+    let mut ch = blake3::Hasher::new();
+    ch.update(b"startup-content-v1");
+    ch.update(epoch.as_bytes());
+    ch.update(renderer_version.as_bytes());
+    ch.update(trust_policy.as_bytes());
+    ch.update(budget.total.to_string().as_bytes());
+    ch.update(budget.atlas.to_string().as_bytes());
+    ch.update(budget.surface.to_string().as_bytes());
+    ch.update(budget.task_delta.to_string().as_bytes());
+    ch.update(budget.structural_source.to_string().as_bytes());
+    ch.update(body.as_bytes());
+    let content_hash = ch.finalize().to_hex().to_string();
+
     let mut artifact = ContextArtifact {
         kind: "startup".into(),
         epoch,
@@ -115,6 +145,7 @@ pub fn build_startup(
         trust_policy,
         budget: budget.clone(),
         sha256,
+        content_hash,
         text: String::new(),
     };
     artifact.text = assemble_block(&atlas, &surface, &coverage, &omissions, &artifact);
@@ -128,6 +159,16 @@ pub fn build_startup(
     }
 }
 
+/// Candidate surface entry ids for the accounting line (deterministic).
+// trace:exempt reason=internal-detail
+fn surface_candidates(compiler: &ContextCompiler) -> Vec<String> {
+    crate::surface::compile_surface_map(compiler)
+        .entries
+        .into_iter()
+        .map(|e| e.id)
+        .collect()
+}
+
 /// The spec's startup block format. Pure function of the context struct, so
 /// `build_startup(..).artifact.text == render_startup(&startup)` always.
 // trace:exempt reason=internal-detail
@@ -135,20 +176,12 @@ pub fn render_startup(s: &StartupContext) -> String {
     assemble_block(&s.atlas, &s.surface, &s.coverage, &s.omissions, &s.artifact)
 }
 
+/// The startup body (all content sections, no artifact metadata comment) —
+/// the preimage of `content_hash`.
 // trace:exempt reason=internal-detail
-fn assemble_block(
-    atlas: &str,
-    surface: &str,
-    coverage: &[String],
-    omissions: &[String],
-    artifact: &ContextArtifact,
-) -> String {
+fn assemble_body(atlas: &str, surface: &str, coverage: &[String], omissions: &[String]) -> String {
     let mut out = String::new();
     out.push_str("# SCC SYSTEM CONTEXT\n");
-    out.push_str(&format!(
-        "<!-- artifact sha256:{} epoch:{} renderer:{} -->\n\n",
-        artifact.sha256, artifact.epoch, artifact.renderer_version
-    ));
     out.push_str("## SYSTEM ATLAS\n");
     out.push_str(atlas.trim_end());
     out.push_str("\n\n## SYSTEM SURFACE MAP\n");
@@ -167,6 +200,24 @@ fn assemble_block(
         out.push_str(o);
         out.push('\n');
     }
+    out
+}
+
+// trace:exempt reason=internal-detail
+fn assemble_block(
+    atlas: &str,
+    surface: &str,
+    coverage: &[String],
+    omissions: &[String],
+    artifact: &ContextArtifact,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# SCC SYSTEM CONTEXT\n");
+    out.push_str(&format!(
+        "<!-- artifact sha256:{} content_hash:{} epoch:{} renderer:{} -->\n\n",
+        artifact.sha256, artifact.content_hash, artifact.epoch, artifact.renderer_version
+    ));
+    out.push_str(&assemble_body(atlas, surface, coverage, omissions));
     out
 }
 
@@ -209,7 +260,10 @@ fn trust_policy_str(p: &scc_graph::TrustPolicy) -> String {
 }
 
 /// The kind-scoped id sets shown by the startup artifact (for ledger
-/// recording): `(symbols, files, components, flows)`.
+/// recording): `(symbols, files, components, flows)`. The surface side
+/// records ONLY the render result's `rendered_ids` — budget-omitted
+/// candidates are never marked visible (audit fix: the ledger must
+/// describe what the agent actually saw).
 // trace:exempt reason=internal-detail
 pub fn visible_ids_from_startup(
     compiler: &ContextCompiler,
@@ -222,9 +276,16 @@ pub fn visible_ids_from_startup(
 
     // Cache-hit in the CLI flow (build_startup already ran system_atlas).
     let atlas_pack = compiler.system_atlas(Some(budget.atlas));
-    let map = crate::surface::compile_surface_map(compiler);
 
+    // Surface: rendered entries ONLY — the same production pipeline the
+    // startup artifact rendered, so the ledger matches the artifact text.
+    let render = crate::surface::select_and_render_global(compiler, budget.surface);
+    let map = crate::surface::compile_surface_map(compiler);
+    let rendered_set: BTreeSet<String> = render.rendered_ids.iter().cloned().collect();
     for e in &map.entries {
+        if !rendered_set.contains(&e.id) {
+            continue; // omitted candidates are never marked visible
+        }
         symbols.insert(e.symbol_id.clone());
         files.insert(e.path.clone());
         if let Some(c) = &e.component {
@@ -511,24 +572,6 @@ pub fn task_surface_with_ids(
 }
 
 // trace:exempt reason=internal-detail
-fn entry_lexical(e: &SurfaceEntry, goal_terms: &BTreeSet<String>) -> f64 {
-    if goal_terms.is_empty() {
-        return 0.0;
-    }
-    let name_terms = terms(&e.qualified_name);
-    let sig_terms = terms(&e.source_signature);
-    let name_hits = goal_terms
-        .iter()
-        .filter(|g| name_terms.iter().any(|n| term_match(g, n)))
-        .count();
-    let sig_hits = goal_terms
-        .iter()
-        .filter(|g| sig_terms.iter().any(|n| term_match(g, n)))
-        .count();
-    (name_hits * 2 + sig_hits) as f64
-}
-
-// trace:exempt reason=internal-detail
 fn api_line(e: &SurfaceEntry) -> String {
     format!(
         "- {} [{}] {}:L{}-L{} — {}",
@@ -587,6 +630,7 @@ mod tests {
                 trust_policy: "floor=0.85".into(),
                 budget: ContextBudget::default(),
                 sha256: "abc".into(),
+                content_hash: "def".into(),
                 text: String::new(),
             },
         };
@@ -598,8 +642,9 @@ mod tests {
         assert!(out.contains("## OMISSIONS"));
         assert!(out.contains("ATLAS-BODY"));
         assert!(out.contains("SURFACE-BODY"));
-        assert!(out.contains("stale: a.py"));
         assert!(out.contains("sha256:abc"));
+        assert!(out.contains("content_hash:def"));
+        assert!(out.contains("stale: a.py"));
     }
 
     #[test]
@@ -610,6 +655,9 @@ mod tests {
         let sc = build_startup(&comp, &budget, "test-renderer");
         assert_eq!(sc.artifact.text, render_startup(&sc));
         assert_eq!(sc.artifact.sha256.len(), 64);
+        assert_eq!(sc.artifact.content_hash.len(), 64);
+        assert_ne!(sc.artifact.content_hash, sc.artifact.sha256);
+        assert!(render_startup(&sc).contains("content_hash:"));
         assert_eq!(sc.artifact.epoch, comp.store.cache_epoch().unwrap_or_default());
     }
 }

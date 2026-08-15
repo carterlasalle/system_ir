@@ -366,13 +366,16 @@ enum BenchSub {
     /// a repo's ground-truth tasks through the benchagent protocol and
     /// print the spec §72 metric row (variant, success rate, mean
     /// exploration, first-plan accuracy, context tokens). Native variants
-    /// (raw, scc-*) run in-process; aider-repomap / repomix-compress
-    /// delegate to benchmarks/external/run_context_bench.py, which owns
-    /// those pinned tools and reports SKIPPED-UNINSTALLED when they are
-    /// not installed.
+    /// (raw, scc-*, and the PPR ablation matrix lexical/global-ppr/
+    /// task-ppr/ppr-mmr/ppr-quotas/ppr-optimizer) run in-process;
+    /// aider-repomap / repomix-compress delegate to
+    /// benchmarks/external/run_context_bench.py, which owns those pinned
+    /// tools and reports SKIPPED-UNINSTALLED (missing) or PIN-MISMATCH
+    /// (wrong installed commit) when they are not available.
     External {
         /// Variant: raw | aider-repomap | repomix-compress | scc-atlas |
-        /// scc-surface | scc-atlas-surface | scc-full
+        /// scc-surface | scc-atlas-surface | scc-full | lexical |
+        /// global-ppr | task-ppr | ppr-mmr | ppr-quotas | ppr-optimizer
         #[arg(long)]
         variant: String,
         /// Restrict to one fixture repo (default: every ground-truth repo)
@@ -402,6 +405,20 @@ enum ContextSub {
     /// epoch (prompt-cache stable)
     Startup {
         /// Token budget (default: the full startup split, 20000)
+        #[arg(long)]
+        budget: Option<usize>,
+    },
+    /// Structural Source: per-file signature/structural representation of
+    /// the requested files, or of the files matched to a task goal
+    Structural {
+        /// Repository-relative file paths to render structurally
+        #[arg(long, value_delimiter = ' ', required_unless_present = "task")]
+        files: Vec<String>,
+        /// Task goal: resolve to the matching files (lexical fallback)
+        #[arg(long)]
+        task: Option<String>,
+        /// Token budget (default: context.structural_source, 6000; scales
+        /// the unit cap)
         #[arg(long)]
         budget: Option<usize>,
     },
@@ -549,6 +566,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {
             ContextSub::Startup { budget } => commands::cmd_context_startup(&root, budget),
+            ContextSub::Structural { files, task, budget } => {
+                let out =
+                    commands::cmd_context_structural(&root, &files, task.as_deref(), budget)?;
+                print!("{out}");
+                Ok(())
+            }
             ContextSub::Task { goal, files, symbols, budget, json, hook, resolve } => {
                 if resolve {
                     let rep = scc_cli::resolve_and_recompile(&root)?;
@@ -893,12 +916,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 const EXTERNAL_VARIANTS: [&str; 2] = ["aider-repomap", "repomix-compress"];
-const NATIVE_VARIANTS: [&str; 5] = [
+const NATIVE_VARIANTS: [&str; 11] = [
     "raw",
     "scc-atlas",
     "scc-surface",
     "scc-atlas-surface",
     "scc-full",
+    // Wave-15 PPR ablation matrix (harness-level mode flags; see
+    // scc_cli::benchagent::SurfaceAblation):
+    "lexical",
+    "global-ppr",
+    "task-ppr",
+    "ppr-mmr",
+    "ppr-quotas",
+    "ppr-optimizer",
 ];
 const DEFAULT_AGENT_CMD: &str = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --color never -C . -";
 
@@ -1039,22 +1070,17 @@ fn run_scc_capture(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Structural source render for the task's matched files (scc-full): the
-/// per-file signature/structural representation from the Wave-14C module.
-// trace:exempt reason=internal-detail  # external-bench scc-full component (impl.scc.cli.main)
-fn structural_source_text(root: &Path, files: &[String]) -> Result<String, String> {
-    let store = scc_cli::open_store(root).map_err(|e| e.to_string())?;
-    let config = scc_cli::load_config(root).map_err(|e| e.to_string())?;
-    let stale = scc_cli::stale_paths(&store).map_err(|e| e.to_string())?;
-    let comp = scc_cli::compiler(&store, &config, stale).map_err(|e| e.to_string())?;
-    let ctx = comp.ctx();
-    let units = scc_context::structural_source::structural_source(&ctx, files, 8);
-    Ok(scc_context::structural_source::render_structural(&units))
-}
-
 /// Generate the variant's context artifact for one task (after the runner
 /// has copied + indexed the repo). Writes `<artifacts_dir>/<repo>.txt` and
 /// returns its path and token estimate.
+///
+/// GROUND-TRUTH DISCIPLINE: `task.files` is the localization ground truth —
+/// it enters SCORING only (the benchagent protocol compares tool events
+/// against it). Context construction never reads it. The structural
+/// section of `scc-full` selects its files from the task-personalized
+/// surface (`scc context structural --task` when the binary supports it,
+/// else `scc surface --task` + the rendered entries); the PPR ablation
+/// modes rank the surface in-process.
 // trace:exempt reason=internal-detail  # external-bench artifact generator (impl.scc.cli.main)
 fn generate_variant_artifact(
     variant: &str,
@@ -1070,22 +1096,64 @@ fn generate_variant_artifact(
     let text: String = match variant {
         "raw" => String::new(),
         "scc-atlas" => {
-            // startup, atlas section only: everything before the surface map
-            let full =
-                run_scc_capture(root, &["context", "startup", "--budget", &budget_s])?;
-            let cut = full.find("\n## SYSTEM SURFACE MAP").unwrap_or(full.len());
-            full[..cut].to_string()
+            // Atlas-only variant: the FULL requested budget goes to the
+            // Atlas (no 13:7 startup split handicap).
+            run_scc_capture(root, &["atlas", "--budget", &budget_s])?
         }
         "scc-surface" => run_scc_capture(root, &["surface", "--budget", &budget_s])?,
         "scc-atlas-surface" => run_scc_capture(root, &["context", "startup", "--budget", &budget_s])?,
         "scc-full" => {
-            let startup = run_scc_capture(root, &["context", "startup", "--budget", &budget_s])?;
-            let task_pack =
-                run_scc_capture(root, &["context", "task", &task.goal, "--budget", &budget_s])?;
-            let structural = structural_source_text(root, &task.files)?;
-            format!("{startup}\n\n{task_pack}\n\n{structural}")
+            // FINAL-artifact budget enforcement: the concatenated
+            // startup + task-delta + structural context must fit `budget`
+            // (enforced on the concatenated artifact, not per piece).
+            // Pieces are sized so the total never exceeds N: startup gets
+            // N/2, the task delta N/4, the structural section gets the
+            // remainder of what the first two actually consumed.
+            let startup_budget = (budget / 2).max(1);
+            let startup = run_scc_capture(
+                root,
+                &["context", "startup", "--budget", &startup_budget.to_string()],
+            )?;
+            let est_s = estimate_tokens(&startup);
+            let remaining = budget.saturating_sub(est_s);
+            let task_budget = (budget / 4).min(remaining / 2).max(1);
+            let task_pack = run_scc_capture(
+                root,
+                &["context", "task", &task.goal, "--budget", &task_budget.to_string()],
+            )?;
+            let est_t = estimate_tokens(&task_pack);
+            let mut structural_budget = budget.saturating_sub(est_s + est_t);
+            let mut structural = scc_cli::benchagent::structural_source_for_goal(
+                root,
+                &task.goal,
+                structural_budget,
+            )?;
+            let mut text = format!("{startup}\n\n{task_pack}\n\n{structural}");
+            text = text.trim_end().to_string();
+            // Hard enforcement on the concatenated artifact: shrink the
+            // structural section (complete-file units) until it fits.
+            while estimate_tokens(&text) > budget && structural_budget > 0 {
+                structural_budget =
+                    structural_budget.saturating_sub(estimate_tokens(&text) - budget + 1);
+                structural = scc_cli::benchagent::structural_source_for_goal(
+                    root,
+                    &task.goal,
+                    structural_budget,
+                )?;
+                text = format!("{startup}\n\n{task_pack}\n\n{structural}")
+                    .trim_end()
+                    .to_string();
+            }
+            text
         }
-        other => return Err(format!("unsupported native variant: {other}")),
+        other => {
+            // Wave-15 PPR ablation matrix: harness-level mode flags (see
+            // scc_cli::benchagent::SurfaceAblation).
+            let mode = scc_cli::benchagent::SurfaceAblation::parse(other).ok_or_else(|| {
+                format!("unsupported native variant: {other}")
+            })?;
+            scc_cli::benchagent::render_ablation_surface(root, mode, &task.goal, budget)?
+        }
     };
 
     std::fs::write(&artifact_path, &text).map_err(|e| e.to_string())?;
@@ -1247,6 +1315,16 @@ fn run_external_python_delegation(
             print!("{stdout}");
         } else {
             println!("{variant}  SKIPPED-UNINSTALLED");
+            eprintln!("{stdout}");
+        }
+        return Ok(());
+    }
+    if out.status.code() == Some(3) {
+        // PIN-MISMATCH: the installed tool does not match the pinned commit
+        if json {
+            print!("{stdout}");
+        } else {
+            println!("{variant}  PIN-MISMATCH");
             eprintln!("{stdout}");
         }
         return Ok(());

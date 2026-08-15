@@ -66,11 +66,20 @@ export default function hook(pi: HookAPI): void {
 
   // Post-edit coaching: run post-mutation so obligations resolve, and
   // append the trace guidance directly to the tool result the model sees.
+  // Write/Edit carry a path; Bash and other opaque filesystem-mutating
+  // tools run the working-tree scan (no path -> _scan_changed_files), so
+  // cat >/patch/generator mutations get the same immediate coaching.
   pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName !== "edit" && event.toolName !== "write") return;
-    const { path } = fileInfo(event.input);
-    if (!path) return;
-    const payload = JSON.stringify({ path, session_id: sessionId(ctx) });
+    const opaque = event.toolName === "bash" || event.toolName === "patch";
+    if (event.toolName !== "edit" && event.toolName !== "write" && !opaque) return;
+    let payload;
+    if (opaque) {
+      payload = JSON.stringify({ session_id: sessionId(ctx) });
+    } else {
+      const { path } = fileInfo(event.input);
+      if (!path) return;
+      payload = JSON.stringify({ path, session_id: sessionId(ctx) });
+    }
     const res = run(["hook", "post-mutation", "--format", "json"], payload);
     if (res.code !== 0) return;
     try {
@@ -88,6 +97,8 @@ export default function hook(pi: HookAPI): void {
   });
 
   // Fail-closed completion gate: block while trace obligations or verify fail.
+  // OMP's SessionStopEventResult carries decision/reason (or continuation
+  // fields) — not a `block` property.
   pi.on("session_stop", async (event, ctx) => {
     const payload = JSON.stringify({
       lifecycle: "wip",
@@ -103,7 +114,7 @@ export default function hook(pi: HookAPI): void {
         // keep default reason
       }
       pi.log(`trace gate: ${reason}`);
-      return { block: true, reason };
+      return { decision: "block", reason };
     }
   });
 }

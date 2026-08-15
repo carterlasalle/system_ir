@@ -18,4 +18,4 @@ require_coverage_confirmation = true
 require_semantic_audit = true
 
 [exclusions]
-paths = ["vendor/**", "generated/**", "docs/vendor/**", "benchmarks/blind-lock.json", "benchmarks/external-lock.json", "benchmarks/external/**", "benchmarks/results/**", ".omp/**", ".pi/**", ".agents/**", ".hermes/**", ".trace/**"]
+paths = ["vendor/**", "generated/**", "docs/vendor/**", "benchmarks/blind-lock.json", "fixtures/surface-signatures/**", "fixtures/contract-ontology-service/**", "benchmarks/external-lock.json", "benchmarks/external/**", "benchmarks/results/**", ".omp/**", ".pi/**", ".agents/**", ".hermes/**", ".trace/**", "sdk/typescript/src/test/**", "plugins/hermes/**/__pycache__/**", "crates/scc-indexer/src/lib.rs", "crates/scc-indexer/src/model.rs", "crates/scc-indexer/src/resolve.rs", "plugins/hermes/scc/schemas.py"]

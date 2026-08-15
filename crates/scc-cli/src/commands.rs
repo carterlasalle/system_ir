@@ -2,6 +2,7 @@
 
 use crate::{checkpoint, compiler, config_path, load_config, open_store, recompile, scc_dir};
 use scc_core::kinds;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -251,6 +252,112 @@ fn record_visible_surface(led: &mut scc_core::ContextLedger, map: &scc_core::Sys
             led.visible_components.insert(c.clone());
         }
     }
+}
+
+/// `scc context structural --files <paths...> | --task "<goal>" [--budget N]` —
+/// the Structural Source product surface (fixwave Item 7): the per-file
+/// signature/structural representation of the requested files, or of the
+/// files matched to a task goal. Returns the rendered text so every
+/// transport (CLI, MCP) shares one implementation.
+// trace:exempt reason=internal-detail
+pub fn cmd_context_structural(
+    root: &Path,
+    files: &[String],
+    task: Option<&str>,
+    budget: Option<usize>,
+) -> crate::Result<String> {
+    let store = open_store(root)?;
+    let config = load_config(root)?;
+    let stale = crate::stale_paths(&store)?;
+    let comp = compiler(&store, &config, stale)?;
+    let ctx = comp.ctx();
+    let tokens = budget.unwrap_or(scc_core::ContextBudget::default().structural_source);
+    // Structural units run ~1000 tokens each: scale the unit cap with the
+    // budget (default 6000 -> 6 units).
+    // ponytail: linear unit cap; revisit if a unit's real cost drifts far
+    // from 1000 tokens.
+    let max_units = (tokens / 1000).clamp(1, 64);
+
+    let paths: Vec<String> = if !files.is_empty() {
+        files.to_vec()
+    } else if let Some(goal) = task {
+        let goal = goal.trim();
+        if goal.is_empty() {
+            return Ok(STRUCTURAL_HELP.to_string());
+        }
+        structural_task_files(&ctx, goal, max_units)
+    } else {
+        return Ok(STRUCTURAL_HELP.to_string());
+    };
+    if paths.is_empty() {
+        return Ok(
+            "# STRUCTURAL SOURCE\n\nNo indexed files matched the task goal \
+             (run `scc index` first, or pass --files explicitly)."
+                .to_string(),
+        );
+    }
+    let units = scc_context::structural_source::structural_source(&ctx, &paths, max_units);
+    if units.is_empty() {
+        return Ok(
+            "# STRUCTURAL SOURCE\n\nNo indexed symbols in the requested files \
+             (run `scc index` first)."
+                .to_string(),
+        );
+    }
+    Ok(scc_context::structural_source::render_structural(&units))
+}
+
+const STRUCTURAL_HELP: &str = "# STRUCTURAL SOURCE\n\nPass --files <paths...> or --task \"<goal>\".";
+
+/// Task -> files resolution for `scc context structural --task` (fixwave
+/// Item 7 fallback): rank the goal's lexical candidates (FTS over entities
+/// and symbols — the same source `task_surface_with_ids` seeds from) and
+/// map each to a repository-relative path: FILE entities by name, symbols
+/// via their `file` attribute. Deterministic: candidates are score-sorted
+/// with id tie-breaks; files deduped in first-seen order.
+// ponytail: lexical fallback — upgrade to task PPR -> Surface entries ->
+// files once surface.rs exposes the task->files resolution (fixwave Item 2).
+// trace:exempt reason=internal-detail
+fn structural_task_files(
+    ctx: &scc_context::ContextCompiler,
+    goal: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut candidates = scc_context::rank::collect_lexical_candidates(
+        ctx.store,
+        &ctx.view,
+        goal,
+        &[],
+        limit.saturating_mul(4),
+    );
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut files: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for c in candidates {
+        let path = if c.kind == kinds::FILE {
+            c.name.clone()
+        } else {
+            ctx.view
+                .entity(&c.id)
+                .and_then(|e| e.attributes.get("file"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        if path.is_empty() || !seen.insert(path.clone()) {
+            continue;
+        }
+        files.push(path);
+        if files.len() >= limit {
+            break;
+        }
+    }
+    files
 }
 
 // trace:exempt reason=internal-detail
