@@ -1,15 +1,194 @@
-# SYSTEM SURFACE MAP (ablation ppr-optimizer: add a --paging flag to the serve subcommand)
+# SYSTEM SURFACE MAP (ablation task-ppr: add a --paging flag to the serve subcommand)
 
-## COMPONENT: root
-- serve [function] cli.py:L20-L26 — def serve(args)
-- ServerState [class] cli.rs:L16-L19 — pub struct ServerState
-- serveCmd [const] main.go:L13-L20 — serveCmd
-- build_parser [function] cli.py:L7-L17 — def build_parser()
-- deploy [function] cli.py:L29-L34 — def deploy(args)
-- rootCmd [const] main.go:L11-L11 — rootCmd
-- build_cli [function] cli.rs:L72-L84 — fn build_cli() -> Command
-- main [function] cli.py:L37-L43 — def main()
-- deployCmd [const] main.go:L22-L29 — deployCmd
-- main [function] cli.rs:L86-L93 — fn main()
-- main [function] main.go:L38-L40 — func main()
-- greet [function] cli.rs:L10-L12 — pub fn greet(name: &str) -> String
+SCC SYSTEM SURFACE MAP
+
+
+ROOT
+
+cli.py
+
+  function build_parser
+
+    def build_parser()
+
+  Used by:
+    main
+
+  Calls:
+    argparse, deploy, serve
+
+  Contracts:
+    cli: --env, cli: --paging, cli: --port, cli: --verbose
+
+  Invocation:
+    cli: cli:build_parser, public_api: export:build_parser (function)
+
+  function deploy
+
+    def deploy(args)
+
+  Used by:
+    build_parser, main
+
+  Invocation:
+    entrypoint:cli-subcommand, public_api: export:deploy (function)
+
+  function main
+
+    def main()
+
+  Used by:
+    cli.py
+
+  Calls:
+    build_parser, deploy, serve
+
+  Invocation:
+    entrypoint:main-guard, process: process:main, public_api: export:main (function)
+
+  function serve
+
+    def serve(args)
+
+  Used by:
+    build_parser, main
+
+  Calls:
+    sqlite3
+
+  Invocation:
+    entrypoint:cli-subcommand, public_api: export:serve (function)
+
+
+ROOT
+
+cli.rs
+
+  class Cli
+
+    struct Cli
+
+  Contracts:
+    cli: --format, cli: --paging
+
+  Invocation:
+    cli: cli:Cli
+
+  class ServerState
+
+    pub struct ServerState
+
+  Invocation:
+    public_api: export:ServerState (class)
+
+  enum Command
+
+    enum Command
+
+  Contracts:
+    cli: --env, cli: --port
+
+  Invocation:
+    cli: cli:Command
+
+  function build_cli
+
+    fn build_cli() -> Command
+
+  Used by:
+    main
+
+  Contracts:
+    cli: --paging, cli: --port, cli: --theme, cli: -p, cli: -t
+
+  Invocation:
+    cli: cli:build_cli, entrypoint:cli-subcommand, entrypoint:cli-subcommand
+
+  function build_router
+
+    pub fn build_router() -> Router
+
+  Contracts:
+    register:/health, register:/users, register:tower_http::trace::TraceLayer::new()
+
+  Invocation:
+    public_api: export:build_router (function)
+
+  function greet
+
+    pub fn greet(name: &str) -> String
+
+  Invocation:
+    public_api: export:greet (function)
+
+  function main
+
+    fn main()
+
+  Calls:
+    build_cli
+
+  Invocation:
+    entrypoint:bin, process: process:main
+
+  function health
+
+    fn health()
+
+  function list_users
+
+    fn list_users()
+
+  function service_port
+
+    fn service_port() -> String
+
+
+ROOT
+
+main.go
+
+  function init
+
+    func init()
+
+  Calls:
+    deployCmd, rootCmd, serveCmd
+
+  Contracts:
+    cli: --env, cli: --paging, cli: --port
+
+  Invocation:
+    cli: cli:init
+
+  function main
+
+    func main()
+
+  Calls:
+    rootCmd
+
+  Invocation:
+    entrypoint:bin, process: process:main
+
+  const deployCmd
+
+    deployCmd
+
+  Used by:
+    init
+
+  const rootCmd
+
+    rootCmd
+
+  Used by:
+    init, main
+
+  const serveCmd
+
+    serveCmd
+
+  Used by:
+    init
+

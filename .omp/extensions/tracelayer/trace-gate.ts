@@ -1,6 +1,12 @@
 // TraceLayer × Oh My Pi — native pre-mutation gate and stop gate.
-// Copy to .omp/extensions/trace-gate.ts (project) or ~/.omp/extensions/ (global).
-// Blocking enforcement: pre-edit context guard + fail-closed completion gate.
+//
+// This file is the extension entry declared by package.json in this
+// directory. `trace install --agent omp` installs the whole package at:
+//   .omp/extensions/tracelayer/          project scope
+//   ~/.omp/agent/extensions/tracelayer/  global scope
+// and `omp install ./adapters/oh-my-pi` links the same directory as a
+// plugin. Do NOT copy this file loose into extensions/ — the legacy raw
+// layout double-registers the factory and was removed deliberately.
 //
 // Type-only import (erased at runtime): the canonical package name is
 // @earendil-works/pi-coding-agent; older runtimes used @oh-my-pi/... The

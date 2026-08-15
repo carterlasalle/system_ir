@@ -281,7 +281,16 @@ fn required_ids(map: &SystemSurfaceMap, compiler: &ContextCompiler) -> BTreeSet<
     }
 
     for e in &map.entries {
-        let mut req = !e.invocation_surfaces.is_empty();
+        // A plain public-API export is NOT a critical coverage item — the
+        // ranker decides whether it earns context. Only concrete
+        // invocation surfaces (http/cli/queue/process/schedule/plugin/
+        // lifecycle/event...) are critical coverage; otherwise every
+        // exported symbol of a large repo becomes 'required' and the
+        // budget never bites (the reviewer's quota/coverage stress case).
+        let mut req = e
+            .invocation_surfaces
+            .iter()
+            .any(|s| !s.starts_with("public_api:"));
         if !req && primary_eps.contains(&e.symbol_id) {
             req = true;
         }
@@ -396,6 +405,41 @@ fn finish_selection(
         .map(|e| estimate_tokens(&render_entry(e)))
         .sum();
     let compress = policy.coverage && required_tokens_full > policy.hard_max;
+
+    // Even compressed, an enormous required set must not blow the hard max
+    // (the reviewer's hard-max semantics: critical facts may exceed the
+    // TARGET but never the hard maximum). When the required set alone
+    // exceeds hard_max, keep the highest-importance required entries that
+    // fit in hard_max — never drop them silently, the omissions block
+    // reports the rest. The single highest-importance required entry is
+    // always kept (its signature compresses to fit).
+    if policy.coverage {
+        let cost_of_c = |id: &str| -> usize {
+            entry_of
+                .get(id)
+                .map(|e| estimate_tokens(&render_entry_compressed(e)))
+                .unwrap_or(1)
+        };
+        let mut spent_c: usize = 0;
+        let mut capped: Vec<(String, f64)> = Vec::new();
+        for (id, imp) in &required_items {
+            let c = cost_of_c(id);
+            if spent_c + c > policy.hard_max && !capped.is_empty() {
+                continue;
+            }
+            spent_c += c;
+            capped.push((id.clone(), *imp));
+        }
+        if capped.is_empty() && !required_items.is_empty() {
+            // pathological: even the first compressed entry alone exceeds
+            // hard_max — keep the single most important one (its metadata
+            // is already stripped; the identity line always remains).
+            capped.push(required_items[0].clone());
+        }
+        if capped.len() < required_items.len() {
+            required_items = capped;
+        }
+    }
 
     let cost_of = |id: &str| -> usize {
         match (entry_of.get(id), compress) {
@@ -2128,6 +2172,11 @@ mod tests {
         e.attr("exported", serde_json::json!(true));
         e.attr("start_line", serde_json::json!(1u32));
         e.attr("end_line", serde_json::json!(10u32));
+        // A concrete invocation surface (http route handler) makes this a
+        // CRITICAL coverage entry — the compression path under hard-max
+        // overflow is what the test exercises. A plain public export is
+        // not critical by design (the ranker decides its fate).
+        e.attr("entrypoints", serde_json::json!(["http: POST /big"]));
         store.insert_entity(&e, &[path.to_string()]).unwrap();
         (dir, store)
     }

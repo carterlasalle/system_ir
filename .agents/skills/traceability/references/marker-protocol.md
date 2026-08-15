@@ -45,8 +45,7 @@ def rotate_refresh_token(...):
 
 ```python
 # trace:v1 id=test.auth.refresh-reuse verifies=REQ-AUTH-017 exercises=impl.auth.refresh
-def test_reused_refresh_token_is_rejected():
-    ...
+def test_reused_refresh_token_is_rejected(): ...
 ```
 
 ```markdown
