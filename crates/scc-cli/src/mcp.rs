@@ -349,6 +349,10 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 budget: tokens,
                 explain: false,
                 policy: scc_context::surface::SurfacePolicy::defaults(tokens),
+                // MCP surface_map currently uses the lexical/PPR pipeline
+                // (no embed_cli rankers wired here); semantic=None makes
+                // the pipeline redistribute the 10% share explicitly.
+                semantic: None,
             };
             let result = scc_context::surface::build_surface(&ctx, request);
             if goal.is_empty() {

@@ -1582,6 +1582,68 @@ impl Default for ContextBudget {
     }
 }
 
+/// Absolute ceiling on the massive-tier surface slice: a 20k-entity repo
+/// must not hand the model an unbounded surface even under a huge total.
+const MASSIVE_SURFACE_CAP: usize = 10_000;
+
+// trace:exempt reason=internal-detail  # impl grouping; adaptive below is traced
+impl ContextBudget {
+    /// Adaptive startup split: scale the Atlas/Surface allocation by repo
+    /// complexity instead of the fixed 13:7 default. Tiers by entity count
+    /// (component count also escalates to `large`):
+    ///
+    /// - tiny (`entity_count < 200`): 55/45 — a small atlas leaves room
+    ///   for a proportionally larger surface;
+    /// - normal: 60/40;
+    /// - large (`entity_count > 5000` or `component_count > 30`): 65/35 —
+    ///   the atlas dominates;
+    /// - massive (`entity_count > 20_000`): 70/30 with the surface slice
+    ///   capped absolutely ([`MASSIVE_SURFACE_CAP`]) and no candidate
+    ///   boost.
+    ///
+    /// Within a tier, the actual candidate pool feeds the surface share:
+    /// every 2,000 surface candidates earns up to +5 percentage points
+    /// (surface never over 50% of the total), so a repo whose surface map
+    /// is genuinely large gets a proportionally larger surface slice.
+    /// `total` is caller-supplied — adaptive scales the SPLIT, never the
+    /// total. Deterministic and no-panic. Defaults stay for callers that
+    /// do not adapt.
+    // trace:v1 id=impl.scc.core.budget-adaptive work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-adaptive-startup-budgets
+    pub fn adaptive(
+        total: usize,
+        entity_count: usize,
+        component_count: usize,
+        _flow_count: usize,
+        surface_candidates: usize,
+    ) -> ContextBudget {
+        let (surface_pct, boost, cap): (f64, f64, Option<usize>) = if entity_count > 20_000 {
+            (30.0, 0.0, Some(MASSIVE_SURFACE_CAP))
+        } else if entity_count > 5_000 || component_count > 30 {
+            (35.0, 5.0, None)
+        } else if entity_count < 200 {
+            (45.0, 5.0, None)
+        } else {
+            (40.0, 5.0, None)
+        };
+        let boost_pp = (surface_candidates / 2_000).min(boost as usize) as f64;
+        let surface_pct = (surface_pct + boost_pp).min(50.0);
+        let atlas_pct = 100.0 - surface_pct;
+        let mut surface = ((total as f64) * surface_pct / 100.0).round() as usize;
+        if let Some(c) = cap {
+            surface = surface.min(c);
+        }
+        let atlas = ((total as f64) * atlas_pct / 100.0).round() as usize;
+        let def = ContextBudget::default();
+        ContextBudget {
+            total,
+            atlas,
+            surface,
+            task_delta: def.task_delta,
+            structural_source: def.structural_source,
+        }
+    }
+}
+
 /// What the agent has already seen — novelty suppression source (the
 /// general form of Aider treating chat files specially).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1728,6 +1790,86 @@ mod tests {
         assert_eq!(back.id, o.id);
         assert_eq!(back.concept, o.concept);
         assert_eq!(back.line, 7);
+    }
+
+// trace:exempt reason=internal-detail
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn adaptive_budget_scales_split_by_repo_complexity() {
+        // tiny repo: 55/45 split — a small atlas leaves room for a
+        // proportionally larger surface (45% share, vs the normal 40%)
+        let tiny = ContextBudget::adaptive(20_000, 50, 2, 1, 10);
+        let tiny_ratio = tiny.surface as f64 / tiny.total as f64;
+        assert!(
+            (tiny_ratio - 0.45).abs() <= 0.01,
+            "tiny: surface share {tiny_ratio}"
+        );
+        assert_eq!(tiny.total, 20_000);
+        assert!(tiny.atlas + tiny.surface <= 20_000);
+
+        // normal repo: 60/40
+        let normal = ContextBudget::adaptive(20_000, 1_000, 5, 4, 10);
+        let normal_ratio = normal.surface as f64 / normal.total as f64;
+        assert!(
+            (normal_ratio - 0.40).abs() <= 0.01,
+            "normal: surface share {normal_ratio}"
+        );
+
+        // large repo (component-heavy): 65/35
+        let large = ContextBudget::adaptive(20_000, 1_000, 40, 4, 10);
+        let large_ratio = large.surface as f64 / large.total as f64;
+        assert!(
+            (large_ratio - 0.35).abs() <= 0.01,
+            "large: surface share {large_ratio}"
+        );
+
+        // massive repo: 70/30 and the surface slice is absolutely capped
+        let massive = ContextBudget::adaptive(20_000, 25_000, 60, 30, 10);
+        assert!(massive.atlas > massive.surface);
+        let massive_ratio = massive.surface as f64 / massive.total as f64;
+        assert!(
+            (massive_ratio - 0.30).abs() <= 0.01,
+            "massive: surface share {massive_ratio}"
+        );
+        // the absolute cap binds under a huge total
+        let massive_huge = ContextBudget::adaptive(100_000, 25_000, 60, 30, 10);
+        assert_eq!(
+            massive_huge.surface, MASSIVE_SURFACE_CAP,
+            "massive surface absolutely capped"
+        );
+
+        // tiny and large must produce different atlas/surface splits
+        assert_ne!(
+            tiny.atlas as f64 / tiny.surface as f64,
+            large.atlas as f64 / large.surface as f64,
+            "tiny vs large splits must differ"
+        );
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn adaptive_budget_candidate_pool_boosts_surface_share() {
+        // 10k candidates: +5pp surface share (10_000 / 2_000 = 5, capped at 5)
+        let boosted = ContextBudget::adaptive(20_000, 1_000, 5, 4, 10_000);
+        let boosted_ratio = boosted.surface as f64 / boosted.total as f64;
+        assert!(
+            (boosted_ratio - 0.45).abs() <= 0.01,
+            "boosted: surface share {boosted_ratio}"
+        );
+        // surface never over 50% of the total
+        let huge = ContextBudget::adaptive(20_000, 100, 2, 1, 100_000);
+        assert!(huge.surface <= huge.total / 2, "surface capped at 50%");
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn adaptive_budget_is_deterministic_and_total_preserving() {
+        let a = ContextBudget::adaptive(15_000, 3_000, 8, 6, 500);
+        let b = ContextBudget::adaptive(15_000, 3_000, 8, 6, 500);
+        assert_eq!(a, b);
+        assert_eq!(a.total, 15_000);
+        assert!(a.atlas + a.surface <= 15_000);
     }
 
     #[test]

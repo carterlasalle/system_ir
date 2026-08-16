@@ -25,6 +25,23 @@ const SYMBOL_KINDS: [&str; 9] = [
     "function", "method", "class", "interface", "trait", "type", "const", "enum", "module",
 ];
 
+/// When no semantic scorer is configured (`SurfaceRequest.semantic` is
+/// `None`), the 10% semantic share of `final_importance` must not silently
+/// vanish (the reviewer's phantom-weight complaint). It is reallocated
+/// proportionally across the other BLEND weights: `final_importance` is
+/// computed with `semantic = 0.0` and the blend renormalized by
+/// `1 / (1 - SEMANTIC_WEIGHT)`, so a full-strength entry still totals 1.0
+/// exactly as the advertised blend promises (the additive novelty term is
+/// untouched). Deterministic and no-panic.
+const REDISTRIBUTION_SCALE: f64 = 1.0 / (1.0 - crate::pagerank::SEMANTIC_WEIGHT);
+
+/// The deepest structural compression level for the hard-max invariant:
+/// 0 = full entry, 1 = first signature line only, 2 = canonical
+/// abbreviated signature, 3 = symbol identity only (kind + name). Level 3
+/// always fits any realistic hard max (a kind + name is a few tokens), so
+/// the progressive-compression loop terminates; entries are never dropped.
+const MAX_COMPRESSION: u8 = 3;
+
 // ---------------------------------------------------------------------------
 // Top-level API
 // ---------------------------------------------------------------------------
@@ -132,20 +149,20 @@ fn render_entry_groups(
     entries: &[SurfaceEntry],
     budget_chars: Option<usize>,
 ) -> (String, BTreeMap<String, usize>) {
-    group_and_render(entries, budget_chars, false, None)
+    group_and_render(entries, budget_chars, 0, false)
 }
 
-/// [`render_entry_groups`] with the pipeline's render options: optional
-/// structural compression (hard-max overflow) and per-entry importance
-/// scores (explain mode). `budget_chars` is the char ceiling for the
-/// plain map render; the selected-subset render passes `None` (the
+/// [`render_entry_groups`] with the pipeline's render options: the
+/// structural compression level (0 full .. 3 identity-only) and per-entry
+/// score decomposition (explain mode). `budget_chars` is the char ceiling
+/// for the plain map render; the selected-subset render passes `None` (the
 /// selection already enforced the token budget).
 // trace:exempt reason=internal-detail
 fn group_and_render(
     entries: &[SurfaceEntry],
     budget_chars: Option<usize>,
-    compress: bool,
-    importance_of: Option<&BTreeMap<String, f64>>,
+    level: u8,
+    explain: bool,
 ) -> (String, BTreeMap<String, usize>) {
     let mut groups: BTreeMap<(String, String, String), Vec<&SurfaceEntry>> = BTreeMap::new();
     for e in entries {
@@ -169,8 +186,8 @@ fn group_and_render(
                 *omitted.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
                 continue;
             }
-            let importance = importance_of.and_then(|m| m.get(&e.id)).copied();
-            let block = render_entry_opt(e, compress, importance);
+            let rank = if explain { Some(&e.rank) } else { None };
+            let block = render_entry_opt(e, level, rank);
             let bc = block.chars().count();
             if fits(total_chars + header.chars().count() + block_chars + bc, budget_chars) {
                 blocks.push(block);
@@ -237,6 +254,20 @@ fn quota_kind(e: &SurfaceEntry) -> &'static str {
     }
 }
 
+/// The names/statements of every invariant in the view — shared by the
+/// required-coverage check (contracts naming an invariant are critical)
+/// and by the explain reasons (`invariant-enforcing`).
+// trace:exempt reason=internal-detail
+fn invariant_names(view: &scc_graph::TrustedGraphView) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for inv in view.invariants() {
+        let name = inv.id.rsplit('/').next().unwrap_or(&inv.id).to_string();
+        names.push(name);
+        names.push(inv.statement.clone());
+    }
+    names
+}
+
 /// Entries the pipeline MUST never omit: critical invocation surfaces
 /// (non-empty `invocation_surfaces`), invariant-enforcing APIs (contracts
 /// containing an invariant name), primary flow entrypoints (entrypoint of a
@@ -248,12 +279,9 @@ fn required_ids(map: &SystemSurfaceMap, compiler: &ContextCompiler) -> BTreeSet<
 
     // Invariant names + critical state ids (state entities named in an
     // invariant's scope are guarded by the invariant → critical).
-    let mut inv_names: Vec<String> = Vec::new();
+    let inv_names = invariant_names(view);
     let mut critical_state: BTreeSet<String> = BTreeSet::new();
     for inv in view.invariants() {
-        let name = inv.id.rsplit('/').next().unwrap_or(&inv.id).to_string();
-        inv_names.push(name);
-        inv_names.push(inv.statement.clone());
         for scope_id in &inv.scope {
             if let Some(e) = view.entity(scope_id) {
                 if e.kind == kinds::STATE {
@@ -316,24 +344,62 @@ fn required_ids(map: &SystemSurfaceMap, compiler: &ContextCompiler) -> BTreeSet<
     required
 }
 
+/// The explain reasons for one entry, populated from the evidence the
+/// entry carries (seeds, flows, visibility, state ownership, invariant
+/// contracts, invocation surfaces, staleness) — the same signals that
+/// drive the required-coverage and criticality decisions. Deterministic
+/// fixed order.
+// trace:exempt reason=internal-detail
+fn entry_reasons(
+    e: &SurfaceEntry,
+    goal: Option<&str>,
+    seed_ids: &BTreeSet<String>,
+    inv_names: &[String],
+    changed: bool,
+) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    if seed_ids.contains(&e.symbol_id) {
+        let label = e
+            .component
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .unwrap_or(goal.unwrap_or("task"));
+        reasons.push(format!("task seed: {label}"));
+    }
+    if !e.flows.is_empty() {
+        reasons.push("primary flow participant".into());
+    }
+    if e.exported || e.visibility == Visibility::Public {
+        reasons.push("public component surface".into());
+    }
+    for s in &e.state_authorities {
+        reasons.push(format!("owns {s}"));
+    }
+    if e.contracts.iter().any(|c| {
+        inv_names
+            .iter()
+            .any(|n| !n.is_empty() && c.to_lowercase().contains(&n.to_lowercase()))
+    }) {
+        reasons.push("invariant-enforcing".into());
+    }
+    if !e.invocation_surfaces.is_empty() {
+        reasons.push("concrete invocation surface".into());
+    }
+    if changed {
+        reasons.push("change risk: modified path".into());
+    }
+    reasons
+}
+
 /// Render the selected subset. No budget cut here — the selection already
 /// enforced the budget, and every selected entry must render so
-/// `rendered_ids` matches the text exactly. `compress` applies the
-/// hard-max structural compression (never drops entries); `explain`
-/// appends each entry's importance score.
+/// `rendered_ids` matches the text exactly. `level` is the structural
+/// compression level (0 full .. 3 identity-only, hard-max overflow never
+/// drops entries); `explain` renders each entry's full score
+/// decomposition from its populated [`SurfaceRank`].
 // trace:exempt reason=internal-detail
-fn render_selected(
-    entries: &[SurfaceEntry],
-    compress: bool,
-    explain: bool,
-    importance_of: &BTreeMap<String, f64>,
-) -> String {
-    let (body, _) = group_and_render(
-        entries,
-        None,
-        compress,
-        if explain { Some(importance_of) } else { None },
-    );
+fn render_selected(entries: &[SurfaceEntry], level: u8, explain: bool) -> String {
+    let (body, _) = group_and_render(entries, None, level, explain);
     let mut out = String::from("SCC SYSTEM SURFACE MAP\n\n");
     if explain {
         out.push_str("selection scores shown per entry\n\n");
@@ -541,7 +607,6 @@ fn finish_selection(
 
     let mut rendered_ids: Vec<String> = Vec::new();
     let mut selected_entries: Vec<SurfaceEntry> = Vec::new();
-    let mut importance_of: BTreeMap<String, f64> = BTreeMap::new();
     for &idx in &selected {
         if idx >= items.len() {
             continue; // defensive: never panic on a misbehaving selector
@@ -549,7 +614,6 @@ fn finish_selection(
         let id = items[idx].id.clone();
         if let Some(e) = entry_of.get(&id) {
             rendered_ids.push(id.clone());
-            importance_of.insert(id.clone(), items[idx].value);
             selected_entries.push((*e).clone());
         }
     }
@@ -575,8 +639,22 @@ fn finish_selection(
         })
         .collect();
 
-    let text = render_selected(&selected_entries, compress, explain, &importance_of);
-    let token_count = estimate_tokens(&text);
+    // Hard-max invariant against the ACTUAL rendered text: when required
+    // coverage forced structural compression (level 1) but the rendered
+    // text still exceeds hard_max (pathological signatures), escalate the
+    // compression ladder level by level — first signature line →
+    // canonical abbreviated signature → symbol identity only — re-rendering
+    // until estimate_tokens(text) <= hard_max. The identity level always
+    // fits any realistic hard max (kind + name is a few tokens), so the
+    // loop terminates; entries are never dropped.
+    let mut level: u8 = if compress { 1 } else { 0 };
+    let mut text = render_selected(&selected_entries, level, explain);
+    let mut token_count = estimate_tokens(&text);
+    while compress && token_count > policy.hard_max && level < MAX_COMPRESSION {
+        level += 1;
+        text = render_selected(&selected_entries, level, explain);
+        token_count = estimate_tokens(&text);
+    }
     scc_core::SurfaceRenderResult {
         text,
         rendered_ids,
@@ -606,14 +684,21 @@ pub enum SurfaceMode<'a> {
 }
 
 /// One surface render request: the mode, the token budget, whether to
-/// explain selection scores, and the pipeline policy.
-#[derive(Debug, Clone, Copy)]
+/// explain selection scores, the pipeline policy, and the optional
+/// semantic scorer.
+#[derive(Clone, Copy)]
 // trace:v1 id=impl.scc.surface.request work=WORK-SCC-015 satisfies=REQ-SCC-IR
 pub struct SurfaceRequest<'a> {
     pub mode: SurfaceMode<'a>,
     pub budget: usize,
     pub explain: bool,
     pub policy: SurfacePolicy,
+    /// The optional semantic scorer (SCC-071, e.g. an embedding model):
+    /// when present, its per-entity score feeds the REAL 10% semantic
+    /// share of `final_importance`. When `None`, the 10% share is
+    /// explicitly redistributed across the other blend weights
+    /// ([`REDISTRIBUTION_SCALE`]) — never a phantom weight.
+    pub semantic: Option<&'a dyn crate::rank::SemanticScorer>,
 }
 
 /// Pipeline policy knobs for one surface render.
@@ -714,11 +799,54 @@ pub fn build_surface(
 /// no task vector; `mmr` off skips diversification; `quotas` off skips
 /// per-kind caps; `optimizer` off renders in importance order up to the
 /// budget. Deterministic and no-panic.
-// trace:v1 id=impl.scc.surface.build-staged work=WORK-SCC-015 satisfies=REQ-SCC-IR
+// trace:v1 id=impl.scc.surface.build-staged work=WORK-SCC-015 satisfies=REQ-SCC-IR,REQ-semantic-10-live-in-final-importance,REQ-explain-renders-score-decomposition,REQ-hard-max-invariant-on-rendered-text
 pub fn build_surface_staged(
     compiler: &ContextCompiler,
     request: SurfaceRequest<'_>,
     stages: &SurfacePipelineStages,
+) -> scc_core::SurfaceRenderResult {
+    build_surface_staged_inner(compiler, request, stages, &mut None)
+}
+
+/// 15.2-cache-seam: cache-aware sibling of [`build_surface`] (Wave 15.2,
+/// REQ-global-rank-cached-per-model-epoch). When `cache` holds a valid
+/// [`crate::startup::GlobalRankCache`] (loaded by
+/// `crate::startup::load_global_rank_cache`), the global PPR vector +
+/// symbol projection come from the cache — skipping
+/// `SystemRanker::new` (the heterogeneous node graph + adjacency +
+/// rarity build) and the 50 power iterations of `global_vector()`. The
+/// pipeline tail (required coverage, MMR, quotas, budget selection,
+/// render) runs identically, so the output is byte-identical to
+/// [`build_surface`]. On a miss (`cache` is `None`) the ranker is built
+/// once and the cache is FILLED (the caller persists it via
+/// `crate::startup::store_global_rank_cache`). Additive: B's `semantic`
+/// field lands on [`SurfaceRequest`]/[`build_surface`] independently.
+// trace:v1 id=impl.scc.surface.build-cached work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-global-rank-cached-per-model-epoch
+pub fn build_surface_cached(
+    compiler: &ContextCompiler,
+    request: SurfaceRequest<'_>,
+    cache: &mut Option<crate::startup::GlobalRankCache>,
+) -> scc_core::SurfaceRenderResult {
+    build_surface_staged_inner(
+        compiler,
+        request,
+        &SurfacePipelineStages::default(),
+        cache,
+    )
+}
+
+/// The shared pipeline body of [`build_surface_staged`] /
+/// [`build_surface_cached`]: `cache` supplies the global PPR vector +
+/// projection on hit; on miss the ranker is built once and the cache
+/// filled (the caller persists it). Task PPR still constructs the
+/// ranker when the cache lacks the adjacency (documented ceiling — the
+/// rank cache stores the global vector + projection only).
+// trace:exempt reason=internal-detail  # shared body; the traced entries are build_surface_staged / build_surface_cached
+fn build_surface_staged_inner(
+    compiler: &ContextCompiler,
+    request: SurfaceRequest<'_>,
+    stages: &SurfacePipelineStages,
+    cache: &mut Option<crate::startup::GlobalRankCache>,
 ) -> scc_core::SurfaceRenderResult {
     let (goal, visible): (Option<&str>, Option<&ContextLedger>) = match &request.mode {
         SurfaceMode::Global => (None, None),
@@ -751,17 +879,47 @@ pub fn build_surface_staged(
         }
     }
 
-    let map = compile_surface_map(compiler);
-    let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
-    let global_of: BTreeMap<String, f64> = if stages.global_ppr {
-        ranker
-            .project_to_symbols(&ranker.global_vector())
-            .into_iter()
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
+    let mut map = compile_surface_map(compiler);
+    // 15.2-cache-seam: on hit, the global vector + projection come from
+    // the cache (no SystemRanker::new, no 50 power iterations); on miss
+    // the ranker is built once and the cache filled — node_symbol_map is
+    // exactly what the pipeline consumes as `global_of`, so the render is
+    // byte-identical either way. `task_ranker` carries the built ranker
+    // to the task-vector step when both are needed.
+    let mut global_of: BTreeMap<String, f64> = BTreeMap::new();
+    let mut task_ranker: Option<crate::pagerank::SystemRanker<'_>> = None;
+    if stages.global_ppr {
+        if let Some(c) = cache.as_ref() {
+            global_of = c.node_symbol_map.clone();
+        } else {
+            let ranker = crate::pagerank::SystemRanker::new(&compiler.view);
+            let gv = ranker.global_vector();
+            global_of = ranker.project_to_symbols(&gv).into_iter().collect();
+            *cache = Some(crate::startup::GlobalRankCache {
+                epoch: compiler
+                    .store
+                    .cache_epoch()
+                    .unwrap_or_else(|_| "no-epoch".into()),
+                policy: crate::startup::trust_policy_str(compiler.view.policy()),
+                salt: compiler.settings.rank_salt.clone(),
+                global_vector: gv,
+                node_symbol_map: global_of.clone(),
+                candidates_epoch: map.epoch.clone(),
+                candidate_ids: map.entries.iter().map(|e| e.id.clone()).collect(),
+                hits: 0,
+            });
+            task_ranker = Some(ranker);
+        }
+    }
     let task_of: BTreeMap<String, f64> = if stages.task_ppr && !seeds.is_empty() {
+        // ponytail: task PPR still builds the ranker when the cache hit
+        // path is active (the cache stores the global vector + projection
+        // only, not the adjacency); cache the adjacency too if task-mode
+        // startup latency ever matters.
+        let ranker = match task_ranker {
+            Some(r) => r,
+            None => crate::pagerank::SystemRanker::new(&compiler.view),
+        };
         ranker
             .project_to_symbols(&ranker.task_vector(&seeds))
             .into_iter()
@@ -772,7 +930,9 @@ pub fn build_surface_staged(
 
     let required = required_ids(&map, compiler);
     let has_task = !seeds.is_empty();
+    let inv_names = invariant_names(&compiler.view);
     let mut ranked: Vec<(String, f64)> = Vec::new();
+    let mut ranks: BTreeMap<String, SurfaceRank> = BTreeMap::new();
     for e in &map.entries {
         let changed = compiler.is_stale_path(&e.path);
         let novelty = match visible {
@@ -791,26 +951,80 @@ pub fn build_surface_staged(
         } else {
             0.0
         };
-        let importance = if stages.lexical {
-            crate::pagerank::final_importance(
+        let change_risk = if changed { 1.0 } else { 0.0 };
+        // The semantic score is the REAL 10% share: the scorer rates the
+        // entry's logical symbol entity against the goal. Absent a scorer
+        // the share is zero and the blend is renormalized (see below) —
+        // never a phantom weight.
+        let semantic = match request.semantic {
+            Some(scorer) => compiler
+                .view
+                .entity(&e.symbol_id)
+                .map(|en| scorer.score(goal.unwrap_or(""), en))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            None => 0.0,
+        };
+        let (importance, semantic_component) = if stages.lexical {
+            // final_importance is linear in every input, so computing the
+            // blend with novelty = 0.0 and adding NOVELTY_WEIGHT * novelty
+            // reproduces the documented blend exactly while keeping the
+            // novelty term additive on top (final_importance's own
+            // contract — the six blend weights sum to 1.0, novelty is the
+            // documented +0.05 bonus).
+            let blend = crate::pagerank::final_importance(
                 task_ppr,
                 global_ppr,
                 lexical,
-                0.0,
+                semantic,
                 e.confidence as f64,
                 criticality,
-                if changed { 1.0 } else { 0.0 },
-                novelty,
+                change_risk,
+                0.0,
                 has_task,
-            )
+            );
+            let total = match request.semantic {
+                // Scorer present: the 10% semantic share is real.
+                Some(_) => blend + crate::pagerank::NOVELTY_WEIGHT * novelty,
+                // No scorer: the 10% share is reallocated proportionally
+                // across the other blend weights (REDISTRIBUTION_SCALE) so
+                // the total still reflects the advertised blend — a
+                // full-strength entry still totals 1.0 + novelty instead
+                // of the phantom-hole 0.9 + novelty.
+                None => blend * REDISTRIBUTION_SCALE + crate::pagerank::NOVELTY_WEIGHT * novelty,
+            };
+            (total, semantic)
         } else {
             // lexical stage off: pure lexical scores, no PPR blend
-            lexical
+            (lexical, 0.0)
         };
         if importance <= 0.0 && !required.contains(&e.id) {
             continue;
         }
+        ranks.insert(
+            e.id.clone(),
+            SurfaceRank {
+                task_ppr,
+                global_ppr,
+                lexical,
+                semantic: semantic_component,
+                confidence: e.confidence as f64,
+                criticality,
+                change_risk,
+                novelty,
+                total: importance,
+                reasons: entry_reasons(e, goal, &seed_ids, &inv_names, changed),
+            },
+        );
         ranked.push((e.id.clone(), importance));
+    }
+    // The compiled map carries the per-entry SurfaceRank so every consumer
+    // (render, MCP JSON, tests) sees the decomposition; the selected
+    // clones inherit it into the render.
+    for e in &mut map.entries {
+        if let Some(r) = ranks.get(&e.id) {
+            e.rank = r.clone();
+        }
     }
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -844,6 +1058,7 @@ pub fn select_and_render_global(
             budget,
             explain: false,
             policy: SurfacePolicy::defaults(budget),
+                    semantic: None,
         },
     )
 }
@@ -869,6 +1084,7 @@ pub fn select_and_render_task(
             budget,
             explain: false,
             policy: SurfacePolicy::defaults(budget),
+                    semantic: None,
         },
     )
 }
@@ -1612,7 +1828,7 @@ fn entry_order(a: &SurfaceEntry, b: &SurfaceEntry) -> std::cmp::Ordering {
 
 // trace:exempt reason=internal-detail
 fn render_entry(e: &SurfaceEntry) -> String {
-    render_entry_opt(e, false, None)
+    render_entry_opt(e, 0, None)
 }
 
 /// The structurally compressed entry block (hard-max overflow, never drops
@@ -1623,32 +1839,45 @@ fn render_entry(e: &SurfaceEntry) -> String {
 /// required set fits under the hard max.
 // trace:exempt reason=internal-detail
 fn render_entry_compressed(e: &SurfaceEntry) -> String {
-    render_entry_opt(e, true, None)
+    render_entry_opt(e, 1, None)
 }
 
-/// One entry block with the pipeline's render options. `compress` drops
-/// the metadata sections and the signature continuation/doc lines;
-/// `importance` (explain mode) appends the selection score.
+/// One entry block with the pipeline's render options. `level` is the
+/// structural compression ladder: 0 = full entry, 1 = first signature
+/// line only, 2 = canonical abbreviated signature, 3 = symbol identity
+/// only (kind + name, always fits any realistic hard max). Levels >= 1
+/// drop the metadata sections and the signature continuation/doc lines.
+/// `rank` (explain mode) appends the entry's full score decomposition
+/// (all eight components + total + reasons) instead of a bare importance.
 // trace:exempt reason=internal-detail
-fn render_entry_opt(e: &SurfaceEntry, compress: bool, importance: Option<f64>) -> String {
+fn render_entry_opt(e: &SurfaceEntry, level: u8, rank: Option<&SurfaceRank>) -> String {
     let mut out = String::new();
     let name = e.qualified_name.rsplit('.').next().unwrap_or(&e.qualified_name);
     out.push_str(&format!("  {} {}\n\n", e.kind.as_str(), name));
-    let sig_lines: Vec<&str> = e.source_signature.split('\n').collect();
-    if compress {
-        if let Some(first) = sig_lines.first() {
+    if (1..3).contains(&level) {
+        // level 2 uses the canonical (whitespace-normalized) signature,
+        // truncated to a fixed width as an abbreviation; level 1 uses the
+        // first source line; level 3 drops the signature entirely
+        // (symbol identity only — always fits any realistic hard max).
+        let sig = match level {
+            2 => e.canonical_signature.split('\n').next().unwrap_or(""),
+            _ => e.source_signature.split('\n').next().unwrap_or(""),
+        };
+        if !sig.is_empty() {
+            let sig: String = sig.chars().take(160).collect();
             out.push_str("    ");
-            out.push_str(first);
+            out.push_str(&sig);
             out.push('\n');
         }
-    } else {
+    } else if level == 0 {
+        let sig_lines: Vec<&str> = e.source_signature.split('\n').collect();
         for line in &sig_lines {
             out.push_str("    ");
             out.push_str(line);
             out.push('\n');
         }
     }
-    if !compress {
+    if level == 0 {
         let sections: [(&str, &[String]); 6] = [
             ("Used by", &e.callers),
             ("Calls", &e.callees),
@@ -1665,9 +1894,23 @@ fn render_entry_opt(e: &SurfaceEntry, compress: bool, importance: Option<f64>) -
             out.push_str(&format!("  {label}:\n    {}\n", vals.join(", ")));
         }
     }
-    if let Some(imp) = importance {
+    if let Some(rank) = rank {
         out.push('\n');
-        out.push_str(&format!("  importance: {imp:.3}\n"));
+        out.push_str(&format!("  importance: {:.3}\n", rank.total));
+        out.push_str(&format!("  task_ppr: {:.3}\n", rank.task_ppr));
+        out.push_str(&format!("  global_ppr: {:.3}\n", rank.global_ppr));
+        out.push_str(&format!("  lexical: {:.3}\n", rank.lexical));
+        out.push_str(&format!("  semantic: {:.3}\n", rank.semantic));
+        out.push_str(&format!("  confidence: {:.3}\n", rank.confidence));
+        out.push_str(&format!("  criticality: {:.3}\n", rank.criticality));
+        out.push_str(&format!("  change_risk: {:.3}\n", rank.change_risk));
+        out.push_str(&format!("  novelty: {:.3}\n", rank.novelty));
+        if !rank.reasons.is_empty() {
+            out.push_str("  because:\n");
+            for r in &rank.reasons {
+                out.push_str(&format!("    {r}\n"));
+            }
+        }
     }
     out.push('\n');
     out
@@ -2430,6 +2673,7 @@ mod tests {
             budget,
             explain: false,
             policy: SurfacePolicy::defaults(budget),
+                    semantic: None,
         };
 
         // Huge budget: the service renders exactly the historical global
@@ -2440,9 +2684,18 @@ mod tests {
         assert_eq!(big.text, legacy.text);
         assert_eq!(big.rendered_ids, legacy.rendered_ids);
         assert_eq!(big.omitted_ids, legacy.omitted_ids);
+        // Selection parity with the full map: every candidate renders under
+        // a huge budget (omissions empty). Wave 15.2 populates per-entry
+        // SurfaceRanks, so the selected render orders each group by
+        // importance while the plain map render keeps the canonical
+        // kind/name order — both carry every entry (same id set).
+        let mut big_ids = big.rendered_ids.clone();
+        big_ids.sort();
+        let mut map_ids: Vec<String> = map.entries.iter().map(|e| e.id.clone()).collect();
+        map_ids.sort();
+        assert_eq!(big_ids, map_ids, "the selected subset must cover every candidate");
         assert_eq!(big.rendered_ids.len(), n);
         assert!(big.omitted_ids.is_empty());
-        assert_eq!(big.text, render_surface_map(&map, None));
 
         // Tiny budget: required coverage survives; byte-identical across
         // runs (deterministic).
@@ -2474,7 +2727,8 @@ mod tests {
                 budget: 100_000,
                 explain: false,
                 policy: SurfacePolicy::defaults(100_000),
-            },
+                        semantic: None,
+        },
         );
         // The already-visible-and-unchanged entry is not re-injected; the
         // rest render (huge budget); omitted ids are honest.
@@ -2497,7 +2751,8 @@ mod tests {
                 budget: 100_000,
                 explain: false,
                 policy: SurfacePolicy::defaults(100_000),
-            },
+                        semantic: None,
+        },
         );
         assert_eq!(full.rendered_ids.len(), map.entries.len());
     }
@@ -2576,6 +2831,7 @@ mod tests {
                 coverage: true,
                 hard_max,
             },
+                    semantic: None,
         };
         let naive = build_surface(&ctx, req(false));
         let balanced = build_surface(&ctx, req(true));
@@ -2607,7 +2863,8 @@ mod tests {
                 budget: 5,
                 explain: false,
                 policy: SurfacePolicy::defaults(5), // hard_max = 505
-            },
+                        semantic: None,
+        },
         );
         assert!(!soft.rendered_ids.is_empty());
         assert!(
@@ -2629,7 +2886,8 @@ mod tests {
                 budget: 100,
                 explain: false,
                 policy: SurfacePolicy::defaults(100), // hard_max = 600
-            },
+                        semantic: None,
+        },
         );
         assert_eq!(hard.rendered_ids.len(), 1, "the required entry is never dropped");
         assert!(
@@ -2662,6 +2920,7 @@ mod tests {
                 coverage: true,
                 hard_max,
             },
+                    semantic: None,
         };
         let render =
             |stages: &SurfacePipelineStages| build_surface_staged(&ctx, req(stages), stages);
@@ -2702,7 +2961,8 @@ mod tests {
                 budget: 100_000,
                 explain: false,
                 policy: SurfacePolicy::defaults(100_000),
-            },
+                        semantic: None,
+        },
             &no_lex_stages,
         );
         let lex_on = build_surface_staged(
@@ -2715,7 +2975,8 @@ mod tests {
                 budget: 100_000,
                 explain: false,
                 policy: SurfacePolicy::defaults(100_000),
-            },
+                        semantic: None,
+        },
             &SurfacePipelineStages::default(),
         );
         assert_eq!(
@@ -2800,5 +3061,322 @@ mod tests {
             "decl_header (exact header) must win over the legacy signature attr"
         );
         assert_eq!(proc.modifiers, vec!["async"]);
+    }
+
+    // ---- Wave 15.2: live semantic 10%, explain decomposition, hard-max ----
+
+    /// Two symmetric private functions (`alpha_fn`, `beta_fn`) in one file
+    /// with identical signatures and no graph edges — the base blend is
+    /// identical for both, so the semantic scorer is the ONLY differentiator
+    /// and the redistribution rule is observable.
+// trace:exempt reason=unit-test-fixture
+    fn symmetric_two_fn_fixture() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        for name in ["alpha_fn", "beta_fn"] {
+            let id = symbol_id(&repo, path, name);
+            let mut e = Entity::new(id.clone(), kinds::SYMBOL, name.to_string());
+            e.attr("kind", serde_json::json!("function"));
+            e.attr("file", serde_json::json!(path));
+            e.attr("signature", serde_json::json!("def f(x): ..."));
+            e.attr("exported", serde_json::json!(false));
+            e.attr("start_line", serde_json::json!(1u32));
+            e.attr("end_line", serde_json::json!(10u32));
+            store.insert_entity(&e, &[path.to_string()]).unwrap();
+        }
+        (dir, store)
+    }
+
+    /// One required entry (concrete http invocation surface) whose
+    /// declaration header is a SINGLE 400-argument line — even the
+    /// level-1 compressed render (first signature line) exceeds any small
+    /// hard max, so the progressive ladder must descend to symbol
+    /// identity.
+// trace:exempt reason=unit-test-fixture
+    fn pathological_signature_fixture() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let repo = store.repo_id.clone();
+        let path = "api/app.py";
+        let id = symbol_id(&repo, path, "big_fn");
+        let mut e = Entity::new(id.clone(), kinds::SYMBOL, "big_fn".to_string());
+        e.attr("kind", serde_json::json!("function"));
+        e.attr("file", serde_json::json!(path));
+        let mut decl = String::from("def big_fn(");
+        for i in 0..400 {
+            decl.push_str(&format!("arg_{i:03}: str, "));
+        }
+        decl.push_str(") -> None:");
+        e.attr("decl_header", serde_json::json!(decl));
+        e.attr("exported", serde_json::json!(true));
+        e.attr("start_line", serde_json::json!(1u32));
+        e.attr("end_line", serde_json::json!(10u32));
+        e.attr("entrypoints", serde_json::json!(["http: POST /big"]));
+        store.insert_entity(&e, &[path.to_string()]).unwrap();
+        (dir, store)
+    }
+
+    /// Scores nothing — the phantom-hole baseline for the redistribution
+    /// rule (semantic = 0.0 with NO renormalization).
+// trace:exempt reason=unit-test-mock
+    struct ZeroScorer;
+// trace:exempt reason=unit-test-mock
+    impl crate::rank::SemanticScorer for ZeroScorer {
+// trace:exempt reason=unit-test-mock
+        fn score(&self, _goal: &str, _entity: &scc_core::Entity) -> f64 {
+            0.0
+        }
+    }
+
+    /// Scores `score` for any entity whose name contains `target`.
+// trace:exempt reason=unit-test-mock
+    struct NameScorer {
+        target: &'static str,
+        score: f64,
+    }
+// trace:exempt reason=unit-test-mock
+    impl crate::rank::SemanticScorer for NameScorer {
+// trace:exempt reason=unit-test-mock
+        fn score(&self, _goal: &str, entity: &scc_core::Entity) -> f64 {
+            if entity.name.contains(self.target) {
+                self.score
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// Parse the explain render into per-entry (name, component) blocks:
+    /// a block starts at a `  <kind> <name>` line where `<kind>` is a
+    /// SurfaceKind word (signature lines like `    public User get(...)`
+    /// are NOT headers — they carry no leading kind) and collects the
+    /// following `  <key>: <value>` component lines. Deterministic.
+// trace:exempt reason=unit-test-helper
+    fn explain_blocks(text: &str) -> Vec<(String, BTreeMap<String, f64>)> {
+        const KINDS: [&str; 11] = [
+            "function", "method", "constructor", "class", "interface",
+            "trait", "type", "enum", "const", "module", "record",
+        ];
+        let mut blocks: Vec<(String, BTreeMap<String, f64>)> = Vec::new();
+        for line in text.lines() {
+            // Entry headers carry EXACTLY two leading spaces (signature
+            // lines and section content are indented deeper, so a
+            // `    class UserService` signature can never be a header).
+            if !line.starts_with("   ") {
+                if let Some(rest) = line.strip_prefix("  ") {
+                    let first = rest.split_whitespace().next().unwrap_or("");
+                    if KINDS.contains(&first) {
+                        let name = rest.split_whitespace().nth(1).unwrap_or("").to_string();
+                        blocks.push((name, BTreeMap::new()));
+                        continue;
+                    }
+                }
+            }
+            if let Some((_, comps)) = blocks.last_mut() {
+                if let Some((k, v)) = line.trim_start().split_once(':') {
+                    if let Ok(num) = v.trim().parse::<f64>() {
+                        comps.insert(k.trim().to_string(), num);
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    #[test]
+// trace:exempt reason=unit-test
+    fn explain_renders_full_score_decomposition() {
+        let (_dir, store) = fixture_store();
+        let ctx = make_ctx(&store);
+        let request = SurfaceRequest {
+            mode: SurfaceMode::Task {
+                goal: "create user",
+                visible: None,
+            },
+            budget: 100_000,
+            explain: true,
+            policy: SurfacePolicy::defaults(100_000),
+            semantic: None,
+        };
+        let out = build_surface(&ctx, request);
+        // All eight components + total + reasons render per entry — never
+        // a bare `importance:` (the reviewer's --explain complaint).
+        for key in [
+            "importance:",
+            "task_ppr:",
+            "global_ppr:",
+            "lexical:",
+            "semantic:",
+            "confidence:",
+            "criticality:",
+            "change_risk:",
+            "novelty:",
+            "because:",
+        ] {
+            assert!(out.text.contains(key), "explain must render {key:?}");
+        }
+        // Reasons populated from the entry's own evidence.
+        assert!(out.text.contains("task seed:"), "seed evidence -> reason");
+        assert!(out.text.contains("primary flow participant"), "flow evidence -> reason");
+        assert!(out.text.contains("public component surface"), "visibility evidence -> reason");
+        assert!(out.text.contains("owns "), "state-authority evidence -> reason");
+        assert!(out.text.contains("concrete invocation surface"), "invocation evidence -> reason");
+        // No phantom semantic: without a scorer the component is honestly 0.
+        for (_, comps) in explain_blocks(&out.text) {
+            assert_eq!(comps.get("semantic").copied().unwrap_or(-1.0), 0.0);
+        }
+        // Deterministic: same request -> byte-identical explain text.
+        let out2 = build_surface(&ctx, request);
+        assert_eq!(out.text, out2.text);
+    }
+
+    #[test]
+// trace:exempt reason=unit-test
+    fn semantic_none_redistributes_and_some_reranks() {
+        let (_dir, store) = symmetric_two_fn_fixture();
+        let ctx = make_ctx(&store);
+        let alpha = symbol_id(&store.repo_id, "api/app.py", "alpha_fn");
+        let beta = symbol_id(&store.repo_id, "api/app.py", "beta_fn");
+
+        // (a) semantic=None: the 10% share is REALLOCATED, never a phantom.
+        let none = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 100_000,
+                explain: true,
+                policy: SurfacePolicy::defaults(100_000),
+                semantic: None,
+            },
+        );
+        let zero = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 100_000,
+                explain: true,
+                policy: SurfacePolicy::defaults(100_000),
+                semantic: Some(&ZeroScorer),
+            },
+        );
+        let none_blocks = explain_blocks(&none.text);
+        let zero_blocks = explain_blocks(&zero.text);
+        assert!(!none_blocks.is_empty());
+        assert_eq!(none_blocks.len(), zero_blocks.len());
+        // The symmetric fixture renders the same entries in the same order
+        // (the renormalization scales every total uniformly), so the
+        // per-entry totals pair up.
+        for ((nname, ncomps), (zname, zcomps)) in none_blocks.iter().zip(&zero_blocks) {
+            assert_eq!(nname, zname);
+            let n = ncomps.get("importance").copied().unwrap();
+            let z = zcomps.get("importance").copied().unwrap();
+            assert!(
+                n > z,
+                "renormalized total must exceed the phantom-hole total for {nname}"
+            );
+            // The full formula, from the rendered components: total ==
+            // REDISTRIBUTION_SCALE * blend + NOVELTY_WEIGHT * novelty,
+            // where blend = final_importance(..., semantic=0, novelty=0).
+            let blend = crate::pagerank::final_importance(
+                ncomps.get("task_ppr").copied().unwrap_or(0.0),
+                ncomps.get("global_ppr").copied().unwrap_or(0.0),
+                ncomps.get("lexical").copied().unwrap_or(0.0),
+                0.0,
+                ncomps.get("confidence").copied().unwrap_or(0.0),
+                ncomps.get("criticality").copied().unwrap_or(0.0),
+                ncomps.get("change_risk").copied().unwrap_or(0.0),
+                0.0,
+                false, // global mode: no task focus
+            );
+            let expected = blend * REDISTRIBUTION_SCALE
+                + crate::pagerank::NOVELTY_WEIGHT
+                    * ncomps.get("novelty").copied().unwrap_or(0.0);
+            assert!(
+                (n - expected).abs() < 0.002,
+                "{nname}: rendered {n:.6} != renormalized {expected:.6} (blend {blend:.6})"
+            );
+        }
+
+        // (b) semantic=Some with a real scorer: the 10% is LIVE. The beta
+        // scorer flips the tie — beta_fn overtakes alpha_fn by exactly the
+        // semantic weight, and the rendered order changes.
+        let real = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 100_000,
+                explain: true,
+                policy: SurfacePolicy::defaults(100_000),
+                semantic: Some(&NameScorer {
+                    target: "beta_fn",
+                    score: 1.0,
+                }),
+            },
+        );
+        let blocks = explain_blocks(&real.text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "beta_fn", "semantic 10% must rerank beta first");
+        let a = blocks
+            .iter()
+            .find(|(n, _)| *n == "alpha_fn")
+            .and_then(|(_, c)| c.get("importance").copied())
+            .unwrap();
+        let b = blocks
+            .iter()
+            .find(|(n, _)| *n == "beta_fn")
+            .and_then(|(_, c)| c.get("importance").copied())
+            .unwrap();
+        assert!(
+            (b - a - crate::pagerank::SEMANTIC_WEIGHT).abs() < 0.002,
+            "beta must lead alpha by the real 10%: {b:.6} - {a:.6}"
+        );
+        // Tie-break check on the None run: alpha first (id order).
+        assert_eq!(none_blocks[0].0, "alpha_fn");
+        assert_eq!(none.rendered_ids[0], alpha);
+        assert_eq!(real.rendered_ids[0], beta);
+    }
+
+    #[test]
+// trace:exempt reason=unit-test
+    fn pathological_required_entry_compresses_to_symbol_identity() {
+        // One required entry whose compressed form still exceeds the hard
+        // max: the progressive ladder re-renders until it fits — the last
+        // resort (symbol identity) always fits, and the hard-max invariant
+        // holds on the ACTUAL rendered text.
+        let (_dir, store) = pathological_signature_fixture();
+        let ctx = make_ctx(&store);
+        let hard_max = 20usize;
+        let out = build_surface(
+            &ctx,
+            SurfaceRequest {
+                mode: SurfaceMode::Global,
+                budget: 1,
+                explain: false,
+                policy: SurfacePolicy {
+                    quotas: true,
+                    mmr: true,
+                    coverage: true,
+                    hard_max,
+                },
+                semantic: None,
+            },
+        );
+        assert_eq!(out.rendered_ids.len(), 1, "the required entry is never dropped");
+        assert!(out.text.contains("function big_fn"), "identity line must render");
+        assert!(
+            !out.text.contains("def big_fn("),
+            "the 400-arg signature must be dropped at the identity level"
+        );
+        assert!(
+            out.token_count <= hard_max,
+            "hard-max invariant on the rendered text: {} > {hard_max}",
+            out.token_count
+        );
     }
 }

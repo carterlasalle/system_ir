@@ -6,25 +6,65 @@
 //! `(epoch, renderer_version, trust_policy, budget)` — no timestamps — so
 //! the same epoch + config always yields byte-identical startup text.
 
-use crate::surface::{build_surface, SurfaceMode, SurfacePolicy, SurfaceRequest};
+use crate::surface::{build_surface, build_surface_cached, SurfaceMode, SurfacePolicy, SurfaceRequest};
 use crate::ContextCompiler;
 use scc_core::kinds;
 use scc_core::{ContextArtifact, ContextBudget, ContextLedger};
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Renderer version: part of the artifact hash. Bump when the startup
 /// renderer's output format changes (invalidates prompt-cache keys).
 pub const RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The startup artifact: atlas + surface + coverage + omissions, with the
-/// deterministic artifact hash.
+/// deterministic artifact hash. `surface_render` is the SAME render the
+/// artifact printed — ledger recording derives visible ids from it, so
+/// the surface is never computed twice per startup.
 // trace:exempt reason=internal-detail
 pub struct StartupContext {
     pub atlas: String,
     pub surface: String,
+    pub surface_render: scc_core::SurfaceRenderResult,
     pub coverage: Vec<String>,
     pub omissions: Vec<String>,
     pub artifact: ContextArtifact,
+}
+
+/// Global-rank cache (Wave 15.2, per-ModelEpoch rank caching): the
+/// expensive, epoch-stable parts of a global Surface build —
+/// `SystemRanker::new` (heterogeneous node graph + adjacency + rarity),
+/// the 50-iteration global PageRank vector, and the projection to symbol
+/// scores — serialized to the store cache so consecutive startups in the
+/// same model epoch skip the rank build entirely. Key:
+/// `rank:global:<blake3(epoch, policy, salt)[..20]>` (mirrors the
+/// `system_atlas` pack-cache pattern in `ContextCompiler::system_atlas`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
+pub struct GlobalRankCache {
+    /// The composite cache epoch the entry was computed under.
+    pub epoch: String,
+    /// The TrustPolicy fingerprint (`trust_policy_str`) the rank used.
+    pub policy: String,
+    /// The active rank salt (`ContextSettings::rank_salt`).
+    pub salt: String,
+    /// The heterogeneous global PageRank vector (index i == `nodes()[i]`).
+    /// Retained so a future task-PPR path can warm-start from it.
+    pub global_vector: Vec<f64>,
+    /// Symbol id -> projected global score (`project_to_symbols` output) —
+    /// exactly what the surface pipeline consumes as `global_of`.
+    pub node_symbol_map: BTreeMap<String, f64>,
+    /// The epoch the candidate entry list came from (epoch-stability
+    /// marker; the cache key already pins the epoch).
+    pub candidates_epoch: String,
+    /// Epoch-stable candidate entry ids (cheap accounting — avoids a
+    /// `compile_surface_map` walk for the surface accounting line).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_ids: Vec<String>,
+    /// How many times this entry has been reused (deterministic
+    /// cache-hit marker for tests).
+    #[serde(default)]
+    pub hits: u64,
 }
 
 /// Build the deterministic startup artifact: the existing System Atlas
@@ -51,20 +91,37 @@ pub fn build_startup(
     // Surface: the FULL production pipeline — the one authoritative
     // [`build_surface`] service in Global mode (heterogeneous global PPR,
     // required coverage, MMR diversity, token-aware quotas, soft/hard
-    // budget selection, render).
-    let render = build_surface(
+    // budget selection, render) — built EXACTLY ONCE per startup. The
+    // per-ModelEpoch global-rank cache supplies the PPR vector + symbol
+    // projection on hit (skipping SystemRanker::new + the 50 power
+    // iterations); on miss the render fills the cache, persisted below.
+    let mut rank_cache = load_global_rank_cache(compiler);
+    let cache_hit = rank_cache.is_some();
+    let render = build_surface_cached(
         compiler,
         SurfaceRequest {
             mode: SurfaceMode::Global,
             budget: budget.surface,
             explain: false,
             policy: SurfacePolicy::defaults(budget.surface),
+            semantic: None,
         },
+        &mut rank_cache,
     );
+    // Best-effort persistence: a cache failure never fails startup. The
+    // hit counter is the deterministic "reused on run 2" marker.
+    if let Some(c) = &mut rank_cache {
+        if cache_hit {
+            c.hits += 1;
+        }
+        store_global_rank_cache(compiler, c);
+    }
     let surface = render.text.clone();
 
     // MODEL COVERAGE: the compiler's existing warnings + stale paths +
-    // a surface accounting line.
+    // a surface accounting line. Candidate count comes from the render
+    // itself (rendered ∪ omitted == every candidate) — never a second
+    // compile_surface_map walk.
     let mut coverage = Vec::new();
     for w in compiler_warnings(compiler) {
         coverage.push(w);
@@ -75,10 +132,11 @@ pub fn build_startup(
     for p in &stale {
         coverage.push(format!("stale: {p}"));
     }
+    let candidates = render.rendered_ids.len() + render.omitted_ids.len();
     coverage.push(format!(
         "surface map: {} of {} entries rendered, {} tokens (budget {})",
         render.rendered_ids.len(),
-        surface_candidates(compiler).len(),
+        candidates,
         render.token_count,
         budget.surface
     ));
@@ -158,20 +216,76 @@ pub fn build_startup(
     StartupContext {
         atlas,
         surface,
+        surface_render: render,
         coverage,
         omissions,
         artifact,
     }
 }
 
-/// Candidate surface entry ids for the accounting line (deterministic).
+/// The store-cache key for the global rank cache: `rank:global:` +
+/// blake3 over the composite cache epoch, the TrustPolicy fingerprint,
+/// and the rank salt (truncated to 20 hex chars, mirroring the
+/// `system_atlas` pack-cache key pattern). A changed epoch, policy, or
+/// salt yields a different key — a stale entry is never served.
 // trace:exempt reason=internal-detail
-fn surface_candidates(compiler: &ContextCompiler) -> Vec<String> {
-    crate::surface::compile_surface_map(compiler)
-        .entries
-        .into_iter()
-        .map(|e| e.id)
-        .collect()
+fn global_rank_key(epoch: &str, policy: &str, salt: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"rank:global:v1");
+    h.update(epoch.as_bytes());
+    h.update(b"\0");
+    h.update(policy.as_bytes());
+    h.update(b"\0");
+    h.update(salt.as_bytes());
+    format!("rank:global:{}", &h.finalize().to_hex()[..20])
+}
+
+/// Load the per-ModelEpoch global rank cache from the store cache
+/// (key `rank:global:<hash>` over epoch + policy + salt). `None` on any
+/// miss/error — never panics, never fabricates. The entry is validated
+/// against the current epoch/policy/salt (belt-and-suspenders: the key
+/// already pins them).
+// trace:v1 id=impl.scc.startup.rank-cache-load work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-global-rank-cached-per-model-epoch
+pub fn load_global_rank_cache(compiler: &ContextCompiler) -> Option<GlobalRankCache> {
+    let epoch = compiler.store.cache_epoch().ok()?;
+    let policy = trust_policy_str(compiler.view.policy());
+    let salt = &compiler.settings.rank_salt;
+    let key = global_rank_key(&epoch, &policy, salt);
+    let cached = compiler.store.cache_get(&key, &epoch).ok().flatten()?;
+    let c: GlobalRankCache = serde_json::from_str(&cached).ok()?;
+    if c.epoch != epoch || c.policy != policy || c.salt != *salt {
+        return None;
+    }
+    Some(c)
+}
+
+/// Persist the per-ModelEpoch global rank cache (best-effort: cache
+/// failures never fail the caller).
+// trace:v1 id=impl.scc.startup.rank-cache-store work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-global-rank-cached-per-model-epoch
+pub fn store_global_rank_cache(compiler: &ContextCompiler, cache: &GlobalRankCache) {
+    let epoch = compiler
+        .store
+        .cache_epoch()
+        .unwrap_or_else(|_| "no-epoch".into());
+    let policy = trust_policy_str(compiler.view.policy());
+    let salt = &compiler.settings.rank_salt;
+    let key = global_rank_key(&epoch, &policy, salt);
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = compiler.store.cache_put(&key, &json, &epoch);
+    }
+}
+
+/// The logical symbol entity id of a rendered entry id: overload-sensitive
+/// entry ids carry a `#overload{N}` suffix (`{symbol}#overload{N}`) that
+/// is stripped to recover the symbol id. Non-overload entry ids ARE the
+/// symbol entity id.
+// trace:exempt reason=internal-detail
+fn symbol_id_of(entry_id: &str) -> String {
+    entry_id
+        .rsplit_once("#overload")
+        .map(|(logical, _)| logical)
+        .unwrap_or(entry_id)
+        .to_string()
 }
 
 /// The spec's startup block format. Pure function of the context struct, so
@@ -252,7 +366,7 @@ fn compiler_warnings(compiler: &ContextCompiler) -> Vec<String> {
 }
 
 // trace:exempt reason=internal-detail
-fn trust_policy_str(p: &scc_graph::TrustPolicy) -> String {
+pub(crate) fn trust_policy_str(p: &scc_graph::TrustPolicy) -> String {
     format!(
         "extracted={} resolved={} observed={} declared={} inferred={} floor={}",
         p.allow_extracted,
@@ -268,11 +382,13 @@ fn trust_policy_str(p: &scc_graph::TrustPolicy) -> String {
 /// recording): `(symbols, files, components, flows)`. The surface side
 /// records ONLY the render result's `rendered_ids` — budget-omitted
 /// candidates are never marked visible (audit fix: the ledger must
-/// describe what the agent actually saw).
+/// describe what the agent actually saw). Consumes the ALREADY-PRODUCED
+/// render (`startup.surface_render`) — the surface is built exactly once
+/// per startup; this function never rebuilds it.
 // trace:exempt reason=internal-detail
 pub fn visible_ids_from_startup(
     compiler: &ContextCompiler,
-    budget: &ContextBudget,
+    startup: &StartupContext,
 ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
     let mut symbols = BTreeSet::new();
     let mut files = BTreeSet::new();
@@ -280,29 +396,47 @@ pub fn visible_ids_from_startup(
     let mut flows = BTreeSet::new();
 
     // Cache-hit in the CLI flow (build_startup already ran system_atlas).
-    let atlas_pack = compiler.system_atlas(Some(budget.atlas));
+    let atlas_pack = compiler.system_atlas(Some(startup.artifact.budget.atlas));
 
-    // Surface: rendered entries ONLY — the same one authoritative
-    // pipeline the startup artifact rendered, so the ledger matches the
-    // artifact text.
-    let render = build_surface(
-        compiler,
-        SurfaceRequest {
-            mode: SurfaceMode::Global,
-            budget: budget.surface,
-            explain: false,
-            policy: SurfacePolicy::defaults(budget.surface),
-        },
-    );
-    let map = crate::surface::compile_surface_map(compiler);
-    let rendered_set: BTreeSet<String> = render.rendered_ids.iter().cloned().collect();
-    for e in &map.entries {
-        if !rendered_set.contains(&e.id) {
-            continue; // omitted candidates are never marked visible
+    // Surface: rendered entries ONLY — the SAME render the artifact
+    // printed, so the ledger exactly matches the artifact text. Entry
+    // metadata (symbol id, file path, component) is derived from the
+    // trusted view per rendered id (cheap: rendered ids only, never the
+    // candidate pool) — no compile_surface_map walk.
+    let view = &compiler.view;
+    let rendered_symbols: BTreeSet<String> = startup
+        .surface_render
+        .rendered_ids
+        .iter()
+        .map(|id| symbol_id_of(id))
+        .collect();
+    // Component attribution mirrors compile_surface_map's containment
+    // walk (component CONTAINS file CONTAINS symbol; first component in
+    // name order wins) but only for the rendered symbol ids.
+    let mut comp_of: BTreeMap<String, String> = BTreeMap::new();
+    for c in view.components() {
+        for r in sorted_rels(view.out_pred(&c.id, scc_core::predicates::CONTAINS)) {
+            for sr in sorted_rels(view.out_pred(&r.object, scc_core::predicates::CONTAINS)) {
+                if rendered_symbols.contains(&sr.object) {
+                    comp_of
+                        .entry(sr.object.clone())
+                        .or_insert_with(|| c.name.clone());
+                }
+            }
         }
-        symbols.insert(e.symbol_id.clone());
-        files.insert(e.path.clone());
-        if let Some(c) = &e.component {
+    }
+    for id in &startup.surface_render.rendered_ids {
+        let symbol_id = symbol_id_of(id);
+        symbols.insert(symbol_id.clone());
+        // The entry id is the entity id for non-overload entries; overload
+        // entries (n >= 1) resolve through the logical symbol id.
+        let ent = view.entity(id).or_else(|| view.entity(&symbol_id));
+        if let Some(e) = ent {
+            if let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) {
+                files.insert(f.to_string());
+            }
+        }
+        if let Some(c) = comp_of.get(&symbol_id) {
             components.insert(c.clone());
         }
     }
@@ -327,6 +461,19 @@ pub fn visible_ids_from_startup(
         }
     }
     (symbols, files, components, flows)
+}
+
+/// Deterministic relationship sort (id, subject, object) — mirrors the
+/// surface compiler's traversal order so attribution walks are stable.
+// trace:exempt reason=internal-detail
+fn sorted_rels(rels: Vec<&scc_core::Relationship>) -> Vec<&scc_core::Relationship> {
+    let mut v = rels;
+    v.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.subject.cmp(&b.subject))
+            .then_with(|| a.object.cmp(&b.object))
+    });
+    v
 }
 
 /// The task delta: the task-personalized surface over the context ledger —
@@ -363,6 +510,7 @@ pub fn task_delta_with_ids(
             budget: budget_tokens,
             explain: false,
             policy: SurfacePolicy::defaults(budget_tokens),
+            semantic: None,
         },
     );
     let mut out = String::new();
@@ -409,6 +557,7 @@ pub fn task_surface_with_ids(
             budget: budget_tokens,
             explain,
             policy: SurfacePolicy::defaults(budget_tokens),
+            semantic: None,
         },
     );
     let mut out = String::new();
@@ -446,6 +595,13 @@ mod tests {
         let sc = StartupContext {
             atlas: "ATLAS-BODY".into(),
             surface: "SURFACE-BODY".into(),
+            surface_render: scc_core::SurfaceRenderResult {
+                text: "SURFACE-BODY".into(),
+                rendered_ids: vec![],
+                omitted_ids: vec![],
+                omissions: vec![],
+                token_count: 0,
+            },
             coverage: vec!["stale: a.py".into()],
             omissions: vec!["none".into()],
             artifact: ContextArtifact {
@@ -484,5 +640,55 @@ mod tests {
         assert_ne!(sc.artifact.content_hash, sc.artifact.sha256);
         assert!(render_startup(&sc).contains("content_hash:"));
         assert_eq!(sc.artifact.epoch, comp.store.cache_epoch().unwrap_or_default());
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn global_rank_cache_roundtrips_through_the_store() {
+        let (_dir, comp) = fixture_compiler();
+        // miss on a cold store
+        assert!(load_global_rank_cache(&comp).is_none());
+        let cache = GlobalRankCache {
+            epoch: comp.store.cache_epoch().unwrap_or_else(|_| "no-epoch".into()),
+            policy: trust_policy_str(comp.view.policy()),
+            salt: comp.settings.rank_salt.clone(),
+            global_vector: vec![0.1, 0.2, 0.3],
+            node_symbol_map: BTreeMap::from([("repo://r/symbol/a.py/serve".into(), 0.42)]),
+            candidates_epoch: comp.store.cache_epoch().unwrap_or_default(),
+            candidate_ids: vec!["repo://r/symbol/a.py/serve".into()],
+            hits: 1,
+        };
+        store_global_rank_cache(&comp, &cache);
+        let loaded = load_global_rank_cache(&comp).expect("cache entry present after store");
+        assert_eq!(loaded, cache);
+        assert_eq!(loaded.hits, 1);
+        assert_eq!(
+            loaded.node_symbol_map.get("repo://r/symbol/a.py/serve"),
+            Some(&0.42)
+        );
+        assert_eq!(loaded.candidates_epoch, loaded.epoch);
+    }
+
+    #[test]
+// trace:exempt reason=internal-detail
+    fn visible_ids_consume_the_same_render_the_artifact_printed() {
+        // The ledger-visible surface ids MUST be exactly the render's
+        // rendered_ids (never a rebuild, never the candidate pool): every
+        // rendered entry's logical symbol is visible. The inverse
+        // direction (omitted candidates never visible) is asserted in the
+        // indexed CLI fixture (surface_startup.rs) where the atlas symbol
+        // set is controlled.
+        let (_dir, comp) = fixture_compiler();
+        let budget = ContextBudget::default();
+        let sc = build_startup(&comp, &budget, "test-renderer");
+        assert!(sc.artifact.text.contains(&sc.surface));
+        let (syms, _files, _comps, _flows) = visible_ids_from_startup(&comp, &sc);
+        for id in &sc.surface_render.rendered_ids {
+            let symbol_id = symbol_id_of(id);
+            assert!(
+                syms.contains(&symbol_id),
+                "rendered entry {id} must be marked visible (symbol {symbol_id})"
+            );
+        }
     }
 }

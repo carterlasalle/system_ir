@@ -839,6 +839,9 @@ pub fn render_ablation_surface(
             coverage: true,
             hard_max: budget,
         },
+        // Ablations never use the semantic scorer (equivalence across
+        // inference on/off is the point); the 10% share is redistributed.
+        semantic: None,
     };
     let result = scc_context::surface::build_surface_staged(&ctx, request, &mode.stages());
     let mut out = label;

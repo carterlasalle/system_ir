@@ -134,15 +134,17 @@ pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
     let ctx = comp.ctx();
-    let budget = startup_budget(budget_tokens);
+    let budget = startup_budget(budget_tokens, &ctx);
     let startup =
         scc_context::startup::build_startup(&ctx, &budget, scc_context::startup::RENDERER_VERSION);
     print!("{}", scc_context::startup::render_startup(&startup));
 
-    // Record what the session just showed (novelty-suppression source).
+    // Record what the session just showed (novelty-suppression source):
+    // the visible ids derive from the SAME render the artifact printed —
+    // the surface is never rebuilt for the ledger.
     let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
     let mut led = ledger_store.load();
-    let (syms, files, comps, flows) = scc_context::startup::visible_ids_from_startup(&ctx, &budget);
+    let (syms, files, comps, flows) = scc_context::startup::visible_ids_from_startup(&ctx, &startup);
     led.visible_entities.extend(syms.iter().cloned());
     led.visible_symbols.extend(syms);
     led.visible_files.extend(files);
@@ -152,22 +154,32 @@ pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::
     Ok(())
 }
 
-/// Wave 14 dynamic budgets: `--budget N` scales the total and keeps the
-/// default atlas:surface split (13:7); no `--budget` uses the defaults.
+/// Wave 15.2 adaptive startup budgets: `--budget N` splits the total by
+/// repo complexity (`ContextBudget::adaptive` — the fixed 13:7 default is
+/// replaced by complexity tiers); no `--budget` uses the defaults.
+/// Deterministic counts come from the trusted view; `surface_candidates`
+/// is the cheap symbol-entity count (the exact candidate list is computed
+/// inside the one surface build, which the budget feeds).
 // trace:exempt reason=internal-detail
-fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
-    let def = scc_core::ContextBudget::default();
+fn startup_budget(
+    tokens: Option<usize>,
+    ctx: &scc_context::ContextCompiler,
+) -> scc_core::ContextBudget {
     match tokens {
-        None => def,
+        None => scc_core::ContextBudget::default(),
         Some(n) => {
-            let total = def.total.max(1) as f64;
-            scc_core::ContextBudget {
-                total: n,
-                atlas: ((n as f64) * (def.atlas as f64 / total)).round() as usize,
-                surface: ((n as f64) * (def.surface as f64 / total)).round() as usize,
-                task_delta: def.task_delta,
-                structural_source: def.structural_source,
-            }
+            let view = &ctx.view;
+            let entity_count = view.entities().count();
+            let component_count = view.components().len();
+            let flow_count = view.flows().len();
+            let surface_candidates = view.entities_of_kind(kinds::SYMBOL).len();
+            scc_core::ContextBudget::adaptive(
+                n,
+                entity_count,
+                component_count,
+                flow_count,
+                surface_candidates,
+            )
         }
     }
 }
@@ -191,6 +203,20 @@ pub fn cmd_surface(
     let comp = compiler(&store, &config, stale)?;
     let ctx = comp.ctx();
     let tokens = budget.unwrap_or(scc_core::ContextBudget::default().surface);
+    // Semantic scorer (SCC-071): wired in when the embed_cli rankers are
+    // available (inference.enabled + remote-model policy) and the surface
+    // is task-personalized (a scorer rates entities against a goal; the
+    // global surface has no goal). Disabled embeddings → None, and the
+    // pipeline explicitly redistributes the 10% semantic share.
+    let scorer = match task {
+        Some(goal) => {
+            let (scorer, _reranker) = crate::embed_cli::rankers(&store, &config, goal);
+            scorer
+        }
+        None => None,
+    };
+    let semantic: Option<&dyn scc_context::rank::SemanticScorer> =
+        scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
     let request = scc_context::surface::SurfaceRequest {
         mode: match task {
             Some(goal) => scc_context::surface::SurfaceMode::Task { goal, visible: None },
@@ -199,6 +225,7 @@ pub fn cmd_surface(
         budget: tokens,
         explain,
         policy: scc_context::surface::SurfacePolicy::defaults(tokens),
+        semantic,
     };
     let result = scc_context::surface::build_surface(&ctx, request);
     let text = match task {
@@ -312,7 +339,13 @@ pub fn cmd_context_structural(
         if goal.is_empty() {
             return Ok(STRUCTURAL_HELP.to_string());
         }
-        surface_task_files(&ctx, goal, max_units, tokens)
+        // Semantic scorer (SCC-071) when the embed_cli rankers are
+        // available; None when embeddings are disabled (the pipeline
+        // redistributes the 10% semantic share).
+        let (scorer, _reranker) = crate::embed_cli::rankers(&store, &config, goal);
+        let semantic: Option<&dyn scc_context::rank::SemanticScorer> =
+            scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
+        surface_task_files(&ctx, goal, max_units, tokens, semantic)
     } else {
         return Ok(STRUCTURAL_HELP.to_string());
     };
@@ -341,13 +374,16 @@ const STRUCTURAL_HELP: &str = "# STRUCTURAL SOURCE\n\nPass --files <paths...> or
 /// rendered entry ids -> `SurfaceEntry.path` (the overload-sensitive entry
 /// ids resolve through the compiled map, never the entity view). Files are
 /// deduped in first-seen (importance) order and capped at `limit`.
-/// Deterministic: the surface pipeline is deterministic per epoch.
+/// `semantic` is the optional embed_cli scorer (None when embeddings are
+/// disabled). Deterministic: the surface pipeline is deterministic per
+/// epoch.
 // trace:exempt reason=internal-detail
 fn surface_task_files(
     ctx: &scc_context::ContextCompiler,
     goal: &str,
     limit: usize,
     tokens: usize,
+    semantic: Option<&dyn scc_context::rank::SemanticScorer>,
 ) -> Vec<String> {
     let budget = tokens.max(1);
     let request = scc_context::surface::SurfaceRequest {
@@ -355,6 +391,7 @@ fn surface_task_files(
         budget,
         explain: false,
         policy: scc_context::surface::SurfacePolicy::defaults(budget),
+        semantic,
     };
     let result = scc_context::surface::build_surface(ctx, request);
     let map = scc_context::surface::compile_surface_map(ctx);
