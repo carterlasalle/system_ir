@@ -1713,6 +1713,7 @@ mod tests {
     use super::*;
 
     #[test]
+// trace:exempt reason=unit-test
     fn component_encode_decode_roundtrip() {
         for name in [
             "Normalizer",
@@ -1727,6 +1728,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=unit-test
     fn component_ids_are_collision_free() {
         assert_ne!(
             encode_component("foo_bar"),
@@ -1873,6 +1875,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=unit-test
     fn contract_kind_renders_as_operation_lines() {
         let mut c = Contract::new(
             "repo://repo/contract/http/get--api-x",
@@ -1890,6 +1893,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=unit-test
     fn contract_subclass_ontology_maps_and_renders() {
         // Render prefixes per-subclass (the atlas CONTRACTS group prefixes).
         assert_eq!(ContractSubclass::Http.as_str(), "http");
@@ -1970,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=unit-test
     fn invocation_surface_kinds_stringify() {
         assert_eq!(InvocationSurfaceKind::PublicApi.as_str(), "public_api");
         assert_eq!(InvocationSurfaceKind::Queue.as_str(), "queue");
