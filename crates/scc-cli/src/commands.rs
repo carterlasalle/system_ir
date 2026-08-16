@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-init work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_init(root: &Path) -> crate::Result<()> {
     let dir = scc_dir(root);
     std::fs::create_dir_all(&dir)?;
@@ -27,6 +28,7 @@ pub fn cmd_init(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-index work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_index(root: &Path, quiet: bool) -> crate::Result<()> {
     let config = load_config(root)?;
     let report = crate::index_and_recompile(root, &config)?;
@@ -44,6 +46,7 @@ pub fn cmd_index(root: &Path, quiet: bool) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-index-paths work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_index_paths(root: &Path, paths: &[String], quiet: bool) -> crate::Result<()> {
     let config = load_config(root)?;
     let store = open_store(root)?;
@@ -57,6 +60,7 @@ pub fn cmd_index_paths(root: &Path, paths: &[String], quiet: bool) -> crate::Res
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-status work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_status(root: &Path) -> crate::Result<()> {
     let store = open_store(root)?;
     let repo = store.repository();
@@ -93,6 +97,7 @@ pub fn cmd_status(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-overview work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -109,6 +114,7 @@ pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
 // trace:v1 id=impl.scc.cli work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 /// `scc atlas [--budget N] [--json]` — the full System Atlas.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-atlas work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -128,6 +134,7 @@ pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Resul
 /// stable). Records what the session just showed in the context ledger so
 /// task deltas suppress already-visible APIs.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-startup work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -161,6 +168,7 @@ pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::
 /// is the cheap symbol-entity count (the exact candidate list is computed
 /// inside the one surface build, which the budget feeds).
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.startup-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn startup_budget(
     tokens: Option<usize>,
     ctx: &scc_context::ContextCompiler,
@@ -191,6 +199,7 @@ fn startup_budget(
 /// artifact for the same request (no parallel pipelines). The rendered
 /// entries are recorded in the context ledger.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-surface work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_surface(
     root: &Path,
     task: Option<&str>,
@@ -250,6 +259,7 @@ pub fn cmd_surface(
 /// `SCC SYSTEM SURFACE MAP` header; the goal framing lives at the transport
 /// boundary (CLI + MCP emit the same text for the same request).
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.task-surface-text work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub(crate) fn task_surface_text(goal: &str, result: &scc_core::SurfaceRenderResult) -> String {
     let body = result
         .text
@@ -261,6 +271,7 @@ pub(crate) fn task_surface_text(goal: &str, result: &scc_core::SurfaceRenderResu
 /// Mark entity ids as visible, classifying them into the ledger's
 /// kind-scoped sets by entity kind.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.record-visible-ids work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn record_visible_ids(
     led: &mut scc_core::ContextLedger,
     ctx: &scc_context::ContextCompiler,
@@ -289,6 +300,7 @@ fn record_visible_ids(
 /// resolving overload-sensitive entry ids (`{symbol}#overload{N}`) through
 /// the compiled map so the ledger always records the logical symbol id.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.record-rendered-surface work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn record_rendered_surface(
     led: &mut scc_core::ContextLedger,
     map: &scc_core::SystemSurfaceMap,
@@ -314,6 +326,7 @@ fn record_rendered_surface(
 /// files matched to a task goal. Returns the rendered text so every
 /// transport (CLI, MCP) shares one implementation.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-structural work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_structural(
     root: &Path,
     files: &[String],
@@ -378,6 +391,7 @@ const STRUCTURAL_HELP: &str = "# STRUCTURAL SOURCE\n\nPass --files <paths...> or
 /// disabled). Deterministic: the surface pipeline is deterministic per
 /// epoch.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.surface-task-files work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn surface_task_files(
     ctx: &scc_context::ContextCompiler,
     goal: &str,
@@ -413,6 +427,7 @@ fn surface_task_files(
 }
 
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_task(
     root: &Path,
     goal: &str,
@@ -477,6 +492,7 @@ pub fn cmd_context_task(
 /// task state + hindsight lessons applied identically on every transport.
 /// CLI, MCP, and HTTP all call this — transport cannot change semantic
 /// quality.
+// trace:v1 id=impl.crates-scc-cli-src-commands.build-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn build_task_pack(
     root: &Path,
     goal: &str,
@@ -533,6 +549,7 @@ pub fn build_task_pack(
 }
 
 /// Task pack as JSON (used by the benchmark harness and integrations).
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task-json work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_task_json(
     root: &Path,
     goal: &str,
@@ -547,6 +564,7 @@ pub fn cmd_context_task_json(
 
 /// `scc context docs <dependency>` — external library docs via Context7
 /// (labeled external; never mixed with repository facts).
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-docs work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_docs(root: &Path, dependency: &str) -> crate::Result<()> {
     let config = load_config(root)?;
     if config.integrations.context7_command.is_empty() {
@@ -565,6 +583,7 @@ pub fn cmd_context_docs(root: &Path, dependency: &str) -> crate::Result<()> {
 /// Subagent context policy (SCC-107, docs/API_AND_INTEGRATIONS.md §5):
 /// a narrower, tighter-budget task pack with explicit scope boundaries so
 /// delegated agents start from the same system model without re-deriving it.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-subagent work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_subagent(
     root: &Path,
     goal: &str,
@@ -598,6 +617,7 @@ pub fn cmd_context_subagent(
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-component work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_component(root: &Path, id: &str, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -612,6 +632,7 @@ pub fn cmd_context_component(root: &Path, id: &str, json: bool) -> crate::Result
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-flow work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_context_flow(root: &Path, id: &str, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -626,6 +647,7 @@ pub fn cmd_context_flow(root: &Path, id: &str, json: bool) -> crate::Result<()> 
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-impact work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_impact(
     root: &Path,
     files: &[String],
@@ -646,6 +668,7 @@ pub fn cmd_impact(
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-verify work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_verify(root: &Path, warnings_only: bool, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
@@ -666,6 +689,7 @@ pub fn cmd_verify(root: &Path, warnings_only: bool, json: bool) -> crate::Result
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-drift work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_drift(root: &Path, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let findings = store.drift_findings(false)?;
@@ -688,6 +712,7 @@ pub fn cmd_drift(root: &Path, json: bool) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-export work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_export(root: &Path, format: &str) -> crate::Result<()> {
     let store = open_store(root)?;
     let ir = crate::export_ir(&store)?;
@@ -715,6 +740,7 @@ pub fn cmd_export(root: &Path, format: &str) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-query work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_query(root: &Path, query: &str, limit: usize) -> crate::Result<()> {
     let store = open_store(root)?;
     println!("— entities —");
@@ -728,6 +754,7 @@ pub fn cmd_query(root: &Path, query: &str, limit: usize) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-list-components work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_list_components(root: &Path) -> crate::Result<()> {
     let store = open_store(root)?;
     for c in store.components()? {
@@ -736,6 +763,7 @@ pub fn cmd_list_components(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-list-flows work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_list_flows(root: &Path) -> crate::Result<()> {
     let store = open_store(root)?;
     for f in store.flows()? {
@@ -747,6 +775,7 @@ pub fn cmd_list_flows(root: &Path) -> crate::Result<()> {
 /// `scc cochange`: print the git co-change pairs (files changed together
 /// across commits) and, when an indexed store exists, enrich its components
 /// with the signal.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-cochange work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_cochange(root: &Path, min_commits: u32) -> crate::Result<()> {
     let pairs = scc_graph::cochange::cochange_pairs(root, min_commits)
         .map_err(crate::CliError::Other)?;
@@ -770,6 +799,7 @@ pub fn cmd_cochange(root: &Path, min_commits: u32) -> crate::Result<()> {
 }
 
 /// scc verify --graph-invariants: structural checks for CI.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-check-invariants work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_check_invariants(root: &Path) -> crate::Result<bool> {
     let store = open_store(root)?;
     let graph = scc_graph::RealityGraph::load(&store)?;
@@ -813,6 +843,7 @@ pub fn cmd_check_invariants(root: &Path) -> crate::Result<bool> {
 
 /// `scc ci check` (docs/DEPLOYMENT_AND_INFRA.md §3, EPIC-180 CI policies):
 /// graph invariants + drift severity policy. Exits nonzero on violation.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-ci-check work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_ci_check(root: &Path, max_severity: &str) -> crate::Result<bool> {
     let store = open_store(root)?;
     let mut ok = cmd_check_invariants(root)?;
@@ -845,6 +876,7 @@ pub fn cmd_ci_check(root: &Path, max_severity: &str) -> crate::Result<bool> {
     Ok(ok)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-checkpoint-save work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_checkpoint_save(root: &Path, json: bool) -> crate::Result<()> {
     let data = checkpoint::capture(root)?;
     if json {
@@ -855,6 +887,7 @@ pub fn cmd_checkpoint_save(root: &Path, json: bool) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-checkpoint-load work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_checkpoint_load(root: &Path, inject: bool) -> crate::Result<()> {
     if let Some(content) = checkpoint::load(root)? {
         print!("{content}");
@@ -864,22 +897,27 @@ pub fn cmd_checkpoint_load(root: &Path, inject: bool) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-watch work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_watch(root: &Path) -> crate::Result<()> {
     crate::httpd::watch_loop(root)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-serve work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_serve(root: &Path) -> crate::Result<()> {
     crate::httpd::serve(root)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-mcp work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_mcp(root: &Path) -> crate::Result<()> {
     crate::mcp::serve_stdio(root)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-setup-claude work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_setup_claude(root: &Path) -> crate::Result<()> {
     crate::plugin::install(root)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-ingest-runtime work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_ingest_runtime(root: &Path, body: &str) -> crate::Result<()> {
     let store = open_store(root)?;
     crate::httpd::ingest_runtime(&store, body)?;
@@ -892,6 +930,7 @@ pub fn cmd_ingest_runtime(root: &Path, body: &str) -> crate::Result<()> {
 /// credentials — but has no per-adapter table, so the assignments are
 /// pinned inline here). Importers read repo-local files only; Context7 runs
 /// an MCP server over stdio via npx (subprocess) that makes network calls.
+// trace:v1 id=impl.crates-scc-cli-src-commands.adapter-scope work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn adapter_scope(name: &str) -> &'static str {
     match name {
         "context7" => "network+subprocess(npx)",
@@ -904,6 +943,7 @@ fn adapter_scope(name: &str) -> &'static str {
 /// config.integrations, then the always-available on-demand importers
 /// (scip/cbm need no config). Fixed declaration order keeps the output
 /// deterministic.
+// trace:v1 id=impl.crates-scc-cli-src-commands.configured-adapters work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn configured_adapters(root: &Path) -> crate::Result<Vec<(String, &'static str)>> {
     let config = load_config(root)?;
     let mut configured: Vec<(String, &'static str)> = Vec::new();
@@ -933,6 +973,7 @@ fn configured_adapters(root: &Path) -> crate::Result<Vec<(String, &'static str)>
 /// `scc adapters` — list enabled adapters with their declared capability
 /// scope (security audit; docs/SECURITY.md §6). `--json` dumps the full
 /// capability manifests instead.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-adapters work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_adapters(root: &Path, json: bool) -> crate::Result<()> {
     let manifests = scc_indexer::adapters::adapter_manifests();
     if json {
@@ -948,6 +989,7 @@ pub fn cmd_adapters(root: &Path, json: bool) -> crate::Result<()> {
 /// `scc lessons add <text>` — append one durable lesson to
 /// `<root>/.scc/lessons.jsonl` (the Hindsight memory bank). The bank is
 /// ingested into the System IR with `scc import hindsight .scc/lessons.jsonl`.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-lessons-add work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_lessons_add(root: &Path, text: &str) -> crate::Result<()> {
     let dir = scc_dir(root);
     std::fs::create_dir_all(&dir)?;
@@ -976,6 +1018,7 @@ pub fn cmd_lessons_add(root: &Path, text: &str) -> crate::Result<()> {
 
 /// `scc lessons` — list stored lessons from the System IR (most important
 /// first, same ordering as the context-pack enrichment).
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-lessons-list work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_lessons_list(root: &Path, limit: usize) -> crate::Result<()> {
     let store = open_store(root)?;
     let lessons = scc_indexer::adapters::hindsight::lessons(&store, limit);
@@ -996,6 +1039,7 @@ pub fn cmd_lessons_list(root: &Path, limit: usize) -> crate::Result<()> {
 
 /// `scc beads` — list active (in-progress) tasks from `.beads/issues.jsonl`
 /// (task state, not system facts).
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-beads work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_beads(root: &Path) -> crate::Result<()> {
     let active = scc_indexer::adapters::beads::active_beads(root, 20);
     if active.is_empty() {
@@ -1009,6 +1053,7 @@ pub fn cmd_beads(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-import work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_import(root: &Path, format: &str, file: &str) -> crate::Result<()> {
     let store = open_store(root)?;
     let report = match format {
@@ -1061,6 +1106,7 @@ pub fn cmd_import(root: &Path, format: &str, file: &str) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-runtime-status work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_runtime_status(root: &Path, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let edges = scc_indexer::runtime::runtime_edges(&store)
@@ -1084,6 +1130,7 @@ pub fn cmd_runtime_status(root: &Path, json: bool) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-runtime-reconcile work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn cmd_runtime_reconcile(root: &Path, json: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let rec = scc_indexer::runtime::reconcile(&store).map_err(crate::CliError::Other)?;
@@ -1112,6 +1159,7 @@ mod tests {
     use super::*;
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-commands.lessons-add-appends-jsonl-lines work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn lessons_add_appends_jsonl_lines() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -1136,6 +1184,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-commands.adapters-lists-configured-scope work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn adapters_lists_configured_scope() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");

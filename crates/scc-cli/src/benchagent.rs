@@ -1024,8 +1024,9 @@ mod tests {
     use crate::benchctx::GroundTruth;
     use std::path::PathBuf;
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.fake-agent-records-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-// trace:exempt reason=unit-test
+
     fn fake_agent_records_metrics() {
         // the fake agent echoes the goal and lists the repo (shows files);
         // no JSON event stream → tool-level counters stay at their defaults
@@ -1046,8 +1047,9 @@ mod tests {
         let _ = PathBuf::new();
     }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.jsonl-event-stream-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-// trace:exempt reason=unit-test
+
     fn jsonl_event_stream_metrics() {
         // Synthetic codex --json stream (task 0 ground truth: main.py +
         // services/transcripts.py): a search, a wrong-file read, then the
@@ -1075,8 +1077,9 @@ mod tests {
         assert!(summary.mean_first_correct_ms.is_some());
     }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.corpus-ground-truth-parses work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-// trace:exempt reason=unit-test
+
     fn corpus_ground_truth_parses() {
         let fixtures = locate_fixtures_dir().unwrap();
         let path = fixtures.parent().unwrap().join("benchmarks/tasks.json");
@@ -1135,7 +1138,7 @@ fn run_variant_tasks_filters_and_first_plan() {
         assert_eq!(summary.mean_search_tool_calls, 1.0);
     }
 
-// trace:exempt reason=unit-test
+
     fn summary_with(search: f64, files: f64, first: Option<f64>) -> AgentBenchSummary {
         AgentBenchSummary {
             tasks: 21,
@@ -1147,8 +1150,9 @@ fn run_variant_tasks_filters_and_first_plan() {
         }
     }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-evaluates-all-three-clauses work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-// trace:exempt reason=unit-test
+
     fn agent_gate_evaluates_all_three_clauses() {
         let a = summary_with(2.0, 4.0, Some(1000.0));
         // E reduces searches AND files AND first-correct -> PASS
@@ -1177,8 +1181,9 @@ fn run_variant_tasks_filters_and_first_plan() {
         assert!(!g5.passed);
     }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-fails-closed-without-json-streams work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-// trace:exempt reason=unit-test
+
     fn agent_gate_fails_closed_without_json_streams() {
         // echo produces no JSON event stream -> no first-correct means ->
         // the gate cannot verify reduction and FAILS closed.
