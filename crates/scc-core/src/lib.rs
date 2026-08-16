@@ -1559,7 +1559,7 @@ pub struct ContextItem {
 
 /// The startup/task context budget split (Wave 14 dynamic budgets).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-// trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.context-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ContextBudget {
     pub total: usize,
     pub atlas: usize,
@@ -1713,7 +1713,7 @@ mod tests {
     use super::*;
 
     #[test]
-// trace:exempt reason=unit-test
+// trace:v1 id=impl.crates-scc-core-src-lib-context-budget.component-encode-decode-roundtrip work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn component_encode_decode_roundtrip() {
         for name in [
             "Normalizer",
@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-// trace:exempt reason=unit-test
+// trace:v1 id=impl.crates-scc-core-src-lib-context-budget.component-ids-are-collision-free work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn component_ids_are_collision_free() {
         assert_ne!(
             encode_component("foo_bar"),
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-// trace:exempt reason=unit-test
+// trace:v1 id=impl.crates-scc-core-src-lib-context-budget.contract-kind-renders-as-operation-lines work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn contract_kind_renders_as_operation_lines() {
         let mut c = Contract::new(
             "repo://repo/contract/http/get--api-x",
@@ -1893,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-// trace:exempt reason=unit-test
+// trace:v1 id=impl.crates-scc-core-src-lib-context-budget.contract-subclass-ontology-maps-and-renders work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn contract_subclass_ontology_maps_and_renders() {
         // Render prefixes per-subclass (the atlas CONTRACTS group prefixes).
         assert_eq!(ContractSubclass::Http.as_str(), "http");
@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-// trace:exempt reason=unit-test
+// trace:v1 id=impl.crates-scc-core-src-lib-context-budget.invocation-surface-kinds-stringify work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn invocation_surface_kinds_stringify() {
         assert_eq!(InvocationSurfaceKind::PublicApi.as_str(), "public_api");
         assert_eq!(InvocationSurfaceKind::Queue.as_str(), "queue");

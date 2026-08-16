@@ -78,8 +78,8 @@ pub struct AgentBenchSummary {
 
 /// A-vs-E agent-behavior gate result: does the atlas variant (E) reduce
 /// exploration vs the baseline (A)?
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-result work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 #[derive(Debug, Clone, serde::Serialize)]
-// trace:exempt reason=internal-detail  # gate-result data of impl.scc.bench.agent
 pub struct AgentGateResult {
     pub baseline: AgentBenchSummary,
     pub atlas: AgentBenchSummary,
@@ -99,7 +99,7 @@ pub struct AgentGateResult {
 /// exploration: requires E.search_tool_calls < A.search_tool_calls AND
 /// E.files_opened <= A.files_opened + 1 AND E.first_correct_ms <=
 /// A.first_correct_ms (means).
-// trace:exempt reason=internal-detail  # gate function of impl.scc.bench.agent
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.evaluate-gate work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn evaluate_gate(a: &AgentBenchSummary, e: &AgentBenchSummary) -> AgentGateResult {
     let search_reduced = e.mean_search_tool_calls < a.mean_search_tool_calls;
     let files_bounded = e.mean_files_opened <= a.mean_files_opened + 1.0;
