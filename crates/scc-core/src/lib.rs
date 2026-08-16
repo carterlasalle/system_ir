@@ -17,7 +17,7 @@ pub const SCHEMA_VERSION: &str = "0.1.0";
 /// Evidence class of a fact, per docs/SYSTEM_IR_SCHEMA.md §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-// trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Provenance work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum Provenance {
     /// Direct syntax/configuration evidence.
     Extracted,
@@ -72,6 +72,7 @@ impl Provenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Severity work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum Severity {
     Info,
     Low,
@@ -98,6 +99,7 @@ impl Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum FlowKind {
     Architecture,
     Workflow,
@@ -118,6 +120,7 @@ impl FlowKind {
     }
 }
 
+// trace:v1 id=impl.crates-scc-core-src-lib.flow-kind-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn flow_kind_str(k: &FlowKind) -> &'static str {
     k.as_str()
 }
@@ -125,6 +128,7 @@ pub fn flow_kind_str(k: &FlowKind) -> &'static str {
 /// Evidence source type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:v1 id=impl.crates-scc-core-src-lib.EvidenceType work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum EvidenceType {
     Source,
     Config,
@@ -147,6 +151,7 @@ pub enum EvidenceType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Archetype work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum Archetype {
     /// HTTP routes + deployment units, no library-scale export ratio.
     ServiceApplication,
@@ -217,6 +222,7 @@ impl Archetype {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.Repository work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Repository {
     pub id: String,
     pub name: String,
@@ -225,6 +231,7 @@ pub struct Repository {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.Snapshot work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Snapshot {
     pub revision: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,6 +243,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Entity work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Entity {
     pub id: String,
     pub kind: String,
@@ -275,6 +283,7 @@ impl Entity {
 /// deletes an occurrence another path still has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Occurrence work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Occurrence {
     /// Stable entity id (see [`occurrence_id`]).
     pub id: String,
@@ -293,6 +302,7 @@ pub struct Occurrence {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Relationship work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Relationship {
     pub id: String,
     pub subject: String,
@@ -338,6 +348,7 @@ impl Relationship {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowStep work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct FlowStep {
     pub id: String,
     pub order: u32,
@@ -360,6 +371,7 @@ pub struct FlowStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.Flow work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Flow {
     pub id: String,
     pub kind: FlowKind,
@@ -372,6 +384,7 @@ pub struct Flow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.Invariant work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Invariant {
     pub id: String,
     pub statement: String,
@@ -390,6 +403,7 @@ pub struct Invariant {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Evidence work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Evidence {
     pub id: String,
     #[serde(rename = "type")]
@@ -436,6 +450,7 @@ impl Evidence {
 /// Edge kind in the canonical causal graph (P1, docs/SYSTEM_DESIGN.md §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowEdgeKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum FlowEdgeKind {
     /// Sequential causality.
     Next,
@@ -468,6 +483,7 @@ pub enum FlowEdgeKind {
 /// retains individual operations — component-level grouping (ComponentSpan)
 /// happens only at display/context time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowNode work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct FlowNode {
     /// Index within the graph (0-based).
     pub id: u32,
@@ -480,6 +496,7 @@ pub struct FlowNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowEdge work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct FlowEdge {
     pub from: u32,
     pub to: u32,
@@ -498,6 +515,7 @@ pub struct FlowEdge {
 /// flattened linear step list. Alternate execution paths are preserved as
 /// branch edges; false sequential causality is impossible by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.FlowGraph work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct FlowGraph {
     pub id: String,
     pub kind: FlowKind,
@@ -527,6 +545,7 @@ pub struct FlowGraph {
 /// upstream/downstream from dependency edges; retry/failure from extracted
 /// failure behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasComponent work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasComponent {
     pub name: String,
     pub purpose: String,
@@ -569,6 +588,7 @@ pub struct AtlasComponent {
 /// entity ids (component ids, or subsystem ids nested inside a service).
 /// Deterministic: `members` sorted by entity id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasHierarchyNode work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasHierarchyNode {
     /// Container entity id (`repo://…/service/…` or `repo://…/subsystem/…`).
     pub id: String,
@@ -582,6 +602,7 @@ pub struct AtlasHierarchyNode {
 /// A typed ownership claim (provenance preserved — DECLARED intent never
 /// promoted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasOwnershipClaim work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasOwnershipClaim {
     pub target: String,
     pub provenance: String,
@@ -590,6 +611,7 @@ pub struct AtlasOwnershipClaim {
 /// A condensed flow: steps collapsed to "Actor: operation" lines, with
 /// branch/async/failure markers preserved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasFlow work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasFlow {
     pub name: String,
     pub kind: FlowKind,
@@ -600,6 +622,7 @@ pub struct AtlasFlow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasEntrypoint work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasEntrypoint {
     pub name: String,
     pub kind: String,
@@ -609,6 +632,7 @@ pub struct AtlasEntrypoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.AtlasInvariant work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct AtlasInvariant {
     pub statement: String,
     pub severity: Severity,
@@ -627,6 +651,7 @@ pub struct AtlasInvariant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ContractSubclass work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum ContractSubclass {
     /// A callable contract surface (framework callback, task, annotated
     /// handler, middleware): the framework invokes this callable.
@@ -714,6 +739,7 @@ impl ContractSubclass {
 /// `user.created`, config key `DEBUG`, annotation `router.get`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Contract work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct Contract {
     pub id: String,
     /// `"http" | "cli" | "event" | "config" | "annotation"`.
@@ -771,6 +797,7 @@ impl Contract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.InvocationSurfaceKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum InvocationSurfaceKind {
     /// OS process spawn / executable entry.
     Process,
@@ -813,6 +840,7 @@ impl InvocationSurfaceKind {
 
 /// One invocation surface: a symbol reachable from outside the process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.InvocationSurface work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct InvocationSurface {
     pub symbol: String,
     pub kind: InvocationSurfaceKind,
@@ -823,6 +851,7 @@ pub struct InvocationSurface {
 /// the machine model handed to agents at session start (docs/SYSTEM_DESIGN.md
 /// §8, Wave 2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-core-src-lib.SystemAtlas work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SystemAtlas {
     pub repository: String,
     pub revision: String,
@@ -902,6 +931,7 @@ pub struct SystemAtlas {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SystemIr work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SystemIr {
     pub schema_version: String,
     pub repository: Repository,
@@ -934,6 +964,7 @@ impl SystemIr {
 // ---------------------------------------------------------------------------
 
 /// Sanitize a free-form name into a stable URI key.
+// trace:v1 id=impl.crates-scc-core-src-lib.sanitize-key work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn sanitize_key(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut prev_dash = false;
@@ -970,6 +1001,7 @@ pub fn sanitize_key(input: &str) -> String {
 }
 
 /// `repo://{repo}/{kind}/{key}` stable identifier.
+// trace:v1 id=impl.crates-scc-core-src-lib.entity-id work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn entity_id(repo: &str, kind: &str, key: &str) -> String {
     format!("repo://{}/{}/{}", sanitize_key(repo), kind, sanitize_key(key))
 }
@@ -980,6 +1012,7 @@ pub fn entity_id(repo: &str, kind: &str, key: &str) -> String {
 /// components are percent-encoded (`@`-separated), so case and separator
 /// distinctions (`a_b` vs `a-b`) never merge distinct occurrences.
 // trace:v1 id=impl.scc.core.occurrence work=WORK-SCC-001 satisfies=REQ-SCC-IR
+// trace:v1 id=impl.crates-scc-core-src-lib.occurrence-id work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn occurrence_id(repo: &str, concept: &str, path: &str, owner: &str, line: u32) -> String {
     format!(
         "repo://{}/occurrence/{}@{}@{}@{}",
@@ -994,6 +1027,7 @@ pub fn occurrence_id(repo: &str, concept: &str, path: &str, owner: &str, line: u
 /// Percent-encode a path/name component for use inside an entity id while
 /// preserving case and common separators (`/`, `.`, `_`, `-`). Collision-free
 /// where `sanitize_key` would risk merging distinct names.
+// trace:v1 id=impl.crates-scc-core-src-lib.encode-component work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn encode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
@@ -1010,6 +1044,7 @@ pub fn encode_component(input: &str) -> String {
 
 /// Inverse of `encode_component`: percent-decodes `%XX` sequences back to
 /// bytes. Used by benchmark/impact tooling to map entity ids back to names.
+// trace:v1 id=impl.crates-scc-core-src-lib.decode-component work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn decode_component(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1031,6 +1066,7 @@ pub fn decode_component(input: &str) -> String {
 }
 
 /// Stable symbol id: `repo://{repo}/symbol/{encoded-file}/{encoded-name}`.
+// trace:v1 id=impl.crates-scc-core-src-lib.symbol-id work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn symbol_id(repo: &str, file: &str, name: &str) -> String {
     format!(
         "repo://{}/symbol/{}/{}",
@@ -1042,11 +1078,13 @@ pub fn symbol_id(repo: &str, file: &str, name: &str) -> String {
 
 /// Evidence id namespace: `evidence:{n}` — stable within a snapshot, assigned
 /// by the store.
+// trace:v1 id=impl.crates-scc-core-src-lib.evidence-id work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn evidence_id(n: u64) -> String {
     format!("evidence:{n}")
 }
 
 /// Relationship id: `rel:{n}` — stable within a snapshot, assigned by store.
+// trace:v1 id=impl.crates-scc-core-src-lib.relationship-id work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn relationship_id(n: u64) -> String {
     format!("rel:{n}")
 }
@@ -1173,6 +1211,7 @@ pub mod predicates {
 
 /// Rough token estimate: 4 characters per token (byte-based for ASCII, but we
 /// operate on char count which is a close approximation across scripts).
+// trace:v1 id=impl.crates-scc-core-src-lib.estimate-tokens work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn estimate_tokens(text: &str) -> usize {
     let chars = text.chars().count();
     chars.div_ceil(4)
@@ -1180,6 +1219,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 /// Hard-truncate `text` to at most `budget` tokens, preferring a clean cut at
 /// a line boundary.
+// trace:v1 id=impl.crates-scc-core-src-lib.truncate-to-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn truncate_to_budget(text: &str, budget: usize) -> String {
     if estimate_tokens(text) <= budget {
         return text.to_string();
@@ -1213,6 +1253,7 @@ pub fn truncate_to_budget(text: &str, budget: usize) -> String {
 // Misc
 // ---------------------------------------------------------------------------
 
+// trace:v1 id=impl.crates-scc-core-src-lib.now-rfc3339 work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -1226,6 +1267,7 @@ pub fn now_rfc3339() -> String {
 /// A source range: file path + 1-based inclusive line span.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SourceRange work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SourceRange {
     pub path: String,
     pub start_line: u32,
@@ -1248,6 +1290,7 @@ impl SourceRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.Visibility work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum Visibility {
     Public,
     Protected,
@@ -1272,6 +1315,7 @@ impl Visibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SurfaceKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum SurfaceKind {
     Function,
     Method,
@@ -1309,6 +1353,7 @@ impl SurfaceKind {
 /// One function/method parameter in structured form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SemanticParameter work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SemanticParameter {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1327,6 +1372,7 @@ pub struct SemanticParameter {
 /// comparisons of source signatures alone.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SemanticSignature work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SemanticSignature {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1350,6 +1396,7 @@ pub struct SemanticSignature {
 /// --explain` renders this).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SurfaceRank work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SurfaceRank {
     pub task_ppr: f64,
     pub global_ppr: f64,
@@ -1366,6 +1413,7 @@ pub struct SurfaceRank {
 
 // trace:exempt reason=internal-detail
 impl Default for SurfaceRank {
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn default() -> Self {
         SurfaceRank {
@@ -1388,6 +1436,7 @@ impl Default for SurfaceRank {
 /// meaning attached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SurfaceEntry work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SurfaceEntry {
     pub id: String,
     pub symbol_id: String,
@@ -1434,6 +1483,7 @@ pub struct SurfaceEntry {
 /// never silently implies completeness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SurfaceOmission work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SurfaceOmission {
     pub count: usize,
     pub kind: String,
@@ -1444,6 +1494,7 @@ pub struct SurfaceOmission {
 /// built from System IR (Level 1 of the context stack).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SystemSurfaceMap work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SystemSurfaceMap {
     pub repository: String,
     pub revision: String,
@@ -1462,6 +1513,7 @@ pub struct SystemSurfaceMap {
 /// the pipeline cut. `omissions` summarizes the cuts by kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.SurfaceRenderResult work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct SurfaceRenderResult {
     /// The rendered surface text (header + selected entry blocks).
     pub text: String,
@@ -1482,6 +1534,7 @@ pub struct SurfaceRenderResult {
 /// (flows, contracts, state) participates in PageRank directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.RankNode work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct RankNode {
     /// The entity id (`repo://{repo}/{kind}/{key}`).
     pub id: String,
@@ -1496,6 +1549,7 @@ pub struct RankNode {
 /// this layer normalizes them for ranking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ReferenceEdge work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ReferenceEdge {
     pub source_symbol: String,
     pub target_symbol: String,
@@ -1510,6 +1564,7 @@ pub struct ReferenceEdge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ReferenceKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum ReferenceKind {
     Read,
     Write,
@@ -1547,6 +1602,7 @@ impl ReferenceKind {
 /// A token-optimized context candidate (Aider-style hard budget search).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ContextItem work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ContextItem {
     pub id: String,
     pub value: f64,
@@ -1559,7 +1615,7 @@ pub struct ContextItem {
 
 /// The startup/task context budget split (Wave 14 dynamic budgets).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-// trace:v1 id=impl.crates-scc-core-src-lib.context-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:v1 id=impl.crates-scc-core-src-lib.ContextBudget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ContextBudget {
     pub total: usize,
     pub atlas: usize,
@@ -1570,6 +1626,7 @@ pub struct ContextBudget {
 
 // trace:exempt reason=internal-detail
 impl Default for ContextBudget {
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn default() -> Self {
         ContextBudget {
@@ -1648,6 +1705,7 @@ impl ContextBudget {
 /// general form of Aider treating chat files specially).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ContextLedger work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ContextLedger {
     pub model_epoch: String,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -1668,6 +1726,7 @@ pub struct ContextLedger {
 /// slice (Level 2), with provenance back to the exact source.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.StructuralSourceUnit work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct StructuralSourceUnit {
     pub path: String,
     /// `source: <path>:L<start>-L<end>` provenance line.
@@ -1681,6 +1740,7 @@ pub struct StructuralSourceUnit {
 /// epoch so prompt caches hit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.ContextArtifact work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct ContextArtifact {
     pub kind: String,
     pub epoch: String,
@@ -1702,6 +1762,7 @@ pub struct ContextArtifact {
 /// One task-seed resolution: task language -> SCC entities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-core-src-lib.TaskSeed work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub struct TaskSeed {
     pub kind: String,
     pub id: String,
@@ -1714,6 +1775,7 @@ mod tests {
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.component-encode-decode-roundtrip work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:exempt reason=internal-detail
     fn component_encode_decode_roundtrip() {
         for name in [
             "Normalizer",
@@ -1729,6 +1791,7 @@ mod tests {
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.component-ids-are-collision-free work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:exempt reason=internal-detail
     fn component_ids_are_collision_free() {
         assert_ne!(
             encode_component("foo_bar"),
@@ -1740,6 +1803,7 @@ mod tests {
 // trace:exempt reason=internal-detail
 
     #[test]
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn occurrence_ids_are_collision_free_per_site() {
         // distinct paths/owners/lines/concepts never merge
@@ -1779,6 +1843,7 @@ mod tests {
 
     #[test]
 // trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
     fn occurrence_roundtrips_through_serde() {
         let o = Occurrence {
             id: occurrence_id("r", "z.object({ x: z.string() })", "src/a.ts", "make", 7),
@@ -1797,6 +1862,7 @@ mod tests {
 // trace:exempt reason=internal-detail
 
     #[test]
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn adaptive_budget_scales_split_by_repo_complexity() {
         // tiny repo: 55/45 split — a small atlas leaves room for a
@@ -1851,6 +1917,7 @@ mod tests {
 
     #[test]
 // trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
     fn adaptive_budget_candidate_pool_boosts_surface_share() {
         // 10k candidates: +5pp surface share (10_000 / 2_000 = 5, capped at 5)
         let boosted = ContextBudget::adaptive(20_000, 1_000, 5, 4, 10_000);
@@ -1866,6 +1933,7 @@ mod tests {
 
     #[test]
 // trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
     fn adaptive_budget_is_deterministic_and_total_preserving() {
         let a = ContextBudget::adaptive(15_000, 3_000, 8, 6, 500);
         let b = ContextBudget::adaptive(15_000, 3_000, 8, 6, 500);
@@ -1876,6 +1944,7 @@ mod tests {
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.contract-kind-renders-as-operation-lines work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:exempt reason=internal-detail
     fn contract_kind_renders_as_operation_lines() {
         let mut c = Contract::new(
             "repo://repo/contract/http/get--api-x",
@@ -1894,6 +1963,7 @@ mod tests {
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.contract-subclass-ontology-maps-and-renders work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:exempt reason=internal-detail
     fn contract_subclass_ontology_maps_and_renders() {
         // Render prefixes per-subclass (the atlas CONTRACTS group prefixes).
         assert_eq!(ContractSubclass::Http.as_str(), "http");
@@ -1975,6 +2045,7 @@ mod tests {
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.invocation-surface-kinds-stringify work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+// trace:exempt reason=internal-detail
     fn invocation_surface_kinds_stringify() {
         assert_eq!(InvocationSurfaceKind::PublicApi.as_str(), "public_api");
         assert_eq!(InvocationSurfaceKind::Queue.as_str(), "queue");
@@ -1988,6 +2059,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn surface_render_result_roundtrips_through_serde() {
         let r = SurfaceRenderResult {
@@ -2010,6 +2082,7 @@ mod tests {
 
     #[test]
 // trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
     fn rank_node_carries_kind_and_name() {
         let n = RankNode {
             id: "repo://r/contract/c1".into(),
@@ -2023,6 +2096,7 @@ mod tests {
     }
 
     #[test]
+// trace:exempt reason=internal-detail
 // trace:exempt reason=internal-detail
     fn context_artifact_content_hash_roundtrips_and_defaults() {
         // new field roundtrips
