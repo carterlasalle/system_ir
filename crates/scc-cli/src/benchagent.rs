@@ -122,6 +122,7 @@ pub fn evaluate_gate(a: &AgentBenchSummary, e: &AgentBenchSummary) -> AgentGateR
 /// the atlas variant (E) command over the same corpus with the same
 /// harness, then evaluate the exploration-reduction clauses (see
 /// [`evaluate_gate`]). `min_files` applies to BOTH runs.
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.run-agent-gate work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn run_agent_gate(
     baseline_cmd: &str,
     atlas_cmd: &str,
@@ -132,6 +133,7 @@ pub fn run_agent_gate(
     Ok(evaluate_gate(&baseline, &atlas))
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.print-agent-gate work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn print_agent_gate(g: &AgentGateResult) {
     println!("scc bench agent --gate — A (baseline) vs E (atlas variant)");
     println!("\n--- baseline (A) ---");
@@ -422,6 +424,7 @@ fn run_task(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.tool-kind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 enum ToolKind {
     Search,
     Read,
@@ -499,6 +502,7 @@ fn parse_event_line(line: &str, root: &Path) -> Option<AgentEvent> {
 
 /// First meaningful token of a shell command: unwraps `/bin/zsh -lc "tool …"`
 /// style wrappers and flag prefixes.
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.tool-from-command work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn tool_from_command(command: &str) -> &str {
     let mut toks = command.split_whitespace();
     let first = toks.next().unwrap_or("");
@@ -522,6 +526,7 @@ fn tool_from_command(command: &str) -> &str {
 /// File paths mentioned in a shell command: whitespace tokens that resolve
 /// inside the repo or carry a source-file extension. Flags, globs, env refs,
 /// and out-of-repo absolute paths are dropped.
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.paths-from-command work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn paths_from_command(command: &str, root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for raw in command.split_whitespace() {
@@ -542,6 +547,7 @@ fn paths_from_command(command: &str, root: &Path) -> Vec<String> {
 }
 
 /// File paths from an MCP tool_use `arguments` / `input` object.
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.paths-from-args work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn paths_from_args(args: &serde_json::Map<String, Value>, root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for key in ["file_path", "path", "file", "filename"] {
@@ -566,6 +572,7 @@ fn paths_from_args(args: &serde_json::Map<String, Value>, root: &Path) -> Vec<St
 /// Resolve a token to a repo-relative path when it exists under the repo
 /// root or looks like a source file. Absolute paths outside the repo are
 /// dropped (skill docs, system files are not repo locations).
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.normalize-path work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn normalize_path(tok: &str, root: &Path) -> Option<String> {
     let tok = tok.trim_end_matches('/');
     if tok.is_empty() {
