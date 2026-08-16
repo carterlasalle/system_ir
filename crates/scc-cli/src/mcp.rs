@@ -14,6 +14,7 @@ use std::path::Path;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+// trace:v1 id=impl.crates-scc-cli-src-mcp.Tool work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 struct Tool {
     name: &'static str,
     description: &'static str,
@@ -21,6 +22,7 @@ struct Tool {
 }
 
 // trace:v1 id=impl.scc.mcp work=WORK-SCC-001 satisfies=REQ-SCC-API
+// trace:v1 id=impl.crates-scc-cli-src-mcp.tools work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -129,6 +131,7 @@ fn tools() -> Vec<Tool> {
 // ponytail: 8-line mirror of commands::startup_budget — promote to a shared
 // pub fn in scc-core when a third transport needs dynamic startup budgets.
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-mcp.startup-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
     let def = scc_core::ContextBudget::default();
     match tokens {
@@ -146,6 +149,7 @@ fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
     }
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-mcp.send work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn send(msg: &serde_json::Value) {
     let mut line = serde_json::to_string(msg).unwrap_or_default();
     line.push('\n');
@@ -155,10 +159,12 @@ fn send(msg: &serde_json::Value) {
     let _ = lock.flush();
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-mcp.reply work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn reply(id: &serde_json::Value, result: serde_json::Value) {
     send(&serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}));
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-mcp.error work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn error(id: &serde_json::Value, code: i64, message: &str) {
     send(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -168,6 +174,7 @@ fn error(id: &serde_json::Value, code: i64, message: &str) {
 }
 
 /// Run the MCP server over stdin/stdout for `root`.
+// trace:v1 id=impl.crates-scc-cli-src-mcp.serve-stdio work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub fn serve_stdio(root: &Path) -> crate::Result<()> {
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -241,6 +248,7 @@ pub fn serve_stdio(root: &Path) -> crate::Result<()> {
 }
 
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-mcp.call-tool work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result<String> {
     let store = crate::open_store(root)?;
     if !store.snapshot_status()?.is_some() {
@@ -382,6 +390,7 @@ mod tests {
 
     #[test]
 // trace:exempt reason=internal-detail
+// trace:v1 id=impl.crates-scc-cli-src-mcp.tool-schemas-are-valid-json-schema work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn tool_schemas_are_valid_json_schema() {
         for t in tools() {
             assert_eq!(t.input_schema["type"], "object");
@@ -391,6 +400,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-mcp.jsonrpc-shapes work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn jsonrpc_shapes() {
         let req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         assert_eq!(req["method"], "tools/list");
