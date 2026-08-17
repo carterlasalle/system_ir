@@ -48,6 +48,7 @@ impl Provenance {
     }
 
     /// Default confidence per docs/SYSTEM_IR_SCHEMA.md §9.
+// trace:v1 id=impl.crates-scc-core-src-lib-provenance.default-confidence work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn default_confidence(&self) -> f64 {
         match self {
             Provenance::Extracted => 1.0,
@@ -60,6 +61,7 @@ impl Provenance {
     }
 
     /// STALE facts may never enter trusted context (only as warnings).
+// trace:v1 id=impl.crates-scc-core-src-lib-provenance.is-trusted work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn is_trusted(&self) -> bool {
         !matches!(self, Provenance::Stale)
     }
@@ -85,6 +87,7 @@ pub enum Severity {
 
 // trace:exempt reason=internal-detail
 impl Severity {
+// trace:v1 id=impl.crates-scc-core-src-lib-severity.rank work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn rank(&self) -> u8 {
         match self {
             Severity::Info => 0,
@@ -113,6 +116,7 @@ pub enum FlowKind {
 
 // trace:exempt reason=internal-detail
 impl FlowKind {
+// trace:v1 id=impl.crates-scc-core-src-lib-flowkind.as-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn as_str(&self) -> &'static str {
         match self {
             FlowKind::Architecture => "architecture",
@@ -179,6 +183,7 @@ pub enum Archetype {
 
 // trace:exempt reason=internal-detail
 impl Archetype {
+// trace:v1 id=impl.crates-scc-core-src-lib-archetype.as-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn as_str(&self) -> &'static str {
         match self {
             Archetype::ServiceApplication => "service_application",
@@ -193,6 +198,7 @@ impl Archetype {
         }
     }
 
+// trace:v1 id=impl.crates-scc-core-src-lib-archetype.label work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn label(&self) -> &'static str {
         match self {
             Archetype::ServiceApplication => "service application",
@@ -261,6 +267,7 @@ pub struct Entity {
 
 // trace:exempt reason=internal-detail
 impl Entity {
+// trace:v1 id=impl.crates-scc-core-src-lib-entity.new work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn new(id: impl Into<String>, kind: impl Into<String>, name: impl Into<String>) -> Self {
         Entity {
             id: id.into(),
@@ -271,6 +278,7 @@ impl Entity {
         }
     }
 
+// trace:v1 id=impl.crates-scc-core-src-lib-entity.attr work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn attr(&mut self, key: &str, value: impl Into<serde_json::Value>) -> &mut Self {
         self.attributes.insert(key.to_string(), value.into());
         self
@@ -324,6 +332,7 @@ pub struct Relationship {
 
 // trace:exempt reason=internal-detail
 impl Relationship {
+// trace:v1 id=impl.crates-scc-core-src-lib-relationship.new work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn new(
         id: impl Into<String>,
         subject: impl Into<String>,
@@ -343,11 +352,13 @@ impl Relationship {
         }
     }
 
+// trace:v1 id=impl.crates-scc-core-src-lib-relationship.with-confidence work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn with_confidence(mut self, c: f64) -> Self {
         self.confidence = c;
         self
     }
 
+// trace:v1 id=impl.crates-scc-core-src-lib-relationship.with-evidence work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
         self.evidence = evidence;
         self
@@ -435,6 +446,7 @@ pub struct Evidence {
 
 // trace:exempt reason=internal-detail
 impl Evidence {
+// trace:v1 id=impl.crates-scc-core-src-lib-evidence.source work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn source(id: impl Into<String>, path: impl Into<String>) -> Self {
         Evidence {
             id: id.into(),
@@ -695,6 +707,7 @@ impl ContractSubclass {
     /// `http: GET /x`, `cli: --flag`, `event: user.created`, `config: DEBUG`,
     /// `public-api: Class.method`, `extension: PluginX`, `serialization:
     /// toJson/fromJson`).
+// trace:v1 id=impl.crates-scc-core-src-lib-contractsubclass.as-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn as_str(&self) -> &'static str {
         match self {
             ContractSubclass::CallContract => "call",
@@ -717,6 +730,7 @@ impl ContractSubclass {
     /// `add_middleware`, ...) that stay framework semantics instead of
     /// first-class contracts. `factory` → PublicApi and `builder` →
     /// Configuration are the ontology's builder/factory rule.
+// trace:v1 id=impl.crates-scc-core-src-lib-contractsubclass.from-kind-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn from_kind_str(kind: &str) -> Option<ContractSubclass> {
         Some(match kind {
             "http" | "route" => ContractSubclass::Http,
@@ -776,6 +790,7 @@ pub struct Contract {
 
 // trace:exempt reason=internal-detail
 impl Contract {
+// trace:v1 id=impl.crates-scc-core-src-lib-contract.new work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn new(
         id: impl Into<String>,
         kind: impl Into<String>,
@@ -794,6 +809,7 @@ impl Contract {
 
     /// Set the semantic subclass (builder-style; the atlas sets it on the
     /// typed families it derives from entity kinds).
+// trace:v1 id=impl.crates-scc-core-src-lib-contract.with-subclass work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn with_subclass(mut self, subclass: ContractSubclass) -> Self {
         self.subclass = subclass;
         self
@@ -833,6 +849,7 @@ pub enum InvocationSurfaceKind {
 
 // trace:exempt reason=internal-detail
 impl InvocationSurfaceKind {
+// trace:v1 id=impl.crates-scc-core-src-lib-invocationsurfacekind.as-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn as_str(&self) -> &'static str {
         match self {
             InvocationSurfaceKind::Process => "process",
@@ -957,6 +974,7 @@ pub struct SystemIr {
 
 // trace:exempt reason=internal-detail
 impl SystemIr {
+// trace:v1 id=impl.crates-scc-core-src-lib-systemir.empty work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn empty(repository: Repository, snapshot: Snapshot) -> Self {
         SystemIr {
             schema_version: SCHEMA_VERSION.to_string(),
