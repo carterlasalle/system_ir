@@ -2718,6 +2718,7 @@ mod tests {
         assert_eq!(file_importance("services/transcripts.py"), 0.0);
     }
 
+// trace:v1 id=impl.crates-scc-context-src-surface.build-surface-global-matches-historical-pipeline work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
     fn build_surface_global_matches_historical_pipeline() {
         let (_dir, store) = fixture_store();
