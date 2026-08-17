@@ -1139,6 +1139,7 @@ fn run_variant_tasks_filters_and_first_plan() {
     }
 
 
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.summary-with work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn summary_with(search: f64, files: f64, first: Option<f64>) -> AgentBenchSummary {
         AgentBenchSummary {
             tasks: 21,
