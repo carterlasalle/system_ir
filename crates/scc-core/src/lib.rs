@@ -33,7 +33,9 @@ pub enum Provenance {
     Stale,
 }
 
+// trace:exempt reason=internal-detail
 impl Provenance {
+// trace:v1 id=impl.crates-scc-core-src-lib-provenance.as-str work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     pub fn as_str(&self) -> &'static str {
         match self {
             Provenance::Extracted => "EXTRACTED",
@@ -81,6 +83,7 @@ pub enum Severity {
     Critical,
 }
 
+// trace:exempt reason=internal-detail
 impl Severity {
     pub fn rank(&self) -> u8 {
         match self {
@@ -108,6 +111,7 @@ pub enum FlowKind {
     Lifecycle,
 }
 
+// trace:exempt reason=internal-detail
 impl FlowKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -173,6 +177,7 @@ pub enum Archetype {
     Unknown,
 }
 
+// trace:exempt reason=internal-detail
 impl Archetype {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -254,6 +259,7 @@ pub struct Entity {
     pub evidence: Vec<String>,
 }
 
+// trace:exempt reason=internal-detail
 impl Entity {
     pub fn new(id: impl Into<String>, kind: impl Into<String>, name: impl Into<String>) -> Self {
         Entity {
@@ -316,6 +322,7 @@ pub struct Relationship {
     pub verified_at: String,
 }
 
+// trace:exempt reason=internal-detail
 impl Relationship {
     pub fn new(
         id: impl Into<String>,
@@ -426,6 +433,7 @@ pub struct Evidence {
     pub extractor_version: Option<String>,
 }
 
+// trace:exempt reason=internal-detail
 impl Evidence {
     pub fn source(id: impl Into<String>, path: impl Into<String>) -> Self {
         Evidence {
@@ -681,6 +689,7 @@ pub enum ContractSubclass {
     Serialization,
 }
 
+// trace:exempt reason=internal-detail
 impl ContractSubclass {
     /// Render prefix used by the atlas CONTRACTS section (stable, sorted:
     /// `http: GET /x`, `cli: --flag`, `event: user.created`, `config: DEBUG`,
@@ -765,6 +774,7 @@ pub struct Contract {
     pub evidence: Vec<String>,
 }
 
+// trace:exempt reason=internal-detail
 impl Contract {
     pub fn new(
         id: impl Into<String>,
@@ -821,6 +831,7 @@ pub enum InvocationSurfaceKind {
     Lifecycle,
 }
 
+// trace:exempt reason=internal-detail
 impl InvocationSurfaceKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -944,6 +955,7 @@ pub struct SystemIr {
     pub evidence: Vec<Evidence>,
 }
 
+// trace:exempt reason=internal-detail
 impl SystemIr {
     pub fn empty(repository: Repository, snapshot: Snapshot) -> Self {
         SystemIr {
