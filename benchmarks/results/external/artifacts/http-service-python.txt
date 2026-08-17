@@ -1,0 +1,339 @@
+# SCC SYSTEM CONTEXT
+<!-- artifact sha256:5eef0af9a404e3e4fab43009cd5b7398d1ffdaf8c4b6044e0d133211d7d57122 content_hash:0ef786e497d79218b90da8c33fd47b8b25152563e021f268e97263efed5b6c5c epoch:epoch:6e1f960ebf73c686ef04dc45 renderer:0.1.0 -->
+
+# SCC SYSTEM CONTEXT
+## SYSTEM ATLAS
+# SYSTEM PURPOSE
+ARCHETYPE: infrastructure_project
+[SYSTEM PURPOSE — from README, DOCUMENTATION not fact]
+This application serves normalized radio transcripts over HTTP. The API layer routes requests, and the service layer owns the transcript repository and its database. Raw transcripts are immutable once stored.
+
+Golden repository for SCC tests: HTTP -> service -> database flow.
+ENTRYPOINTS
+  GET /api/transcripts [route]
+  GET /health [route]
+  Normalizer [public_api] — export:Normalizer (class)
+  Normalizer.__init__ [public_api] — export:Normalizer.__init__ (method)
+  Normalizer.normalize [public_api] — export:Normalizer.normalize (method)
+  TranscriptRepository [public_api] — export:TranscriptRepository (class)
+  TranscriptRepository.__init__ [public_api] — export:TranscriptRepository.__init__ (method)
+  TranscriptRepository.find_all [public_api] — export:TranscriptRepository.find_all (method)
+  TranscriptRepository.save [public_api] — export:TranscriptRepository.save (method)
+  handle_transcripts [http] — GET /api/transcripts
+  handle_transcripts [public_api] — export:handle_transcripts (function)
+  health [http] — GET /health
+  health [public_api] — export:health (function)
+  test_normalization_preserves_raw [public_api] — export:test_normalization_preserves_raw (function)
+  test_repository_find_all [public_api] — export:test_repository_find_all (function)
+
+
+# ARCHITECTURE
+
+ROOT
+Purpose: Handles GET /api/transcripts
+Implementation: root (5 member symbols)
+Downstream: services
+Owns: main.app (EXTRACTED)
+
+SERVICES
+Implementation: services (7 member symbols)
+Upstream: root, tests
+Owns: TranscriptRepository.db (EXTRACTED), db (EXTRACTED)
+
+TESTS
+Implementation: tests (2 member symbols)
+Downstream: services
+
+
+# FLOWS
+
+TranscriptRepository.__init__ [sequence]
+Trigger: export:TranscriptRepository.__init__ (method)
+services: TranscriptRepository.__init__
+  -> component:root: repo://repo/external_api/sqlite3
+component:root: repo://repo/external_api/sqlite3
+
+get-/api/transcripts [sequence]
+Trigger: GET /api/transcripts
+root: handle_transcripts
+  -> services: TranscriptRepository
+services: TranscriptRepository
+
+handle_transcripts [sequence]
+Trigger: export:handle_transcripts (function)
+root: handle_transcripts
+  -> services: TranscriptRepository
+services: TranscriptRepository
+
+test_normalization_preserves_raw [sequence]
+Trigger: export:test_normalization_preserves_raw (function)
+tests: test_normalization_preserves_raw
+  -> services: Normalizer
+services: Normalizer
+
+test_repository_find_all [sequence]
+Trigger: export:test_repository_find_all (function)
+tests: test_repository_find_all
+  -> services: TranscriptRepository
+services: TranscriptRepository
+
+Normalizer [sequence]
+Trigger: export:Normalizer (class)
+services: Normalizer
+
+Normalizer.__init__ [sequence]
+Trigger: export:Normalizer.__init__ (method)
+services: Normalizer.__init__
+
+Normalizer.normalize [sequence]
+Trigger: export:Normalizer.normalize (method)
+services: Normalizer.normalize
+
+TranscriptRepository [sequence]
+Trigger: export:TranscriptRepository (class)
+services: TranscriptRepository
+
+TranscriptRepository.find_all [sequence]
+Trigger: export:TranscriptRepository.find_all (method)
+services: TranscriptRepository.find_all
+
+TranscriptRepository.save [sequence]
+Trigger: export:TranscriptRepository.save (method)
+services: TranscriptRepository.save
+
+get-/health [sequence]
+Trigger: GET /health
+root: health
+
+health [sequence]
+Trigger: export:health (function)
+root: health
+
+
+# STATE & DATA AUTHORITY
+DATA OWNERSHIP
+root owns main.app (EXTRACTED)
+services owns TranscriptRepository.db (EXTRACTED)
+services owns db (EXTRACTED)
+
+DATA STORES
+  db
+
+RUNTIME STATE
+  root owns main.app (mutable) (EXTRACTED)
+  services owns TranscriptRepository.db (mutable) (EXTRACTED)
+
+
+# CONTRACTS
+config: LOG_LEVEL
+config: PORT
+http: GET /api/transcripts
+http: GET /health
+public-api: handle_transcripts
+public-api: health
+public-api: test_normalization_preserves_raw
+public-api: test_repository_find_all
+
+# PUBLIC API
+root: exports handle_transcripts, health
+services: exports Normalizer, TranscriptRepository
+tests: exports test_normalization_preserves_raw, test_repository_find_all
+
+# FRAMEWORK SEMANTICS
+root: annotates handle_transcripts (app.get)
+root: annotates health (app.get)
+
+# PIPELINE
+(none)
+
+# LANDMARKS
+export Normalizer
+export TranscriptRepository
+export handle_transcripts
+export health
+export test_normalization_preserves_raw
+export test_repository_find_all
+handle_transcripts (@app.get)
+health (@app.get)
+
+# CRITICAL INVARIANTS
+
+
+# FAILURE / RETRY
+
+
+# DEPLOYMENT
+api (transcripts/api)
+db (postgres:16)
+
+# TRUST BOUNDARIES
+local/services -> external/sqlite3
+
+# ASYNC BOUNDARIES
+(none)
+
+# EXTERNAL SYSTEMS
+(none)
+
+# IMPLEMENTATION MAP
+root: root
+services: services
+tests: tests
+
+
+# EVIDENCE STATUS
+6 EXTRACTED, 16 SOURCE
+
+# RUNTIME
+(none)
+
+
+# MODEL COVERAGE
+call_targets_resolved: 50% (3/6, 0 LSP-RESOLVED) — exploration still justified in unresolved regions
+dynamic_receivers_unresolved: 3 (calls whose target is not a local symbol; unknown-receiver calls are not persisted)
+exported_api: 6 export entities (6 EXPORTS edges)
+framework_registrations_unknown: 0 (0 known registrations — unknown surfaces only reported with registry evidence)
+invocation_surfaces: 13 (http 2, public_api 11)
+model_epoch_generations: 2 (source 1, semantic 0, evidence 0, intent 0, runtime 0, derived 1)
+parsed_source_files: 50% (3/6)
+stale_evidence: 0 (model FRESH)
+unparsed_files: 3 (config/docs/infra — scanned but not source-parsed)
+⚠ WARNING: Model is FRESH
+
+## SYSTEM SURFACE MAP
+SCC SYSTEM SURFACE MAP
+
+
+(UNATTRIBUTED)
+
+services/transcripts.py
+
+  function normalize
+
+    normalize
+
+
+ROOT
+
+main.py
+
+  function handle_transcripts
+
+    def handle_transcripts() -> list[dict]
+
+  Calls:
+    TranscriptRepository
+
+  Contracts:
+    http: GET /api/transcripts
+
+  Invocation:
+    http: GET /api/transcripts, public_api: export:handle_transcripts (function)
+
+  function health
+
+    def health() -> dict
+
+  Contracts:
+    http: GET /health
+
+  Invocation:
+    http: GET /health, public_api: export:health (function)
+
+  module main
+
+    module main
+
+
+SERVICES
+
+services/transcripts.py
+
+  class Normalizer
+
+    class Normalizer
+
+  Used by:
+    test_normalization_preserves_raw
+
+  Invocation:
+    public_api: export:Normalizer (class)
+
+  class TranscriptRepository
+
+    class TranscriptRepository
+
+  Used by:
+    handle_transcripts, test_repository_find_all
+
+  Invocation:
+    public_api: export:TranscriptRepository (class)
+
+  constructor __init__
+
+    def __init__(self, resolver=None)
+
+  Invocation:
+    public_api: export:Normalizer.__init__ (method)
+
+  constructor __init__
+
+    def __init__(self)
+
+  Calls:
+    sqlite3
+
+  Invocation:
+    public_api: export:TranscriptRepository.__init__ (method)
+
+  method normalize
+
+    def normalize(self, raw_text: str) -> str
+
+  Invocation:
+    public_api: export:Normalizer.normalize (method)
+
+  method find_all
+
+    def find_all(self) -> list[dict]
+
+  Invocation:
+    public_api: export:TranscriptRepository.find_all (method)
+
+  method save
+
+    def save(self, raw_text: str, normalized_text: str) -> None
+
+  Invocation:
+    public_api: export:TranscriptRepository.save (method)
+
+
+TESTS
+
+tests/test_transcripts.py
+
+  function test_normalization_preserves_raw
+
+    def test_normalization_preserves_raw()
+
+  Calls:
+    Normalizer
+
+  Invocation:
+    public_api: export:test_normalization_preserves_raw (function)
+
+  function test_repository_find_all
+
+    def test_repository_find_all()
+
+  Calls:
+    TranscriptRepository
+
+  Invocation:
+    public_api: export:test_repository_find_all (function)
+
+## MODEL COVERAGE
+surface map: 13 of 13 entries rendered, 511 tokens (budget 5600)
+
+## OMISSIONS
+none

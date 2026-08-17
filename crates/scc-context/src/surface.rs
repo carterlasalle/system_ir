@@ -408,6 +408,45 @@ fn render_selected(entries: &[SurfaceEntry], level: u8, explain: bool) -> String
     out
 }
 
+
+/// §41 important-file evidence: a symbol whose file is a package/workspace
+/// manifest, Docker/Compose, CI entrypoint, framework bootstrap, or main
+/// binary is architecturally load-bearing — importance EVIDENCE only, never
+/// raw inclusion (the file's text is not injected). Returns 1.0 for an
+/// important file, 0.0 otherwise. Deterministic, path-based.
+// trace:v1 id=impl.scc.surface.file-importance work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-SCC-IR
+pub(crate) fn file_importance(path: &str) -> f64 {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let important = [
+        // package / workspace manifests
+        "package.json", "pnpm-workspace.yaml", "yarn.lock", "Cargo.toml",
+        "Cargo.lock", "go.mod", "pyproject.toml", "setup.py", "setup.cfg",
+        "requirements.txt", "pom.xml", "build.gradle", "build.gradle.kts",
+        "settings.gradle", "settings.gradle.kts", "gradlew", "Makefile",
+        "CMakeLists.txt", "mix.exs", "Gemfile", "composer.json",
+        // Docker / orchestration
+        "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+        "compose.yml", "compose.yaml", ".dockerignore",
+        // CI entrypoints
+        ".github/workflows/ci.yml", ".github/workflows/main.yml",
+        ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml",
+        ".circleci/config.yml", "buildkite.yml",
+        // framework bootstrap / main binaries
+        "main.py", "main.go", "main.ts", "index.ts", "index.js",
+        "app.py", "server.py", "server.ts", "server.js", "cli.py",
+        "cli.ts", "cli.go", "src/main.rs", "bin/main.rs", "app.js",
+        "app.ts",
+    ];
+    if important.contains(&base) || important.contains(&path) {
+        return 1.0;
+    }
+    // CI workflow dirs: any file under .github/workflows/ is a CI entrypoint
+    if path.starts_with(".github/workflows/") {
+        return 1.0;
+    }
+    0.0
+}
+
 /// Lexical relevance of an entry to the goal terms: name hits count double,
 /// signature hits count single (shared with the task-delta pipeline).
 // trace:exempt reason=internal-detail
@@ -949,7 +988,10 @@ fn build_surface_staged_inner(
         let criticality = if seed_ids.contains(&e.symbol_id) || required.contains(&e.id) {
             1.0
         } else {
-            0.0
+            // §41: important-file evidence (manifests, Docker, CI, bootstrap,
+            // main binaries) is a criticality signal — importance evidence,
+            // never raw file text injection.
+            crate::surface::file_importance(&e.path) * 0.5
         };
         let change_risk = if changed { 1.0 } else { 0.0 };
         // The semantic score is the REAL 10% share: the scorer rates the
@@ -2660,7 +2702,23 @@ mod tests {
     // ---- Wave 15.1: the one authoritative surface service ----
 
     #[test]
-// trace:exempt reason=internal-detail
+// trace:v1 id=impl.scc.surface.file-importance-boosts-manifest-symbols-without-injecting-text work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    fn file_importance_boosts_manifest_symbols_without_injecting_text() {
+        // §41: a symbol in a manifest/bootstrap file gets a criticality
+        // bump (importance evidence) — and the file's TEXT never enters
+        // the surface (we only score the path).
+        assert_eq!(file_importance("package.json"), 1.0);
+        assert_eq!(file_importance("Dockerfile"), 1.0);
+        assert_eq!(file_importance(".github/workflows/ci.yml"), 1.0);
+        assert_eq!(file_importance("src/main.rs"), 1.0);
+        assert_eq!(file_importance("src/util.rs"), 0.0);
+        assert_eq!(file_importance("src/main.py"), 1.0);
+        assert_eq!(file_importance("Makefile"), 1.0);
+        // non-important file stays neutral
+        assert_eq!(file_importance("services/transcripts.py"), 0.0);
+    }
+
+    #[test]
     fn build_surface_global_matches_historical_pipeline() {
         let (_dir, store) = fixture_store();
         let ctx = make_ctx(&store);
