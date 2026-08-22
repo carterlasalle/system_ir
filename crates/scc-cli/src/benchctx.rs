@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.benchmark-corpus
 pub struct BenchmarkCorpus {
     pub version: u32,
     #[serde(default)]
@@ -21,6 +22,7 @@ pub struct BenchmarkCorpus {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.bench-task
 pub struct BenchTask {
     pub id: String,
     pub repo: String,
@@ -31,6 +33,7 @@ pub struct BenchTask {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.ground-truth
 pub struct GroundTruth {
     #[serde(default)]
     pub files: Vec<String>,
@@ -49,6 +52,7 @@ pub struct GroundTruth {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.hallucination
 pub struct Hallucination {
     #[serde(rename = "type")]
     pub kind: String,
@@ -56,6 +60,7 @@ pub struct Hallucination {
 }
 
 #[derive(Debug, Clone, Default)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.task-result
 pub struct TaskResult {
     pub id: String,
     pub recall: f64,
@@ -68,6 +73,7 @@ pub struct TaskResult {
 }
 
 #[derive(Debug, Clone, Default)]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.bench-summary
 pub struct BenchSummary {
     pub tasks: usize,
     pub mean_recall: f64,
@@ -80,6 +86,7 @@ pub struct BenchSummary {
 
 /// Locate the fixtures directory: walk up from cwd; fall back to the
 /// build-time manifest path (dev tooling).
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.locate-fixtures-dir
 pub fn locate_fixtures_dir() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
@@ -99,6 +106,7 @@ pub fn locate_fixtures_dir() -> Option<PathBuf> {
     candidate
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.copy-fixture
 fn copy_fixture(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -119,6 +127,7 @@ fn copy_fixture(src: &Path, dst: &Path) {
 }
 
 /// Normalize a pack entity id to a `(kind, name)` pair.
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.normalize-id
 fn normalize_id(id: &str) -> Option<(String, String)> {
     // repo://<repo>/<kind>/<rest...>
     let rest = id.strip_prefix("repo://")?;
@@ -146,6 +155,7 @@ fn normalize_id(id: &str) -> Option<(String, String)> {
     }
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.score-task-public
 pub fn score_task_public(
     repo_dir: &Path,
     task: &BenchTask,
@@ -153,6 +163,7 @@ pub fn score_task_public(
     score_task(repo_dir, task)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.score-task
 fn score_task(
     repo_dir: &Path,
     task: &BenchTask,
@@ -162,10 +173,12 @@ fn score_task(
     copy_fixture(repo_dir, &root);
 
     crate::commands::cmd_index(&root, true).map_err(|e| format!("index: {e}"))?;
-    let pack_json = crate::commands::cmd_context_task_json(&root, &task.goal, &[], &[], None)
+    let artifact_json = crate::commands::cmd_context_task_json(&root, &task.goal, &[], &[], None)
         .map_err(|e| format!("task: {e}"))?;
-    let pack: serde_json::Value =
-        serde_json::from_str(&pack_json).map_err(|e| format!("pack json: {e}"))?;
+    // The artifact is {pack, delta, delta_ids}; recall scores the PACK.
+    let artifact: serde_json::Value =
+        serde_json::from_str(&artifact_json).map_err(|e| format!("artifact json: {e}"))?;
+    let pack = artifact["pack"].clone();
 
     let ids: Vec<String> = pack["entity_ids"]
         .as_array()
@@ -295,6 +308,7 @@ fn score_task(
 // trace:v1 id=impl.scc.bench.context work=WORK-SCC-001 verifies=REQ-SCC-TEST
 
 /// Run the full context benchmark against `benchmarks/tasks.json`.
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.run-context-benchmark
 pub fn run_context_benchmark(min_recall: f64) -> Result<BenchSummary, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let corpus_path = fixtures
@@ -354,6 +368,7 @@ pub fn run_context_benchmark(min_recall: f64) -> Result<BenchSummary, String> {
     Ok(summary)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.print-summary
 pub fn print_summary(s: &BenchSummary) {
     println!("scc bench context — ground-truth corpus");
     println!(
@@ -381,6 +396,7 @@ mod tests {
     use super::*;
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.normalize-id-handles-encoding
     fn normalize_id_handles_encoding() {
         let id = "repo://repo/symbol/src/asr/client.ts/transcribe";
         let (kind, name) = normalize_id(id).unwrap();
@@ -395,6 +411,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.corpus-is-valid-json
     fn corpus_is_valid_json() {
         let fixtures = locate_fixtures_dir().expect("fixtures dir");
         let path = fixtures
@@ -414,6 +431,7 @@ mod match_tests {
     use super::*;
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.test-entity-matches-sanitized-gt
     fn test_entity_matches_sanitized_gt() {
         // pack id for a test entity
         let id = "repo://repo/test/tests/test-transcripts.py/test-normalization-preserves-raw";
@@ -424,6 +442,7 @@ mod match_tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.file-ids-sanitize-underscores
     fn file_ids_sanitize_underscores() {
         let id = "repo://repo/file/tests/test-transcripts.py";
         let (kind, name) = normalize_id(id).unwrap();
@@ -432,6 +451,7 @@ mod match_tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-benchctx.route-ids-match
     fn route_ids_match() {
         let id = "repo://repo/route/get-/api/transcripts/-id";
         let (kind, name) = normalize_id(id).unwrap();

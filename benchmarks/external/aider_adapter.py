@@ -62,7 +62,12 @@ GOAL_STOPWORDS = frozenset(
     under between through during before after above below again further then
     once here there when where why how both each few more most other some such
     no nor only own same too very just should now will would could may might
-    must shall""".split()
+    must shall
+    change fix rename update refactor implement handle check test error
+    handling field response request value new old one two three code file
+    line call return param argument method function class module package
+    version build run start stop get put post delete create remove
+""".split()
 )
 
 
@@ -140,25 +145,94 @@ def installed_aider_commit(site_packages=None):
     return None
 
 
+IDENT_STOPWORDS = GOAL_STOPWORDS
+
+
 def mentioned_idents(goal):
-    """Extract mentioned identifiers from the task goal: simple word
-    tokens (>= 3 chars, grammar words dropped, `--flag` prefixes
-    stripped). The same rule applies to every goal, so aider's
-    personalization sees the same signal the SCC task variants do."""
+    """Extract mentioned identifiers from the task goal, PRESERVING ORIGINAL
+    CASE. The pinned aider matches `mentioned_idents` exactly (case-
+    sensitive) against file/symbol tokens when personalizing the map, so
+    lowercasing here silently suppressed its boost for PascalCase /
+    camelCase mentions ("IncidentEngine" → "incidentengine" matched
+    nothing). Each token is emitted in its original spelling; a lowercase
+    variant is ADDED ONLY for mixed-case tokens (so both `IncidentEngine`
+    and `incidentengine` can hit), never as a replacement. Grammar words
+    are dropped; `--flag` prefixes are stripped; likely-identifier shapes
+    (snake_case, camelCase, PascalCase, dotted.names, paths, filenames)
+    pass through.
+    """
     out = []
     seen = set()
-    for raw in re.split(r"[^A-Za-z0-9]+", goal or ""):
-        tok = raw.strip().lstrip("-").lower()
-        if len(tok) < 3 or tok in GOAL_STOPWORDS or tok in seen:
+    # Split on whitespace/quotes first so path-ish tokens (src/engine.ts,
+    # services/transcripts.py) survive whole, then split each chunk on
+    # non-[A-Za-z0-9_.-] for bare identifiers.
+    chunks = re.split(r"[\s`'\"]+", goal or "")
+    for chunk in chunks:
+        tok = chunk.strip().rstrip(".,;:!?)")
+        if not tok:
             continue
-        seen.add(tok)
-        out.append(tok)
+        if tok.startswith("-"):
+            # CLI flag: aider personalizes on identifiers, not flags.
+            continue
+        candidates = [tok]
+        if not re.fullmatch(r"[A-Za-z0-9_./\-]+", tok):
+            # punctuation-heavy chunk: fall back to alnum splitting for the
+            # inner words (original behavior), keeping case
+            candidates = [
+                w for w in re.split(r"[^A-Za-z0-9_]+", tok) if w
+            ]
+        for cand in candidates:
+            forms = [cand]
+            if cand != cand.lower():
+                # mixed case: keep the original spelling first-class and add
+                # the lowercase twin AFTER it (aider matches exactly, so both
+                # spellings can hit; the original always leads)
+                forms.append(cand.lower())
+            for idx, form in enumerate(forms):
+                low = form.lower()
+                if len(form) < 3 or low in IDENT_STOPWORDS:
+                    continue
+                if form in seen:
+                    continue
+                if idx > 0 and low in seen:
+                    # an all-lowercase token with this spelling was already
+                    # emitted — the twin would be a duplicate
+                    continue
+                seen.add(form)
+                if form == low:
+                    seen.add(low)
+                out.append(form)
+    return out
+
+
+def mentioned_fnames(goal):
+    """Paths/filenames literally present in the task goal: any whitespace-
+    delimited chunk containing a `/` or looking like `name.<ext>` with a
+    plausible source extension. Only strings ACTUALLY IN the task are
+    returned — ground truth is never inferred here."""
+    exts = (
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".java", ".rb",
+        ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".swift", ".kt", ".md",
+        ".json", ".yaml", ".yml", ".toml",
+    )
+    low = goal or ""
+    out = []
+    seen = set()
+    for chunk in re.split(r"[\s`'\"]+", low):
+        tok = chunk.strip().lstrip("-").rstrip(".,;:!?)")
+        if len(tok) < 3 or tok in seen:
+            continue
+        if "/" in tok or tok.lower().endswith(exts):
+            seen.add(tok)
+            out.append(tok)
     return out
 
 
 def build_repomap(repo_abs, budget, goal, site_packages=None):
-    """Construct the pinned aider RepoMap for the budget. Returns the map
-    text, or raises AiderMissing / PinMismatch."""
+    """Construct the pinned aider RepoMap for the budget. Returns
+    `(map_text, map_tokens_used)` — the map_tokens the equal-token search
+    actually landed on (the harness records it as
+    `native_tool_budget_parameter`). Raises AiderMissing / PinMismatch."""
     commit = installed_aider_commit(site_packages=site_packages)
     if commit is None:
         raise AiderMissing(
@@ -183,29 +257,105 @@ def build_repomap(repo_abs, budget, goal, site_packages=None):
         model = None  # token counting falls back to the chars/4 heuristic
 
     io = InputOutput(pretty=False, yes=True)
-    try:
-        rm = RepoMap(
-            map_tokens=budget,
-            root=repo_abs,
-            main_model=model,
-            io=io,
-            refresh="manual",
-        )
-    except TypeError:
-        # Older pinned signatures: (map_tokens, root, main_model, io)
-        rm = RepoMap(budget, repo_abs, model, io)
 
     other_files = src_files(repo_abs)
-    # chat_files=[] -> whole-repo map at max_map_tokens (equal-token mode).
-    # mentioned_idents = the goal's identifier tokens (aider's task
-    # personalization input; see aider/repomap.py at the pinned commit).
-    # The map can land within +/-15% of the budget (aider's binary search);
-    # the adapter reports the actual estimate.
     idents = set(mentioned_idents(goal))
-    return rm.get_repo_map([], other_files, mentioned_idents=idents) or ""
+    fnames = set(mentioned_fnames(goal))
 
+    def gen(map_tokens):
+        """One aider map at a given map_tokens. Aider sizes the map with
+        its OWN model tokenizer (its binary search targets ±15% of
+        map_tokens), so map_tokens alone does not make the shared chars/4
+        budget equal-token — the caller searches over it."""
+        try:
+            rm = RepoMap(
+                map_tokens=map_tokens,
+                root=repo_abs,
+                main_model=model,
+                io=io,
+                refresh="manual",
+            )
+        except TypeError:
+            rm = RepoMap(map_tokens, repo_abs, model, io)
+        try:
+            return rm.get_repo_map(
+                [], other_files, mentioned_idents=idents, mentioned_fnames=fnames
+            ) or ""
+        except TypeError:
+            # Older pinned signature without the mentioned_fnames kwarg.
+            return rm.get_repo_map([], other_files, mentioned_idents=idents) or ""
+
+    # EQUAL-TOKEN mode (Part H): the shared chars/4 estimator governs.
+    # Search the largest map_tokens whose generated map fits the budget
+    # under estimate_tokens — aider's internal tokenizer may disagree with
+    # chars/4 in either direction, so a single map_tokens=budget call can
+    # over- OR under-shoot. Geometric ramp + binary search; the generated
+    # map itself always fits (never mid-truncated).
+    map_tokens = budget
+    text = gen(map_tokens)
+    if estimate_tokens(text) > budget:
+        hi = map_tokens
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi) // 2
+            candidate = gen(max(1, mid))
+            if estimate_tokens(candidate) <= budget:
+                text = candidate
+                map_tokens = max(1, mid)
+                lo = mid + 1
+            else:
+                hi = mid
+    return text, map_tokens
+
+
+def build_repomap_native(repo_abs, goal, site_packages=None):
+    """NATIVE-DEFAULT mode (Part I): aider's intended default behavior —
+    RepoMap constructed WITHOUT a map_tokens override (aider's own
+    default), personalized with the goal's idents/fnames as usual. The
+    artifact's actual cost is reported, never normalized; do not use this
+    mode to claim per-token superiority. Returns `(map_text,
+    map_tokens_used)` where the second element is `None` (aider default)."""
+    commit = installed_aider_commit(site_packages=site_packages)
+    if commit is None:
+        raise AiderMissing("aider install not found")
+    if commit != LOCKED_AIDER_COMMIT:
+        raise PinMismatch(
+            f"installed aider commit {commit} != pinned {LOCKED_AIDER_COMMIT}"
+        )
+    try:
+        from aider.io import InputOutput  # noqa: F401
+        from aider.models import Model
+        from aider.repomap import RepoMap
+    except ImportError as exc:
+        raise AiderMissing(f"aider python package not importable: {exc}") from exc
+    try:
+        model = Model("gpt-4o")
+    except Exception:
+        model = None
+    io = InputOutput(pretty=False, yes=True)
+    try:
+        rm = RepoMap(root=repo_abs, main_model=model, io=io, refresh="manual")
+    except TypeError:
+        rm = RepoMap(None, repo_abs, model, io)
+    other_files = src_files(repo_abs)
+    idents = set(mentioned_idents(goal))
+    fnames = set(mentioned_fnames(goal))
+    try:
+        text = rm.get_repo_map(
+            [], other_files, mentioned_idents=idents, mentioned_fnames=fnames
+        ) or ""
+    except TypeError:
+        text = rm.get_repo_map([], other_files, mentioned_idents=idents) or ""
+    return text, None
 
 def main(argv):
+    # --native (Part I): aider's OWN default configuration — no shared
+    # budget, no search; RepoMap is constructed with aider's default
+    # map_tokens and the artifact's actual cost is REPORTED, never
+    # normalized. Scores from this mode must not be read per-token.
+    native = "--native" in argv[4:]
+    if "--native" in argv[4:]:
+        argv = [a for a in argv if a != "--native"]
     if len(argv) not in (4, 6) or (len(argv) == 6 and argv[4] != "--goal"):
         print(
             json.dumps(
@@ -245,7 +395,14 @@ def main(argv):
         # contract stays clean; generation errors still hit stderr.
         import contextlib
         with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-            map_text = build_repomap(repo_abs, budget, goal, site_packages=site_packages)
+            if native:
+                map_text, map_tokens_used = build_repomap_native(
+                    repo_abs, goal, site_packages=site_packages
+                )
+            else:
+                map_text, map_tokens_used = build_repomap(
+                    repo_abs, budget, goal, site_packages=site_packages
+                )
     except AiderMissing as exc:
         print(json.dumps({"ok": False, "error": f"SKIPPED-UNINSTALLED: {exc}"}))
         return 2
@@ -260,15 +417,22 @@ def main(argv):
     with open(artifact, "w") as fh:
         fh.write(map_text)
 
+    actual = estimate_tokens(map_text)
     print(
         json.dumps(
             {
                 "ok": True,
                 "tool": "aider",
-                "tokens": estimate_tokens(map_text),
+                "tokens": actual,
                 "files": len(src_files(repo_abs)),
                 "artifact": artifact,
                 "pinned": LOCKED_AIDER_COMMIT,
+                "mode": "native-default" if native else "equal-token",
+                "requested_budget": budget,
+                "actual_shared_tokens": actual,
+                "native_tool_budget_parameter": map_tokens_used,
+                "utilization": round(actual / budget, 4) if budget else 0.0,
+                "mode": "equal-token",
             }
         )
     )

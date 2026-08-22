@@ -121,16 +121,16 @@ fn parse_markers(content: &str) -> Vec<TraceMarker> {
                 .strip_suffix(" -->")
                 .unwrap_or(marker_str);
 
-            // Parse key=value pairs
+            // Parse key=value pairs. Values containing whitespace MUST be
+            // double-quoted (marker protocol); quoted values honor \"
+            // escapes. A whitespace split alone would truncate
+            // title="System IR schema" to `"System`.
             let mut properties = HashMap::new();
             let mut id = None;
-
-            for part in marker_str.split_whitespace() {
-                if let Some((key, value)) = part.split_once('=') {
-                    properties.insert(key.to_string(), value.to_string());
-                    if key == "id" {
-                        id = Some(value.to_string());
-                    }
+            for (key, value) in parse_kv_pairs(marker_str) {
+                properties.insert(key.clone(), value);
+                if key == "id" {
+                    id = Some(properties.get("id").cloned().unwrap_or_default());
                 }
             }
 
@@ -143,7 +143,62 @@ fn parse_markers(content: &str) -> Vec<TraceMarker> {
     markers
 }
 
-/// Import trace markers from a source file.
+/// Tokenize `key=value` pairs from a marker body, honoring double-quoted
+/// values (with `\"` / `\\` escapes) per the marker protocol. Unquoted
+/// values end at whitespace. Malformed tails are skipped, never panic.
+// trace:v1 id=impl.crates-scc-indexer-src-adapters-tracelayer.parse-kv-pairs work=WORK-implement-trace-layer-as-an-evidence-adapter-for-system-ir-parsing-trace satisfies=REQ-SCC-IR
+fn parse_kv_pairs(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' || i == key_start {
+            // not a key= token; skip one char and continue
+            i += 1;
+            continue;
+        }
+        let key = body[key_start..i].to_string();
+        i += 1; // '='
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        value.push(bytes[i + 1] as char);
+                        i += 2;
+                    }
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {
+                        // push the full UTF-8 char starting at i
+                        let ch_len = body[i..].chars().next().map_or(1, char::len_utf8);
+                        value.push_str(&body[i..i + ch_len]);
+                        i += ch_len;
+                    }
+                }
+            }
+        } else {
+            let v_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            value.push_str(&body[v_start..i]);
+        }
+        out.push((key, value));
+    }
+    out
+}
 // trace:v1 id=impl.crates-scc-indexer-src-adapters-tracelayer.import-tracelayer
 pub fn import_tracelayer(store: &Store, path: &Path) -> Result<TraceLayerReport, String> {
     let content = std::fs::read_to_string(path)

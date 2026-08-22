@@ -1555,6 +1555,12 @@ pub struct SurfaceRenderResult {
     pub omissions: Vec<SurfaceOmission>,
     /// Token estimate of `text`.
     pub token_count: usize,
+    /// Required entries the hard-max invariant had to DROP after every
+    /// compression level was exhausted (explicit CRITICAL omissions — the
+    /// highest-ranked required entry is preserved whenever anything fits).
+    /// Empty in every non-pathological render.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_drops: Vec<String>,
 }
 
 /// One node in the heterogeneous ranking universe (Wave 14B): any rankable
@@ -1677,11 +1683,15 @@ const MASSIVE_SURFACE_CAP: usize = 10_000;
 impl ContextBudget {
     /// Adaptive startup split: scale the Atlas/Surface allocation by repo
     /// complexity instead of the fixed 13:7 default. Tiers by entity count
-    /// (component count also escalates to `large`):
+    /// (component count escalates to `large`; flow count escalates to
+    /// `architecture-heavy`):
     ///
     /// - tiny (`entity_count < 200`): 55/45 — a small atlas leaves room
     ///   for a proportionally larger surface;
-    /// - normal: 60/40;
+    /// - ordinary: 60/40;
+    /// - architecture-heavy (`flow_count > 40`): 65/35 — flows, routes and
+    ///   contracts are Atlas content, so a flow-dense repo needs the Atlas
+    ///   slice even when its entity count is ordinary;
     /// - large (`entity_count > 5000` or `component_count > 30`): 65/35 —
     ///   the atlas dominates;
     /// - massive (`entity_count > 20_000`): 70/30 with the surface slice
@@ -1700,12 +1710,17 @@ impl ContextBudget {
         total: usize,
         entity_count: usize,
         component_count: usize,
-        _flow_count: usize,
+        flow_count: usize,
         surface_candidates: usize,
     ) -> ContextBudget {
         let (surface_pct, boost, cap): (f64, f64, Option<usize>) = if entity_count > 20_000 {
             (30.0, 0.0, Some(MASSIVE_SURFACE_CAP))
         } else if entity_count > 5_000 || component_count > 30 {
+            (35.0, 5.0, None)
+        } else if flow_count > 40 {
+            // Architecture-heavy: flows/routes/contracts are Atlas content.
+            // Checked BEFORE the tiny tier — a small but flow-dense repo
+            // still needs the Atlas slice.
             (35.0, 5.0, None)
         } else if entity_count < 200 {
             (45.0, 5.0, None)
@@ -2102,6 +2117,7 @@ mod tests {
                 reason: "token budget".into(),
             }],
             token_count: 7,
+            critical_drops: vec![],
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: SurfaceRenderResult = serde_json::from_str(&json).unwrap();

@@ -9,7 +9,7 @@
 use crate::surface::{build_surface, build_surface_cached, SurfaceMode, SurfacePolicy, SurfaceRequest};
 use crate::ContextCompiler;
 use scc_core::kinds;
-use scc_core::{ContextArtifact, ContextBudget, ContextLedger};
+use scc_core::{estimate_tokens, ContextArtifact, ContextBudget, ContextLedger};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,7 +36,14 @@ pub struct StartupContext {
 /// `SystemRanker::new` (heterogeneous node graph + adjacency + rarity),
 /// the 50-iteration global PageRank vector, and the projection to symbol
 /// scores — serialized to the store cache so consecutive startups in the
-/// same model epoch skip the rank build entirely. Key:
+/// same model epoch skip the rank build entirely.
+///
+/// Scope evidence (Part F profiling, cli-service fixture, budget 7000):
+/// cold rebuild 44-242µs vs 25µs cache hit — the rebuild is sub-millisecond
+/// at fixture scale, so the seam stays STARTUP-ONLY; plain `scc surface` /
+/// MCP `surface_map` keep the uncached `build_surface` (identical output,
+/// measured cost negligible). Re-measure before extending the seam to
+/// larger corpora. Key:
 /// `rank:global:<blake3(epoch, policy, salt)[..20]>` (mirrors the
 /// `system_atlas` pack-cache pattern in `ContextCompiler::system_atlas`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +72,96 @@ pub struct GlobalRankCache {
     /// cache-hit marker for tests).
     #[serde(default)]
     pub hits: u64,
+}
+
+/// THE one startup-budget allocator (transport parity): every transport
+/// that builds a startup artifact — CLI `context startup`, MCP
+/// `system_context`, HTTP, Hermes, the SDKs, the Claude SessionStart /
+/// PreCompact hooks, and the benchmark harness — resolves its budget
+/// through this function and never derives an Atlas:Surface split itself.
+///
+/// `target_tokens == None` does NOT bypass adaptation: it selects the
+/// configured default total (`ContextBudget::default().total`), which then
+/// goes through the SAME adaptive complexity split. An explicit target
+/// scales the total; repo complexity decides the split — in both cases via
+/// [`scc_core::ContextBudget::adaptive`]. Deterministic per (target,
+/// view): same inputs, same budget.
+// trace:v1 id=impl.scc.startup.allocate-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-adaptive-startup-budgets
+pub fn allocate_startup_budget(
+    compiler: &ContextCompiler,
+    target_tokens: Option<usize>,
+) -> ContextBudget {
+    let total = target_tokens.unwrap_or_else(|| ContextBudget::default().total);
+    let view = &compiler.view;
+    let entity_count = view.entities().count();
+    let component_count = view.components().len();
+    let flow_count = view.flows().len();
+    let surface_candidates = view.entities_of_kind(scc_core::kinds::SYMBOL).len();
+    scc_core::ContextBudget::adaptive(total, entity_count, component_count, flow_count, surface_candidates)
+}
+
+// trace:v1 id=impl.crates-scc-context-src-startup.coverage-lines work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-hard-max-invariant-on-rendered-text
+fn coverage_lines(
+    compiler: &ContextCompiler,
+    render_ids: usize,
+    candidates: usize,
+    render_tokens: usize,
+    surface_budget: usize,
+) -> Vec<String> {
+    let mut coverage = Vec::new();
+    for w in compiler_warnings(compiler) {
+        coverage.push(w);
+    }
+    let mut stale: Vec<String> = compiler.stale_paths.clone();
+    stale.sort();
+    stale.dedup();
+    for p in &stale {
+        coverage.push(format!("stale: {p}"));
+    }
+    coverage.push(format!(
+        "surface map: {} of {} entries rendered, {} tokens (budget {})",
+        render_ids,
+        candidates,
+        render_tokens,
+        surface_budget
+    ));
+    coverage
+}
+
+// OMISSIONS helper (module-level so its trace marker attaches): the render
+// result's per-kind cuts + omitted-id count + the
+// atlas's dropped sections (honest: omitted ids are never silent).
+// trace:v1 id=impl.crates-scc-context-src-startup.omission-lines
+fn omission_lines(
+    render_omissions: &[scc_core::SurfaceOmission],
+    omitted_len: usize,
+    atlas_dropped: &[String],
+    atlas_hard_truncated: bool,
+    atlas_exceeded: bool,
+) -> Vec<String> {
+    let mut omissions = Vec::new();
+    for o in render_omissions {
+        omissions.push(format!("surface: {} ({})", o.kind, o.reason));
+    }
+    if omitted_len > 0 {
+        omissions.push(format!(
+            "surface: {} lower-ranked definitions omitted",
+            omitted_len
+        ));
+    }
+    for d in atlas_dropped {
+        omissions.push(format!("atlas section dropped: {d}"));
+    }
+    if atlas_hard_truncated {
+        omissions.push("atlas hard-truncated mid-section".into());
+    }
+    if atlas_exceeded {
+        omissions.push("atlas exceeded soft budget: kept complete, over budget".into());
+    }
+    if omissions.is_empty() {
+        omissions.push("none".into());
+    }
+    omissions
 }
 
 /// Build the deterministic startup artifact: the existing System Atlas
@@ -108,8 +205,66 @@ pub fn build_startup(
         },
         &mut rank_cache,
     );
-    // Best-effort persistence: a cache failure never fails startup. The
-    // hit counter is the deterministic "reused on run 2" marker.
+    // Startup hard-max semantics (Part E): `budget.total` is the SOFT
+    // target; the hard maximum is target + 20% (min +500). Atlas and
+    // Surface may borrow from each other within it: if the FUSED body
+    // (atlas + coverage + omissions + surface) exceeds the hard max, the
+    // surface slice is re-selected against whatever room the atlas's
+    // ACTUAL size left — never by silently cutting the artifact.
+    let startup_hard_max = budget.total.saturating_add((budget.total / 5).max(500));
+
+    let mut render = render;
+    // MODEL COVERAGE: compiler warnings + stale paths + a surface accounting
+    // line, derived from the render itself (rendered ∪ omitted == every
+    // candidate) — never a second compile_surface_map walk. Recomputed
+    // after any hard-max rebalance below.
+    let mut coverage = coverage_lines(
+        compiler,
+        render.rendered_ids.len(),
+        render.rendered_ids.len() + render.omitted_ids.len(),
+        render.token_count,
+        budget.surface,
+    );
+    {
+        let omissions_probe = omission_lines(
+            &render.omissions,
+            render.omitted_ids.len(),
+            &atlas_pack.dropped_sections,
+            atlas_pack.hard_truncated,
+            atlas_pack.exceeded_soft_budget,
+        );
+        let overhead = estimate_tokens(&assemble_body(&atlas, "", &coverage, &omissions_probe));
+        let room = startup_hard_max.saturating_sub(overhead);
+        if render.token_count > room && room >= 64 {
+            let policy = SurfacePolicy {
+                quotas: true,
+                mmr: true,
+                coverage: true,
+                hard_max: room,
+            };
+            render = build_surface_cached(
+                compiler,
+                SurfaceRequest {
+                    mode: SurfaceMode::Global,
+                    budget: room,
+                    explain: false,
+                    policy,
+                    semantic: None,
+                },
+                &mut rank_cache,
+            );
+            coverage = coverage_lines(
+                compiler,
+                render.rendered_ids.len(),
+                render.rendered_ids.len() + render.omitted_ids.len(),
+                render.token_count,
+                room,
+            );
+        }
+    }
+    // Best-effort persistence AFTER any hard-max rebalance (the rebalance
+    // re-render also feeds the cache): a cache failure never fails startup.
+    // The hit counter is the deterministic "reused on run 2" marker.
     if let Some(c) = &mut rank_cache {
         if cache_hit {
             c.hits += 1;
@@ -118,53 +273,16 @@ pub fn build_startup(
     }
     let surface = render.text.clone();
 
-    // MODEL COVERAGE: the compiler's existing warnings + stale paths +
-    // a surface accounting line. Candidate count comes from the render
-    // itself (rendered ∪ omitted == every candidate) — never a second
-    // compile_surface_map walk.
-    let mut coverage = Vec::new();
-    for w in compiler_warnings(compiler) {
-        coverage.push(w);
-    }
-    let mut stale: Vec<String> = compiler.stale_paths.clone();
-    stale.sort();
-    stale.dedup();
-    for p in &stale {
-        coverage.push(format!("stale: {p}"));
-    }
-    let candidates = render.rendered_ids.len() + render.omitted_ids.len();
-    coverage.push(format!(
-        "surface map: {} of {} entries rendered, {} tokens (budget {})",
-        render.rendered_ids.len(),
-        candidates,
-        render.token_count,
-        budget.surface
-    ));
-
-    // OMISSIONS: the render result's per-kind cuts + omitted-id count + the
-    // atlas's dropped sections (honest: omitted ids are never silent).
-    let mut omissions = Vec::new();
-    for o in &render.omissions {
-        omissions.push(format!("surface: {} ({})", o.kind, o.reason));
-    }
-    if !render.omitted_ids.is_empty() {
-        omissions.push(format!(
-            "surface: {} lower-ranked definitions omitted",
-            render.omitted_ids.len()
-        ));
-    }
-    for d in &atlas_pack.dropped_sections {
-        omissions.push(format!("atlas section dropped: {d}"));
-    }
-    if atlas_pack.hard_truncated {
-        omissions.push("atlas hard-truncated mid-section".into());
-    }
-    if atlas_pack.exceeded_soft_budget {
-        omissions.push("atlas exceeded soft budget: kept complete, over budget".into());
-    }
-    if omissions.is_empty() {
-        omissions.push("none".into());
-    }
+    // OMISSIONS (final render — after any hard-max rebalance): the render
+    // result's per-kind cuts + omitted-id count + the atlas's dropped
+    // sections (honest: omitted ids are never silent).
+    let omissions = omission_lines(
+        &render.omissions,
+        render.omitted_ids.len(),
+        &atlas_pack.dropped_sections,
+        atlas_pack.hard_truncated,
+        atlas_pack.exceeded_soft_budget,
+    );
 
     let trust_policy = trust_policy_str(compiler.view.policy());
 
@@ -476,29 +594,21 @@ fn sorted_rels(rels: Vec<&scc_core::Relationship>) -> Vec<&scc_core::Relationshi
     v
 }
 
-/// The task delta: the task-personalized surface over the context ledger —
-/// only *new* relevant APIs (entries already visible AND unchanged this
-/// epoch are not re-injected), budget-capped. Routed through the one
-/// authoritative [`build_surface`] service in Task mode; never re-dumps
-/// the Atlas. The custom task/PPR selection implementation was deleted —
-/// [`build_surface`] is the only ranking pipeline.
-// trace:exempt reason=internal-detail
-pub fn task_delta(
-    compiler: &ContextCompiler,
-    goal: &str,
-    visible: &ContextLedger,
-    budget_tokens: usize,
-) -> String {
-    task_delta_with_ids(compiler, goal, visible, budget_tokens).0
-}
-
-/// `task_delta` plus the ids it rendered (for ledger recording).
-// trace:exempt reason=internal-detail
+/// `task_delta` plus the ids it rendered (for ledger recording). Routed
+/// through the one authoritative [`build_surface`] service in Task mode;
+/// never re-dumps the Atlas — the custom task/PPR selection implementation
+/// was deleted, [`build_surface`] is the only ranking pipeline. `semantic`
+/// is the caller-resolved scorer — transport parity: every transport with
+/// inference enabled passes the SAME scorer it passed to the task pack
+/// (interface choice must not change ranking quality). `None` redistributes
+/// the 10% share explicitly.
+// trace:v1 id=impl.scc.startup.task-delta-with-ids work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn task_delta_with_ids(
     compiler: &ContextCompiler,
     goal: &str,
     visible: &ContextLedger,
     budget_tokens: usize,
+    semantic: Option<&dyn crate::rank::SemanticScorer>,
 ) -> (String, Vec<String>) {
     let render = build_surface(
         compiler,
@@ -510,7 +620,7 @@ pub fn task_delta_with_ids(
             budget: budget_tokens,
             explain: false,
             policy: SurfacePolicy::defaults(budget_tokens),
-            semantic: None,
+            semantic,
         },
     );
     let mut out = String::new();
@@ -535,17 +645,21 @@ pub fn task_surface(
     goal: &str,
     budget_tokens: usize,
     explain: bool,
+    semantic: Option<&dyn crate::rank::SemanticScorer>,
 ) -> String {
-    task_surface_with_ids(compiler, goal, budget_tokens, explain).0
+    task_surface_with_ids(compiler, goal, budget_tokens, explain, semantic).0
 }
 
 /// `task_surface` plus the rendered entry ids (for ledger recording).
-// trace:exempt reason=internal-detail
+/// `semantic` is the caller-resolved scorer — transport parity, same rule
+/// as [`task_delta_with_ids`].
+// trace:v1 id=impl.scc.startup.task-surface-with-ids work=WORK-SCC-014 satisfies=REQ-SCC-IR
 pub fn task_surface_with_ids(
     compiler: &ContextCompiler,
     goal: &str,
     budget_tokens: usize,
     explain: bool,
+    semantic: Option<&dyn crate::rank::SemanticScorer>,
 ) -> (String, Vec<String>) {
     let render = build_surface(
         compiler,
@@ -557,7 +671,7 @@ pub fn task_surface_with_ids(
             budget: budget_tokens,
             explain,
             policy: SurfacePolicy::defaults(budget_tokens),
-            semantic: None,
+            semantic,
         },
     );
     let mut out = String::new();
@@ -601,6 +715,7 @@ mod tests {
                 omitted_ids: vec![],
                 omissions: vec![],
                 token_count: 0,
+                critical_drops: vec![],
             },
             coverage: vec!["stale: a.py".into()],
             omissions: vec!["none".into()],

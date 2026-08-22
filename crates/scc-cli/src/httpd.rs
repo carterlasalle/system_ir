@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+// trace:v1 id=impl.crates-scc-cli-src-httpd.serve
 pub fn serve(root: &Path) -> crate::Result<()> {
     let config = crate::load_config(root)?;
     let addr = config.security.listen.clone();
@@ -37,6 +38,7 @@ pub fn serve(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-httpd.handle-request
 fn handle_request(
     root: PathBuf,
     mut request: tiny_http::Request,
@@ -58,6 +60,7 @@ fn handle_request(
 }
 // trace:v1 id=impl.scc.http work=WORK-SCC-001 satisfies=REQ-SCC-API
 
+// trace:v1 id=impl.crates-scc-cli-src-httpd.route
 fn route(
     root: &Path,
     method: &str,
@@ -100,10 +103,48 @@ fn route(
             let files = json_arr(&req, "files");
             let symbols = json_arr(&req, "symbols");
             let budget = req.get("token_budget").and_then(|b| b.as_u64()).map(|b| b as usize);
-            // P0 parity: the SAME enriched pipeline as CLI/MCP (rankers +
-            // beads + hindsight), so transport cannot change quality.
-            let pack = crate::commands::build_task_pack(root, goal, &files, &symbols, budget)?;
-            Ok((200, serde_json::to_string(&pack)?))
+            // Transport parity: THE one complete task artifact — pack AND
+            // surface delta, same derivation as CLI text/JSON and MCP.
+            // Serialization is the only difference (structured JSON here).
+            let artifact =
+                crate::commands::build_task_context(root, goal, &files, &symbols, budget, false)?;
+            Ok((200, serde_json::to_string(&artifact)?))
+        }
+        ("POST", "/v1/context/startup") => {
+            let req: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+            let store = crate::open_store(root)?;
+            if store.snapshot_status()?.is_none() {
+                return json_err(409, "not indexed; POST /v1/index first".into());
+            }
+            let config = crate::load_config(root)?;
+            let stale = crate::stale_paths(&store)?;
+            let comp = crate::compiler(&store, &config, stale)?;
+            let ctx = comp.ctx();
+            // Transport parity: THE shared allocator; `token_budget` absent
+            // selects the default total and STILL adapts.
+            let budget_tokens = req.get("token_budget").and_then(|b| b.as_u64()).map(|b| b as usize);
+            let budget = scc_context::startup::allocate_startup_budget(&ctx, budget_tokens);
+            let startup =
+                scc_context::startup::build_startup(&ctx, &budget, scc_context::startup::RENDERER_VERSION);
+            // Ledger parity with CLI/MCP: record what THIS transport showed.
+            let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
+            let mut led = ledger_store.load();
+            let (syms, files, comps, flows) =
+                scc_context::startup::visible_ids_from_startup(&ctx, &startup);
+            led.visible_entities.extend(syms.iter().cloned());
+            led.visible_symbols.extend(syms);
+            led.visible_files.extend(files);
+            led.visible_components.extend(comps);
+            led.visible_flows.extend(flows);
+            ledger_store.save(&led);
+            Ok((
+                200,
+                serde_json::to_string(&serde_json::json!({
+                    "text": scc_context::startup::render_startup(&startup),
+                    "budget": budget,
+                    "artifact": startup.artifact,
+                }))?,
+            ))
         }
         ("GET", "/v1/atlas") => {
             let store = crate::open_store(root)?;
@@ -215,6 +256,7 @@ fn route(
     }
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-httpd.json-arr
 fn json_arr(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(|x| x.as_array())
@@ -229,6 +271,7 @@ fn json_arr(v: &serde_json::Value, key: &str) -> Vec<String> {
 /// Runtime observation ingest: OTLP/JSON traces (`resourceSpans`) or the
 /// simple `[{source, target, count}]` shape. Aggregates into runtime_edges
 /// (OBSERVED provenance).
+// trace:v1 id=impl.crates-scc-cli-src-httpd.ingest-runtime
 pub fn ingest_runtime(store: &Store, body: &str) -> crate::Result<()> {
     if body.contains("resourceSpans") {
         scc_indexer::runtime::ingest_otlp_json(store, body)
@@ -246,10 +289,12 @@ pub fn ingest_runtime(store: &Store, body: &str) -> crate::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// `scc watch`: foreground watcher loop.
+// trace:v1 id=impl.crates-scc-cli-src-httpd.watch-loop
 pub fn watch_loop(root: &Path) -> crate::Result<()> {
     watch_loop_inner(root, false)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-httpd.watch-loop-inner
 fn watch_loop_inner(root: &Path, quiet: bool) -> crate::Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Event>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {

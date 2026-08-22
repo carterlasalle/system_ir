@@ -429,7 +429,7 @@ def run_task_via_protocol(agent_cmd, artifact_path, goal, gt_files, plan_keys, r
     }
 
 
-def run_external_variant(variant, tasks, budget, agent_cmd, workdir):
+def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal-token"):
     """aider-repomap / repomix-compress over the tasks. Returns (rows,
     skipped) where rows is a list of per-repo metric dicts and skipped is
     None, or a dict {"status": ..., "error": ...} for the first
@@ -448,6 +448,8 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir):
         per_task = []
         for task in repo_tasks:
             argv = [bench_python(), str(adapter), str(fixture), str(budget), str(artifacts_dir)]
+            if mode == "native-default":
+                argv.append("--native")
             if variant == "aider-repomap":
                 argv += ["--goal", task["goal"]]
             elif variant == "repomix-compress":
@@ -502,6 +504,7 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget):
     mean_tokens = sum(tokens) // max(len(tokens), 1) if tokens else 0
     return {
         "variant": variant,
+        "mode": mode,
         "budget": budget,
         "repo": repo,
         "tasks": len(results),
@@ -521,18 +524,21 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget):
 # scc-native variants -> `scc bench external`
 # --------------------------------------------------------------------------
 
-def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir):
+def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode="equal-token"):
     rows = []
     for repo in sorted(tasks):
         argv = [
             scc_bin, "bench", "external",
             "--variant", variant,
             "--repo", repo,
-            "--budget", str(budget),
             "--cmd", agent_cmd,
             "--workdir", str(workdir),
             "--json",
         ]
+        if mode == "equal-token":
+            argv += ["--budget", str(budget)]
+        # native-default: no --budget — the scc variants run their intended
+        # defaults (adaptive startup split, default task slices).
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -601,6 +607,15 @@ def main(argv):
     parser.add_argument("--workdir", default=None, help="artifact/result workdir (default: benchmarks/results/external)")
     parser.add_argument("--json", action="store_true", help="emit JSON rows instead of the table")
     parser.add_argument("--single", action="store_true", help="one (variant, budget, repo-filtered) run; exit 2 when the external tool is missing")
+    parser.add_argument(
+        "--mode",
+        choices=("equal-token", "native-default"),
+        default="equal-token",
+        help="equal-token: every artifact constrained by the shared chars/4 "
+        "estimator at the given budgets. native-default: each tool's own "
+        "default configuration; actual token cost reported, never "
+        "normalized — do NOT read per-token superiority from it.",
+    )
     args = parser.parse_args(argv)
 
     tasks = load_tasks()
@@ -615,14 +630,26 @@ def main(argv):
     scc_bin = args.scc_bin or os.environ.get("SCC_BIN") or "scc"
 
     variants = [args.variant] if args.variant else VARIANTS
-    budgets = [args.budget] if args.budget else BUDGETS
+    if args.mode == "native-default":
+        # One pass per variant — native tools pick their own sizes.
+        budgets = [0]
+        for v in ("aider-repomap-native", "repomix-native"):
+            if args.variant is None and v not in variants:
+                variants.append(v)
+    else:
+        budgets = [args.budget] if args.budget else BUDGETS
 
     all_rows = []
     skipped_status = None
     for variant in variants:
         for budget in budgets:
-            if variant in EXTERNAL_VARIANTS:
-                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir)
+            if variant.endswith("-native") and variant.replace("-native", "") in EXTERNAL_VARIANTS:
+                base = variant.replace("-native", "")
+                rows, skipped = run_external_variant(
+                    base, tasks, budget, args.agent_cmd, workdir, mode=args.mode
+                )
+            elif variant in EXTERNAL_VARIANTS:
+                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode)
                 if skipped is not None:
                     status = skipped.get("status", "SKIPPED-UNINSTALLED")
                     skipped_status = {"variant": variant, "budget": budget, "status": status, "detail": skipped.get("error", "")}
@@ -638,7 +665,7 @@ def main(argv):
                     return 0
                 all_rows.append(aggregate(rows))
             else:
-                rows, skipped = run_native_variant(variant, tasks, budget, args.agent_cmd, scc_bin, workdir)
+                rows, skipped = run_native_variant(variant, tasks, budget, args.agent_cmd, scc_bin, workdir, mode=args.mode)
                 if args.single:
                     print(json.dumps(aggregate(rows)))
                     return 0

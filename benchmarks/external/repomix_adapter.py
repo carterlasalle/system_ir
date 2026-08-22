@@ -213,11 +213,19 @@ class PinUnverified(Exception):
     pass
 
 
+NATIVE_CONTEXT_WINDOW = 200_000  # chars/4 feasibility ceiling for native mode
+
+
 def run_repomix(argv):
     repo_abs = os.path.abspath(argv[1])
     budget = int(argv[2])
     out_dir = os.path.abspath(argv[3])
     compress = "--compress" in argv[4:]
+    # --native (Part I): repomix's intended default behavior — the FULL
+    # compressed pack, no shared-budget file-boundary cut. The artifact's
+    # actual cost is reported; packs beyond a realistic context window are
+    # reported infeasible rather than silently truncated.
+    native = "--native" in argv[4:]
 
     if not os.path.isdir(repo_abs):
         return {"ok": False, "error": f"not a directory: {argv[1]}"}, 1
@@ -271,16 +279,44 @@ def run_repomix(argv):
 
     # The final artifact's token estimate includes the `## File:` header
     # lines, so the cap is enforced on the concatenated artifact.
-    kept = []
-    total = 0
-    for path, content in sections:
-        header = f"## File: {path}\n"
-        tokens = estimate_tokens(header + content)
-        if kept and total + tokens > budget:
-            break  # budget reached — stop at a file boundary
-        kept.append((path, content))
-        total += tokens
-
+    if not native:
+        kept = []
+        total = 0
+        for path, content in sections:
+            header = f"## File: {path}\n"
+            tokens = estimate_tokens(header + content)
+            if kept and total + tokens > budget:
+                break  # budget reached — stop at a file boundary
+            kept.append((path, content))
+            total += tokens
+    else:
+        kept = list(sections)
+        packed_probe = "\n\n".join(f"## File: {p}\n{c}" for p, c in kept)
+        if estimate_tokens(packed_probe) > NATIVE_CONTEXT_WINDOW // 1:
+            return {
+                "ok": False,
+                "error": f"NATIVE-INFEASIBLE: full pack exceeds the {NATIVE_CONTEXT_WINDOW}-token context-window ceiling",
+            }, 5
+    if native:
+        packed = "\n\n".join(f"## File: {path}\n{content}" for path, content in kept)
+        total = estimate_tokens(packed)
+        artifact = os.path.join(out_dir, "repomix-native.txt")
+        with open(artifact, "w") as fh:
+            fh.write(packed)
+        print(json.dumps({
+            "ok": True,
+            "tool": "repomix",
+            "tokens": total,
+            "files": len(kept),
+            "artifact": artifact,
+            "compressed": compress,
+            "pinned": LOCKED_REPOMIX_COMMIT,
+            "mode": "native-default",
+            "requested_budget": None,
+            "actual_shared_tokens": total,
+            "native_tool_budget_parameter": None,
+        }))
+        return None
     packed = "\n\n".join(f"## File: {path}\n{content}" for path, content in kept)
     artifact = os.path.join(out_dir, "repomix.txt")
     with open(artifact, "w") as fh:
@@ -294,6 +330,10 @@ def run_repomix(argv):
         "artifact": artifact,
         "compressed": compress,
         "pinned": LOCKED_REPOMIX_COMMIT,
+        "mode": "equal-token",
+        "requested_budget": budget,
+        "actual_shared_tokens": total,
+        "utilization": round(total / budget, 4) if budget else 0.0,
     }, 0
 
 
@@ -318,8 +358,9 @@ def main(argv):
         return 1
 
     payload, code = run_repomix(argv)
-    print(json.dumps(payload))
-    return code
+    if payload is not None:  # native mode already printed its own payload
+        print(json.dumps(payload))
+    return 0 if payload is None else code
 
 
 if __name__ == "__main__":

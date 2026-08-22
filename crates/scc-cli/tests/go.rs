@@ -5,6 +5,7 @@
 mod golden;
 use golden::*;
 
+// trace:v1 id=test.crates-scc-cli-tests-go.go-service work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_service() -> tempfile::TempDir {
     let repo = copy_fixture("go-service");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -12,6 +13,7 @@ fn go_service() -> tempfile::TempDir {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-go.go-index-flows-mention-main work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_index_flows_mention_main() {
     let repo = go_service();
     let flows = run_ok(&workdir(repo.path()), &["flows"]);
@@ -19,6 +21,7 @@ fn go_index_flows_mention_main() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-go.go-atlas-has-service-component-and-main-entrypoint work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_atlas_has_service_component_and_main_entrypoint() {
     let repo = go_service();
     let atlas = run_ok(&workdir(repo.path()), &["atlas"]);
@@ -34,6 +37,7 @@ fn go_atlas_has_service_component_and_main_entrypoint() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-go.go-export-has-symbols-from-main-go work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_export_has_symbols_from_main_go() {
     let repo = go_service();
     let out = run_ok(&workdir(repo.path()), &["export", "system-ir.json"]);
@@ -62,13 +66,16 @@ fn go_export_has_symbols_from_main_go() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-go.go-task-pack-store-mentions-write-symbol work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_task_pack_store_mentions_write_symbol() {
     let repo = go_service();
     let out = run_ok(
         &workdir(repo.path()),
         &["context", "task", "store", "--json"],
     );
-    let pack: serde_json::Value = serde_json::from_str(&out).unwrap();
+    // The artifact is {pack, delta, delta_ids}; the assertions score the PACK.
+    let artifact: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let pack = &artifact["pack"];
     let content = pack["content"].as_str().unwrap();
     assert!(
         content.contains("Store.Save"),

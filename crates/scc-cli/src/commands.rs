@@ -161,35 +161,19 @@ pub fn cmd_context_startup(root: &Path, budget_tokens: Option<usize>) -> crate::
     Ok(())
 }
 
-/// Wave 15.2 adaptive startup budgets: `--budget N` splits the total by
-/// repo complexity (`ContextBudget::adaptive` — the fixed 13:7 default is
-/// replaced by complexity tiers); no `--budget` uses the defaults.
-/// Deterministic counts come from the trusted view; `surface_candidates`
-/// is the cheap symbol-entity count (the exact candidate list is computed
-/// inside the one surface build, which the budget feeds).
-// trace:exempt reason=internal-detail
-// trace:v1 id=impl.crates-scc-cli-src-commands.startup-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+/// Wave 15.2 adaptive startup budgets — the transport-parity shim over THE
+/// one allocator ([`scc_context::startup::allocate_startup_budget`]): no
+/// `--budget` selects the configured default total and STILL runs the
+/// adaptive complexity split (None never bypasses adaptation); an explicit
+/// `--budget N` scales the total through the same allocator. MCP, HTTP,
+/// Hermes, the SDKs and the hooks all resolve budgets through the same
+/// function — no transport keeps its own 13:7 formula.
+// trace:v1 id=impl.crates-scc-cli-src-commands.startup-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-adaptive-startup-budgets
 fn startup_budget(
     tokens: Option<usize>,
     ctx: &scc_context::ContextCompiler,
 ) -> scc_core::ContextBudget {
-    match tokens {
-        None => scc_core::ContextBudget::default(),
-        Some(n) => {
-            let view = &ctx.view;
-            let entity_count = view.entities().count();
-            let component_count = view.components().len();
-            let flow_count = view.flows().len();
-            let surface_candidates = view.entities_of_kind(kinds::SYMBOL).len();
-            scc_core::ContextBudget::adaptive(
-                n,
-                entity_count,
-                component_count,
-                flow_count,
-                surface_candidates,
-            )
-        }
-    }
+    scc_context::startup::allocate_startup_budget(ctx, tokens)
 }
 
 /// `scc surface [--task "<goal>"] [--budget N] [--explain]` — the System
@@ -426,84 +410,47 @@ fn surface_task_files(
     files
 }
 
-// trace:exempt reason=internal-detail
-// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_context_task(
-    root: &Path,
-    goal: &str,
-    files: &[String],
-    symbols: &[String],
-    budget: Option<usize>,
-    json: bool,
-    hook: bool,
-) -> crate::Result<()> {
-    if hook {
-        // Wave 2 (§37): UserPromptSubmit injects a task focus only when
-        // context.inject_task_focus is enabled; otherwise silent no-op.
-        let config = load_config(root)?;
-        if !config.context.inject_task_focus {
-            return Ok(());
-        }
-    }
-    // hook mode keeps the focus small (<= 1500 tokens, §37 option B)
-    let budget = if hook {
-        Some(budget.unwrap_or(1500).min(1500))
-    } else {
-        budget
-    };
-    let pack_json = cmd_context_task_json(root, goal, files, symbols, budget)?;
-    if json {
-        println!("{pack_json}");
-    } else {
-        let pack: scc_context::ContextPack = serde_json::from_str(&pack_json)?;
-        print!("{}", pack.content);
-        // Wave 14E: append the task delta — only NEW relevant APIs vs the
-        // context ledger — after the pack content. Hook mode keeps the
-        // total output within its 1500-token cap (the delta gets the
-        // remaining budget); an explicit --budget caps the total the same
-        // way; the default gives the delta its own task_delta slice.
-        let store = open_store(root)?;
-        let config = load_config(root)?;
-        let stale = crate::stale_paths(&store)?;
-        let comp = compiler(&store, &config, stale)?;
-        let ctx = comp.ctx();
-        let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
-        let visible = ledger_store.load();
-        let delta_budget = if hook {
-            budget.unwrap_or(0).saturating_sub(pack.tokens)
-        } else {
-            budget
-                .map(|b| b.saturating_sub(pack.tokens))
-                .unwrap_or(scc_core::ContextBudget::default().task_delta)
-        };
-        let (delta, ids) =
-            scc_context::startup::task_delta_with_ids(&ctx, goal, &visible, delta_budget);
-        print!("\n{delta}");
-        if !ids.is_empty() {
-            let mut led = visible;
-            record_visible_ids(&mut led, &ctx, &ids);
-            ledger_store.save(&led);
-        }
-    }
-    Ok(())
+/// THE one complete task artifact (transport parity): the enriched task
+/// pack AND its surface delta derived together, from ONE builder. Every
+/// transport — CLI text, CLI `--json`, MCP `task_context`, HTTP
+/// `/v1/context/task`, Hermes, both SDKs (via the CLI), and the Claude
+/// hook — calls [`build_task_context`]; outputs differ in serialization
+/// only, never in semantic content. The semantic scorer is resolved ONCE
+/// here and feeds BOTH the pack rankers and the task-delta Surface request,
+/// so interface choice cannot change ranking quality.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// trace:v1 id=impl.crates-scc-cli-src-commands.task-context-artifact work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+pub struct TaskContextArtifact {
+    pub pack: scc_context::ContextPack,
+    /// The task-personalized Surface delta (only NEW relevant APIs vs the
+    /// ledger). Empty string when the delta budget is 0.
+    pub delta: String,
+    /// Entry ids the delta rendered (ledger recording).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delta_ids: Vec<String>,
 }
 
-/// THE one task-context pipeline (P0 parity): semantic rankers + beads
-/// task state + hindsight lessons applied identically on every transport.
-/// CLI, MCP, and HTTP all call this — transport cannot change semantic
-/// quality.
-// trace:v1 id=impl.crates-scc-cli-src-commands.build-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn build_task_pack(
+/// Build the complete task artifact: scorer + beads + hindsight enrichment
+/// for the pack, then the SAME-scorer task delta against the ledger.
+/// `hook` keeps the whole focus within the §37 1500-token cap (the delta
+/// gets what the pack leaves); an explicit budget caps the total; the
+/// default gives the delta its own `task_delta` slice.
+// trace:v1 id=impl.crates-scc-cli-src-commands.build-task-context work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+pub fn build_task_context(
     root: &Path,
     goal: &str,
     files: &[String],
     symbols: &[String],
     budget: Option<usize>,
-) -> crate::Result<scc_context::ContextPack> {
+    hook: bool,
+) -> crate::Result<TaskContextArtifact> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
+    // Semantic services resolved ONCE per operation (transport parity):
+    // the same scorer instance backs the pack's candidate fusion and the
+    // delta's SurfaceRequest.semantic. Fails closed on remote policy.
     let (scorer, reranker) = crate::embed_cli::rankers(&store, &config, goal);
     let scorer_trait: Option<&dyn scc_context::rank::SemanticScorer> =
         scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
@@ -513,7 +460,11 @@ pub fn build_task_pack(
         goal,
         files,
         symbols,
-        budget,
+        if hook {
+            Some(budget.unwrap_or(1500).min(1500))
+        } else {
+            budget
+        },
         scorer_trait,
         reranker_trait,
     );
@@ -545,11 +496,78 @@ pub fn build_task_pack(
             }
         }
     }
-    Ok(pack)
+    // The delta: same scorer as the pack, budget = explicit total minus the
+    // pack's actual tokens (hook mode) or the dedicated task_delta slice
+    // (default). Zero budget renders an empty delta honestly.
+    let delta_budget = if hook || budget.is_some() {
+        budget.unwrap_or(if hook { 1500 } else { 0 }).saturating_sub(pack.tokens)
+    } else {
+        scc_core::ContextBudget::default().task_delta
+    };
+    let ctx = comp.ctx();
+    let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
+    let visible = ledger_store.load();
+    let (delta, delta_ids) =
+        scc_context::startup::task_delta_with_ids(&ctx, goal, &visible, delta_budget, scorer_trait);
+    if !delta_ids.is_empty() {
+        let mut led = visible;
+        record_visible_ids(&mut led, &ctx, &delta_ids);
+        ledger_store.save(&led);
+    }
+    Ok(TaskContextArtifact { pack, delta, delta_ids })
 }
 
-/// Task pack as JSON (used by the benchmark harness and integrations).
-// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task-json work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+/// `scc context task <goal> [--budget N] [--json] [--hook]` — the complete
+/// task focus. Text and JSON are TWO VIEWS OF ONE ARTIFACT built by
+/// [`build_task_context`]: JSON carries `{pack, delta, delta_ids}`, text
+/// prints pack content followed by the delta — identical derivation, no
+/// transport downgrades quality.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+pub fn cmd_context_task(
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: Option<usize>,
+    json: bool,
+    hook: bool,
+) -> crate::Result<()> {
+    if hook {
+        // Wave 2 (§37): UserPromptSubmit injects a task focus only when
+        // context.inject_task_focus is enabled; otherwise silent no-op.
+        let config = load_config(root)?;
+        if !config.context.inject_task_focus {
+            return Ok(());
+        }
+    }
+    let artifact = build_task_context(root, goal, files, symbols, budget, hook)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&artifact)?);
+    } else {
+        print!("{}", artifact.pack.content);
+        print!("\n{}", artifact.delta);
+    }
+    Ok(())
+}
+
+
+/// Pack-only view of THE one task artifact (compatibility shim): the pack
+/// half of [`build_task_context`]. New transports should call
+/// [`build_task_context`] directly so the delta ships with the pack.
+// trace:exempt reason=internal-detail
+pub fn build_task_pack(
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: Option<usize>,
+) -> crate::Result<scc_context::ContextPack> {
+    Ok(build_task_context(root, goal, files, symbols, budget, false)?.pack)
+}
+
+/// The complete task artifact as JSON — the same derivation as CLI text
+/// (`{pack, delta, delta_ids}`); serialization is the only difference.
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task-json work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
 pub fn cmd_context_task_json(
     root: &Path,
     goal: &str,
@@ -557,8 +575,8 @@ pub fn cmd_context_task_json(
     symbols: &[String],
     budget: Option<usize>,
 ) -> crate::Result<String> {
-    Ok(serde_json::to_string_pretty(&build_task_pack(
-        root, goal, files, symbols, budget,
+    Ok(serde_json::to_string_pretty(&build_task_context(
+        root, goal, files, symbols, budget, false,
     )?)?)
 }
 

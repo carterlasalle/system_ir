@@ -125,29 +125,6 @@ fn tools() -> Vec<Tool> {
     ]
 }
 
-/// Wave 14 dynamic budgets: `--budget N` scales the total and keeps the
-/// default atlas:surface split (13:7); mirrors `commands::startup_budget`
-/// so MCP and CLI render the same startup artifact for the same budget.
-// ponytail: 8-line mirror of commands::startup_budget — promote to a shared
-// pub fn in scc-core when a third transport needs dynamic startup budgets.
-// trace:exempt reason=internal-detail
-// trace:v1 id=impl.crates-scc-cli-src-mcp.startup-budget work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-fn startup_budget(tokens: Option<usize>) -> scc_core::ContextBudget {
-    let def = scc_core::ContextBudget::default();
-    match tokens {
-        None => def,
-        Some(n) => {
-            let total = def.total.max(1) as f64;
-            scc_core::ContextBudget {
-                total: n,
-                atlas: ((n as f64) * (def.atlas as f64 / total)).round() as usize,
-                surface: ((n as f64) * (def.surface as f64 / total)).round() as usize,
-                task_delta: def.task_delta,
-                structural_source: def.structural_source,
-            }
-        }
-    }
-}
 
 // trace:v1 id=impl.crates-scc-cli-src-mcp.send work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn send(msg: &serde_json::Value) {
@@ -287,16 +264,22 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
                 .map(|b| b as usize);
-            // P0 parity: the SAME enriched pipeline as CLI/HTTP (rankers +
-            // beads + hindsight), so transport cannot change quality.
-            let pack = crate::commands::build_task_pack(
+            // Transport parity: THE one complete task artifact — the same
+            // builder as CLI text/JSON and HTTP, so MCP gets the surface
+            // delta too (pack-only responses were a transport downgrade).
+            let artifact = crate::commands::build_task_context(
                 root,
                 &goal,
                 &arr_arg("files"),
                 &arr_arg("symbols"),
                 budget,
+                false,
             )?;
-            Ok(pack.content)
+            if artifact.delta.is_empty() {
+                Ok(artifact.pack.content)
+            } else {
+                Ok(format!("{}\n{}", artifact.pack.content, artifact.delta))
+            }
         }
         "component_context" => {
             let id = str_arg("component");
@@ -325,12 +308,29 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .get("token_budget")
                 .and_then(|b| b.as_u64())
                 .map(|b| b as usize);
-            let budget = startup_budget(budget_tokens);
+            // Transport parity: THE shared allocator (same as CLI/HTTP) —
+            // None selects the default total and STILL adapts; no local
+            // 13:7 formula survives here.
+            let budget = scc_context::startup::allocate_startup_budget(&comp.ctx(), budget_tokens);
+            let ctx = comp.ctx();
             let startup = scc_context::startup::build_startup(
-                &comp.ctx(),
+                &ctx,
                 &budget,
                 scc_context::startup::RENDERER_VERSION,
             );
+            // Ledger parity with CLI `context startup`: record what THIS
+            // transport just showed, or task deltas for MCP-only agents
+            // re-inject already-visible APIs.
+            let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(ctx.store);
+            let mut led = ledger_store.load();
+            let (syms, files, comps, flows) =
+                scc_context::startup::visible_ids_from_startup(&ctx, &startup);
+            led.visible_entities.extend(syms.iter().cloned());
+            led.visible_symbols.extend(syms);
+            led.visible_files.extend(files);
+            led.visible_components.extend(comps);
+            led.visible_flows.extend(flows);
+            ledger_store.save(&led);
             Ok(scc_context::startup::render_startup(&startup))
         }
         "surface_map" => {
@@ -342,9 +342,18 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 .unwrap_or(scc_core::ContextBudget::default().surface);
             let ctx = comp.ctx();
             // One authoritative pipeline: `build_surface` in Global or Task
-            // mode — the same service the CLI (`scc surface`) runs. The
-            // goal framing (task-personalized header) is shared with the
-            // CLI so both transports render the same artifact.
+            // mode — the same service the CLI (`scc surface`) runs, with
+            // the SAME semantic-scorer resolution: task mode wires the
+            // embed_cli rankers when inference is enabled and the remote
+            // policy permits (fail closed), global mode has no goal to
+            // score against. Transport cannot change ranking quality.
+            let (scorer, _reranker) = if goal.is_empty() {
+                (None, None)
+            } else {
+                crate::embed_cli::rankers(ctx.store, &config, &goal)
+            };
+            let semantic: Option<&dyn scc_context::rank::SemanticScorer> =
+                scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
             let request = scc_context::surface::SurfaceRequest {
                 mode: if goal.is_empty() {
                     scc_context::surface::SurfaceMode::Global
@@ -357,10 +366,7 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
                 budget: tokens,
                 explain: false,
                 policy: scc_context::surface::SurfacePolicy::defaults(tokens),
-                // MCP surface_map currently uses the lexical/PPR pipeline
-                // (no embed_cli rankers wired here); semantic=None makes
-                // the pipeline redistribute the 10% share explicitly.
-                semantic: None,
+                semantic,
             };
             let result = scc_context::surface::build_surface(&ctx, request);
             if goal.is_empty() {

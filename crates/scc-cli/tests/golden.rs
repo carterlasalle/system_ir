@@ -5,12 +5,14 @@ use std::path::PathBuf;
 use std::process::Command;
 // trace:v1 id=test.scc.golden verifies=REQ-SCC-IR exercises=impl.scc.cli,impl.scc.store
 
+// trace:v1 id=test.crates-scc-cli-tests-golden.scc
 pub fn scc() -> &'static str {
     env!("CARGO_BIN_EXE_scc")
 }
 
 /// Copy a fixture tree (minus its `.scc` state) into a fresh tempdir under a
 /// fixed `repo` directory so repository ids are stable across runs.
+// trace:v1 id=test.crates-scc-cli-tests-golden.copy-fixture
 pub fn copy_fixture(name: &str) -> tempfile::TempDir {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -26,6 +28,7 @@ pub fn copy_fixture(name: &str) -> tempfile::TempDir {
     dst
 }
 
+// trace:v1 id=test.crates-scc-cli-tests-golden.copy-tree
 pub fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
@@ -45,10 +48,12 @@ pub fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 /// The directory the fixture was copied into (the `scc` repo root).
+// trace:v1 id=test.crates-scc-cli-tests-golden.workdir
 pub fn workdir(tmp: &std::path::Path) -> std::path::PathBuf {
     tmp.join("repo")
 }
 
+// trace:v1 id=test.crates-scc-cli-tests-golden.run
 pub fn run(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(scc())
         .args(args)
@@ -57,6 +62,7 @@ pub fn run(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .expect("scc binary runs")
 }
 
+// trace:v1 id=test.crates-scc-cli-tests-golden.run-ok
 pub fn run_ok(dir: &std::path::Path, args: &[&str]) -> String {
     let out = run(dir, args);
     assert!(
@@ -71,6 +77,7 @@ pub fn run_ok(dir: &std::path::Path, args: &[&str]) -> String {
 /// A valid CFG branch condition: a control-block kind (if/else/for/while/
 /// try/catch/match/switch/with/do/loop/finally/select) or the legacy
 /// `conditional: <op>` format from pre-CFG indexes.
+// trace:v1 id=test.crates-scc-cli-tests-golden.is-cfg-condition
 pub fn is_cfg_condition(c: &str) -> bool {
     matches!(
         c,
@@ -80,6 +87,7 @@ pub fn is_cfg_condition(c: &str) -> bool {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.http-service-produces-expected-ir
 fn http_service_produces_expected_ir() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -123,6 +131,7 @@ fn http_service_produces_expected_ir() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.stale-worktree-never-serves-cached-pack
 fn stale_worktree_never_serves_cached_pack() {
     // P0 trust contract (§7): a pack cached under a clean revision must not
     // be returned after a working-tree file changed WITHOUT re-indexing.
@@ -155,6 +164,7 @@ fn stale_worktree_never_serves_cached_pack() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.canonical-flow-graph-preserves-topology
 fn canonical_flow_graph_preserves_topology() {
     // Wave 3 exit condition: the canonical FlowGraph preserves branches,
     // retry, and fanout exactly — alternate execution paths are never
@@ -240,6 +250,7 @@ fn canonical_flow_graph_preserves_topology() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.checkpoint-captures-goal-from-active-bead
 fn checkpoint_captures_goal_from_active_bead() {
     // §126: checkpoint goal/bead are populated from active task state.
     let repo = copy_fixture("http-service-python");
@@ -261,6 +272,7 @@ fn checkpoint_captures_goal_from_active_bead() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.atlas-describes-system-accurately
 fn atlas_describes_system_accurately() {
     // Wave 2 QA: the agent should be able to explain the system from the
     // atlas alone — purpose, architecture, flows, ownership, contracts,
@@ -286,6 +298,7 @@ fn atlas_describes_system_accurately() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.atlas-excludes-stale-facts-and-warns
 fn atlas_excludes_stale_facts_and_warns() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());
@@ -307,6 +320,7 @@ fn atlas_excludes_stale_facts_and_warns() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.atlas-runtime-section-shows-observed-paths-and-drift
 fn atlas_runtime_section_shows_observed_paths_and_drift() {
     // Wave 6: the atlas RUNTIME section surfaces observed trace signatures
     // and three-way drift findings (declared vs static vs observed).
@@ -345,6 +359,7 @@ fn atlas_runtime_section_shows_observed_paths_and_drift() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.atlas-budget-accounting-is-honest
 fn atlas_budget_accounting_is_honest() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());
@@ -374,6 +389,7 @@ fn atlas_budget_accounting_is_honest() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.task-cache-hits-within-an-epoch-and-misses-across
 fn task_cache_hits_within_an_epoch_and_misses_across() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());
@@ -382,10 +398,19 @@ fn task_cache_hits_within_an_epoch_and_misses_across() {
 
     let a = run_ok(&dir, &["context", "task", "--json", goal]);
     let b = run_ok(&dir, &["context", "task", "--json", goal]);
-    assert_eq!(a, b, "same model state must serve the cached pack");
+    // The artifact is {pack, delta, delta_ids}: the PACK must be cached
+    // byte-identically; the delta intentionally evolves with the ledger
+    // (run 1 recorded its rendered ids, so run 2's delta suppresses them —
+    // that suppression IS the Wave-14E novelty contract).
+    let pack_of = |s: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        serde_json::to_string(&v["pack"]).unwrap()
+    };
+    assert_eq!(pack_of(&a), pack_of(&b), "same model state must serve the cached pack");
 
     // identical re-index: rebuild is deterministic — same state yields the
-    // same pack (the epoch change invalidated the cache key, not the truth)
+    // same pack AND the same full artifact (the epoch change invalidated
+    // the cache key and reset the per-epoch ledger, not the truth)
     run_ok(&dir, &["index", "--quiet"]);
     let c = run_ok(&dir, &["context", "task", "--json", goal]);
     assert_eq!(a, c, "deterministic rebuild for identical state");
@@ -401,6 +426,7 @@ fn task_cache_hits_within_an_epoch_and_misses_across() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.incremental-refresh-matches-cold-cli
 fn incremental_refresh_matches_cold_cli() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -435,6 +461,7 @@ fn incremental_refresh_matches_cold_cli() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.stale-detection-and-verify
 fn stale_detection_and_verify() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -460,6 +487,7 @@ fn stale_detection_and_verify() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.secret-redaction-end-to-end
 fn secret_redaction_end_to_end() {
     let repo = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(workdir(repo.path())).unwrap();
@@ -477,6 +505,7 @@ fn secret_redaction_end_to_end() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.check-invariants-fails-on-dangling-refs
 fn check_invariants_fails_on_dangling_refs() {
     let repo = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(workdir(repo.path())).unwrap();
@@ -495,6 +524,7 @@ fn check_invariants_fails_on_dangling_refs() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.query-and-export-formats
 fn query_and_export_formats() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);

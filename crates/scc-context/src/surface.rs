@@ -518,6 +518,7 @@ fn finish_selection(
     // fit in hard_max — never drop them silently, the omissions block
     // reports the rest. The single highest-importance required entry is
     // always kept (its signature compresses to fit).
+    let mut pre_cap_critical_drops: Vec<String> = Vec::new();
     if policy.coverage {
         let cost_of_c = |id: &str| -> usize {
             entry_of
@@ -530,6 +531,9 @@ fn finish_selection(
         for (id, imp) in &required_items {
             let c = cost_of_c(id);
             if spent_c + c > policy.hard_max && !capped.is_empty() {
+                // Required entry that cannot fit even compressed: an
+                // explicit CRITICAL drop, never a silent skip.
+                pre_cap_critical_drops.push(id.clone());
                 continue;
             }
             spent_c += c;
@@ -540,6 +544,11 @@ fn finish_selection(
             // hard_max — keep the single most important one (its metadata
             // is already stripped; the identity line always remains).
             capped.push(required_items[0].clone());
+            for (id, _) in &required_items[1..] {
+                if !pre_cap_critical_drops.contains(id) {
+                    pre_cap_critical_drops.push(id.clone());
+                }
+            }
         }
         if capped.len() < required_items.len() {
             required_items = capped;
@@ -657,8 +666,43 @@ fn finish_selection(
         }
     }
 
+    // Hard-max invariant against the ACTUAL rendered text — headers
+    // included, because `render_selected` re-renders the full block each
+    // iteration. The ladder (spec Part E): escalate structural compression
+    // first (first signature line → abbreviated → identity-only), then drop
+    // the lowest-value NON-required entries as honest omissions, then — and
+    // only then — drop the lowest-value REQUIRED entries as explicit
+    // CRITICAL drops (`critical_drops`), preserving the highest-ranked
+    // required entry whenever anything fits. Terminates: each step either
+    // raises the bounded level or shrinks the selected set; an empty
+    // selection renders header-only.
+    let mut level: u8 = if compress { 1 } else { 0 };
+    let mut critical_drops: Vec<String> = pre_cap_critical_drops;
+    let mut overflow_drops: usize = 0;
+    let mut text = render_selected(&selected_entries, level, explain);
+    let mut token_count = estimate_tokens(&text);
+    while token_count > policy.hard_max {
+        if level < MAX_COMPRESSION {
+            level += 1;
+        } else {
+            let Some(dropped) = selected_entries.pop() else {
+                break; // nothing left to drop: impossible-minimum floor
+            };
+            rendered_ids.retain(|id| id != &dropped.id);
+            if required.contains(&dropped.id) {
+                critical_drops.push(dropped.id.clone());
+            } else {
+                overflow_drops += 1;
+            }
+        }
+        text = render_selected(&selected_entries, level, explain);
+        token_count = estimate_tokens(&text);
+    }
+
     // Omissions: every candidate not rendered, summarized per kind (honest —
-    // the artifact never silently implies completeness).
+    // the artifact never silently implies completeness). Overflow drops get
+    // their own reason line so the artifact states WHY they left; critical
+    // drops are listed by id in `critical_drops`.
     let rendered_set: BTreeSet<String> = rendered_ids.iter().cloned().collect();
     let mut omitted_ids: Vec<String> = Vec::new();
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
@@ -669,7 +713,7 @@ fn finish_selection(
         omitted_ids.push(e.id.clone());
         *by_kind.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
     }
-    let omissions: Vec<SurfaceOmission> = by_kind
+    let mut omissions: Vec<SurfaceOmission> = by_kind
         .into_iter()
         .map(|(kind, count)| SurfaceOmission {
             count,
@@ -677,22 +721,12 @@ fn finish_selection(
             reason: "not selected within budget (diversity/quotas/token budget)".into(),
         })
         .collect();
-
-    // Hard-max invariant against the ACTUAL rendered text: when required
-    // coverage forced structural compression (level 1) but the rendered
-    // text still exceeds hard_max (pathological signatures), escalate the
-    // compression ladder level by level — first signature line →
-    // canonical abbreviated signature → symbol identity only — re-rendering
-    // until estimate_tokens(text) <= hard_max. The identity level always
-    // fits any realistic hard max (kind + name is a few tokens), so the
-    // loop terminates; entries are never dropped.
-    let mut level: u8 = if compress { 1 } else { 0 };
-    let mut text = render_selected(&selected_entries, level, explain);
-    let mut token_count = estimate_tokens(&text);
-    while compress && token_count > policy.hard_max && level < MAX_COMPRESSION {
-        level += 1;
-        text = render_selected(&selected_entries, level, explain);
-        token_count = estimate_tokens(&text);
+    if overflow_drops > 0 {
+        omissions.push(SurfaceOmission {
+            count: overflow_drops,
+            kind: "required-overflow".into(),
+            reason: "hard-max invariant on final rendered text (lowest-value entries dropped after full compression)".into(),
+        });
     }
     scc_core::SurfaceRenderResult {
         text,
@@ -700,6 +734,7 @@ fn finish_selection(
         omitted_ids,
         omissions,
         token_count,
+        critical_drops,
     }
 }
 
@@ -2718,8 +2753,8 @@ mod tests {
         assert_eq!(file_importance("services/transcripts.py"), 0.0);
     }
 
-// trace:v1 id=impl.crates-scc-context-src-surface.build-surface-global-matches-historical-pipeline work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
+// trace:v1 id=impl.crates-scc-context-src-surface.build-surface-global-matches-historical-pipeline work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     fn build_surface_global_matches_historical_pipeline() {
         let (_dir, store) = fixture_store();
         let ctx = make_ctx(&store);

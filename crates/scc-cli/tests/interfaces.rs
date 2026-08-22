@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 // trace:v1 id=test.scc.interfaces verifies=REQ-SCC-API exercises=impl.scc.mcp,impl.scc.http,impl.scc.cli
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-interfaces.export-validates-against-json-schema work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn export_validates_against_json_schema() {
     let repo = copy_fixture("monorepo-acceptance");
     std::fs::create_dir_all(workdir(repo.path()).join(".scc")).unwrap();
@@ -161,6 +162,7 @@ fn mcp_server_exposes_ten_semantic_tools() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-interfaces.mcp-unknown-tool-returns-error work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn mcp_unknown_tool_returns_error() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -189,6 +191,7 @@ fn mcp_unknown_tool_returns_error() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-interfaces.context-parity-across-cli-http-mcp work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn context_parity_across_cli_http_mcp() {
     // P0 §10: transport must not change semantic quality — the same
     // task_context request yields the same pack content on CLI, HTTP, MCP,
@@ -231,7 +234,9 @@ fn context_parity_across_cli_http_mcp() {
     // CLI (JSON pack)
     let cli_json = run_ok(&dir, &["context", "task", "--json", goal]);
     let cli: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
-    let cli_content = cli["content"].as_str().unwrap().to_string();
+    // The artifact is {pack, delta, delta_ids}; parity is about the PACK
+    // half (the delta is ledger-dependent per transport session).
+    let cli_content = cli["pack"]["content"].as_str().unwrap().to_string();
     assert!(
         cli_content.contains("ACTIVE TASK STATE"),
         "beads enrichment present on CLI: {cli_content}"
@@ -277,7 +282,11 @@ fn context_parity_across_cli_http_mcp() {
     );
     assert_eq!(s, 200);
     let http: serde_json::Value = serde_json::from_str(&http_body).unwrap();
-    let http_content = http["content"].as_str().unwrap().to_string();
+    let http_content = http["pack"]["content"].as_str().unwrap().to_string();
+    assert!(
+        http["delta"].as_str().is_some_and(|d| !d.is_empty()),
+        "HTTP artifact must carry the surface delta"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -318,9 +327,13 @@ fn context_parity_across_cli_http_mcp() {
     }
     assert!(!mcp_content.is_empty(), "MCP answered: {stdout}");
 
-    // parity: identical content on every transport
+    // parity: identical PACK content on every transport; MCP delivers it
+    // together with the delta (pack-only responses were a downgrade)
     assert_eq!(cli_content, http_content, "CLI and HTTP packs differ");
-    assert_eq!(cli_content, mcp_content, "CLI and MCP packs differ");
+    assert!(
+        mcp_content.starts_with(&cli_content),
+        "CLI and MCP packs differ (MCP must lead with the same pack)"
+    );
 }
 
 #[test]
@@ -352,6 +365,7 @@ fn structural_source_cli_renders_file_units() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-interfaces.http-daemon-endpoints work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn http_daemon_endpoints() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
@@ -426,7 +440,9 @@ fn http_daemon_endpoints() {
     let (s, body) = post("/v1/context/task", r#"{"goal":"transcript normalization"}"#);
     assert_eq!(s, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["kind"], "task");
+    // /v1/context/task returns THE complete artifact {pack, delta, delta_ids}
+    assert_eq!(v["pack"]["kind"], "task");
+    assert!(v["delta"].is_string(), "artifact carries the surface delta");
     let (s, _body) = post("/v1/runtime/traces", r#"[{"source":"a","target":"b","count":3}]"#);
     assert_eq!(s, 202);
     let (s, body) = post("/v1/impact", r#"{"files":["main.py"]}"#);

@@ -47,7 +47,8 @@ fn acceptance_scenario_entities_identified_before_any_edit() {
         ],
     );
     assert!(out.status.success());
-    let pack: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let artifact: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pack = &artifact["pack"];
     let ids: Vec<&str> = pack["entity_ids"]
         .as_array()
         .unwrap()
@@ -95,6 +96,7 @@ fn acceptance_scenario_entities_identified_before_any_edit() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-monorepo.intent-invariants-and-drift work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn intent_invariants_and_drift() {
     let repo = monorepo_with_intent();
     let status = run_ok(&workdir(repo.path()), &["status"]);
@@ -140,7 +142,9 @@ fn precision_and_recall_on_acceptance_task() {
             "--json",
         ],
     );
-    let pack: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The artifact is {pack, delta, delta_ids}; precision/recall score the PACK.
+    let artifact: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pack = &artifact["pack"];
     let ids: Vec<String> = pack["entity_ids"]
         .as_array()
         .unwrap()

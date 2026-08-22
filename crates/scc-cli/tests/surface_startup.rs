@@ -181,7 +181,9 @@ fn startup_ledger_records_the_same_render_it_printed() {
     with_cli_compiler(&dir, |store, comp| {
         let ctx = comp.ctx();
 
-        let budget = scc_core::ContextBudget::default();
+        // Part B contract: no --budget selects the DEFAULT TOTAL and still
+        // runs THE one adaptive allocator — the CLI path exactly.
+        let budget = scc_context::startup::allocate_startup_budget(&ctx, None);
         let sc = scc_context::startup::build_startup(
             &ctx,
             &budget,

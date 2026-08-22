@@ -11,6 +11,7 @@ use std::path::Path;
 /// (dedup, component collapse, evidence compression, priority-preserving
 /// truncation). `--cmd` additionally pipes the markdown through an external
 /// summarizer; its output is treated as UNTRUSTED inference and labeled.
+// trace:v1 id=impl.crates-scc-cli-src-compress.cmd-context-compress-json
 pub fn cmd_context_compress_json(
     root: &Path,
     goal: &str,
@@ -25,6 +26,7 @@ pub fn cmd_context_compress_json(
 /// entity_ids, evidence_summary) and MUST emit typed claims referencing
 /// known evidence; claims without valid evidence references are rejected —
 /// the LLM may label evidence, it may not invent it.
+// trace:v1 id=impl.crates-scc-cli-src-compress.cmd-context-compress-json-claims
 pub fn cmd_context_compress_json_claims(
     root: &Path,
     goal: &str,
@@ -32,8 +34,10 @@ pub fn cmd_context_compress_json_claims(
     budget: Option<usize>,
     claims: bool,
 ) -> crate::Result<String> {
-    let pack_json = crate::commands::cmd_context_task_json(root, goal, &[], &[], budget)?;
-    let mut pack: scc_context::ContextPack = serde_json::from_str(&pack_json)?;
+    // The compressor operates on the PACK half of the task artifact (the
+    // delta is dynamic surface text, not compressible pack content).
+    let mut pack: scc_context::ContextPack =
+        crate::commands::build_task_context(root, goal, &[], &[], budget, false)?.pack;
 
     if let Some(command) = cmd {
         if claims {
@@ -62,6 +66,7 @@ pub fn cmd_context_compress_json_claims(
     Ok(serde_json::to_string_pretty(&pack)?)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-compress.compress-with-claims
 fn compress_with_claims(command: &str, pack: &mut scc_context::ContextPack) -> crate::Result<String> {
     let input = serde_json::json!({
         "goal": pack.content.split('\n').next().unwrap_or("").to_string(),
@@ -138,6 +143,7 @@ fn compress_with_claims(command: &str, pack: &mut scc_context::ContextPack) -> c
     Ok(serde_json::to_string_pretty(pack)?)
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-compress.cmd-context-compress
 pub fn cmd_context_compress(
     root: &Path,
     goal: &str,
@@ -155,6 +161,7 @@ pub fn cmd_context_compress(
     Ok(())
 }
 
+// trace:v1 id=impl.crates-scc-cli-src-compress.run-external
 fn run_external(command: &str, input: &str) -> crate::Result<String> {
     let mut child = std::process::Command::new("sh")
         .arg("-c")
@@ -190,6 +197,7 @@ fn run_external(command: &str, input: &str) -> crate::Result<String> {
 
 /// `scc export capsule.md` — portable startup capsule for any harness
 /// (Claude Code, Codex, Hermes, OpenCode...).
+// trace:v1 id=impl.crates-scc-cli-src-compress.capsule-markdown
 pub fn capsule_markdown(root: &Path) -> crate::Result<String> {
     let store = crate::open_store(root)?;
     let config = crate::load_config(root)?;
@@ -209,6 +217,7 @@ pub fn capsule_markdown(root: &Path) -> crate::Result<String> {
 
 /// `scc setup codex` — write AGENTS.md with the capsule + usage rules
 /// (docs/API_AND_INTEGRATIONS.md §5 for the Codex harness).
+// trace:v1 id=impl.crates-scc-cli-src-compress.cmd-setup-codex
 pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
     let capsule = capsule_markdown(root)?;
     let path = root.join("AGENTS.md");
@@ -249,6 +258,7 @@ pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
 /// (Codex/OpenCode/Hermes all read AGENTS.md); additionally write
 /// .opencode/opencode.json wiring the SCC MCP server so OpenCode sessions
 /// get the six semantic tools.
+// trace:v1 id=impl.crates-scc-cli-src-compress.cmd-setup-opencode
 pub fn cmd_setup_opencode(root: &Path) -> crate::Result<()> {
     if !root.join("AGENTS.md").exists() {
         cmd_setup_codex(root)?;
@@ -277,6 +287,7 @@ mod tests {
     use super::*;
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-compress.external-summarizer-runs-and-is-labeled
     fn external_summarizer_runs_and_is_labeled() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -290,6 +301,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-compress.claims-mode-rejects-invented-evidence
     fn claims_mode_rejects_invented_evidence() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -304,6 +316,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-compress.capsule-export-has-header
     fn capsule_export_has_header() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -317,6 +330,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.crates-scc-cli-src-compress.codex-setup-idempotent-with-user-content
     fn codex_setup_idempotent_with_user_content() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
