@@ -13,3 +13,4 @@ benchmarks/holdout/*
 .trace/cache/
 benchmarks/blind-test/*
 !benchmarks/blind-test/README.md
+.DS_Store

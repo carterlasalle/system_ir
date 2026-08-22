@@ -1,6 +1,6 @@
 {
   "name": "tracelayer",
-  "version": "0.2.7",
+  "version": "0.2.32",
   "description": "TraceLayer ambient trace gates for omp: pre-mutation authoring gate, post-edit coaching, and the fail-closed stop gate.",
   "license": "Apache-2.0",
   "pi": {

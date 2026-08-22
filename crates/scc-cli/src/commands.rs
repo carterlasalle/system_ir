@@ -1087,9 +1087,16 @@ pub fn cmd_import(root: &Path, format: &str, file: &str) -> crate::Result<()> {
                 imports: 0,
                 errors: r.errors,
             }),
+        "tracelayer" => scc_indexer::adapters::tracelayer::import_tracelayer(&store, std::path::Path::new(file))
+            .map(|r| scc_indexer::adapters::ImportReport {
+                symbols: r.requirements + r.implementations + r.tests + r.decisions,
+                calls: r.relationships,
+                imports: r.work_items,
+                errors: r.errors,
+            }),
         other => {
             return Err(crate::CliError::Other(format!(
-                "unknown import format '{other}' (use scip, ccg, gitnexus, beads, cbm, or hindsight)"
+                "unknown import format '{other}' (use scip, ccg, gitnexus, beads, cbm, hindsight, or tracelayer)"
             )))
         }
     }

@@ -24,12 +24,14 @@ pub mod cbm;
 pub mod context7;
 pub mod gitnexus;
 pub mod hindsight;
+pub mod tracelayer;
 
 /// Adapter capability manifest (docs/SECURITY.md §6, SCC-224): every
 /// evidence provider declares its filesystem scope, network access,
 /// subprocess usage, and credential use. Third-party adapters must not
 /// exceed their declared capabilities (SCC-225 sandbox policy).
 #[derive(Debug, Clone, serde::Serialize)]
+// trace:v1 id=impl.scc.indexer.adapters.adapter-manifest work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub struct AdapterManifest {
     pub name: &'static str,
     pub description: &'static str,
@@ -43,6 +45,7 @@ pub struct AdapterManifest {
 /// All adapters and their declared capabilities. Native extractors and the
 /// bundled importers are repo-read only; the LSP adapters spawn a local
 /// language server (no network, no credentials).
+// trace:v1 id=impl.scc.indexer.adapters.adapter-manifests work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub fn adapter_manifests() -> Vec<AdapterManifest> {
     vec![
         AdapterManifest {
@@ -123,6 +126,7 @@ pub fn adapter_manifests() -> Vec<AdapterManifest> {
 /// Sandbox policy check (SCC-225): verify a manifest is within the allowed
 /// default profile — no network, no credentials, subprocess only for
 /// explicitly declared server adapters. Returns the violation list.
+// trace:v1 id=impl.scc.indexer.adapters.sandbox-violations work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub fn sandbox_violations(m: &AdapterManifest) -> Vec<String> {
     let mut out = Vec::new();
     if m.network {
@@ -146,6 +150,7 @@ pub fn sandbox_violations(m: &AdapterManifest) -> Vec<String> {
 ///
 /// HOME is kept because npx (the Context7 MCP launcher) caches packages
 /// under ~/.npm; without it every spawn would re-fetch from the network.
+// trace:v1 id=impl.scc.indexer.adapters.sandboxed-command work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub fn sandboxed_command(command: &str, cwd: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(command).current_dir(cwd).env_clear();
@@ -171,6 +176,7 @@ pub fn sandboxed_command(command: &str, cwd: &Path) -> std::process::Command {
 
 /// Aggregate result of one import run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+// trace:v1 id=impl.scc.indexer.adapters.import-report work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub struct ImportReport {
     pub symbols: usize,
     pub calls: usize,
@@ -182,14 +188,17 @@ pub struct ImportReport {
 // shared helpers
 // ---------------------------------------------------------------------------
 
+// trace:v1 id=impl.scc.indexer.adapters.get-str work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
+// trace:v1 id=impl.scc.indexer.adapters.roles-of work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn roles_of(v: &Value) -> u64 {
     v.get("symbol_roles").and_then(Value::as_u64).unwrap_or(0)
 }
 
+// trace:v1 id=impl.scc.indexer.adapters.range-of work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn range_of(v: &Value) -> Option<(u64, u64)> {
     let a = v.get("range")?.as_array()?;
     if a.len() < 2 {
@@ -200,6 +209,7 @@ fn range_of(v: &Value) -> Option<(u64, u64)> {
 
 /// SCIP definition flag: roles include DEFINITION (0x1), or any relationship
 /// entry declares `is_definition: true`.
+// trace:v1 id=impl.scc.indexer.adapters.is-definition work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn is_definition(v: &Value) -> bool {
     roles_of(v) & 1 != 0
         || v.get("relationships").and_then(Value::as_array).is_some_and(|rels| {
@@ -213,6 +223,7 @@ fn is_definition(v: &Value) -> bool {
 
 /// Last moniker segment: the part after the final `#`, falling back to the
 /// part after the final space, then the whole string.
+// trace:v1 id=impl.scc.indexer.adapters.short-name work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn short_name(symbol: &str) -> String {
     if let Some((_, tail)) = symbol.rsplit_once('#') {
         if !tail.is_empty() {
@@ -228,6 +239,7 @@ fn short_name(symbol: &str) -> String {
 }
 
 /// Join a JSON array of strings (e.g. `documentation`) into one docstring.
+// trace:v1 id=impl.scc.indexer.adapters.strings-field work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn strings_field(v: &Value, key: &str) -> Option<String> {
     let parts: Vec<String> = v
         .get(key)
@@ -243,6 +255,7 @@ fn strings_field(v: &Value, key: &str) -> Option<String> {
     }
 }
 
+// trace:v1 id=impl.scc.indexer.adapters.make-evidence work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn make_evidence(
     id: String,
     typ: EvidenceType,
@@ -265,6 +278,7 @@ fn make_evidence(
     }
 }
 
+// trace:v1 id=impl.scc.indexer.adapters.scip-evidence work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn scip_evidence(file: &str, kind: &str, symbol: &str, version: Option<&str>) -> Evidence {
     make_evidence(
         evidence_id(file, kind, symbol, 0),
@@ -276,6 +290,7 @@ fn scip_evidence(file: &str, kind: &str, symbol: &str, version: Option<&str>) ->
     )
 }
 
+// trace:v1 id=impl.scc.indexer.adapters.ccg-evidence work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn ccg_evidence(file: &str, kind: &str, symbol: &str, typ: EvidenceType) -> Evidence {
     make_evidence(
         evidence_id(file, kind, symbol, 0),
@@ -289,6 +304,7 @@ fn ccg_evidence(file: &str, kind: &str, symbol: &str, typ: EvidenceType) -> Evid
 
 /// Create (once per unique id) an `external_api` entity for an unresolved
 /// referenced symbol; returns the entity id.
+// trace:v1 id=impl.scc.indexer.adapters.ensure-external-api work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn ensure_external_api(
     store: &Store,
     repo: &str,
@@ -324,6 +340,7 @@ fn ensure_external_api(
 /// Create (once per unique id) a symbol entity + `symbols` row + evidence for
 /// a SCIP definition; returns the entity id and bumps `report.symbols` only
 /// on first creation.
+// trace:v1 id=impl.scc.indexer.adapters.ensure-scip-symbol work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 fn ensure_scip_symbol(
     store: &Store,
     repo: &str,
@@ -370,12 +387,14 @@ fn ensure_scip_symbol(
 /// tracked per document in `ScipDoc::defs` (containment is a same-document
 /// relation); this map only resolves a symbol string to its canonical
 /// definition site.
+// trace:v1 id=impl.scc.indexer.adapters.ScipDef work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 struct ScipDef {
     file: String,
     entity: String,
 }
 
 /// Per-document state gathered in pass 1, resolved in pass 2.
+// trace:v1 id=impl.scc.indexer.adapters.ScipDoc work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 struct ScipDoc {
     file: String,
     file_id: String,
@@ -389,6 +408,7 @@ struct ScipDoc {
 
 /// Import a SCIP index (`index.scip`, JSON form). See module docs for the
 /// exact rules; malformed entries are skipped and counted, never fatal.
+// trace:v1 id=impl.scc.indexer.adapters.import-scip work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub fn import_scip(store: &Store, path: &Path) -> Result<ImportReport, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("scip: cannot read {}: {e}", path.display()))?;
@@ -652,6 +672,7 @@ pub fn import_scip(store: &Store, path: &Path) -> Result<ImportReport, String> {
 /// become symbol entities + `symbols` rows, and `calls` (top-level field or
 /// `attributes.calls`) become RESOLVED call edges resolved by id, then by
 /// name, then to `external_api`.
+// trace:v1 id=impl.scc.indexer.adapters.import-ccg work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
 pub fn import_ccg(store: &Store, path: &Path) -> Result<ImportReport, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("ccg: cannot read {}: {e}", path.display()))?;
@@ -818,6 +839,7 @@ mod manifest_tests {
     use super::*;
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.all-manifests-are-within-default-profile work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn all_manifests_are_within_default_profile() {
         let manifests = adapter_manifests();
         assert!(manifests.len() >= 8);
@@ -828,6 +850,7 @@ mod manifest_tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.lsp-adapters-declare-subprocess work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn lsp_adapters_declare_subprocess() {
         let manifests = adapter_manifests();
         let m = manifests
@@ -883,6 +906,7 @@ mod tests {
       ]
     }"#;
 
+// trace:v1 id=impl.scc.indexer.adapters.store work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn store() -> (Store, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -891,6 +915,7 @@ mod tests {
         (store, dir)
     }
 
+// trace:v1 id=impl.scc.indexer.adapters.write work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn write(dir: &TempDir, name: &str, text: &str) -> std::path::PathBuf {
         let p = dir.path().join(name);
         std::fs::write(&p, text).unwrap();
@@ -898,6 +923,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.scip-imports-definitions-calls-and-imports work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn scip_imports_definitions_calls_and_imports() {
         let (store, dir) = store();
         let p = write(&dir, "index.scip", SCIP_FIXTURE);
@@ -985,6 +1011,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.scip-unresolved-references-become-external-api-edges work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn scip_unresolved_references_become_external_api_edges() {
         let (store, dir) = store();
         let p = write(
@@ -1037,6 +1064,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.scip-malformed-input-never-panics work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn scip_malformed_input_never_panics() {
         let (store, dir) = store();
         let bad = write(&dir, "bad.json", "{not json");
@@ -1079,6 +1107,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.ccg-imports-architecture-symbols-and-calls work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn ccg_imports_architecture_symbols_and_calls() {
         let (store, dir) = store();
         let p = write(
@@ -1160,6 +1189,7 @@ mod tests {
     }
 
     #[test]
+// trace:v1 id=impl.scc.indexer.adapters.ccg-malformed-input-never-panics work=WORK-trace-layer-adapter-for-system-ir satisfies=REQ-SCC-IR
     fn ccg_malformed_input_never_panics() {
         let (store, dir) = store();
         let bad = write(&dir, "bad.ccg", "[1, 2]");
