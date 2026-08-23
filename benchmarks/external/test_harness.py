@@ -415,3 +415,47 @@ class PairedBootstrapTest(unittest.TestCase):
         self.assertEqual((m1, lo1, hi1), (m2, lo2, hi2), "deterministic seed -> identical CI")
         self.assertTrue(lo1 <= m1 <= hi1)
         self.assertLess(m1, 1.0)
+
+
+class AggregateShapeTest(unittest.TestCase):
+    """Part 12/19: aggregate() and print_table() accept BOTH the read-only
+    (exploration) and writable (task_success) row shapes without KeyError;
+    a run must never crash at report time."""
+
+class AggregateShapeTest(unittest.TestCase):
+    """Part 12/19: aggregate() and print_table() accept BOTH the read-only
+    (exploration) and writable (task_success) row shapes without KeyError;
+    a run must never crash at report time."""
+
+    def test_aggregate_handles_both_row_shapes(self):
+        h = load("run_context_bench")
+        ro_row = {
+            "variant": "aider", "budget": 8000, "repo": "r", "tasks": 1,
+            "run_completion_rate": 1.0, "mean_exploration": 4.0,
+            "first_plan_accuracy": 1.0, "context_tokens": 100,
+            "mean_files_opened": 3.0, "mean_search_tool_calls": 1.0,
+            "mean_files_opened_before_first_correct": 1.0,
+        }
+        wr_row = {
+            "variant": "aider", "budget": 8000, "repo": "r", "tasks": 2,
+            "run_completion_rate": 0.5, "task_success_rate": 0.0,
+            "tasks_with_evaluator": 2, "patch_rate": 0.5, "mean_wall_sec": 3.0,
+            "context_tokens": 10,
+        }
+        agg = h.aggregate([ro_row, wr_row])
+        self.assertAlmostEqual(agg["run_completion_rate"], 0.75)
+        # task_success_rate is present (a 0.0, not None) and the read-only
+        # key that the writable row lacks does not crash the aggregation.
+        self.assertEqual(agg["task_success_rate"], 0.0)
+        self.assertEqual(agg["mean_exploration"], 4.0)
+        # print_table renders the mixed shapes without KeyError.
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            h.print_table([ro_row, wr_row], json_out=False)
+        self.assertIn("aider", buf.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

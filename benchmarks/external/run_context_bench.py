@@ -694,22 +694,25 @@ def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode
 # --------------------------------------------------------------------------
 
 def aggregate(rows):
+    """Aggregate row dicts that may be either the read-only shape (exploration
+    metrics) or the writable coding shape (task_success_rate/patch_rate).
+    Keys absent from a shape are averaged as absent (not fabricated 0)."""
     n = max(len(rows), 1)
-    return {
-        "variant": rows[0]["variant"] if rows else "",
-        "budget": rows[0]["budget"] if rows else 0,
-        "repos": len(rows),
-        "tasks": sum(r["tasks"] for r in rows),
-        "run_completion_rate": sum(r["run_completion_rate"] for r in rows) / n,
-        "mean_exploration": sum(r["mean_exploration"] for r in rows) / n,
-        "first_plan_accuracy": sum(r["first_plan_accuracy"] for r in rows) / n,
-        "context_tokens": sum(r["context_tokens"] for r in rows) / n,
-        "mean_files_opened": sum(r["mean_files_opened"] for r in rows) / n,
-        "mean_search_tool_calls": sum(r["mean_search_tool_calls"] for r in rows) / n,
-        "mean_files_opened_before_first_correct": sum(
-            r["mean_files_opened_before_first_correct"] for r in rows
-        ) / n,
-    }
+    rec = {"variant": rows[0]["variant"] if rows else "",
+           "budget": rows[0]["budget"] if rows else 0,
+           "repos": len(rows),
+           "tasks": sum(r["tasks"] for r in rows),
+           "run_completion_rate": sum(r["run_completion_rate"] for r in rows) / n,
+           "context_tokens": sum(r["context_tokens"] for r in rows) / n}
+    mean_keys = ["mean_exploration", "first_plan_accuracy", "mean_files_opened",
+                 "mean_search_tool_calls", "mean_files_opened_before_first_correct",
+                 "task_success_rate", "patch_rate", "mean_wall_sec"]
+    for key in mean_keys:
+        present = [r for r in rows if r.get(key) is not None]
+        # mean over the rows that actually carry this shape's key; a row of a
+        # different shape must not dilute (or be filtered from) the metric.
+        rec[key] = sum(r.get(key) or 0 for r in present) / len(present) if present else None
+    return rec
 
 
 def print_table(rows, json_out):
@@ -719,16 +722,15 @@ def print_table(rows, json_out):
     if not rows:
         print("no rows")
         return
-    print(f"{'variant':<18} {'run_completion':>15} {'mean_exploration':>16} {'first_plan_acc':>14} {'tokens':>8}  status")
+    print(f"{'variant':<18} {'run_completion':>15} {'task_success':>13} {'tokens':>8}  status")
     for row in rows:
         status = row.get("status")
         if status:
-            print(f"{row['variant']:<18} {'—':>8} {'—':>16} {'—':>14} {'—':>8}  {status} ({row.get('detail','')})")
+            print(f"{row['variant']:<18} {'—':>15} {'—':>13} {'—':>8}  {status} ({row.get('detail','')})")
             continue
-        print(
-            f"{row['variant']:<18} {row['run_completion_rate']:>15.3f} {row['mean_exploration']:>16.2f} "
-            f"{row['first_plan_accuracy']:>14.3f} {row['context_tokens']:>8.0f}"
-        )
+        ts = row.get("task_success_rate")
+        ts_s = "—" if ts is None else f"{ts:.3f}"
+        print(f"{row['variant']:<18} {row.get('run_completion_rate', 0):>15.3f} {ts_s:>13} {row.get('context_tokens', 0):>8.0f}")
 
 
 def main(argv):
