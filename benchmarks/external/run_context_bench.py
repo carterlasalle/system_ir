@@ -353,11 +353,17 @@ def parse_event(line, root):
 # external`, which runs the same protocol natively in benchagent.rs)
 # --------------------------------------------------------------------------
 
+# Tool/agent state dirs that must never leak into a benchmark copy (they
+# would count as agent "edits" and pollute the patch/modified-file metrics).
+STATE_DIRS = {".scc", ".serena", ".git", ".aider.tags.cache.v3",
+              ".aider.tags.cache.v4", "node_modules", "__pycache__", "target"}
+
+
 def copy_tree(src, dst):
     dst = Path(dst)
     dst.mkdir(parents=True, exist_ok=True)
     for entry in Path(src).iterdir():
-        if entry.name == ".scc":
+        if entry.name in STATE_DIRS:
             continue
         target = dst / entry.name
         if entry.is_dir():
@@ -452,10 +458,17 @@ def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None):
 
     Returns a per-task dict with run_completion and task_success as
     SEPARATE fields (an agent that exits 0 without solving the task is not
-    a pass)."""
+    a pass).
+    """
     import shlex as _sh
     import subprocess as _sp
     import time
+    # Make the isolated copy a git repo so the patch (the agent's actual
+    # edits) is captured; the copy is disposable per task, so no state leaks.
+    _sp.run(["git", "init"], cwd=root, capture_output=True, text=True, timeout=60)
+    _sp.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True, timeout=120)
+    _sp.run(["git", "-c", "user.email=b@c", "-c", "user.name=bench",
+             "commit", "-qm", "baseline"], cwd=root, capture_output=True, text=True, timeout=120)
     quoted = _sh.quote(str(agent_cmd))
     started = time.monotonic()
     proc = _sp.run(

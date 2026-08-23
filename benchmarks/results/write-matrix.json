@@ -1,0 +1,119 @@
+{
+  "meta": {
+    "agent": "codex",
+    "mode": "writable",
+    "budget": 8000,
+    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+  },
+  "cells": {
+    "raw/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 60.2
+    },
+    "raw/queue-worker.asr-retry": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 157.1
+    },
+    "raw/ts-api-web.pagination": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 38.8
+    },
+    "raw/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 140.2
+    },
+    "raw/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 106.7
+    },
+    "raw/queue-worker.street-vocabulary": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 1,
+      "wall_sec": 154.6
+    },
+    "scc-full/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 117,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 81.8
+    },
+    "scc-full/queue-worker.asr-retry": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 117,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 166.4
+    },
+    "scc-full/ts-api-web.pagination": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 114,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 64.6
+    },
+    "scc-full/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 114,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 198.8
+    },
+    "scc-full/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 107,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 83.6
+    },
+    "scc-full/queue-worker.street-vocabulary": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 122,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 90.6
+    }
+  },
+  "summary": {
+    "n_tasks": 6,
+    "raw_task_success": 0.5,
+    "scc_full_task_success": 0.5,
+    "raw_run_completion": 1.0,
+    "scc_run_completion": 1.0,
+    "paired_mean_diff_scc_minus_raw": 0.0,
+    "ci95": [
+      0.0,
+      0.0
+    ],
+    "ci_note": "CI crosses zero \u2014 no superiority claim"
+  }
+}
