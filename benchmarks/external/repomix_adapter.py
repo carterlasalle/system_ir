@@ -191,9 +191,16 @@ def verify_repomix_pin():
             f"installed repomix resolves to the pinned checkout but its HEAD {src_head} "
             f"!= pinned {LOCKED_REPOMIX_COMMIT}"
         )
-    # The installed package does not resolve to the pinned checkout: no
-    # gitHead + no resolvable pinned source => the commit is unprovable,
-    # even when the version matches. NOT a passing pin.
+    # The installed package does not resolve to the pinned checkout. A
+    # demonstrated VERSION MISMATCH is a PIN-MISMATCH (exit 3) — the install
+    # is plainly not the locked release. A matching version with no provable
+    # commit is PIN-UNVERIFIED (exit 4) — version is not commit proof.
+    if version and str(version) != str(LOCKED_REPOMIX_VERSION):
+        raise PinMismatch(
+            f"installed repomix {version} does not match the lock "
+            f"(commit {LOCKED_REPOMIX_COMMIT}, version {LOCKED_REPOMIX_VERSION}); "
+            "reinstall from the pinned source checkout"
+        )
     raise PinUnverified(
         f"installed repomix package {pkg_dir} does not resolve to the pinned "
         f"checkout ({PINNED_SOURCE_DIR}) and has no gitHead; version {version} "
