@@ -56,6 +56,7 @@ protocol; see benchmarks/run_agent_bench.sh for the codex form).
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -440,14 +441,28 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal
     personalize with — fair Aider-vs-task-SCC."""
     rows = []
     skipped = None
-    artifacts_dir = workdir / "artifacts" / variant / str(budget)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # Native mode has no shared budget: label the artifact root "native"
+    # (a real budget in equal-token mode keeps its numeric label).
+    budget_label = "native" if mode == "native-default" else str(budget)
+    artifacts_root = workdir / "artifacts" / variant / budget_label
+    artifacts_root.mkdir(parents=True, exist_ok=True)
     for repo, repo_tasks in sorted(tasks.items()):
         fixture = FIXTURES / repo
         adapter = BENCHMARKS / "external" / ("aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
         per_task = []
         for task in repo_tasks:
-            argv = [bench_python(), str(adapter), str(fixture), str(budget), str(artifacts_dir)]
+            # Part 6 fairness: every task-personalized artifact gets its own
+            # immutable directory (aider writes aider-map.txt into <out_dir>)
+            # — a shared out_dir would overwrite task A's map with task C's.
+            # The repomix artifact is task-INVARIANT (same files, no goal),
+            # so it can share; aider must not.
+            task_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(task.get("id", "task")))
+            if variant == "aider-repomap":
+                artifact_dir = artifacts_root / repo / task_id
+            else:
+                artifact_dir = artifacts_root / repo  # repomix: task-invariant
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            argv = [bench_python(), str(adapter), str(fixture), str(budget if budget is not None else 0), str(artifact_dir)]
             if mode == "native-default":
                 argv.append("--native")
             if variant == "aider-repomap":
@@ -478,16 +493,18 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal
                 return rows, skipped
             per_task.append((Path(payload["artifact"]), int(payload.get("tokens", 0))))
 
-        row = _row_for(repo_tasks, per_task, agent_cmd, repo, variant, budget)
+        row = _row_for(repo_tasks, per_task, agent_cmd, repo, variant, budget, mode)
         rows.append(row)
     return rows, skipped
 
 
-def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget):
+def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equal-token"):
     """Run the repo's tasks through the agent protocol in fixture copies,
     one goal-personalized artifact per task. `artifacts` is a list of
     (artifact_path, tokens) aligned with `repo_tasks`; the row's
-    context_tokens is the mean over tasks (scc-full-style)."""
+    context_tokens is the mean over tasks (scc-full-style). `mode` is the
+    benchmark mode (equal-token | native-default) — threaded explicitly,
+    never inherited from a global."""
     results = []
     tokens = []
     with tempfile.TemporaryDirectory(prefix="scc-ext-") as tmp:
@@ -508,7 +525,10 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget):
         "budget": budget,
         "repo": repo,
         "tasks": len(results),
-        "success_rate": sum(1 for r in results if r["exit_ok"]) / n,
+        # run_completion_rate = agent process exited 0 — NOT task success.
+        # Task success (evaluator/test-based) is reported separately as
+        # task_success_rate when an evaluator exists (writable mode).
+        "run_completion_rate": sum(1 for r in results if r["exit_ok"]) / n,
         "mean_exploration": sum(
             r["files_opened"] + r["search_tool_calls"] + r["graph_tool_calls"] for r in results
         ) / n,
@@ -563,7 +583,7 @@ def aggregate(rows):
         "budget": rows[0]["budget"] if rows else 0,
         "repos": len(rows),
         "tasks": sum(r["tasks"] for r in rows),
-        "success_rate": sum(r["success_rate"] for r in rows) / n,
+        "run_completion_rate": sum(r["run_completion_rate"] for r in rows) / n,
         "mean_exploration": sum(r["mean_exploration"] for r in rows) / n,
         "first_plan_accuracy": sum(r["first_plan_accuracy"] for r in rows) / n,
         "context_tokens": sum(r["context_tokens"] for r in rows) / n,
@@ -582,14 +602,14 @@ def print_table(rows, json_out):
     if not rows:
         print("no rows")
         return
-    print(f"{'variant':<18} {'success':>8} {'mean_exploration':>16} {'first_plan_acc':>14} {'tokens':>8}  status")
+    print(f"{'variant':<18} {'run_completion':>15} {'mean_exploration':>16} {'first_plan_acc':>14} {'tokens':>8}  status")
     for row in rows:
         status = row.get("status")
         if status:
             print(f"{row['variant']:<18} {'—':>8} {'—':>16} {'—':>14} {'—':>8}  {status} ({row.get('detail','')})")
             continue
         print(
-            f"{row['variant']:<18} {row['success_rate']:>8.3f} {row['mean_exploration']:>16.2f} "
+            f"{row['variant']:<18} {row['run_completion_rate']:>15.3f} {row['mean_exploration']:>16.2f} "
             f"{row['first_plan_accuracy']:>14.3f} {row['context_tokens']:>8.0f}"
         )
 
@@ -629,13 +649,17 @@ def main(argv):
 
     scc_bin = args.scc_bin or os.environ.get("SCC_BIN") or "scc"
 
+    # Explicit (variant, mode) model (Part 10): behavior is determined by
+    # (tool, mode), never by name suffix tricks. `VARIANTS` is the single
+    # canonical set; native-default reuses it and simply runs each tool in
+    # its native configuration. No synthetic "-native" variants, no zero
+    # budgets.
     variants = [args.variant] if args.variant else VARIANTS
     if args.mode == "native-default":
-        # One pass per variant — native tools pick their own sizes.
-        budgets = [0]
-        for v in ("aider-repomap-native", "repomix-native"):
-            if args.variant is None and v not in variants:
-                variants.append(v)
+        # One pass per variant — each tool picks its own native sizes. The
+        # budget is None (no shared cap); the adapters honor --native and
+        # ignore/report their own cost.
+        budgets = [None]
     else:
         budgets = [args.budget] if args.budget else BUDGETS
 
@@ -643,12 +667,7 @@ def main(argv):
     skipped_status = None
     for variant in variants:
         for budget in budgets:
-            if variant.endswith("-native") and variant.replace("-native", "") in EXTERNAL_VARIANTS:
-                base = variant.replace("-native", "")
-                rows, skipped = run_external_variant(
-                    base, tasks, budget, args.agent_cmd, workdir, mode=args.mode
-                )
-            elif variant in EXTERNAL_VARIANTS:
+            if variant in EXTERNAL_VARIANTS:
                 rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode)
                 if skipped is not None:
                     status = skipped.get("status", "SKIPPED-UNINSTALLED")

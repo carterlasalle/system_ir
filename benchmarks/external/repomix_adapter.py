@@ -166,28 +166,39 @@ def verify_repomix_pin():
             )
         return
 
-    # The documented install: global install of the pinned source checkout.
-    # Verify the source checkout's git HEAD is the locked commit AND the
-    # installed version matches the source version (transitive pin: the
-    # installed copy is built from the pinned checkout).
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(PINNED_SOURCE_DIR), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=30,
+    # Documented install: `npm install -g <PINNED_SOURCE_DIR>`. The ONLY
+    # transitive proof of the installed COMMIT is that the INSTALLED path
+    # itself resolves to the pinned checkout — same version + same-commit
+    # checkout does NOT prove the global binary was built from it (Part 11:
+    # a system-wide repomix 1.18.0 plus an unrelated checkout at the locked
+    # commit would pass a version-only comparison). The acceptable proof is
+    # the resolved installed package directory being AT the pinned source
+    # checkout whose git HEAD is the locked commit.
+    installed = pkg_dir.resolve()
+    pinned = PINNED_SOURCE_DIR.resolve()
+    if installed == pinned:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(PINNED_SOURCE_DIR), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            src_head = out.stdout.strip() if out.returncode == 0 else None
+        except Exception:
+            src_head = None
+        if src_head == LOCKED_REPOMIX_COMMIT:
+            return
+        raise PinMismatch(
+            f"installed repomix resolves to the pinned checkout but its HEAD {src_head} "
+            f"!= pinned {LOCKED_REPOMIX_COMMIT}"
         )
-        src_head = out.stdout.strip() if out.returncode == 0 else None
-        src_version = None
-        src_pkg = PINNED_SOURCE_DIR / "package.json"
-        if src_pkg.is_file():
-            try:
-                src_version = json.loads(src_pkg.read_text()).get("version")
-            except ValueError:
-                pass
-    except Exception:
-        src_head = None
-        src_version = None
-    if src_head == LOCKED_REPOMIX_COMMIT and src_version and src_version == version:
-        return
+    # The installed package does not resolve to the pinned checkout: no
+    # gitHead + no resolvable pinned source => the commit is unprovable,
+    # even when the version matches. NOT a passing pin.
+    raise PinUnverified(
+        f"installed repomix package {pkg_dir} does not resolve to the pinned "
+        f"checkout ({PINNED_SOURCE_DIR}) and has no gitHead; version {version} "
+        "matching the lock is not commit proof"
+    )
 
     # Version-only coincidence is NOT commit proof. A version that differs
     # from the lock is a demonstrable mismatch; a matching version with an
@@ -280,15 +291,47 @@ def run_repomix(argv):
     # The final artifact's token estimate includes the `## File:` header
     # lines, so the cap is enforced on the concatenated artifact.
     if not native:
+        # STRICT equal-token (Part 9): the artifact never exceeds the
+        # requested shared budget — INCLUDING its first file. A file that
+        # individually exceeds the remaining budget is SKIPPED (complete
+        # units only; never a mid-file truncation); if no complete file
+        # fits at all, the artifact is empty and reports
+        # "no complete unit fits" explicitly instead of silently
+        # over-committing the budget.
         kept = []
         total = 0
         for path, content in sections:
             header = f"## File: {path}\n"
             tokens = estimate_tokens(header + content)
-            if kept and total + tokens > budget:
-                break  # budget reached — stop at a file boundary
+            if total + tokens > budget:
+                # The file does not fit as a COMPLETE unit: skip it, do not
+                # truncate it, never let the first (or any) file exceed the
+                # cap.
+                continue
             kept.append((path, content))
             total += tokens
+        if kept and total == 0:
+            raise AssertionError("kept files with zero token cost — impossible")
+        if not kept and sections:
+            # No complete unit fits the budget — explicit status, not a
+            # silent partial artifact or an over-budget one.
+            empty = os.path.join(out_dir, "repomix.txt")
+            with open(empty, "w") as fh:
+                fh.write("<!-- repomix: no complete file fits within the budget; artifact intentionally empty -->\n")
+            return {
+                "ok": True,
+                "tool": "repomix",
+                "tokens": 0,
+                "files": 0,
+                "artifact": empty,
+                "compressed": compress,
+                "pinned": LOCKED_REPOMIX_COMMIT,
+                "mode": "equal-token",
+                "requested_budget": budget,
+                "actual_shared_tokens": 0,
+                "utilization": 0.0,
+                "note": "no complete unit fits within the requested budget",
+            }, 0
     else:
         kept = list(sections)
         packed_probe = "\n\n".join(f"## File: {p}\n{c}" for p, c in kept)

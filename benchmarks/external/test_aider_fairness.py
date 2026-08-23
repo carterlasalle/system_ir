@@ -79,6 +79,87 @@ class _FakeRepoMap:
         return "x" * n
 
 
+class _UnderScaleRepoMap:
+    """RepoMap whose native tokenizer thinks a map is SMALLER than chars/4
+    does: chars = map_tokens * 2, so estimate_tokens(chars) = map_tokens/2.
+    The equal-token search must ramp map_tokens UP (geometric) to claw back
+    the under-used shared budget — the regression this tests."""
+
+    calls = []
+
+    def __init__(self, map_tokens=None, root=None, main_model=None, io=None, refresh=None):
+        type(self).calls.append(map_tokens)
+        self.map_tokens = map_tokens if map_tokens is not None else 1024
+
+    def get_repo_map(self, chat_files, other_files, mentioned_idents=None, mentioned_fnames=None):
+        n = max(1, int(self.map_tokens)) * 2  # chars => estimate == map_tokens/2
+        return "y" * n
+
+
+class UpRampSearchTest(unittest.TestCase):
+    """Part 8 regression: when aider's native tokenizer UNDER-sizes the map
+    relative to the shared chars/4 estimator, the equal-token search must
+    ramp map_tokens UP and return the largest artifact that fits the shared
+    budget — never a half-budget map."""
+
+    def _run_with(self, fake_map_cls, fn):
+        """Run `fn(a, calls)` with the pin check bypassed and the fake aider
+        modules installed; restores everything afterwards (the monkeypatch
+        must stay active for the WHOLE build, so the build happens here)."""
+        import types
+        a = load_adapter()
+        orig = a.installed_aider_commit
+        a.installed_aider_commit = lambda site_packages=None: a.LOCKED_AIDER_COMMIT
+        fake_map_cls.calls = []
+        fake_repo_map = types.ModuleType("aider.repomap")
+        fake_repo_map.RepoMap = fake_map_cls
+        fake_io = types.ModuleType("aider.io")
+        fake_io.InputOutput = lambda **kw: object()
+        fake_models = types.ModuleType("aider.models")
+        fake_models.Model = lambda name: None
+        fake_pkg = types.ModuleType("aider")
+        fake_pkg.__path__ = []
+        for name, mod in {
+            "aider": fake_pkg,
+            "aider.repomap": fake_repo_map,
+            "aider.io": fake_io,
+            "aider.models": fake_models,
+        }.items():
+            sys.modules[name] = mod
+        try:
+            return fn(a, fake_map_cls)
+        finally:
+            a.installed_aider_commit = orig
+            for name in ("aider", "aider.repomap", "aider.io", "aider.models"):
+                sys.modules.pop(name, None)
+
+    def test_upward_ramp_fills_the_budget(self):
+        budget = 4000
+
+        def build(a, cls):
+            text, map_tokens = a.build_repomap("/nx", budget, "", site_packages=str(HERE))
+            return a, cls, text, map_tokens
+        a, cls, text, map_tokens = self._run_with(_UnderScaleRepoMap, build)
+        actual = a.estimate_tokens(text)
+        # The under-scaling fake: to FIT budget shared tokens, map_tokens
+        # must ramp up -> actual approaches budget (never exceeds).
+        self.assertLessEqual(actual, budget)
+        self.assertGreater(actual, budget // 2, "upward ramp must reclaim the under-used budget")
+        self.assertGreater(len(cls.calls), 1, "search must try multiple native sizes")
+
+    def test_downward_search_still_caps(self):
+        budget = 400  # chars == map_tokens*4 (exact-scale fake)
+
+        def build(a, cls):
+            text, map_tokens = a.build_repomap("/nx", budget, "", site_packages=str(HERE))
+            return a, text, map_tokens
+        a, text, map_tokens = self._run_with(_FakeRepoMap, build)
+        # estimate(chars) == map_tokens for this fake; the binary search
+        # must land the shared estimate <= budget.
+        self.assertLessEqual(a.estimate_tokens(text), budget)
+        self.assertGreater(text, "")
+
+
 class EqualTokenSearchTest(unittest.TestCase):
     def setUp(self):
         import types

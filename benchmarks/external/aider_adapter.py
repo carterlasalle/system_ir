@@ -285,26 +285,72 @@ def build_repomap(repo_abs, budget, goal, site_packages=None):
             # Older pinned signature without the mentioned_fnames kwarg.
             return rm.get_repo_map([], other_files, mentioned_idents=idents) or ""
 
-    # EQUAL-TOKEN mode (Part H): the shared chars/4 estimator governs.
-    # Search the largest map_tokens whose generated map fits the budget
-    # under estimate_tokens — aider's internal tokenizer may disagree with
-    # chars/4 in either direction, so a single map_tokens=budget call can
-    # over- OR under-shoot. Geometric ramp + binary search; the generated
-    # map itself always fits (never mid-truncated).
-    map_tokens = budget
-    text = gen(map_tokens)
-    if estimate_tokens(text) > budget:
-        hi = map_tokens
+    # EQUAL-TOKEN mode (Part 8): the shared chars/4 estimator governs. The
+    # initial map_tokens=budget call can over- OR under-shoot because
+    # aider's OWN tokenizer sizes the map (its binary search targets ±15%
+    # of map_tokens and can land far from chars/4 in either direction).
+    # Search BOTH ways: if the initial map is UNDER the budget, geometrically
+    # ramp map_tokens UP (1.5x) until the shared estimate exceeds the budget
+    # OR the map saturates (no longer grows / safe cap) — otherwise return
+    # the under-sized map and waste the shared budget (a 9k map when SCC
+    # gets 16k is not an equal-token comparison). Then binary-search the
+    # largest map_tokens whose generated map fits. The generated map itself
+    # always fits under budget — never mid-truncated.
+    def sized_tokens(map_tokens):
+        return estimate_tokens(gen(map_tokens))
+
+    # 1) Downward: an initial overshoot (large native tokenizer) needs a
+    #    binary search down from budget.
+    if sized_tokens(budget) > budget:
+        hi = budget
         lo = 0
+        best_text = None
+        best_map = 0
         while lo < hi:
             mid = (lo + hi) // 2
             candidate = gen(max(1, mid))
             if estimate_tokens(candidate) <= budget:
-                text = candidate
-                map_tokens = max(1, mid)
+                best_text = candidate
+                best_map = max(1, mid)
                 lo = mid + 1
             else:
                 hi = mid
+        return best_text, best_map
+
+    # 2) Upward ramp: under-budget at map_tokens=budget — grow the native
+    #    budget geometrically until the shared estimate exceeds the budget,
+    #    the map stops growing (saturated), or a safe 8x cap is reached.
+    text = gen(budget)
+    map_tokens = budget
+    lo = budget
+    hi_step = budget * 2
+    while hi_step <= budget * 8:
+        candidate = gen(hi_step)
+        cand_tokens = estimate_tokens(candidate)
+        if cand_tokens > budget:
+            hi = hi_step
+            break
+        if cand_tokens == 0 or cand_tokens == estimate_tokens(text):
+            # Saturated: the map no longer grows with a larger budget.
+            hi = hi_step
+            break
+        text = candidate
+        map_tokens = hi_step
+        hi_step = hi_step * 3 // 2
+    else:
+        # Reached the safe cap without exceeding: the largest mapped artifact.
+        hi = map_tokens
+
+    # 3) Binary search between the last fitting lower bound and the
+    #    overshooting/saturating upper bound.
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if estimate_tokens(gen(max(1, mid))) <= budget:
+            text = gen(mid)
+            map_tokens = max(1, mid)
+            lo = mid + 1
+        else:
+            hi = mid
     return text, map_tokens
 
 
@@ -380,8 +426,9 @@ def main(argv):
     except ValueError:
         print(json.dumps({"ok": False, "error": f"invalid token budget: {budget_s}"}))
         return 1
-    if budget <= 0:
-        print(json.dumps({"ok": False, "error": "token budget must be positive"}))
+    if budget <= 0 and not native:
+        # Native mode needs no shared budget: aider uses its own defaults.
+        print(json.dumps({"ok": False, "error": "token budget must be positive (or use --native)"}))
         return 1
 
     repo_abs = os.path.abspath(repo)
@@ -428,11 +475,10 @@ def main(argv):
                 "artifact": artifact,
                 "pinned": LOCKED_AIDER_COMMIT,
                 "mode": "native-default" if native else "equal-token",
-                "requested_budget": budget,
+                "requested_budget": None if native else budget,
                 "actual_shared_tokens": actual,
                 "native_tool_budget_parameter": map_tokens_used,
-                "utilization": round(actual / budget, 4) if budget else 0.0,
-                "mode": "equal-token",
+                "utilization": round(actual / budget, 4) if not native and budget else 0.0,
             }
         )
     )
