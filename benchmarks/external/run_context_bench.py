@@ -192,14 +192,21 @@ def load_tasks():
         corpus = json.load(fh)
     for task in corpus["tasks"]:
         gt = task.get("ground_truth", {})
-        merged.setdefault(task["repo"], []).append(
-            {
-                "id": task["id"],
-                "goal": task["goal"],
-                "files": list(gt.get("files", [])),
-                "symbols": list(gt.get("symbols", [])),
-            }
-        )
+        entry = {
+            "id": task["id"],
+            "goal": task["goal"],
+            "files": list(gt.get("files", [])),
+            "symbols": list(gt.get("symbols", [])),
+        }
+        # Optional evaluator fields for the WRITABLE coding bench (Part 13):
+        # `validate` = shell command asserting the task's behavioral
+        # acceptance criteria; `tests` = regression test command. Present
+        # only when the corpus defines them; absent -> task_success_rate is
+        # NOT computed (never exit-code task success).
+        for key in ("validate", "tests"):
+            if key in task:
+                entry[key] = task[key]
+        merged.setdefault(task["repo"], []).append(entry)
 
     yaml_path = BENCHMARKS / "external" / "ground-truth.yaml"
     if yaml_path.exists():
@@ -208,14 +215,16 @@ def load_tasks():
             for task in tasks:
                 files = list(task.get("implementation_landmarks") or task.get("public_surfaces") or [])
                 symbols = list(task.get("symbols") or []) + list(task.get("important_types") or [])
-                merged.setdefault(repo, []).append(
-                    {
-                        "id": task["id"],
-                        "goal": task["goal"],
-                        "files": files,
-                        "symbols": symbols,
-                    }
-                )
+                entry = {
+                    "id": task["id"],
+                    "goal": task["goal"],
+                    "files": files,
+                    "symbols": symbols,
+                }
+                for key in ("validate", "tests"):
+                    if key in task:
+                        entry[key] = task[key]
+                merged.setdefault(repo, []).append(entry)
     return merged
 
 
@@ -430,11 +439,101 @@ def run_task_via_protocol(agent_cmd, artifact_path, goal, gt_files, plan_keys, r
     }
 
 
-def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal-token"):
+def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None):
+    """WRITABLE coding mode (Part 13): run the agent in the ALREADY-COPIED
+    isolated repo dir and ALLOW edits (the harness owns isolation — the
+    agent command must NOT be a read-only sandbox for this mode).
+
+    After the run:
+      1. capture the patch (`git diff` of the working tree);
+      2. run the task's EVALUATOR: `validate_cmd` (behavioral acceptance) or
+         `tests_cmd` (regression tests) in the edited repo;
+      3. record task_success = EVALUATOR exit 0 — never the agent exit code.
+
+    Returns a per-task dict with run_completion and task_success as
+    SEPARATE fields (an agent that exits 0 without solving the task is not
+    a pass)."""
+    import shlex as _sh
+    import subprocess as _sp
+    import time
+    quoted = _sh.quote(str(agent_cmd))
+    started = time.monotonic()
+    proc = _sp.run(
+        ["sh", "-c", f"printf 'TASK: %s\n' \"$SCC_GOAL\" | sh -c {quoted}"],
+        cwd=root, env={**os.environ, "SCC_GOAL": goal},
+        capture_output=True, text=True, timeout=3600,
+    )
+    elapsed = round(time.monotonic() - started, 2)
+    # 1) capture the patch (working-tree diff vs HEAD; empty for a clean tree).
+    patch = ""
+    try:
+        diff = _sp.run(["git", "diff"], cwd=root, capture_output=True, text=True, timeout=60)
+        if diff.returncode == 0:
+            patch = diff.stdout
+    except Exception:
+        patch = ""
+    # 2) evaluator: validation/tests run in the edited repo.
+    task_success = None  # None => no evaluator defined; never an exit-code pass
+    eval_rc = eval_out = None
+    cmd = validate_cmd or tests_cmd
+    if cmd:
+        try:
+            ev = _sp.run(["sh", "-c", cmd], cwd=root, capture_output=True, text=True, timeout=900)
+            eval_rc, eval_out = ev.returncode, (ev.stdout + ev.stderr)[:2000]
+            task_success = eval_rc == 0
+        except Exception as exc:
+            eval_rc, eval_out, task_success = -1, str(exc)[:500], False
+    # 3) modified files (for "unnecessary files changed" analysis).
+    modified = []
+    try:
+        st = _sp.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=60)
+        if st.returncode == 0:
+            modified = [ln[3:] for ln in st.stdout.splitlines() if ln.strip()]
+    except Exception:
+        modified = []
+    return {
+        "run_completion": proc.returncode == 0,
+        "task_success": task_success,
+        "task_success_defined": task_success is not None,
+        "patch": patch,
+        "patch_produced": bool(patch and patch.strip()),
+        "modified_files": modified,
+        "eval_exit": eval_rc,
+        "eval_output": eval_out,
+        "wall_sec": elapsed,
+    }
+
+
+def paired_bootstrap_ci(a, b, rng_seed=1234, n=10000):
+    """PART 16 — paired bootstrap 95% CI for the mean difference a-b over
+    paired task outcomes. Deterministic (fixed seed). Returns
+    (mean_diff, ci_low, ci_high). A positive mean with a CI crossing zero
+    is NOT a superiority claim."""
+    import random
+    rng = random.Random(rng_seed)
+    n_pairs = min(len(a), len(b))
+    if n_pairs == 0:
+        return (0.0, 0.0, 0.0)
+    diffs = [a[i] - b[i] for i in range(n_pairs)]
+    samples = []
+    for _ in range(n):
+        total = 0.0
+        for _ in range(n_pairs):
+            total += diffs[rng.randrange(n_pairs)]
+        samples.append(total / n_pairs)
+    samples.sort()
+    lo = samples[int(0.025 * n)]
+    hi = samples[int(0.975 * n)]
+    return (sum(diffs) / n_pairs, lo, hi)
+
+
+def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal-token", writable=False):
     """aider-repomap / repomix-compress over the tasks. Returns (rows,
     skipped) where rows is a list of per-repo metric dicts and skipped is
     None, or a dict {"status": ..., "error": ...} for the first
-    SKIPPED-UNINSTALLED / PIN-MISMATCH outcome.
+    SKIPPED-UNINSTALLED / PIN-MISMATCH outcome. `writable=True` uses the
+    Part 13 writable coding protocol (isolated editable repo copies +
+    evaluator-driven task_success).
 
     Artifacts are per-task: aider personalizes the repo map with the task
     goal (mentioned_idents), the same goal the SCC task variants
@@ -493,18 +592,20 @@ def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal
                 return rows, skipped
             per_task.append((Path(payload["artifact"]), int(payload.get("tokens", 0))))
 
-        row = _row_for(repo_tasks, per_task, agent_cmd, repo, variant, budget, mode)
+        row = _row_for(repo_tasks, per_task, agent_cmd, repo, variant, budget, mode, writable=writable)
         rows.append(row)
     return rows, skipped
 
 
-def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equal-token"):
+def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equal-token", writable=False):
     """Run the repo's tasks through the agent protocol in fixture copies,
     one goal-personalized artifact per task. `artifacts` is a list of
-    (artifact_path, tokens) aligned with `repo_tasks`; the row's
+    (artifact_path, artifact_path) aligned with `repo_tasks`; the row's
     context_tokens is the mean over tasks (scc-full-style). `mode` is the
-    benchmark mode (equal-token | native-default) — threaded explicitly,
-    never inherited from a global."""
+    benchmark mode (equal-token | native-default). `writable=True` runs the
+    WRITABLE coding protocol (Part 13): agents edit an isolated repo copy;
+    task_success_rate comes from the task's EVALUATOR (validate/tests), not
+    from the agent exit code."""
     results = []
     tokens = []
     with tempfile.TemporaryDirectory(prefix="scc-ext-") as tmp:
@@ -512,32 +613,48 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equa
         for task, (artifact, tok) in zip(repo_tasks, artifacts):
             root = tmp / task["id"]
             copy_tree(FIXTURES / repo, root)
-            plan_keys = list(task["files"]) + list(task["symbols"])
-            results.append(
-                run_task_via_protocol(agent_cmd, artifact, task["goal"], task["files"], plan_keys, root)
-            )
+            if writable:
+                results.append(
+                    run_write_task(agent_cmd, root, task["goal"],
+                                   validate_cmd=task.get("validate"), tests_cmd=task.get("tests"))
+                )
+            else:
+                plan_keys = list(task["files"]) + list(task["symbols"])
+                results.append(
+                    run_task_via_protocol(agent_cmd, artifact, task["goal"], task["files"], plan_keys, root)
+                )
             tokens.append(tok)
     n = max(len(results), 1)
     mean_tokens = sum(tokens) // max(len(tokens), 1) if tokens else 0
-    return {
+    row = {
         "variant": variant,
         "mode": mode,
         "budget": budget,
         "repo": repo,
         "tasks": len(results),
-        # run_completion_rate = agent process exited 0 — NOT task success.
-        # Task success (evaluator/test-based) is reported separately as
-        # task_success_rate when an evaluator exists (writable mode).
-        "run_completion_rate": sum(1 for r in results if r["exit_ok"]) / n,
-        "mean_exploration": sum(
-            r["files_opened"] + r["search_tool_calls"] + r["graph_tool_calls"] for r in results
-        ) / n,
-        "first_plan_accuracy": sum(1 for r in results if r["first_plan_correct"]) / n,
         "context_tokens": mean_tokens,
-        "mean_files_opened": sum(r["files_opened"] for r in results) / n,
-        "mean_search_tool_calls": sum(r["search_tool_calls"] for r in results) / n,
-        "mean_files_opened_before_first_correct": sum(r["wrong_first_locations"] for r in results) / n,
     }
+    if writable:
+        # Part 13: task_success is EVALUATOR-based, and only when the task
+        # defines an evaluator — an undefined evaluator never masquerades
+        # as a cheap exit-code pass.
+        defined = [r for r in results if r.get("task_success_defined")]
+        row["task_success_rate"] = (sum(1 for r in defined if r["task_success"]) / len(defined)
+                                    if defined else None)
+        row["tasks_with_evaluator"] = len(defined)
+        row["patch_rate"] = sum(1 for r in results if r.get("patch_produced")) / n
+        row["mean_wall_sec"] = sum((r.get("wall_sec") or 0) for r in results) / n
+        row["run_completion_rate"] = sum(1 for r in results if r.get("run_completion")) / n
+    else:
+        row["run_completion_rate"] = sum(1 for r in results if r.get("exit_ok")) / n
+        row["mean_exploration"] = sum(
+            r["files_opened"] + r["search_tool_calls"] + r["graph_tool_calls"] for r in results
+        ) / n
+        row["first_plan_accuracy"] = sum(1 for r in results if r["first_plan_correct"]) / n
+        row["mean_files_opened"] = sum(r["files_opened"] for r in results) / n
+        row["mean_search_tool_calls"] = sum(r["search_tool_calls"] for r in results) / n
+        row["mean_files_opened_before_first_correct"] = sum(r["wrong_first_locations"] for r in results) / n
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -628,6 +745,13 @@ def main(argv):
     parser.add_argument("--json", action="store_true", help="emit JSON rows instead of the table")
     parser.add_argument("--single", action="store_true", help="one (variant, budget, repo-filtered) run; exit 2 when the external tool is missing")
     parser.add_argument(
+        "--writable", action="store_true",
+        help="WRITABLE coding mode (Part 13): agents edit isolated repo "
+        "copies; task_success_rate comes from each task's evaluator "
+        "(validate/tests), never from the agent exit code. Use ONLY with "
+        "agent commands that are not read-only sandboxes.",
+    )
+    parser.add_argument(
         "--mode",
         choices=("equal-token", "native-default"),
         default="equal-token",
@@ -668,7 +792,7 @@ def main(argv):
     for variant in variants:
         for budget in budgets:
             if variant in EXTERNAL_VARIANTS:
-                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode)
+                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode, writable=args.writable)
                 if skipped is not None:
                     status = skipped.get("status", "SKIPPED-UNINSTALLED")
                     skipped_status = {"variant": variant, "budget": budget, "status": status, "detail": skipped.get("error", "")}

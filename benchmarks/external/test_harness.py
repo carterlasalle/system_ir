@@ -350,3 +350,68 @@ class NativeRoutingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class WritableModeTest(unittest.TestCase):
+    """Part 13: task_success_rate is EVALUATOR-driven (validate/tests), and
+    run_completion_rate stays a separate process-exit metric."""
+
+    def setUp(self):
+        self.h = load("run_context_bench")
+        self._fixtures = tempfile.TemporaryDirectory()
+        (Path(self._fixtures.name) / "repo").mkdir(exist_ok=True)
+        (Path(self._fixtures.name) / "repo" / "a.py").write_text("def a(): return 1\n")
+        self._orig_fixtures = self.h.FIXTURES
+        self.h.FIXTURES = Path(self._fixtures.name)
+
+    def tearDown(self):
+        self.h.FIXTURES = self._orig_fixtures
+        self._fixtures.cleanup()
+
+    def test_task_success_is_evaluator_driven(self):
+        # Agent "exits 0" but fails the evaluator -> run_completion 1.0,
+        # task_success 0.0. The two MUST be distinct.
+        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None: {
+            "run_completion": True,
+            "task_success": False,
+            "task_success_defined": True,
+            "patch": "x", "patch_produced": True,
+            "modified_files": ["a.py"], "eval_exit": 1,
+            "wall_sec": 5.0,
+        }
+        tasks = [{"id": "t1", "goal": "g1", "files": [], "symbols": [], "validate": "true"}]
+        artifacts = [(Path(self._fixtures.name) / "a.txt", 100)]
+        row = self.h._row_for(tasks, artifacts, "agent", "repo", "aider-repomap", 8000, mode="equal-token", writable=True)
+        self.assertEqual(row["run_completion_rate"], 1.0)
+        self.assertEqual(row["task_success_rate"], 0.0)
+        self.assertEqual(row["tasks_with_evaluator"], 1)
+        self.assertIn("patch_rate", row)
+
+    def test_task_success_absent_without_evaluator(self):
+        # No validate/tests on the task -> task_success_rate is None
+        # (never a cheap exit-code pass).
+        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None: {
+            "run_completion": True,
+            "task_success": None,
+            "task_success_defined": False,
+            "patch": "", "patch_produced": False,
+            "modified_files": [], "eval_exit": None, "wall_sec": 1.0,
+        }
+        tasks = [{"id": "t1", "goal": "go1", "files": [], "symbols": []}]
+        artifacts = [(Path(self._fixtures.name) / "a.txt", 100)]
+        row = self.h._row_for(tasks, artifacts, "agent", "repo", "aiderrepomap", None, mode="native-default", writable=True)
+        self.assertIsNone(row["task_success_rate"])
+        self.assertEqual(row["tasks_with_evaluator"], 0)
+
+
+class PairedBootstrapTest(unittest.TestCase):
+    """Part 16: paired bootstrap 95% CI over paired outcomes; deterministic."""
+
+    def test_ci_sane_and_deterministic(self):
+        h = load("run_context_bench")
+        a = [1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+        b = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0]
+        m1, lo1, hi1 = h.paired_bootstrap_ci(a, b)
+        m2, lo2, hi2 = h.paired_bootstrap_ci(a, b)
+        self.assertEqual((m1, lo1, hi1), (m2, lo2, hi2), "deterministic seed -> identical CI")
+        self.assertTrue(lo1 <= m1 <= hi1)
+        self.assertLess(m1, 1.0)
