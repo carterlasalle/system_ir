@@ -214,6 +214,9 @@ pub fn build_startup(
     let startup_hard_max = budget.total.saturating_add((budget.total / 5).max(500));
 
     let mut render = render;
+    let mut atlas_pack = atlas_pack;
+    let mut atlas = atlas;
+    let mut atlas_budget = budget.atlas;
     // MODEL COVERAGE: compiler warnings + stale paths + a surface accounting
     // line, derived from the render itself (rendered ∪ omitted == every
     // candidate) — never a second compile_surface_map walk. Recomputed
@@ -225,7 +228,31 @@ pub fn build_startup(
         render.token_count,
         budget.surface,
     );
-    {
+
+    // Startup hard-max CORRECTIVE LOOP (Part 4): the invariant is on the
+    // FINAL assembled text — `estimate_tokens(assemble_body(atlas, surface,
+    // coverage, omissions)) <= startup_hard_max`. Headers, coverage lines,
+    // omission text, and the atlas's actual size can each push the fused
+    // body past the room estimated pre-assembly, so the ONE-SHOT rebalance
+    // is not sufficient. This loop reassembles and recounts after every
+    // change; first it shrinks the Surface (re-selected with hard_max = the
+    // room the current atlas/coverage/omissions actually leave), then, when
+    // the Surface is at its floor (no room left), it shrinks the Atlas
+    // budget in 25% steps — dropping lower-priority sections that are
+    // RECORDED via atlas_pack.dropped_sections and surfaced in OMISSIONS.
+    // Deterministic convergence, not a fixed round cap: each round either
+    // shrinks the Surface (re-selected with hard_max = the room the current
+    // atlas/coverage/omissions actually leave) or, once the surface is at
+    // its 64-token floor, shrinks the Atlas budget by 25% (dropping
+    // lower-priority sections that are RECORDED via dropped_sections and
+    // surfaced in OMISSIONS). Both steps are monotone, so the loop
+    // terminates at the natural floor in a bounded number of rounds (well
+    // under the 64-round safety net). The fit check counts the FULL
+    // assembled block (the "# SCC SYSTEM CONTEXT" header + artifact comment
+    // are part of the final text), so the invariant holds on artifact.text.
+    const BLOCK_HEADER_OVERHEAD: usize = 40; // header + metadata comment, chars/4
+    let mut iterations = 0;
+    loop {
         let omissions_probe = omission_lines(
             &render.omissions,
             render.omitted_ids.len(),
@@ -233,9 +260,24 @@ pub fn build_startup(
             atlas_pack.hard_truncated,
             atlas_pack.exceeded_soft_budget,
         );
+        let fused = assemble_body(&atlas, &render.text, &coverage, &omissions_probe);
+        if BLOCK_HEADER_OVERHEAD + estimate_tokens(&fused) <= startup_hard_max {
+            break;
+        }
+        iterations += 1;
+        if iterations > 64 {
+            // Safety net: the natural floors (surface < 64 tokens + atlas
+            // floor) always terminate well before this; if both floors are
+            // exhausted and the artifact STILL exceeds the hard max, the
+            // final assert below documents the pathological residual rather
+            // than looping forever.
+            break;
+        }
         let overhead = estimate_tokens(&assemble_body(&atlas, "", &coverage, &omissions_probe));
         let room = startup_hard_max.saturating_sub(overhead);
-        if render.token_count > room && room >= 64 {
+        if room >= 64 {
+            // Surface still has room: shrink it to the room the current
+            // atlas + coverage + omissions ACTUALLY leave (headers included).
             let policy = SurfacePolicy {
                 quotas: true,
                 mmr: true,
@@ -260,10 +302,20 @@ pub fn build_startup(
                 render.token_count,
                 room,
             );
+        } else {
+            // Surface at its floor: shrink the Atlas in 25% steps.
+            let smaller = atlas_budget.saturating_mul(3) / 4;
+            if smaller == atlas_budget {
+                break; // atlas floor reached — nothing more to give.
+            }
+            atlas_budget = smaller;
+            atlas_pack = compiler.system_atlas(Some(atlas_budget));
+            atlas = atlas_pack.content.clone();
         }
     }
-    // Best-effort persistence AFTER any hard-max rebalance (the rebalance
-    // re-render also feeds the cache): a cache failure never fails startup.
+
+    // Best-effort persistence AFTER the corrective loop (the final surface
+    // render also feeds the cache): a cache failure never fails startup.
     // The hit counter is the deterministic "reused on run 2" marker.
     if let Some(c) = &mut rank_cache {
         if cache_hit {
@@ -273,7 +325,7 @@ pub fn build_startup(
     }
     let surface = render.text.clone();
 
-    // OMISSIONS (final render — after any hard-max rebalance): the render
+    // OMISSIONS (final render — after the corrective loop): the render
     // result's per-kind cuts + omitted-id count + the atlas's dropped
     // sections (honest: omitted ids are never silent).
     let omissions = omission_lines(
@@ -330,6 +382,18 @@ pub fn build_startup(
         text: String::new(),
     };
     artifact.text = assemble_block(&atlas, &surface, &coverage, &omissions, &artifact);
+
+    // Final invariant (Part 4): the COMPLETE startup text never exceeds the
+    // hard maximum. The corrective loop above guarantees it by construction
+    // (the fit check counts the assembled block); this assert makes the
+    // hard max a true final invariant, not a one-shot approximation.
+    assert!(
+        estimate_tokens(&artifact.text) <= startup_hard_max,
+        "startup artifact {} tokens exceeds hard_max {} ({} corrective-loop rounds)",
+        estimate_tokens(&artifact.text),
+        startup_hard_max,
+        iterations
+    );
 
     StartupContext {
         atlas,

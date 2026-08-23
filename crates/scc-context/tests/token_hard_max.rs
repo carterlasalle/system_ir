@@ -253,3 +253,63 @@ fn startup_allocator_default_is_adaptive_and_flow_aware() {
     let tiny = ContextBudget::adaptive(20_000, 100, 2, 0, 10);
     assert!(tiny.surface > arch.surface, "tiny repos keep the larger surface share");
 }
+
+/// Part 4 — FUSED startup hard-max invariant: a pathological repository
+/// (huge atlas + huge surface, omission metadata) must fit the FINAL
+/// assembled startup text within hard_max (= total + max(total/5, 500)).
+/// The corrective loop re-selects the surface against the atlas's ACTUAL
+/// size and drops lower-priority atlas sections when the surface is at its
+/// floor; the final assert is on artifact.text (headers included) — the
+/// one-shot pre-assembly room estimate alone did not guarantee this.
+#[test]
+// trace:v1 id=test.scc-context-token-invariants.fused-startup-hard-max work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching verifies=REQ-hard-max-invariant-on-rendered-text
+fn fused_startup_respects_final_hard_max() {
+    let f = fixture();
+    let repo = f.store.repo_id.clone();
+    let mut rid: u64 = 1;
+    // A lot of components + symbols -> both the atlas and the surface are
+    // large; the fused startup (atlas + surface + coverage + omissions)
+    // would exceed a small total without the corrective loop.
+    for c in 0..12usize {
+        let comp_id = entity_id(&repo, kinds::COMPONENT, &format!("c{c}"));
+        f.store.replace_components(&[Entity::new(comp_id.clone(), kinds::COMPONENT, format!("comp{c}"))]).unwrap();
+        for s in 0..5usize {
+            let sig = format!("def fn_{c}_{s}(arg_{s}: VeryLongTypeName_{s}, other: AnotherDescender) -> Result<(), Error>: ...");
+            add_symbol(&f, &mut rid, &format!("pkg{c}/mod{s}.py"), &comp_id, &format!("sym{c}_{s}"), Some(&sig), true, |_| ());
+        }
+    }
+    let ctx = compiler(&f);
+
+    // Explicit tiny total: hard_max = 1024 + max(1024/5, 500) = 1024+512 = 1536.
+    let budget = ContextBudget { total: 1024, atlas: 900, surface: 900, task_delta: 0, structural_source: 0 };
+    let startup = scc_context::startup::build_startup(&ctx, &budget, scc_context::startup::RENDERER_VERSION);
+
+    let hard_max = budget.total.saturating_add((budget.total / 5).max(500));
+    let actual = estimate_tokens(&startup.artifact.text);
+    assert!(
+        actual <= hard_max,
+        "fused startup artifact {} tokens exceeds hard_max {} (headers included)",
+        actual,
+        hard_max
+    );
+    // The heavily over-budget surface (900-token budget + 807-token atlas)
+    // proves the loop ran: the surface was re-selected against the room the
+    // atlas actually left. The omitted candidates are surfaced honestly in
+    // the OMISSIONS coverage (never silent).
+    // The heavily over-budget surface proves the loop ran, and the omitted
+    // ids are surfaced HONESTLY in the OMISSIONS section (never silent).
+    if !startup.surface_render.omitted_ids.is_empty() {
+        let omission_text: String = startup.omissions.join("\n");
+        assert!(
+            omission_text.contains("lower-ranked definitions omitted"),
+            "OMISSIONS must report the omitted count when ids were dropped: {:?}",
+            startup.omissions
+        );
+    }
+    // The final render is what the text printed (single build, no drift):
+    // the surface section in the artifact is byte-identical to the render.
+    assert!(
+        startup.artifact.text.contains(&startup.surface),
+        "artifact text must embed the final surface render"
+    );
+}

@@ -539,6 +539,7 @@ pub fn build_enriched_task_pack(
 /// [`build_enriched_task_pack`]. Pure: no delta, no ledger, no side
 /// effects.
 // trace:v1 id=impl.crates-scc-cli-src-commands.enrich-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+#[allow(clippy::too_many_arguments)] // one shared enrichment seam: every arg is a distinct input axis
 fn enrich_task_pack(
     comp: &crate::Compiler,
     store: &scc_store::Store,
