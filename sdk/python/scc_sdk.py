@@ -19,14 +19,16 @@ class SCCError(Exception):
     """Raised when the ``scc`` CLI exits with a non-zero status."""
 
 
-# trace:exempt reason=internal-detail  # thin CLI subprocess wrapper, not repo behavior
+# trace:v1 id=impl.sdk-python-scc-sdk.scc work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 class SCC:
     """Client for the ``scc`` CLI (thin subprocess wrapper)."""
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.init work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def __init__(self, bin: Optional[str] = None, cwd: Optional[str] = None) -> None:
         self._bin = bin or os.environ.get("SCC_BIN") or "scc"
         self._cwd = cwd or os.getcwd()
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.run work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def _run(self, args: List[str]) -> subprocess.CompletedProcess:
         proc = subprocess.run(
             [self._bin, "--root", self._cwd, *args],
@@ -41,15 +43,17 @@ class SCC:
             raise SCCError(message)
         return proc
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.run-json work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def _run_json(self, args: List[str]) -> Dict[str, Any]:
         proc = self._run(args)
         return json.loads(proc.stdout)
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.system-overview work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def systemOverview(self) -> Dict[str, Any]:
         """Compile the system overview capsule."""
         return self._run_json(["overview", "--json"])
 
-    # trace:exempt reason=internal-detail  # thin subprocess wrapper method; CLI contract traced at impl.crates-scc-cli-src-commands.build-task-context
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.task-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def taskContext(
         self,
         goal: str,
@@ -78,14 +82,17 @@ class SCC:
         args.append("--json")
         return self._run_json(args)
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.component-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def componentContext(self, id: str) -> Dict[str, Any]:
         """Compile the context pack for one component (by id or name)."""
         return self._run_json(["context", "component", id, "--json"])
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.flow-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def flowContext(self, id: str) -> Dict[str, Any]:
         """Compile the context pack for one flow (by id or name)."""
         return self._run_json(["context", "flow", id, "--json"])
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.impact-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def impactContext(
         self, files: Optional[List[str]] = None, symbols: Optional[List[str]] = None
     ) -> Dict[str, Any]:
@@ -98,6 +105,7 @@ class SCC:
         args.append("--json")
         return self._run_json(args)
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.verify-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def verifyContext(self) -> Dict[str, Any]:
         """Run the freshness/evidence verification.
 
@@ -122,7 +130,7 @@ class SCC:
             "truncated": False,
         }
 
-    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.context-startup work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def contextStartup(self, budget: Optional[int] = None) -> Dict[str, Any]:
         """Compile the fused session-startup artifact (Atlas + Surface +
         coverage + omissions).
@@ -146,7 +154,7 @@ class SCC:
             "truncated": False,
         }
 
-    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.surface-map work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def surfaceMap(
         self, goal: Optional[str] = None, budget: Optional[int] = None
     ) -> Dict[str, Any]:
@@ -173,7 +181,7 @@ class SCC:
             "truncated": False,
         }
 
-    # trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.structural-source work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def structuralSource(
         self,
         files: Optional[List[str]] = None,
@@ -207,6 +215,7 @@ class SCC:
             "truncated": False,
         }
 
+    # trace:v1 id=impl.sdk-python-scc-sdk-scc.index work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def index(self) -> Dict[str, bool]:
         """Index the repository (idempotent; incremental after the first run)."""
         self._run(["index"])
