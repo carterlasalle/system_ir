@@ -63,18 +63,28 @@ class TestSCCSDK(unittest.TestCase):
         self.assertIn("IDENTITY", pack["content"])
         self.assertIsInstance(pack["entity_ids"], list)
 
+    # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.crates-scc-cli-src-commands.build-task-context
     def test_task_context_has_entity_ids_array(self):
-        pack = self.scc.taskContext("transcript")
-        self.assertEqual(pack["kind"], "task")
-        self.assertIsInstance(pack["entity_ids"], list)
-        self.assertIn("Goal: transcript", pack["content"])
+        artifact = self.scc.taskContext("transcript")
+        self.assertEqual(artifact["pack"]["kind"], "task")
+        self.assertIsInstance(artifact["pack"]["entity_ids"], list)
+        self.assertIn("Goal: transcript", artifact["pack"]["content"])
+        self.assertIsInstance(artifact["delta"], str)
+        # delta_ids is omitted by the CLI when the delta is empty
+        # (skip_serializing_if set on the Rust struct) — the SDK mirrors the
+        # CLI verbatim, so the key may be absent.
+        self.assertTrue(
+            "delta_ids" not in artifact or isinstance(artifact["delta_ids"], list)
+        )
+        self.assertIsInstance(artifact["token_count"], int)
 
+    # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.crates-scc-cli-src-commands.build-task-context
     def test_task_context_honors_options(self):
-        pack = self.scc.taskContext(
+        artifact = self.scc.taskContext(
             "add numbers", files=["a.py", "b.py"], symbols=["add"], tokenBudget=500
         )
-        self.assertIn("Explicit files: a.py, b.py", pack["content"])
-        self.assertIn("Explicit symbols: add", pack["content"])
+        self.assertIn("Explicit files: a.py, b.py", artifact["pack"]["content"])
+        self.assertIn("Explicit symbols: add", artifact["pack"]["content"])
 
     def test_component_context_resolves_component(self):
         pack = self.scc.componentContext("root")
@@ -121,6 +131,38 @@ class TestSCCSDK(unittest.TestCase):
         self.assertIn("source: a.py:L", pack["content"])
         by_goal = self.scc.structuralSource(goal="multiply calculator")
         self.assertIn("representation:", by_goal["content"])
+
+    # trace:exempt reason=internal-detail  # sdk parity test; behavior traced at impl.crates-scc-cli-src-commands.build-task-context
+    def test_task_context_mirrors_cli_json_exactly(self):
+        """Parity: the SDK's taskContext() must return the CLI's
+        `scc context task --json` output verbatim (nested artifact shape,
+        no flattening) — the CLI JSON, Python SDK, and TypeScript SDK all
+        expose the same {pack, delta, delta_ids, token_count} contract for
+        the same fixture/goal."""
+        import json
+        import subprocess
+
+        goal = "transcript"
+        sdk_artifact = self.scc.taskContext(goal)
+
+        cli = subprocess.run(
+            [BIN, "--root", str(self.tmp), "context", "task", goal, "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cli_artifact = json.loads(cli.stdout)
+
+        # The SDK MUST expose the CLI shape: top-level pack (not flattened).
+        self.assertEqual(sorted(sdk_artifact.keys()), sorted(cli_artifact.keys()))
+        self.assertEqual(sdk_artifact["pack"], cli_artifact["pack"])
+        self.assertEqual(sdk_artifact["delta"], cli_artifact["delta"])
+        if "delta_ids" in cli_artifact:
+            self.assertEqual(sdk_artifact["delta_ids"], cli_artifact["delta_ids"])
+        self.assertEqual(sdk_artifact["token_count"], cli_artifact["token_count"])
+        # And the nested pack fields are the flat pack contract.
+        self.assertEqual(sdk_artifact["pack"]["kind"], "task")
+        self.assertIn("Goal: transcript", sdk_artifact["pack"]["content"])
 
     def test_nonzero_exit_raises_scc_error(self):
         fake_bin = Path(self.tmp) / "fake-scc"

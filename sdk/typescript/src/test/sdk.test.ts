@@ -66,21 +66,24 @@ test("systemOverview() content identifies the repository", { skip: skip ? skipRe
   assert.ok(Array.isArray(pack.entity_ids));
 });
 
-test("taskContext() returns a pack with entity_ids array", { skip: skip ? skipReason : false }, async () => {
-  const pack = await scc().taskContext("transcript");
-  assert.equal(pack.kind, "task");
-  assert.ok(Array.isArray(pack.entity_ids));
-  assert.match(pack.content, /Goal: transcript/);
+test("taskContext() returns the complete artifact with a nested pack", { skip: skip ? skipReason : false }, async () => {
+  const artifact = await scc().taskContext("transcript");
+  assert.equal(artifact.pack.kind, "task");
+  assert.ok(Array.isArray(artifact.pack.entity_ids));
+  assert.match(artifact.pack.content, /Goal: transcript/);
+  assert.equal(typeof artifact.delta, "string");
+  assert.ok(Array.isArray(artifact.delta_ids));
+  assert.equal(typeof artifact.token_count, "number");
 });
 
 test("taskContext() honors files/symbols/tokenBudget options", { skip: skip ? skipReason : false }, async () => {
-  const pack = await scc().taskContext("add numbers", {
+  const artifact = await scc().taskContext("add numbers", {
     files: ["a.py", "b.py"],
     symbols: ["add"],
     tokenBudget: 500,
   });
-  assert.match(pack.content, /Explicit files: a\.py, b\.py/);
-  assert.match(pack.content, /Explicit symbols: add/);
+  assert.match(artifact.pack.content, /Explicit files: a\.py, b\.py/);
+  assert.match(artifact.pack.content, /Explicit symbols: add/);
 });
 
 test("componentContext() resolves a component", { skip: skip ? skipReason : false }, async () => {

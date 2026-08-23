@@ -36,6 +36,19 @@ export interface TaskContextOptions {
   tokenBudget?: number;
 }
 
+// trace:exempt reason=internal-detail  # public type mirror of the CLI task artifact JSON (pack/delta/delta_ids); behavior traced at impl.crates-scc-cli-src-commands.build-task-context
+export interface TaskContextArtifact {
+  /** The enriched task pack (`context task --json` → field `pack`). */
+  // (fields documented inline below)
+  pack: ContextPack;
+  /** The task-personalized Surface delta (new relevant APIs vs the ledger). */
+  delta: string;
+  /** Entry ids the delta rendered (ledger recording). */
+  delta_ids: string[];
+  /** Actual token count of the complete rendered artifact (pack + delta). */
+  token_count?: number;
+}
+
 /** Result of `scc index`. */
 export interface IndexResult {
   ok: boolean;
@@ -48,13 +61,16 @@ export interface IndexResult {
  */
 // trace:exempt reason=internal-detail  # thin CLI subprocess wrapper, not repo behavior
 export class SCC {
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
   constructor(private opts: SCCOptions = {}) {}
 
   /** Resolve the scc binary: explicit option, then $SCC_BIN, then PATH. */
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
   private get bin(): string {
     return this.opts.bin ?? process.env.SCC_BIN ?? "scc";
   }
 
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
   private get cwd(): string {
     return this.opts.cwd ?? process.cwd();
   }
@@ -63,6 +79,7 @@ export class SCC {
    * Run `scc --root <cwd> <args>` and resolve with captured stdout/stderr.
    * Rejects on spawn failure or non-zero exit (message = trimmed stderr).
    */
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
   private run(args: string[]): Promise<{ stdout: string; stderr: string }> {
     const { promise, resolve, reject } = Promise.withResolvers<{
       stdout: string;
@@ -98,13 +115,29 @@ export class SCC {
     return JSON.parse(stdout) as ContextPack;
   }
 
+  /**
+   * Run a command that emits arbitrary JSON on stdout and resolve it as `T`.
+   * Used for commands whose JSON shape is not a flat ContextPack (e.g. the
+   * task artifact `{pack, delta, delta_ids}`) — never casts the artifact to
+   * a ContextPack.
+   */
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  private async runJson<T>(args: string[]): Promise<T> {
+    const { stdout } = await this.run(args);
+    return JSON.parse(stdout) as T;
+  }
+
   /** Compile the system overview capsule. */
   async systemOverview(): Promise<ContextPack> {
     return this.runPack(["overview", "--json"]);
   }
 
-  /** Compile a task context pack for a goal. */
-  async taskContext(goal: string, opts?: TaskContextOptions): Promise<ContextPack> {
+  /**
+   * Compile the complete task context artifact for a goal: the enriched
+   * task pack plus the task-personalized Surface delta.
+   */
+  // trace:exempt reason=internal-detail  # thin subprocess wrapper member; CLI contract traced at impl.crates-scc-cli-src-commands.build-task-context
+  async taskContext(goal: string, opts?: TaskContextOptions): Promise<TaskContextArtifact> {
     const args = ["context", "task", goal];
     if (opts?.files && opts.files.length > 0) {
       args.push("--files", opts.files.join(" "));
@@ -116,7 +149,7 @@ export class SCC {
       args.push("--budget", String(opts.tokenBudget));
     }
     args.push("--json");
-    return this.runPack(args);
+    return this.runJson<TaskContextArtifact>(args);
   }
 
   /** Compile the context pack for one component (by id or name). */

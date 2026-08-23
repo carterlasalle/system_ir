@@ -428,6 +428,12 @@ pub struct TaskContextArtifact {
     /// Entry ids the delta rendered (ledger recording).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delta_ids: Vec<String>,
+    /// Actual token count of the complete rendered artifact:
+    /// `estimate_tokens(pack.content) + estimate_tokens(delta)` computed
+    /// AFTER all enrichment (Beads/Hindsight), never from stale component
+    /// estimates — the accounting the SDKs and benchmarking rely on.
+    #[serde(default)]
+    pub token_count: usize,
 }
 
 /// Build the complete task artifact: scorer + beads + hindsight enrichment
@@ -456,49 +462,23 @@ pub fn build_task_context(
         scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
     let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
         reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
-    let mut pack = comp.ctx().task_context_with_rankers(
+        // The enriched pack, with its token count recomputed AFTER beads +
+    // hindsight (Part 2 accounting fix) so the delta budget below derives
+    // from the pack's ACTUAL size, not a stale pre-enrichment estimate.
+    let pack = enrich_task_pack(
+        &comp,
+        &store,
+        &config,
+        root,
         goal,
         files,
         symbols,
-        if hook {
-            Some(budget.unwrap_or(1500).min(1500))
-        } else {
-            budget
-        },
+        budget,
+        hook,
         scorer_trait,
         reranker_trait,
     );
-    // task-state + memory enrichment (below the System IR authority line)
-    let beads_active = scc_indexer::adapters::beads::active_beads(root, 5);
-    if !beads_active.is_empty() {
-        pack.content.push_str(
-            "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n",
-        );
-        for t in beads_active {
-            pack.content.push_str("- ");
-            pack.content.push_str(&t);
-            pack.content.push('\n');
-        }
-    }
-    if config.integrations.hindsight {
-        let lessons = scc_indexer::adapters::hindsight::lessons(&store, 5);
-        if !lessons.is_empty() {
-            pack.content.push_str(
-                "\n# HINDSIGHT LESSONS (memory, below System IR authority — not verified facts)\n",
-            );
-            for (content, tags) in lessons {
-                let tag_str = if tags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", tags.join(", "))
-                };
-                pack.content.push_str(&format!("- {content}{tag_str}\n"));
-            }
-        }
-    }
-    // The delta: same scorer as the pack, budget = explicit total minus the
-    // pack's actual tokens (hook mode) or the dedicated task_delta slice
-    // (default). Zero budget renders an empty delta honestly.
+    // slice (default). Zero budget renders an empty delta honestly.
     let delta_budget = if hook || budget.is_some() {
         budget.unwrap_or(if hook { 1500 } else { 0 }).saturating_sub(pack.tokens)
     } else {
@@ -514,7 +494,110 @@ pub fn build_task_context(
         record_visible_ids(&mut led, &ctx, &delta_ids);
         ledger_store.save(&led);
     }
-    Ok(TaskContextArtifact { pack, delta, delta_ids })
+    // Final accounting from the ACTUAL rendered artifact (enriched pack +
+    // delta), not stale component estimates.
+    let token_count = scc_core::estimate_tokens(&pack.content) + scc_core::estimate_tokens(&delta);
+    Ok(TaskContextArtifact { pack, delta, delta_ids, token_count })
+}
+
+/// The PURE task-pack builder (Part 3 ledger purity): the enriched task
+/// pack with scorer + beads + hindsight and its post-enrichment token
+/// count. NO Surface delta, NO ContextLedger mutation, NO visibility side
+/// effects. Pack-only callers (`context compress`, [`build_task_pack`])
+/// MUST use this — NEVER [`build_task_context`], which also builds a delta
+/// and records its rendered ids in the ledger: throwing the delta away
+/// would mark Surface APIs "already visible" the agent never saw, breaking
+/// the ledger invariant (ledger = content actually shown to the agent).
+// trace:v1 id=impl.crates-scc-cli-src-commands.build-enriched-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+pub fn build_enriched_task_pack(
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: Option<usize>,
+    hook: bool,
+) -> crate::Result<scc_context::ContextPack> {
+    let store = open_store(root)?;
+    let config = load_config(root)?;
+    let stale = crate::stale_paths(&store)?;
+    let comp = compiler(&store, &config, stale)?;
+    // No delta, no ledger: pack-only, pure. Scorer resolved for the pack's
+    // candidate fusion (same fallback-closed semantics as the full builder).
+    let (scorer, reranker) = crate::embed_cli::rankers(&store, &config, goal);
+    let scorer_trait: Option<&dyn scc_context::rank::SemanticScorer> =
+        scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
+    let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
+        reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
+    Ok(enrich_task_pack(
+        &comp, &store, &config, root, goal, files, symbols, budget, hook, scorer_trait, reranker_trait,
+    ))
+}
+
+/// The enriched task pack + its post-enrichment token recompute (the one
+/// place enrichment happens). Shared by [`build_task_context`] (which then
+/// layers the delta + ledger on top) and the pure
+/// [`build_enriched_task_pack`]. Pure: no delta, no ledger, no side
+/// effects.
+// trace:v1 id=impl.crates-scc-cli-src-commands.enrich-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
+fn enrich_task_pack(
+    comp: &crate::Compiler,
+    store: &scc_store::Store,
+    config: &scc_indexer::Config,
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    symbols: &[String],
+    budget: Option<usize>,
+    hook: bool,
+    scorer: Option<&dyn scc_context::rank::SemanticScorer>,
+    reranker: Option<&dyn scc_context::rank::Reranker>,
+) -> scc_context::ContextPack {
+    let mut pack = comp.ctx().task_context_with_rankers(
+        goal,
+        files,
+        symbols,
+        if hook {
+            Some(budget.unwrap_or(1500).min(1500))
+        } else {
+            budget
+        },
+        scorer,
+        reranker,
+    );
+    // task-state + memory enrichment (below the System IR authority line)
+    let beads_active = scc_indexer::adapters::beads::active_beads(root, 5);
+    if !beads_active.is_empty() {
+        pack.content.push_str(
+            "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n",
+        );
+        for t in beads_active {
+            pack.content.push_str("- ");
+            pack.content.push_str(&t);
+            pack.content.push('\n');
+        }
+    }
+    if config.integrations.hindsight {
+        let lessons = scc_indexer::adapters::hindsight::lessons(store, 5);
+        if !lessons.is_empty() {
+            pack.content.push_str(
+                "\n# HINDSIGHT LESSONS (memory, below System IR authority — not verified facts)\n",
+            );
+            for (content, tags) in lessons {
+                let tag_str = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tags.join(", "))
+                };
+                pack.content.push_str(&format!("- {content}{tag_str}\n"));
+            }
+        }
+    }
+    // Part 2 accounting fix: recompute AFTER ALL enrichment so `pack.tokens`
+    // reflects the ACTUAL rendered content (the pre-enrichment count hid
+    // beads+hindsight, so the surface-delta budget overallocated by the
+    // enrichment size and could blow the documented task cap).
+    pack.tokens = scc_core::estimate_tokens(&pack.content);
+    pack
 }
 
 /// `scc context task <goal> [--budget N] [--json] [--hook]` — the complete
@@ -551,8 +634,8 @@ pub fn cmd_context_task(
 }
 
 
-/// Pack-only view of THE one task artifact (compatibility shim): the pack
-/// half of [`build_task_context`]. New transports should call
+/// half built by the pure [`build_enriched_task_pack`] — NO delta, NO
+/// ledger side effects. New transports should call
 /// [`build_task_context`] directly so the delta ships with the pack.
 // trace:exempt reason=internal-detail
 pub fn build_task_pack(
@@ -562,9 +645,8 @@ pub fn build_task_pack(
     symbols: &[String],
     budget: Option<usize>,
 ) -> crate::Result<scc_context::ContextPack> {
-    Ok(build_task_context(root, goal, files, symbols, budget, false)?.pack)
+    build_enriched_task_pack(root, goal, files, symbols, budget, false)
 }
-
 /// The complete task artifact as JSON — the same derivation as CLI text
 /// (`{pack, delta, delta_ids}`); serialization is the only difference.
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-task-json work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports

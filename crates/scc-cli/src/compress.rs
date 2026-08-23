@@ -34,11 +34,13 @@ pub fn cmd_context_compress_json_claims(
     budget: Option<usize>,
     claims: bool,
 ) -> crate::Result<String> {
-    // The compressor operates on the PACK half of the task artifact (the
-    // delta is dynamic surface text, not compressible pack content).
+    // delta is dynamic surface text, not compressible pack content). The
+    // pure builder is used — NOT `build_task_context` — so compression
+    // never builds a Surface delta or records its ids into the
+    // ContextLedger (a pack-only caller discarding the delta must not mark
+    // APIs the agent never saw as already visible).
     let mut pack: scc_context::ContextPack =
-        crate::commands::build_task_context(root, goal, &[], &[], budget, false)?.pack;
-
+        crate::commands::build_enriched_task_pack(root, goal, &[], &[], budget, false)?;
     if let Some(command) = cmd {
         if claims {
             return compress_with_claims(&command, &mut pack);

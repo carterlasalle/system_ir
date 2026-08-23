@@ -49,6 +49,7 @@ class SCC:
         """Compile the system overview capsule."""
         return self._run_json(["overview", "--json"])
 
+    # trace:exempt reason=internal-detail  # thin subprocess wrapper method; CLI contract traced at impl.crates-scc-cli-src-commands.build-task-context
     def taskContext(
         self,
         goal: str,
@@ -56,7 +57,17 @@ class SCC:
         symbols: Optional[List[str]] = None,
         tokenBudget: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Compile a task context pack for a goal."""
+        """Compile the complete task context artifact for a goal: the enriched
+        task pack plus its task-personalized Surface delta.
+
+        Returns the CLI's `scc context task --json` output verbatim:
+        ``{"pack": {...}, "delta": "...", "delta_ids": [...],
+        "token_count": N}`` — ``pack`` is the flat task pack (keys
+        ``kind``, ``content``, ``entity_ids``, ...); ``delta`` is the
+        task-personalized Surface delta; ``delta_ids`` are the delta's
+        rendered entry ids. Never flattened: consumers read
+        ``result["pack"]["content"]``, not ``result["content"]``.
+        """
         args = ["context", "task", goal]
         if files:
             args.extend(["--files", " ".join(files)])
