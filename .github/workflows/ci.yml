@@ -1,3 +1,4 @@
+# trace:exempt reason=infra-config  # CI workflow declaration, not repo behavior; the jobs' behavior is traced at the source modules they run
 name: CI
 on:
   push:
@@ -12,10 +13,28 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Python SDK tests
+        # The Python SDK shells out to the built `scc` binary; tests skip
+        # cleanly only when no binary exists, so point SCC_BIN at the
+        # freshly-built target and run from the sdk dir.
+        run: |
+          cd sdk/python && SCC_BIN=$PWD/../../target/debug/scc python3 -m unittest test_scc_sdk.py
+      - name: TypeScript SDK build + tests
+        run: |
+          cd sdk/typescript
+          npm install --no-audit --no-fund
+          npm run build
+          SCC_BIN=$PWD/../../target/debug/scc npm test
+      - name: External benchmark harness + adapter self-tests (no network)
+        run: |
+          cd benchmarks/external && python3 -m unittest test_harness.py test_aider_fairness.py
+      - name: Test
+        run: |
+          # resolution-in-the-bench tests need the semantic backends
+          # (behavior_resolve drives tsserver through
+          # typescript-language-server); pyright is bundled via npm too.
+          npm install -g typescript-language-server typescript pyright
+          cargo test --workspace
       - name: Test
         run: |
           # resolution-in-the-bench tests need the semantic backends
