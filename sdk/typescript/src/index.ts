@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 // trace:v1 id=impl.scc.sdk.typescript work=WORK-SCC-014 satisfies=REQ-SCC-IR
 
 /** A compiled context pack emitted by the scc CLI. */
+// trace:v1 id=impl.sdk-typescript-src-index.context-pack work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export interface ContextPack {
   kind: string;
   repository_revision: string;
@@ -23,6 +24,7 @@ export interface ContextPack {
   truncated: boolean;
 }
 
+// trace:v1 id=impl.sdk-typescript-src-index.scc-options work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export interface SCCOptions {
   /** Path to the scc binary (default: $SCC_BIN or `scc` on PATH). */
   bin?: string;
@@ -30,13 +32,14 @@ export interface SCCOptions {
   cwd?: string;
 }
 
+// trace:v1 id=impl.sdk-typescript-src-index.task-context-options work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export interface TaskContextOptions {
   files?: string[];
   symbols?: string[];
   tokenBudget?: number;
 }
 
-// trace:exempt reason=internal-detail  # public type mirror of the CLI task artifact JSON (pack/delta/delta_ids); behavior traced at impl.crates-scc-cli-src-commands.build-task-context
+// trace:v1 id=impl.sdk-typescript-src-index.task-context-artifact work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export interface TaskContextArtifact {
   /** The enriched task pack (`context task --json` → field `pack`). */
   // (fields documented inline below)
@@ -50,6 +53,7 @@ export interface TaskContextArtifact {
 }
 
 /** Result of `scc index`. */
+// trace:v1 id=impl.sdk-typescript-src-index.index-result work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export interface IndexResult {
   ok: boolean;
 }
@@ -59,18 +63,18 @@ export interface IndexResult {
  * resolves with the parsed JSON result; a non-zero exit rejects with an
  * Error carrying the process's stderr.
  */
-// trace:exempt reason=internal-detail  # thin CLI subprocess wrapper, not repo behavior
+// trace:v1 id=impl.sdk-typescript-src-index-scc work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
 export class SCC {
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.constructor work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   constructor(private opts: SCCOptions = {}) {}
 
   /** Resolve the scc binary: explicit option, then $SCC_BIN, then PATH. */
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.bin work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   private get bin(): string {
     return this.opts.bin ?? process.env.SCC_BIN ?? "scc";
   }
 
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.cwd work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   private get cwd(): string {
     return this.opts.cwd ?? process.cwd();
   }
@@ -79,7 +83,7 @@ export class SCC {
    * Run `scc --root <cwd> <args>` and resolve with captured stdout/stderr.
    * Rejects on spawn failure or non-zero exit (message = trimmed stderr).
    */
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.run work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   private run(args: string[]): Promise<{ stdout: string; stderr: string }> {
     const { promise, resolve, reject } = Promise.withResolvers<{
       stdout: string;
@@ -110,6 +114,7 @@ export class SCC {
   }
 
   /** Run a command that emits a JSON context pack on stdout. */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.run-pack work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   private async runPack(args: string[]): Promise<ContextPack> {
     const { stdout } = await this.run(args);
     return JSON.parse(stdout) as ContextPack;
@@ -121,13 +126,14 @@ export class SCC {
    * task artifact `{pack, delta, delta_ids}`) — never casts the artifact to
    * a ContextPack.
    */
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.run-json work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   private async runJson<T>(args: string[]): Promise<T> {
     const { stdout } = await this.run(args);
     return JSON.parse(stdout) as T;
   }
 
   /** Compile the system overview capsule. */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.system-overview work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async systemOverview(): Promise<ContextPack> {
     return this.runPack(["overview", "--json"]);
   }
@@ -136,7 +142,7 @@ export class SCC {
    * Compile the complete task context artifact for a goal: the enriched
    * task pack plus the task-personalized Surface delta.
    */
-  // trace:exempt reason=internal-detail  # thin subprocess wrapper member; CLI contract traced at impl.crates-scc-cli-src-commands.build-task-context
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.task-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async taskContext(goal: string, opts?: TaskContextOptions): Promise<TaskContextArtifact> {
     const args = ["context", "task", goal];
     if (opts?.files && opts.files.length > 0) {
@@ -153,16 +159,19 @@ export class SCC {
   }
 
   /** Compile the context pack for one component (by id or name). */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.component-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async componentContext(id: string): Promise<ContextPack> {
     return this.runPack(["context", "component", id, "--json"]);
   }
 
   /** Compile the context pack for one flow (by id or name). */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.flow-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async flowContext(id: string): Promise<ContextPack> {
     return this.runPack(["context", "flow", id, "--json"]);
   }
 
   /** Compile an impact analysis pack for a set of files/symbols. */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.impact-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async impactContext(files?: string[], symbols?: string[]): Promise<ContextPack> {
     const args: string[] = ["impact"];
     if (files && files.length > 0) {
@@ -179,6 +188,7 @@ export class SCC {
    * Run the freshness/evidence verification. `scc verify` has no JSON mode,
    * so the pack is synthesized from its markdown output.
    */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.verify-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async verifyContext(): Promise<ContextPack> {
     const { stdout } = await this.run(["verify"]);
     const revision = stdout.match(/^Revision:\s*(.+)$/m)?.[1]?.trim() ?? "";
@@ -200,7 +210,7 @@ export class SCC {
    * omissions). `scc context startup` has no JSON mode, so the pack is
    * synthesized from its markdown output.
    */
-  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.context-startup work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async contextStartup(budget?: number): Promise<ContextPack> {
     const args = ["context", "startup"];
     if (budget !== undefined) {
@@ -225,7 +235,7 @@ export class SCC {
    * surface` has no JSON mode, so the pack is synthesized from its markdown
    * output.
    */
-  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.surface-map work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async surfaceMap(goal?: string, budget?: number): Promise<ContextPack> {
     const args: string[] = ["surface"];
     if (goal) {
@@ -255,7 +265,7 @@ export class SCC {
    * `scc context structural` has no JSON mode, so the pack is synthesized
    * from its markdown output.
    */
-  // trace:exempt reason=internal-detail  # CLI mirror wrapper, behavior traced at impl.scc.cli
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.structural-source work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async structuralSource(files?: string[], goal?: string, budget?: number): Promise<ContextPack> {
     const args: string[] = ["context", "structural"];
     if (files && files.length > 0) {
@@ -282,6 +292,7 @@ export class SCC {
   }
 
   /** Index the repository (idempotent; incremental after the first run). */
+  // trace:v1 id=impl.sdk-typescript-src-index-scc.index work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
   async index(): Promise<IndexResult> {
     await this.run(["index"]);
     return { ok: true };
