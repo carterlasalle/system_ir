@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# trace:v1 id=test.scc.bench-harness work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching verifies=REQ-complete-task-context-identical-across-transports
 """External-benchmark harness self-tests (Parts 5/6/9/10/11/12/13).
 
 No network, no installed tools. Exercises the harness and the adapter
@@ -32,6 +31,7 @@ def load(name):
     return mod
 
 
+# trace:v1 id=test.scc.bench-harness work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching verifies=REQ-complete-task-context-identical-across-transports
 class RowForTest(unittest.TestCase):
     """Part 5/12: `_row_for` builds the row with an explicit mode and the
     honest run_completion_rate metric (agent process exit, NOT task success)."""
