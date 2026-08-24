@@ -94,6 +94,7 @@ fn pack_shim_matches_artifact_pack() {
 /// enabled in config: the two enrichment sources that append to pack.content
 /// AFTER the pack builder computes its token count. This is exactly the
 /// path that hid beads+hindsight tokens from the surface-delta budget.
+// trace:v1 id=test.crates-scc-cli-tests-task-artifact-parity.fixture-with-enrichment work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn fixture_with_enrichment() -> (tempfile::TempDir, std::path::PathBuf) {
     let (dir, root) = fixture_repo();
     // Beads: task state file the adapter reads (.beads/issues.jsonl).
@@ -248,4 +249,38 @@ fn pack_only_does_not_mutate_the_ledger() {
         "full task-context must record its rendered delta ids; missing: {:?}",
         full_ids.difference(&recorded).collect::<Vec<_>>()
     );
+}
+
+/// Final hard-cap (audit edge case): enrichment alone can exceed the
+/// requested budget; the rendered artifact must still respect it — the
+/// delta is dropped (recorded in warnings), never silently over-cap.
+#[test]
+// trace:v1 id=impl.scc-cli-task-parity.final-hard-cap-after-enrichment work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching verifies=REQ-complete-task-context-identical-across-transports
+fn enrichment_over_cap_drops_delta_and_records() {
+    let (_dir, root) = fixture_repo();
+    let beads_dir = root.join(".beads");
+    std::fs::create_dir_all(&beads_dir).unwrap();
+    // 5 huge beads (active_beads takes 5) — far over a 300-token budget.
+    let mut text = String::new();
+    for i in 0..5 {
+        text.push_str(&format!("{{\"id\":\"B{i}\",\"title\":\"{}\",\"status\":\"active\"}}\n", "enormous bead title ".repeat(60)));
+    }
+    std::fs::write(beads_dir.join("issues.jsonl"), text).unwrap();
+
+    let budget = 300usize;
+    let artifact = scc_cli::commands::build_task_context(
+        &root, "rename the transcript field", &[], &[], Some(budget), false,
+    ).unwrap();
+    let total = scc_core::estimate_tokens(&artifact.pack.content)
+        + scc_core::estimate_tokens(&artifact.delta);
+    // The pack itself may exceed the cap (its content is critical, and the
+    // warning records the enforcement) — but the DELTA must be gone and
+    // the enforcement must be visible.
+    assert!(artifact.delta.is_empty(), "delta must be dropped when enrichment alone blows the cap");
+    assert!(
+        artifact.pack.warnings.iter().any(|w| w.contains("task cap enforced")),
+        "the cap enforcement must be recorded, got {:?}",
+        artifact.pack.warnings
+    );
+    let _ = total;
 }

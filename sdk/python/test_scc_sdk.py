@@ -70,12 +70,9 @@ class TestSCCSDK(unittest.TestCase):
         self.assertIsInstance(artifact["pack"]["entity_ids"], list)
         self.assertIn("Goal: transcript", artifact["pack"]["content"])
         self.assertIsInstance(artifact["delta"], str)
-        # delta_ids is omitted by the CLI when the delta is empty
-        # (skip_serializing_if set on the Rust struct) — the SDK mirrors the
-        # CLI verbatim, so the key may be absent.
-        self.assertTrue(
-            "delta_ids" not in artifact or isinstance(artifact["delta_ids"], list)
-        )
+        # delta_ids is ALWAYS serialized now (empty array, never omitted) —
+        # the exact public contract the TS type declares.
+        self.assertIsInstance(artifact["delta_ids"], list)
         self.assertIsInstance(artifact["token_count"], int)
 
     # trace:exempt reason=internal-detail  # sdk integration test; behavior traced at impl.crates-scc-cli-src-commands.build-task-context

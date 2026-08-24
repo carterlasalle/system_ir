@@ -445,10 +445,17 @@ def run_task_via_protocol(agent_cmd, artifact_path, goal, gt_files, plan_keys, r
     }
 
 
-def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None):
+def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None, artifact_path=None):
     """WRITABLE coding mode (Part 13): run the agent in the ALREADY-COPIED
     isolated repo dir and ALLOW edits (the harness owns isolation — the
     agent command must NOT be a read-only sandbox for this mode).
+
+    `artifact_path` is the variant's context artifact (SCC task pack,
+    aider map, repomix pack, ...). It is injected into the agent's stdin
+    with the SAME protocol as the read-only runner — `SCC CONTEXT:` +
+    artifact + `TASK:` + goal — so a writable comparison actually varies
+    the CONTEXT between variants. Without it every variant is just raw
+    (P0 fairness bug in the first writable draft).
 
     After the run:
       1. capture the patch (`git diff` of the working tree);
@@ -470,9 +477,17 @@ def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None):
     _sp.run(["git", "-c", "user.email=b@c", "-c", "user.name=bench",
              "commit", "-qm", "baseline"], cwd=root, capture_output=True, text=True, timeout=120)
     quoted = _sh.quote(str(agent_cmd))
+    # Variant context on stdin — identical framing to the read-only
+    # protocol so the ONLY difference between variants is the artifact.
+    if artifact_path is not None:
+        art_q = _sh.quote(str(artifact_path))
+        prompt = (f"CTX=$(cat {art_q} 2>/dev/null || true); "
+                  f"printf 'SCC CONTEXT:\\n%s\\n\\nTASK: %s\\n' \"$CTX\" \"$SCC_GOAL\"")
+    else:
+        prompt = f"printf 'TASK: %s\\n' \"$SCC_GOAL\""
     started = time.monotonic()
     proc = _sp.run(
-        ["sh", "-c", f"printf 'TASK: %s\n' \"$SCC_GOAL\" | sh -c {quoted}"],
+        ["sh", "-c", f"{prompt} | sh -c {quoted}"],
         cwd=root, env={**os.environ, "SCC_GOAL": goal},
         capture_output=True, text=True, timeout=3600,
     )
@@ -629,7 +644,8 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equa
             if writable:
                 results.append(
                     run_write_task(agent_cmd, root, task["goal"],
-                                   validate_cmd=task.get("validate"), tests_cmd=task.get("tests"))
+                                   validate_cmd=task.get("validate"), tests_cmd=task.get("tests"),
+                                   artifact_path=artifact)
                 )
             else:
                 plan_keys = list(task["files"]) + list(task["symbols"])

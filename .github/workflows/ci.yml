@@ -13,10 +13,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # HERMETIC ORDER: the SDK tests shell out to target/debug/scc, so the
+      # build MUST come first — a warm cache must never be what makes CI
+      # green on a cold runner.
+      - name: Build
+        run: cargo build --workspace
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Python SDK tests
-        # The Python SDK shells out to the built `scc` binary; tests skip
-        # cleanly only when no binary exists, so point SCC_BIN at the
-        # freshly-built target and run from the sdk dir.
         run: |
           cd sdk/python && SCC_BIN=$PWD/../../target/debug/scc python3 -m unittest test_scc_sdk.py
       - name: TypeScript SDK build + tests
@@ -35,13 +39,8 @@ jobs:
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
           cargo test --workspace
-      - name: Test
-        run: |
-          # resolution-in-the-bench tests need the semantic backends
-          # (behavior_resolve drives tsserver through
-          # typescript-language-server); pyright is bundled via npm too.
-          npm install -g typescript-language-server typescript pyright
-          cargo test --workspace
+      - name: Trace policy gate
+        run: trace verify
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test

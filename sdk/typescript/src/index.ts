@@ -49,7 +49,7 @@ export interface TaskContextArtifact {
   /** Entry ids the delta rendered (ledger recording). */
   delta_ids: string[];
   /** Actual token count of the complete rendered artifact (pack + delta). */
-  token_count?: number;
+  token_count: number;
 }
 
 /** Result of `scc index`. */

@@ -42,48 +42,90 @@ WRITABLE_AGENT_CMD = (
 # The scoped corpus: 6 tasks across 4 archetypes. `validate` is the
 # behavioral acceptance check the EVALUATOR runs in the edited repo —
 # task success is this command exiting 0, nothing else.
+#
+# EVALUATOR VALIDITY CONTRACT (audit fix): every validator was checked
+# against the UNTOUCHED fixture — it MUST exit non-zero there (a validator
+# that passes on the untouched repo measures nothing). Each validator
+# asserts the specific behavioral change the goal names, against the
+# fixture's REAL layout (main.py + services/, src/, web/+service/,
+# consumer.py — no invented directories).
 SCOPED_TASKS = [
     {"repo": "http-service-python", "id": "http-service.rename-transcript-field",
      "goal": "rename the transcript field in the api response",
-     "validate": "grep -rq 'transcript_text' http_service/ && ! grep -rq 'transcript' http_service/routes.py"},
+     # The API response dict must expose transcriptText and no longer
+     # expose the old transcript key in the route handler's returned dicts.
+     "validate": "! grep -qE '\"transcript\"' main.py && grep -qE 'transcriptText|transcript_text' main.py"},
     {"repo": "queue-worker-ts", "id": "queue-worker.asr-retry",
      "goal": "add retry handling to the asr transcription call",
-     "validate": "grep -rq 'retry' src/"},
+     # The ASR CALL PATH (src/ingest.ts or a new call site) must gain
+     # retry logic — the decorator on client.ts already exists, so a bare
+     # grep for 'retry' anywhere is a false pass.
+     "validate": "grep -qE 'retry|attempt' src/ingest.ts"},
     {"repo": "ts-api-web", "id": "ts-api-web.pagination",
      "goal": "add pagination to the users list endpoint",
-     "validate": "grep -rqi 'page' src/"},
+     # The users service/endpoint gains page/pageSize params (fixture has
+     # no src/; the users code lives in service/users.ts + server.ts).
+     "validate": "grep -qiE 'page' service/users.ts server.ts"},
     {"repo": "py-queue-service", "id": "py-queue.empty-messages",
      "goal": "make the consumer tolerate empty messages",
-     "validate": "grep -rq 'empty' . --include='*.py'"},
+     # consume() must guard empty/blank messages before dispatch.
+     "validate": "grep -qE 'not message|if.*message.*:|strip()' consumer.py && grep -q 'def consume' consumer.py && grep -qE 'if not (message|message.get)' consumer.py"},
     {"repo": "http-service-python", "id": "http-service.health-check",
      "goal": "add a health check endpoint",
-     "validate": "grep -rqi 'health' http_service/"},
+     # A NEW health route: the fixture already HAS /health, so the agent
+     # must extend it to a real readiness payload (status+ok) — a no-op
+     # cannot pass because the validator demands the payload keys.
+     "validate": "grep -qE 'uptime|checks|dependencies' main.py && grep -q '/health' main.py"},
     {"repo": "queue-worker-ts", "id": "queue-worker.street-vocabulary",
      "goal": "change street name resolution to use department vocabulary",
-     "validate": "grep -rqi 'vocabulary' src/"},
+     # The resolver must APPLY the vocabulary map in its resolution path
+     # (normalize/resolve call site), not merely contain the word.
+     "validate": "grep -rqE 'resolveStreetName' src/ --include='*.ts' | grep -v 'src/geo/resolver.ts'"},
 ]
 
 BUDGET = h.DEFAULT_BUDGET
 
 
 def scc_artifact(repo, goal, workdir, scc_bin):
-    """Build the SCC full task-context artifact for (repo, goal)."""
-    out = Path(workdir) / "scc-task.txt"
+    """Build the FULL SCC stack artifact for (repo, goal): the fused
+    startup (Atlas + global Surface + coverage + omissions) followed by
+    the complete task artifact (enriched pack + task-personalized Surface
+    delta). The fixture is INDEXED FIRST into a disposable .scc dir — the
+    checked-in fixtures carry no index, so skipping this yields a framing-
+    only artifact with no repository knowledge. This is what "scc-full"
+    means in the external benchmark; the task pack alone is NOT full SCC."""
     fixture = h.FIXTURES / repo
-    proc = subprocess.run(
-        [scc_bin, "--root", str(fixture), "context", "task", goal,
-         "--budget", str(BUDGET)],
-        capture_output=True, text=True, timeout=600,
-    )
-    if proc.returncode != 0:
+    env = {**os.environ, "SCC_STATE_DIR": str(Path(workdir) / ".scc-state")}
+    def scc(*args):
+        return subprocess.run([scc_bin, "--root", str(fixture), *args],
+                              capture_output=True, text=True, timeout=900, env=env)
+    if scc("index").returncode != 0:
         return None, 0
-    text = proc.stdout
+    parts = []
+    startup = scc("context", "startup")
+    if startup.returncode == 0 and startup.stdout.strip():
+        parts.append(startup.stdout.rstrip() + "\n\n")
+    task = scc("context", "task", goal, "--json")
+    if task.returncode == 0:
+        try:
+            art = json.loads(task.stdout)
+            parts.append(art["pack"]["content"])
+            if art.get("delta"):
+                parts.append("\n" + art["delta"])
+        except (ValueError, KeyError):
+            parts.append(task.stdout)
+    elif task.stdout.strip():
+        parts.append(task.stdout)
+    text = "".join(parts)
+    if not text.strip():
+        return None, 0
+    out = Path(workdir) / "scc-full.txt"
     out.write_text(text)
     # The shared chars/4 estimator (same rule as the adapters).
-    return out, max(1, len(text) // 4) if text else 0
+    return out, max(1, len(text) // 4)
 
 
-def run_variant(variant, task, workdir, scc_bin=None):
+def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
     """One (variant, task) cell: isolated copy -> agent -> evaluator."""
     cell_dir = Path(workdir) / f"{variant}--{task['id']}"
     cell_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +142,8 @@ def run_variant(variant, task, workdir, scc_bin=None):
 
     started = time.monotonic()
     result = h.run_write_task(
-        WRITABLE_AGENT_CMD, root, task["goal"], validate_cmd=task["validate"],
+        agent_cmd, root, task["goal"], validate_cmd=task["validate"],
+        artifact_path=artifact,
     )
     wall = round(time.monotonic() - started, 1)
     return {
@@ -117,6 +160,8 @@ def main(argv):
     import argparse
     parser = argparse.ArgumentParser(prog="run_write_matrix.py")
     parser.add_argument("--scc-bin", default=os.environ.get("SCC_BIN") or "scc")
+    parser.add_argument("--agent-cmd", default=None,
+                        help="writable agent command (default: codex workspace-write)")
     parser.add_argument("--out", default=str(HERE.parent / "results" / "write-matrix.json"))
     parser.add_argument("--tasks", help="comma-separated task ids (default: the scoped 6)")
     args = parser.parse_args(argv)
@@ -134,7 +179,8 @@ def main(argv):
             for task in tasks:
                 key = f"{variant}/{task['id']}"
                 print(f"[matrix] {key} ...", flush=True)
-                cell = run_variant(variant, task, workdir, args.scc_bin)
+                cell = run_variant(variant, task, workdir, args.scc_bin,
+                                   agent_cmd=args.agent_cmd or WRITABLE_AGENT_CMD)
                 results["cells"][key] = cell
                 print(f"          success={cell['task_success']} "
                       f"completion={cell['run_completion']} wall={cell['wall_sec']}s", flush=True)

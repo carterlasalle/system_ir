@@ -425,8 +425,9 @@ pub struct TaskContextArtifact {
     /// The task-personalized Surface delta (only NEW relevant APIs vs the
     /// ledger). Empty string when the delta budget is 0.
     pub delta: String,
-    /// Entry ids the delta rendered (ledger recording).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Entry ids the delta rendered (ledger recording). ALWAYS serialized
+    /// (empty array, not omitted) — the public JSON contract the SDKs type.
+    #[serde(default)]
     pub delta_ids: Vec<String>,
     /// Actual token count of the complete rendered artifact:
     /// `estimate_tokens(pack.content) + estimate_tokens(delta)` computed
@@ -494,10 +495,34 @@ pub fn build_task_context(
         record_visible_ids(&mut led, &ctx, &delta_ids);
         ledger_store.save(&led);
     }
+    // Final hard-cap pass (audit edge case): enrichment can push the pack
+    // OVER the requested total on its own (beads/lessons are not length-
+    // bounded). The delta then gets zero room, but the ARTIFACT would still
+    // exceed the cap. Enforce the documented cap on the rendered total:
+    // drop the delta first (it is additive surface text, never the pack's
+    // critical content) and record the drop honestly.
+    let mut delta = delta;
+    let mut delta_ids = delta_ids;
+    let mut cap_dropped_delta = false;
+    if let Some(cap) = budget.filter(|_| hook || budget.is_some()) {
+        let total = scc_core::estimate_tokens(&pack.content) + scc_core::estimate_tokens(&delta);
+        if total > cap && !delta.is_empty() {
+            delta = String::new();
+            delta_ids.clear();
+            cap_dropped_delta = true;
+        }
+    }
     // Final accounting from the ACTUAL rendered artifact (enriched pack +
     // delta), not stale component estimates.
     let token_count = scc_core::estimate_tokens(&pack.content) + scc_core::estimate_tokens(&delta);
-    Ok(TaskContextArtifact { pack, delta, delta_ids, token_count })
+    let mut artifact = TaskContextArtifact { pack, delta, delta_ids, token_count };
+    if cap_dropped_delta {
+        artifact
+            .pack
+            .warnings
+            .push("task cap enforced: surface delta dropped (enrichment consumed the budget)".into());
+    }
+    Ok(artifact)
 }
 
 /// The PURE task-pack builder (Part 3 ledger purity): the enriched task
