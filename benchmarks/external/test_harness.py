@@ -370,7 +370,7 @@ class WritableModeTest(unittest.TestCase):
     def test_task_success_is_evaluator_driven(self):
         # Agent "exits 0" but fails the evaluator -> run_completion 1.0,
         # task_success 0.0. The two MUST be distinct.
-        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None: {
+        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None, artifact_path=None: {
             "run_completion": True,
             "task_success": False,
             "task_success_defined": True,
@@ -389,7 +389,7 @@ class WritableModeTest(unittest.TestCase):
     def test_task_success_absent_without_evaluator(self):
         # No validate/tests on the task -> task_success_rate is None
         # (never a cheap exit-code pass).
-        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None: {
+        self.h.run_write_task = lambda agent_cmd, root, goal, validate_cmd=None, tests_cmd=None, artifact_path=None: {
             "run_completion": True,
             "task_success": None,
             "task_success_defined": False,
