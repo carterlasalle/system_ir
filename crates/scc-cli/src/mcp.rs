@@ -13,6 +13,38 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// The newest MCP protocol revision this server can speak. The client
+/// requests a version in `initialize.params.protocolVersion`; we negotiate
+/// down to the newest revision we support that is <= the client's, so both
+/// the 2025-06-18 and 2025-11-25 protocol generations work (fixwave Item
+/// 14 — OMP offers 2025-11-25, other clients 2025-06-18).
+const MAX_PROTOCOL_VERSION: &str = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
+
+/// Negotiate the protocol version: prefer the client's requested revision
+/// when we support it; otherwise fall back to the newest supported revision
+/// that is not newer than the client's request; as a last resort use our
+/// oldest supported revision (a client that predates both gets the oldest
+/// we speak).
+// trace:v1 id=impl.crates-scc-cli-src-mcp.negotiate-protocol work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+fn negotiate_protocol(requested: Option<&str>) -> &'static str {
+    let Some(req) = requested else {
+        return PROTOCOL_VERSION;
+    };
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&req) {
+        return SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .find(|v| **v == req)
+            .copied()
+            .unwrap_or(PROTOCOL_VERSION);
+    }
+    // Unsupported request: if it is newer than everything we support,
+    // answer with our newest; if it is older, answer with our oldest.
+    if req > MAX_PROTOCOL_VERSION {
+        return MAX_PROTOCOL_VERSION;
+    }
+    PROTOCOL_VERSION
+}
 
 // trace:v1 id=impl.crates-scc-cli-src-mcp.Tool work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 struct Tool {
@@ -177,10 +209,13 @@ pub fn serve_stdio(root: &Path) -> crate::Result<()> {
 
         match method {
             "initialize" => {
+                let requested = params
+                    .get("protocolVersion")
+                    .and_then(|v| v.as_str());
                 reply(
                     &id,
                     serde_json::json!({
-                        "protocolVersion": PROTOCOL_VERSION,
+                        "protocolVersion": negotiate_protocol(requested),
                         "capabilities": {"tools": {"listChanged": false}},
                         "serverInfo": {"name": "scc", "version": env!("CARGO_PKG_VERSION")}
                     }),
@@ -406,9 +441,25 @@ mod tests {
     }
 
     #[test]
-// trace:v1 id=impl.crates-scc-cli-src-mcp.jsonrpc-shapes work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-    fn jsonrpc_shapes() {
-        let req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        assert_eq!(req["method"], "tools/list");
+// trace:v1 id=impl.crates-scc-cli-src-mcp.negotiate-protocol-echoes-supported work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    fn negotiate_protocol_echoes_supported() {
+        // A client requesting a version we support gets it back verbatim.
+        assert_eq!(negotiate_protocol(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_protocol(Some("2025-11-25")), "2025-11-25");
+    }
+
+    #[test]
+// trace:v1 id=impl.crates-scc-cli-src-mcp.negotiate-protocol-newer-falls-back work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    fn negotiate_protocol_newer_falls_back_to_max() {
+        // A client requesting a NEWER protocol than we support gets our
+        // newest supported revision (2025-11-25).
+        assert_eq!(negotiate_protocol(Some("2026-01-01")), "2025-11-25");
+    }
+
+    #[test]
+// trace:v1 id=impl.crates-scc-cli-src-mcp.negotiate-protocol-absent-defaults work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    fn negotiate_protocol_absent_defaults() {
+        // No requested version -> our baseline.
+        assert_eq!(negotiate_protocol(None), "2025-06-18");
     }
 }

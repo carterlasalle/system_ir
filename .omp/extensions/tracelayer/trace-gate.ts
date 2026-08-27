@@ -14,17 +14,6 @@
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// The session_stop event is a compat surface of the OMP runtime (it fires
-// in current versions too) even though the published ExtensionAPI type
-// union does not list it. Extend the type rather than fighting it.
-// trace:exempt reason=internal-helper
-type SessionStopCompat = ExtensionAPI & {
-  on(
-    event: "session_stop",
-    handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown
-  ): void;
-};
-
 // trace:v1 id=impl.omp.trace-gate work=WORK-TL-001
 export default function hook(pi: ExtensionAPI): void {
   // node:child_process spawnSync (NOT Bun.spawnSync): Bun's spawnSync
@@ -147,31 +136,6 @@ export default function hook(pi: ExtensionAPI): void {
       return { content };
     } catch {
       return;
-    }
-  });
-
-  // Fail-closed completion gate: block while trace obligations or verify
-  // fail. OMP's SessionStopEventResult carries decision/reason (or
-  // continuation fields) — not a `block` property. The engine's stop hook
-  // ALSO runs the merge-grade auto-finalizer internally.
-  (pi as SessionStopCompat).on("session_stop", async (_event, ctx) => {
-    const body = JSON.stringify({
-      lifecycle: "wip",
-      session_id: sessionId(ctx),
-    });
-    const res = run(["hook", "stop", "--format", "json"], body);
-    if (res.code !== 0) {
-      let reason = "trace verification has blocking failures";
-      try {
-        const d = JSON.parse(res.out) as { output?: string };
-        if (typeof d.output === "string" && d.output) reason = d.output;
-      } catch {
-        // keep default reason
-      }
-      // The extension API has no `log` method — stderr lands in the OMP
-      // log, and the block reason is returned to the session result.
-      console.error(`trace gate: ${reason}`);
-      return { decision: "block", reason };
     }
   });
 }

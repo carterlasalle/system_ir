@@ -280,6 +280,46 @@ fn record_visible_ids(
     }
 }
 
+/// Truncate `content` so its estimated token count fits `cap`. Used as the
+/// LAST-RESORT trim step in [`build_task_context`] when dropping Hindsight,
+/// Beads, and the Surface delta still leaves the artifact over the caller's
+/// explicit hard cap (the pack builder only drops whole sections). Cuts at
+/// the first newline boundary at or after the cap so the result stays
+/// readable; returns the original if it already fits.
+// trace:v1 id=impl.crates-scc-cli-src-commands.truncate-to work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+fn truncate_to(content: &str, cap: usize) -> String {
+    if scc_core::estimate_tokens(content) <= cap {
+        return content.to_string();
+    }
+    const FOOTER: &str = "\n\n… [task hard cap: content truncated to fit budget]\n";
+    let footer_tokens = scc_core::estimate_tokens(FOOTER);
+    let target = cap.saturating_sub(footer_tokens);
+    let mut lo = 0usize;
+    let mut hi = content.len();
+    // Binary search the largest prefix whose estimated tokens fit the
+    // target (which reserves the footer's tokens so the final artifact
+    // still satisfies the cap).
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let prefix = &content[..content.floor_char_boundary(mid)];
+        if scc_core::estimate_tokens(prefix) <= target {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut cut = content.floor_char_boundary(lo);
+    // Extend to the next newline so we never split mid-line.
+    if let Some(rest) = content.get(cut..) {
+        if let Some(nl) = rest.find('\n') {
+            cut += nl;
+        }
+    }
+    let mut out = content[..cut].to_string();
+    out.push_str(FOOTER);
+    out
+}
+
 /// Mark the RENDERED surface entries visible (symbols, files, components),
 /// resolving overload-sensitive entry ids (`{symbol}#overload{N}`) through
 /// the compiled map so the ledger always records the logical symbol id.
@@ -463,10 +503,7 @@ pub fn build_task_context(
         scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
     let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
         reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
-        // The enriched pack, with its token count recomputed AFTER beads +
-    // hindsight (Part 2 accounting fix) so the delta budget below derives
-    // from the pack's ACTUAL size, not a stale pre-enrichment estimate.
-    let pack = enrich_task_pack(
+    let mut ep = enrich_task_pack(
         &comp,
         &store,
         &config,
@@ -479,53 +516,94 @@ pub fn build_task_context(
         scorer_trait,
         reranker_trait,
     );
-    // slice (default). Zero budget renders an empty delta honestly.
-    let delta_budget = if hook || budget.is_some() {
-        budget.unwrap_or(if hook { 1500 } else { 0 }).saturating_sub(pack.tokens)
+    // ONE hard cap (fixwave Item 25): hook mode always caps at 1500 (or an
+    // explicit budget, whichever is smaller); explicit mode uses the budget;
+    // neither -> the delta gets its own task_delta slice (no total cap).
+    let hard_cap: Option<usize> = if hook {
+        Some(budget.unwrap_or(1500).min(1500))
     } else {
-        scc_core::ContextBudget::default().task_delta
+        budget
     };
     let ctx = comp.ctx();
     let ledger_store = scc_context::context_ledger::ContextLedgerStore::new(&store);
     let visible = ledger_store.load();
-    let (delta, delta_ids) =
+    // The delta gets what the fully-enriched pack leaves of the cap.
+    let delta_budget = match hard_cap {
+        Some(c) => c.saturating_sub(ep.pack.tokens),
+        None => scc_core::ContextBudget::default().task_delta,
+    };
+    let (mut delta, mut delta_ids) =
         scc_context::startup::task_delta_with_ids(&ctx, goal, &visible, delta_budget, scorer_trait);
+    // Trim order when the FINAL rendered artifact exceeds the hard cap:
+    // Hindsight -> Beads -> lower-ranked Surface delta -> task-pack content
+    // (fixwave Item 26).
+    let mut include_hindsight = true;
+    let mut include_beads = true;
+    let mut dropped: Vec<&str> = Vec::new();
+    if let Some(cap) = hard_cap {
+        let full = ep.tokens_including(true, true) + scc_core::estimate_tokens(&delta);
+        if full > cap && include_hindsight && !ep.hindsight.is_empty() {
+            include_hindsight = false;
+            dropped.push("hindsight");
+        }
+        let no_h = ep.tokens_including(include_hindsight, true) + scc_core::estimate_tokens(&delta);
+        if no_h > cap && include_beads && !ep.beads.is_empty() {
+            include_beads = false;
+            dropped.push("beads");
+        }
+        let no_e = ep.tokens_including(include_hindsight, include_beads)
+            + scc_core::estimate_tokens(&delta);
+        if no_e > cap && !delta.is_empty() {
+            delta = String::new();
+            delta_ids.clear();
+            dropped.push("surface-delta");
+        }
+    }
+    ep.assemble(include_hindsight, include_beads);
+    if let Some(cap) = hard_cap {
+        let total = scc_core::estimate_tokens(&ep.pack.content) + scc_core::estimate_tokens(&delta);
+        if total > cap {
+            // Last resort: hard-truncate the task-pack content to fit the
+            // caller's explicit cap (the pack builder only drops whole
+            // sections; this is the caller's cap enforcement).
+            ep.pack.content = truncate_to(&ep.pack.content, cap);
+            ep.pack.tokens = scc_core::estimate_tokens(&ep.pack.content);
+            ep.pack.hard_truncated = true;
+            dropped.push("task-pack");
+        }
+    }
+    // The ledger records ONLY the FINAL delta ids — after the cap and trim
+    // have decided what is actually shown (fixwave Item 24). Never record
+    // ids whose delta was dropped.
     if !delta_ids.is_empty() {
         let mut led = visible;
         record_visible_ids(&mut led, &ctx, &delta_ids);
         ledger_store.save(&led);
     }
-    // Final hard-cap pass (audit edge case): enrichment can push the pack
-    // OVER the requested total on its own (beads/lessons are not length-
-    // bounded). The delta then gets zero room, but the ARTIFACT would still
-    // exceed the cap. Enforce the documented cap on the rendered total:
-    // drop the delta first (it is additive surface text, never the pack's
-    // critical content) and record the drop honestly.
-    let mut delta = delta;
-    let mut delta_ids = delta_ids;
-    let mut cap_dropped_delta = false;
-    if let Some(cap) = budget.filter(|_| hook || budget.is_some()) {
-        let total = scc_core::estimate_tokens(&pack.content) + scc_core::estimate_tokens(&delta);
-        if total > cap && !delta.is_empty() {
-            delta = String::new();
-            delta_ids.clear();
-            cap_dropped_delta = true;
-        }
-    }
     // Final accounting from the ACTUAL rendered artifact (enriched pack +
     // delta), not stale component estimates.
-    let token_count = scc_core::estimate_tokens(&pack.content) + scc_core::estimate_tokens(&delta);
-    let mut artifact = TaskContextArtifact { pack, delta, delta_ids, token_count };
-    if cap_dropped_delta {
-        artifact
-            .pack
-            .warnings
-            .push("task cap enforced: surface delta dropped (enrichment consumed the budget)".into());
+    let token_count = scc_core::estimate_tokens(&ep.pack.content) + scc_core::estimate_tokens(&delta);
+    let mut artifact = TaskContextArtifact {
+        pack: ep.pack,
+        delta,
+        delta_ids,
+        token_count,
+    };
+    if let Some(cap) = hard_cap {
+        assert!(
+            artifact.token_count <= cap,
+            "task artifact {token_count} exceeded hard cap {cap}"
+        );
+    }
+    if !dropped.is_empty() {
+        artifact.pack.warnings.push(format!(
+            "task cap enforced: dropped [{}]",
+            dropped.join(", ")
+        ));
     }
     Ok(artifact)
 }
 
-/// The PURE task-pack builder (Part 3 ledger purity): the enriched task
 /// pack with scorer + beads + hindsight and its post-enrichment token
 /// count. NO Surface delta, NO ContextLedger mutation, NO visibility side
 /// effects. Pack-only callers (`context compress`, [`build_task_pack`])
@@ -553,9 +631,10 @@ pub fn build_enriched_task_pack(
         scorer.as_ref().map(|s| s as &dyn scc_context::rank::SemanticScorer);
     let reranker_trait: Option<&dyn scc_context::rank::Reranker> =
         reranker.as_ref().map(|r| r as &dyn scc_context::rank::Reranker);
-    Ok(enrich_task_pack(
+    let ep = enrich_task_pack(
         &comp, &store, &config, root, goal, files, symbols, budget, hook, scorer_trait, reranker_trait,
-    ))
+    );
+    Ok(ep.pack)
 }
 
 /// The enriched task pack + its post-enrichment token recompute (the one
@@ -563,8 +642,8 @@ pub fn build_enriched_task_pack(
 /// layers the delta + ledger on top) and the pure
 /// [`build_enriched_task_pack`]. Pure: no delta, no ledger, no side
 /// effects.
-// trace:v1 id=impl.crates-scc-cli-src-commands.enrich-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
 #[allow(clippy::too_many_arguments)] // one shared enrichment seam: every arg is a distinct input axis
+// trace:v1 id=impl.crates-scc-cli-src-commands.enrich-task-pack work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching satisfies=REQ-complete-task-context-identical-across-transports
 fn enrich_task_pack(
     comp: &crate::Compiler,
     store: &scc_store::Store,
@@ -577,7 +656,7 @@ fn enrich_task_pack(
     hook: bool,
     scorer: Option<&dyn scc_context::rank::SemanticScorer>,
     reranker: Option<&dyn scc_context::rank::Reranker>,
-) -> scc_context::ContextPack {
+) -> EnrichedPack {
     let mut pack = comp.ctx().task_context_with_rankers(
         goal,
         files,
@@ -591,21 +670,23 @@ fn enrich_task_pack(
         reranker,
     );
     // task-state + memory enrichment (below the System IR authority line)
+    let mut beads = String::new();
     let beads_active = scc_indexer::adapters::beads::active_beads(root, 5);
     if !beads_active.is_empty() {
-        pack.content.push_str(
+        beads.push_str(
             "\n# ACTIVE TASK STATE (from .beads/issues.jsonl — task state, not system facts)\n",
         );
         for t in beads_active {
-            pack.content.push_str("- ");
-            pack.content.push_str(&t);
-            pack.content.push('\n');
+            beads.push_str("- ");
+            beads.push_str(&t);
+            beads.push('\n');
         }
     }
+    let mut hindsight = String::new();
     if config.integrations.hindsight {
         let lessons = scc_indexer::adapters::hindsight::lessons(store, 5);
         if !lessons.is_empty() {
-            pack.content.push_str(
+            hindsight.push_str(
                 "\n# HINDSIGHT LESSONS (memory, below System IR authority — not verified facts)\n",
             );
             for (content, tags) in lessons {
@@ -614,16 +695,64 @@ fn enrich_task_pack(
                 } else {
                     format!(" [{}]", tags.join(", "))
                 };
-                pack.content.push_str(&format!("- {content}{tag_str}\n"));
+                hindsight.push_str(&format!("- {content}{tag_str}\n"));
             }
         }
     }
+    let base = pack.content.clone();
+    pack.content.push_str(&beads);
+    pack.content.push_str(&hindsight);
     // Part 2 accounting fix: recompute AFTER ALL enrichment so `pack.tokens`
     // reflects the ACTUAL rendered content (the pre-enrichment count hid
     // beads+hindsight, so the surface-delta budget overallocated by the
     // enrichment size and could blow the documented task cap).
     pack.tokens = scc_core::estimate_tokens(&pack.content);
-    pack
+    EnrichedPack {
+        pack,
+        base,
+        beads,
+        hindsight,
+    }
+}
+
+/// The result of [`enrich_task_pack`]: the fully-enriched pack plus the
+/// separable enrichment sections, so [`build_task_context`] can trim
+/// low-authority enrichment (Hindsight -> Beads) when the final artifact
+/// exceeds the hard cap. `pack.content` is `base + beads + hindsight`;
+/// `pack.tokens` is its estimate.
+// trace:exempt reason=internal-helper
+struct EnrichedPack {
+    pack: scc_context::ContextPack,
+    base: String,
+    beads: String,
+    hindsight: String,
+}
+// trace:exempt reason=internal-helper
+impl EnrichedPack {
+    /// Token count of the pack content with the requested enrichment
+    /// sections included (Hindsight/Beads are dropped in that order when
+    /// the artifact exceeds the cap).
+    // trace:exempt reason=internal-helper
+    fn tokens_including(&self, hindsight: bool, beads: bool) -> usize {
+        scc_core::estimate_tokens(&self.base)
+            + if beads { scc_core::estimate_tokens(&self.beads) } else { 0 }
+            + if hindsight { scc_core::estimate_tokens(&self.hindsight) } else { 0 }
+    }
+
+    /// Rebuild `pack.content` from the retained sections and refresh its
+    /// token count.
+    // trace:exempt reason=internal-helper
+    fn assemble(&mut self, hindsight: bool, beads: bool) {
+        self.pack.content = String::new();
+        self.pack.content.push_str(&self.base);
+        if beads {
+            self.pack.content.push_str(&self.beads);
+        }
+        if hindsight {
+            self.pack.content.push_str(&self.hindsight);
+        }
+        self.pack.tokens = scc_core::estimate_tokens(&self.pack.content);
+    }
 }
 
 /// `scc context task <goal> [--budget N] [--json] [--hook]` — the complete

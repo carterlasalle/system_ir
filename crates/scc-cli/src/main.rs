@@ -517,6 +517,7 @@ enum LessonsSub {
 }
 
 #[derive(Subcommand)]
+// trace:exempt reason=evolved
 enum SetupSub {
     /// Install Claude Code hooks
     Claude,
@@ -526,6 +527,8 @@ enum SetupSub {
     Opencode,
     /// Install the Hermes plugin (native tools + skill)
     Hermes,
+    /// Install the Oh My Pi (OMP) native integration (extension + MCP + skill + AGENTS)
+    Omp,
 }
 
 // trace:exempt reason=internal-detail
@@ -645,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SetupSub::Codex => scc_cli::compress::cmd_setup_codex(&root),
             SetupSub::Opencode => scc_cli::compress::cmd_setup_opencode(&root),
             SetupSub::Hermes => scc_cli::plugin_hermes::cmd_setup_hermes(&root),
+            SetupSub::Omp => scc_cli::plugin_omp::cmd_setup_omp(&root),
         },
         Commands::Serve => commands::cmd_serve(&root),
         Commands::Mcp => commands::cmd_mcp(&root),

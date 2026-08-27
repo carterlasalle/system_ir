@@ -13,6 +13,7 @@ pub mod httpd;
 pub mod mcp;
 pub mod plugin;
 pub mod plugin_hermes;
+pub mod plugin_omp;
 pub mod resolve;
 
 use scc_context::ContextCompiler;
@@ -124,6 +125,7 @@ pub fn stale_paths(store: &Store) -> Result<Vec<String>> {
     Ok(out)
 }
 
+// trace:exempt reason=existing
 pub struct Compiler<'a> {
     pub store: &'a Store,
     pub graph: RealityGraph,
@@ -132,6 +134,7 @@ pub struct Compiler<'a> {
 }
 
 /// Build a ready compiler with freshness state.
+// trace:v1 id=impl.crates-scc-cli-src-lib.compiler work=WORK-SCC-001 satisfies=REQ-SCC-API
 pub fn compiler<'a>(
     store: &'a Store,
     config: &Config,

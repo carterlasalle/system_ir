@@ -16,3 +16,5 @@ benchmarks/blind-test/*
 .DS_Store
 __pycache__/
 *.pyc
+**/.aider.tags.cache.v4/
+**/.aider.input.history
