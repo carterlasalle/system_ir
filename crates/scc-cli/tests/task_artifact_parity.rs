@@ -284,3 +284,229 @@ fn enrichment_over_cap_drops_delta_and_records() {
     );
     let _ = total;
 }
+
+// ---------------------------------------------------------------------------
+// Part 4 — hard-cap + trim-order regression tests (fixwave Items 24-26)
+// ---------------------------------------------------------------------------
+
+/// A fixture with configurable Beads and Hindsight enrichment.
+// trace:exempt reason=test-helper
+fn fixture_enrich(root: &std::path::Path, beads: Option<&str>, hindsight: bool) {
+    if let Some(text) = beads {
+        let beads_dir = root.join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(beads_dir.join("issues.jsonl"), text).unwrap();
+    }
+    if hindsight {
+        let store = scc_store::Store::open(&root.join(".scc").join("scc.db"), root).unwrap();
+        let entity = scc_core::Entity::new(
+            scc_core::entity_id(&store.repo_id, "lesson", "lesson-x"),
+            "lesson",
+            "a hindsight lesson",
+        );
+        store.insert_entity(&entity, &[]).unwrap();
+        let cfg_dir = root.join(".scc");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.yaml"),
+            "integrations:\n  hindsight: true\n",
+        )
+        .unwrap();
+    }
+}
+
+/// No enrichment: the artifact fits a tiny explicit budget with room to
+/// spare — no trim fires, the delta survives.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.no-enrichment-fits
+fn no_enrichment_fits_tiny_budget() {
+    let (_dir, root) = fixture_repo();
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(800), false)
+            .unwrap();
+    assert!(artifact.token_count <= 800,
+        "artifact {} must fit the explicit budget", artifact.token_count);
+    assert!(artifact.pack.warnings.iter().all(|w| !w.contains("task cap enforced")),
+        "no trim should fire when the artifact fits");
+}
+
+/// Beads only: the delta gets what the enriched pack leaves; the artifact
+/// still fits the cap.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.beads-only-fits
+fn beads_only_fits_budget() {
+    let (_dir, root) = fixture_repo();
+    fixture_enrich(&root, Some("{\"id\":\"T1\",\"title\":\"bead one\",\"status\":\"active\"}\n"), false);
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(800), false)
+            .unwrap();
+    assert!(artifact.pack.content.contains("ACTIVE TASK STATE"));
+    assert!(artifact.token_count <= 800);
+}
+
+/// Hindsight only: same contract.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.hindsight-only-fits
+fn hindsight_only_fits_budget() {
+    let (_dir, root) = fixture_repo();
+    fixture_enrich(&root, None, true);
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(800), false)
+            .unwrap();
+    assert!(artifact.pack.content.contains("HINDSIGHT LESSONS"));
+    assert!(artifact.token_count <= 800);
+}
+
+/// Both Beads and Hindsight: both appear when the budget fits.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.both-enrichment-fit
+fn both_enrichment_fit_budget() {
+    let (_dir, root) = fixture_repo();
+    fixture_enrich(&root, Some("{\"id\":\"T1\",\"title\":\"beads one\",\"status\":\"active\"}\n"), true);
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(800), false)
+            .unwrap();
+    assert!(artifact.pack.content.contains("ACTIVE TASK STATE"));
+    assert!(artifact.pack.content.contains("HINDSIGHT LESSONS"));
+    assert!(artifact.token_count <= 800);
+}
+
+/// Huge Beads title over a tiny cap: Hindsight is absent, so Beads is the
+/// first low-authority section trimmed; the artifact still fits the cap.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.huge-beads-trimmed
+fn huge_beads_title_trimmed() {
+    let (_dir, root) = fixture_repo();
+    // 5 huge beads (active_beads takes 5) — far over a 300-token cap.
+    let mut text = String::new();
+    for i in 0..5 {
+        text.push_str(&format!("{{\"id\":\"B{i}\",\"title\":\"{}\",\"status\":\"active\"}}\n", "enormous bead title ".repeat(60)));
+    }
+    fixture_enrich(&root, Some(&text), false);
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(300), false)
+            .unwrap();
+    assert!(artifact.token_count <= 300,
+        "artifact {} must fit cap 300 after trim", artifact.token_count);
+    // The beads section was dropped (it is the only low-authority section).
+    assert!(!artifact.pack.content.contains("ACTIVE TASK STATE"),
+        "beads must be trimmed when they alone blow the cap");
+    assert!(artifact.pack.warnings.iter().any(|w| w.contains("beads")),
+        "the trim must be recorded in warnings: {:?}", artifact.pack.warnings);
+}
+
+/// Huge Hindsight lesson over a tiny cap: Hindsight is trimmed FIRST (it
+/// is lower authority than Beads), Beads survives.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.huge-hindsight-trimmed-first
+fn huge_hindsight_lesson_trimmed_first() {
+    let (_dir, root) = fixture_repo();
+    // A beads line that fits, plus a Hindsight lesson far over the cap.
+    fixture_enrich(&root, Some("{\"id\":\"T1\",\"title\":\"beads one\",\"status\":\"active\"}\n"), true);
+    let store = scc_store::Store::open(&root.join(".scc").join("scc.db"), &root).unwrap();
+    let huge = "hindsight lesson ".repeat(600);
+    let entity = scc_core::Entity::new(
+        scc_core::entity_id(&store.repo_id, "lesson", "lesson-huge"),
+        "lesson",
+        &huge,
+    );
+    store.insert_entity(&entity, &[]).unwrap();
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(500), false)
+            .unwrap();
+    assert!(artifact.token_count <= 500);
+    // Hindsight trimmed first; Beads survives.
+    assert!(!artifact.pack.content.contains("HINDSIGHT LESSONS"),
+        "hindsight must be trimmed first");
+    assert!(artifact.pack.content.contains("ACTIVE TASK STATE"),
+        "beads must survive when hindsight is trimmed first");
+    assert!(artifact.pack.warnings.iter().any(|w| w.contains("hindsight")),
+        "the hindsight trim must be recorded: {:?}", artifact.pack.warnings);
+}
+
+/// Implicit hook cap (1500): hook mode with no explicit budget still caps
+/// the artifact at 1500.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.hook-implicit-1500
+fn hook_implicit_1500_cap() {
+    let (_dir, repo) = fixture_repo();
+    let artifact =
+        scc_cli::commands::build_task_context(&repo, "rename the transcript field", &[], &[], None, true)
+            .unwrap();
+    assert!(artifact.token_count <= 1500,
+        "hook mode must cap at 1500, got {}", artifact.token_count);
+}
+
+/// Explicit tiny cap lower than the pack builder's floor: the last-resort
+/// content truncation fires and the artifact still fits the cap.
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.explicit-tiny-cap-truncates
+fn explicit_tiny_cap_truncates() {
+    let (_dir, repo) = fixture_repo();
+    // A cap far below the pack builder's minimum (512): Hindsight/Beads
+    // absent, so the only way to fit is to truncate the pack content.
+    let artifact =
+        scc_cli::commands::build_task_context(&repo, "rename the transcript field", &[], &[], Some(120), false)
+            .unwrap();
+    assert!(artifact.token_count <= 120,
+        "artifact {} must fit explicit cap 120", artifact.token_count);
+    assert!(artifact.pack.hard_truncated,
+        "the pack must be hard-truncated to fit a tiny cap");
+}
+
+/// Delta dropped after the cap is applied: the ledger must NOT record ids
+/// that were never shown (fixwave Item 24).
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.delta-dropped-not-recorded
+fn delta_dropped_not_recorded_in_ledger() {
+    let (_dir, root) = fixture_repo();
+    // A delta that would render ids, but an over-cap enrichment forces the
+    // delta to be dropped; the ledger must not record those ids.
+    let beads_dir = root.join(".beads");
+    std::fs::create_dir_all(&beads_dir).unwrap();
+    let mut text = String::new();
+    for i in 0..5 {
+        text.push_str(&format!("{{\"id\":\"B{i}\",\"title\":\"{}\",\"status\":\"active\"}}\n", "enormous bead title ".repeat(60)));
+    }
+    std::fs::write(beads_dir.join("issues.jsonl"), text).unwrap();
+
+    let artifact = scc_cli::commands::build_task_context(
+        &root, "rename the transcript field", &[], &[], Some(300), false,
+    ).unwrap();
+    // The delta is dropped (beads + hindsight alone exceed the cap).
+    assert!(artifact.delta.is_empty(), "delta must be dropped");
+    // The ledger must not record ids for a dropped delta.
+    let store = scc_store::Store::open(&root.join(".scc").join("scc.db"), &root).unwrap();
+    let led = scc_context::context_ledger::ContextLedgerStore::new(&store).load();
+    assert!(led.visible_symbols.is_empty() && led.visible_files.is_empty()
+        && led.visible_components.is_empty() && led.visible_flows.is_empty(),
+        "a dropped delta must not record visibility: {led:?}");
+}
+
+/// Ledger visibility remains correct when the delta survives: recorded ids
+/// are exactly the final delta ids, and a later call sees them as "already
+/// visible".
+#[test]
+// trace:v1 id=test.scc-cli-task-parity.ledger-records-final-ids
+fn ledger_records_only_final_delta_ids() {
+    let (_dir, root) = fixture_repo();
+    let artifact =
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], None, false)
+            .unwrap();
+    assert!(!artifact.delta_ids.is_empty(), "fresh ledger must render a delta");
+    let store = scc_store::Store::open(&root.join(".scc").join("scc.db"), &root).unwrap();
+    let led = scc_context::context_ledger::ContextLedgerStore::new(&store).load();
+    let recorded: std::collections::BTreeSet<String> = [
+        led.visible_symbols.clone(),
+        led.visible_files.clone(),
+        led.visible_components.clone(),
+        led.visible_flows.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let final_ids: std::collections::BTreeSet<String> = artifact.delta_ids.iter().cloned().collect();
+    assert!(final_ids.is_subset(&recorded),
+        "ledger must record exactly the final delta ids; missing {:?}",
+        final_ids.difference(&recorded).collect::<Vec<_>>());
+}

@@ -1,0 +1,227 @@
+{
+  "meta": {
+    "agent": "codex",
+    "mode": "writable",
+    "budget": 8000,
+    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+  },
+  "cells": {
+    "raw/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 76.4
+    },
+    "raw/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 128.5
+    },
+    "raw/ts-api-web.pagination": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 29.0
+    },
+    "raw/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 240.2
+    },
+    "raw/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 102.4
+    },
+    "raw/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 122.0
+    },
+    "scc-full/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 2465,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 52.2
+    },
+    "scc-full/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 2262,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 185.6
+    },
+    "scc-full/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 1903,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 163.2
+    },
+    "scc-full/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 2423,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 164.0
+    },
+    "scc-full/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 2277,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 75.3
+    },
+    "scc-full/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 2211,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 91.5
+    },
+    "aider-repomap/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 178,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 42.7
+    },
+    "aider-repomap/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 333,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 120.7
+    },
+    "aider-repomap/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 167.6
+    },
+    "aider-repomap/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 165.5
+    },
+    "aider-repomap/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 178,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 125.2
+    },
+    "aider-repomap/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 333,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 81.8
+    },
+    "repomix-compress/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 516,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 47.7
+    },
+    "repomix-compress/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 490,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 131.5
+    },
+    "repomix-compress/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 339,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 213.6
+    },
+    "repomix-compress/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 407,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 145.8
+    },
+    "repomix-compress/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 516,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 93.8
+    },
+    "repomix-compress/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 490,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 128.5
+    }
+  },
+  "summary": {
+    "n_tasks": 6,
+    "variants": [
+      "raw",
+      "scc-full",
+      "aider-repomap",
+      "repomix-compress"
+    ],
+    "raw_task_success": 0.16666666666666666,
+    "scc_full_task_success": 0.3333333333333333,
+    "aider_task_success": 0.3333333333333333,
+    "repomix_task_success": 0.3333333333333333,
+    "skipped_cells": {
+      "raw": 0,
+      "scc-full": 0,
+      "aider-repomap": 0,
+      "repomix-compress": 0
+    },
+    "paired_mean_diff_scc_minus_raw": 0.16666666666666666,
+    "ci95": [
+      0.0,
+      0.5
+    ],
+    "ci_note": "CI crosses zero \u2014 no superiority claim"
+  }
+}

@@ -78,9 +78,9 @@ SCOPED_TASKS = [
      "validate": "grep -qE 'uptime|checks|dependencies' main.py && grep -q '/health' main.py"},
     {"repo": "queue-worker-ts", "id": "queue-worker.street-vocabulary",
      "goal": "change street name resolution to use department vocabulary",
-     # The resolver must APPLY the vocabulary map in its resolution path
-     # (normalize/resolve call site), not merely contain the word.
-     "validate": "grep -rqE 'resolveStreetName' src/ --include='*.ts' | grep -v 'src/geo/resolver.ts'"},
+     # The resolver must APPLY the vocabulary map in its resolution path —
+     # a vocabulary map must exist AND be applied (includes/replace).
+     "validate": "grep -qE 'Map<|DEPARTMENT_VOCAB' src/geo/resolver.ts && grep -qE 'includes|replace' src/geo/resolver.ts"},
 ]
 
 BUDGET = h.DEFAULT_BUDGET
@@ -125,6 +125,48 @@ def scc_artifact(repo, goal, workdir, scc_bin):
     return out, max(1, len(text) // 4)
 
 
+EXTERNAL_VARIANTS = ("aider-repomap", "repomix-compress")
+
+
+def task_slug(goal):
+    import re
+    return re.sub(r"[^A-Za-z0-9._-]", "_", goal)[:40] or "task"
+
+
+def external_artifact(variant, repo, goal, workdir, budget):
+    """Build the pinned aider/repomix artifact for (repo, goal) via the
+    shared adapters, returning (artifact_path, tokens, error). A missing
+    or unpinned tool yields error (SKIPPED-UNINSTALLED / PIN-MISMATCH /
+    PIN-UNVERIFIED) and a None artifact — the cell is reported, never
+    silently treated as a pass."""
+    adapter = h.BENCHMARKS / "external" / (
+        "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
+    # Aider personalizes per goal (immutable per-task dir); repomix is
+    # task-invariant but regenerating per cell is harmless and keeps the
+    # cell self-contained.
+    art_dir = Path(workdir) / "artifacts" / variant / task_slug(goal)
+    art_dir.mkdir(parents=True, exist_ok=True)
+    argv = [h.bench_python(), str(adapter), str(h.FIXTURES / repo), str(budget), str(art_dir)]
+    if variant == "aider-repomap":
+        argv += ["--goal", goal]
+    else:
+        argv.append("--compress")
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None, 0, f"adapter output not JSON: {proc.stdout[:200]}"
+    if proc.returncode == 2:
+        return None, 0, "SKIPPED-UNINSTALLED"
+    if proc.returncode == 3:
+        return None, 0, "PIN-MISMATCH"
+    if proc.returncode == 4:
+        return None, 0, "PIN-UNVERIFIED"
+    if not payload.get("ok"):
+        return None, 0, payload.get("error", "adapter failed")
+    return Path(payload["artifact"]), int(payload.get("tokens", 0)), None
+
+
 def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
     """One (variant, task) cell: isolated copy -> agent -> evaluator."""
     cell_dir = Path(workdir) / f"{variant}--{task['id']}"
@@ -139,6 +181,12 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
         if artifact is None:
             return {"task_success": False, "run_completion": False,
                     "context_tokens": 0, "wall_sec": 0.0, "error": "scc artifact failed"}
+    elif variant in EXTERNAL_VARIANTS:
+        artifact, ctx_tokens, err = external_artifact(
+            variant, task["repo"], task["goal"], cell_dir, BUDGET)
+        if artifact is None:
+            return {"task_success": False, "run_completion": False,
+                    "context_tokens": 0, "wall_sec": 0.0, "error": err}
 
     started = time.monotonic()
     result = h.run_write_task(
@@ -174,8 +222,9 @@ def main(argv):
     results = {"meta": {"agent": "codex", "mode": "writable", "budget": BUDGET,
                         "note": "scoped real-agent matrix; NOT the full corpus showdown"},
                "cells": {}}
+    variants = ("raw", "scc-full", "aider-repomap", "repomix-compress")
     try:
-        for variant in ("raw", "scc-full"):
+        for variant in variants:
             for task in tasks:
                 key = f"{variant}/{task['id']}"
                 print(f"[matrix] {key} ...", flush=True)
@@ -189,17 +238,38 @@ def main(argv):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
 
-    # Paired report + bootstrap CI (Part 16).
+    # Paired report + bootstrap CI (Part 16). Aider/repomix cells whose
+    # artifact could not be built (SKIPPED-UNINSTALLED / PIN-*) are
+    # excluded from the success-rate numerator and reported separately,
+    # so a missing external tool never masquerades as a 0% pass.
     ids = [t["id"] for t in tasks]
-    raw = [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in ids]
-    scc = [1.0 if results["cells"][f"scc-full/{i}"]["task_success"] else 0.0 for i in ids]
-    mean_diff, lo, hi = h.paired_bootstrap_ci(scc, raw)
+    def success_series(variant):
+        out = 0.0
+        n = 0
+        for i in ids:
+            cell = results["cells"].get(f"{variant}/{i}")
+            if cell is None or cell.get("error"):
+                continue
+            n += 1
+            out += 1.0 if cell.get("task_success") else 0.0
+        return (out / n) if n else None, n
+    raw_rate, raw_n = success_series("raw")
+    scc_rate, scc_n = success_series("scc-full")
+    aider_rate, aider_n = success_series("aider-repomap")
+    repomix_rate, repomix_n = success_series("repomix-compress")
+    skipped = {v: sum(1 for i in ids if results["cells"].get(f"{v}/{i}", {}).get("error"))
+               for v in variants}
+    mean_diff, lo, hi = h.paired_bootstrap_ci(
+        [1.0 if results["cells"][f"scc-full/{i}"]["task_success"] else 0.0 for i in ids],
+        [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in ids])
     summary = {
         "n_tasks": len(ids),
-        "raw_task_success": sum(raw) / len(raw) if raw else None,
-        "scc_full_task_success": sum(scc) / len(scc) if scc else None,
-        "raw_run_completion": (sum(1.0 for i in ids if results["cells"][f"raw/{i}"]["run_completion"]) / len(ids)),
-        "scc_run_completion": (sum(1.0 for i in ids if results["cells"][f"scc-full/{i}"]["run_completion"]) / len(ids)),
+        "variants": list(variants),
+        "raw_task_success": raw_rate,
+        "scc_full_task_success": scc_rate,
+        "aider_task_success": aider_rate,
+        "repomix_task_success": repomix_rate,
+        "skipped_cells": skipped,
         "paired_mean_diff_scc_minus_raw": mean_diff,
         "ci95": [lo, hi],
         "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
