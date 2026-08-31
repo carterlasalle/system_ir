@@ -78,7 +78,13 @@ jobs:
       - name: Install TraceLayer (pinned)
         run: uv tool install tracelayer==0.2.40
       - name: Trace policy gate
-        run: trace verify --changed
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v trace >/dev/null 2>&1; then
+            echo "TraceLayer CLI not on PATH after uv tool install" >&2
+            exit 1
+          fi
+          trace verify --changed
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test

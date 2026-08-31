@@ -134,6 +134,11 @@ def main() -> int:
             "checkpoint --inject": "checkpoint" in ts and "--inject" in ts,
             "SCC_BIN": "SCC_BIN" in ts,
             "index failure loud": "index --paths failed" in ts or "did not succeed" in ts,
+            "porcelain -z": "--porcelain=v1" in ts and "-z" in ts,
+            "rev-parse HEAD": "rev-parse" in ts and "HEAD" in ts,
+            "no Date.now snapshot id": "toolName}:${Date.now()" not in ts,
+            "startupOk": "startupOk" in ts,
+            "toolCallId required": "if (!id) return" in ts,
         }
         failed = [k for k, ok in checks.items() if not ok]
         if failed:
@@ -148,6 +153,19 @@ def main() -> int:
 
         if os.environ.get("SCC_OMP_TYPECHECK", "1") != "0":
             try_typecheck(repo / ".omp/extensions/scc")
+
+    gate = ROOT / ".omp/extensions/tracelayer/trace-gate.ts"
+    if gate.is_file():
+        g = gate.read_text()
+        if "timeout:" not in g or "HOOK_TIMEOUT_MS" not in g:
+            sys.stderr.write("trace-gate.ts must set spawnSync timeout\n")
+            return 1
+        if (
+            'reason: "trace hook returned empty output", block: true' not in g
+            or 'reason: "trace hook returned malformed JSON", block: true' not in g
+        ):
+            sys.stderr.write("trace-gate parseHook must fail closed (block: true)\n")
+            return 1
 
     print("omp smoke: setup discovery + generated extension contracts OK")
     return 0

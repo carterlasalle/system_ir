@@ -390,6 +390,13 @@ def estimate_shared_tokens(text):
     return max(1, len(text) // 4)
 
 
+def _budget_flag(budget):
+    """CLI --budget args, or empty so SCC native defaults apply."""
+    if budget is None:
+        return []
+    return ["--budget", str(int(budget))]
+
+
 def _scc_run(scc_bin, repo_root, args, env, timeout=900):
     return subprocess.run(
         [scc_bin, "--root", str(repo_root), *args],
@@ -409,58 +416,69 @@ def build_scc_variant_artifact(variant, repo_root, goal, workdir, scc_bin, budge
     env = {**os.environ, "SCC_STATE_DIR": str(Path(workdir) / ".scc-state")}
     if _scc_run(scc_bin, repo_root, ["index", "--quiet"], env).returncode != 0:
         return None, 0, "scc index failed"
-    budget = int(budget or DEFAULT_BUDGET)
-    budget_s = str(budget)
+    budget_args = _budget_flag(budget)
     if variant == "raw":
         return None, 0, None
     if variant == "scc-atlas":
-        proc = _scc_run(scc_bin, repo_root, ["atlas", "--budget", budget_s], env)
+        proc = _scc_run(scc_bin, repo_root, ["atlas", *budget_args], env)
         text = proc.stdout if proc.returncode == 0 else ""
     elif variant == "scc-surface":
-        proc = _scc_run(scc_bin, repo_root, ["surface", "--budget", budget_s], env)
+        proc = _scc_run(scc_bin, repo_root, ["surface", *budget_args], env)
         text = proc.stdout if proc.returncode == 0 else ""
     elif variant == "scc-atlas-surface":
-        proc = _scc_run(scc_bin, repo_root, ["context", "startup", "--budget", budget_s], env)
+        proc = _scc_run(scc_bin, repo_root, ["context", "startup", *budget_args], env)
         text = proc.stdout if proc.returncode == 0 else ""
     elif variant == "scc-full":
-        startup_budget = max(1, budget // 2)
-        startup = _scc_run(
-            scc_bin, repo_root, ["context", "startup", "--budget", str(startup_budget)], env
-        )
-        startup_text = startup.stdout if startup.returncode == 0 else ""
-        est_s = estimate_shared_tokens(startup_text)
-        remaining = max(0, budget - est_s)
-        task_budget = max(1, min(budget // 4, max(1, remaining // 2)))
-        task = _scc_run(
-            scc_bin, repo_root, ["context", "task", goal, "--budget", str(task_budget)], env
-        )
-        task_text = task.stdout if task.returncode == 0 else ""
-        est_t = estimate_shared_tokens(task_text)
-        structural_budget = max(0, budget - est_s - est_t)
-        structural_text = ""
-        if structural_budget > 0:
+        if budget is None:
+            startup = _scc_run(scc_bin, repo_root, ["context", "startup"], env)
+            startup_text = startup.stdout if startup.returncode == 0 else ""
+            task = _scc_run(scc_bin, repo_root, ["context", "task", goal], env)
+            task_text = task.stdout if task.returncode == 0 else ""
             st = _scc_run(
-                scc_bin, repo_root,
-                ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
-                env,
-            )
-            if st.returncode == 0:
-                structural_text = st.stdout
-        text = "\n\n".join(p for p in (startup_text, task_text, structural_text) if p and p.strip())
-        # Hard enforcement on the concatenated artifact: shrink structural.
-        while estimate_shared_tokens(text) > budget and structural_budget > 0:
-            over = estimate_shared_tokens(text) - budget + 1
-            structural_budget = max(0, structural_budget - over)
-            st = _scc_run(
-                scc_bin, repo_root,
-                ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
-                env,
+                scc_bin, repo_root, ["context", "structural", "--task", goal], env
             )
             structural_text = st.stdout if st.returncode == 0 else ""
+            text = "\n\n".join(
+                p for p in (startup_text, task_text, structural_text) if p and p.strip()
+            )
+        else:
+            budget = int(budget)
+            startup_budget = max(1, budget // 2)
+            startup = _scc_run(
+                scc_bin, repo_root, ["context", "startup", "--budget", str(startup_budget)], env
+            )
+            startup_text = startup.stdout if startup.returncode == 0 else ""
+            est_s = estimate_shared_tokens(startup_text)
+            remaining = max(0, budget - est_s)
+            task_budget = max(1, min(budget // 4, max(1, remaining // 2)))
+            task = _scc_run(
+                scc_bin, repo_root, ["context", "task", goal, "--budget", str(task_budget)], env
+            )
+            task_text = task.stdout if task.returncode == 0 else ""
+            est_t = estimate_shared_tokens(task_text)
+            structural_budget = max(0, budget - est_s - est_t)
+            structural_text = ""
+            if structural_budget > 0:
+                st = _scc_run(
+                    scc_bin, repo_root,
+                    ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
+                    env,
+                )
+                if st.returncode == 0:
+                    structural_text = st.stdout
             text = "\n\n".join(p for p in (startup_text, task_text, structural_text) if p and p.strip())
-        if estimate_shared_tokens(text) > budget:
-            # Last-resort byte cap so the declared budget is never exceeded.
-            text = text[: budget * 4]
+            while estimate_shared_tokens(text) > budget and structural_budget > 0:
+                over = estimate_shared_tokens(text) - budget + 1
+                structural_budget = max(0, structural_budget - over)
+                st = _scc_run(
+                    scc_bin, repo_root,
+                    ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
+                    env,
+                )
+                structural_text = st.stdout if st.returncode == 0 else ""
+                text = "\n\n".join(p for p in (startup_text, task_text, structural_text) if p and p.strip())
+            if estimate_shared_tokens(text) > budget:
+                text = text[: budget * 4]
     else:
         return None, 0, f"unsupported native variant {variant}"
     if not text or not str(text).strip():
@@ -798,54 +816,68 @@ def run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=Non
     """
     rows = []
     skipped = None
-    budget_or_default = budget if budget is not None else DEFAULT_BUDGET
+    adapter_budget = budget if budget is not None else DEFAULT_BUDGET
+    budget_label = "native" if budget is None else str(budget)
     for repo, repo_tasks in sorted(tasks.items()):
         results = []
         tokens = []
         for task in repo_tasks:
-            cell = Path(workdir) / "writable" / str(variant) / repo / task["id"]
+            cell = Path(workdir) / "writable" / str(variant) / budget_label / repo / task["id"]
+            if cell.exists():
+                shutil.rmtree(cell)
             cell.mkdir(parents=True, exist_ok=True)
             root = cell / "repo"
             copy_tree(FIXTURES / repo, root)
             artifact, tok, err = None, 0, None
             if variant in EXTERNAL_VARIANTS:
-                adapter = BENCHMARKS / "external" / (
-                    "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
-                art_dir = cell / "artifact"
-                art_dir.mkdir(parents=True, exist_ok=True)
-                argv = [bench_python(), str(adapter), str(root), str(budget_or_default), str(art_dir)]
-                if mode == "native-default":
-                    argv.append("--native")
-                if variant == "aider-repomap":
-                    argv += ["--goal", task["goal"]]
-                else:
-                    argv.append("--compress")
-                proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
                 try:
-                    payload = json.loads(proc.stdout or "{}")
-                except ValueError:
-                    payload = {"ok": False, "error": proc.stdout[:200]}
-                if proc.returncode == 2:
-                    return rows, {"status": "SKIPPED-UNINSTALLED", "error": payload.get("error", "")}
-                if proc.returncode == 3:
-                    return rows, {"status": "PIN-MISMATCH", "error": payload.get("error", "")}
-                if proc.returncode == 4:
-                    return rows, {"status": "PIN-UNVERIFIED", "error": payload.get("error", "")}
-                if not payload.get("ok"):
-                    err = payload.get("error", "adapter failed")
-                    results.append({"run_completion": False, "task_success": False,
-                                    "task_success_defined": True, "patch_produced": False,
-                                    "wall_sec": 0, "error": err})
+                    adapter = BENCHMARKS / "external" / (
+                        "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
+                    art_dir = cell / "artifact"
+                    art_dir.mkdir(parents=True, exist_ok=True)
+                    argv = [bench_python(), str(adapter), str(root), str(adapter_budget), str(art_dir)]
+                    if mode == "native-default":
+                        argv.append("--native")
+                    if variant == "aider-repomap":
+                        argv += ["--goal", task["goal"]]
+                    else:
+                        argv.append("--compress")
+                    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+                    try:
+                        payload = json.loads(proc.stdout or "{}")
+                    except ValueError:
+                        payload = {"ok": False, "error": proc.stdout[:200]}
+                    if proc.returncode == 2:
+                        return rows, {"status": "SKIPPED-UNINSTALLED", "error": payload.get("error", "")}
+                    if proc.returncode == 3:
+                        return rows, {"status": "PIN-MISMATCH", "error": payload.get("error", "")}
+                    if proc.returncode == 4:
+                        return rows, {"status": "PIN-UNVERIFIED", "error": payload.get("error", "")}
+                    if not payload.get("ok"):
+                        err = payload.get("error", "adapter failed")
+                        results.append({"run_completion": False, "task_success": None,
+                                        "task_success_defined": False, "patch_produced": False,
+                                        "wall_sec": 0, "error": err, "status": "ARTIFACT_FAILED"})
+                        tokens.append(0)
+                        continue
+                    artifact, tok = Path(payload["artifact"]), int(payload.get("tokens", 0))
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    results.append({"run_completion": False, "task_success": None,
+                                    "task_success_defined": False, "patch_produced": False,
+                                    "wall_sec": 0, "error": f"{type(exc).__name__}: {exc}",
+                                    "status": "ARTIFACT_FAILED"})
                     tokens.append(0)
                     continue
-                artifact, tok = Path(payload["artifact"]), int(payload.get("tokens", 0))
             elif variant != "raw":
-                artifact, tok, err = build_scc_variant_artifact(
-                    variant, root, task["goal"], cell, scc_bin or "scc", budget_or_default)
+                try:
+                    artifact, tok, err = build_scc_variant_artifact(
+                        variant, root, task["goal"], cell, scc_bin or "scc", budget)
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    artifact, tok, err = None, 0, f"{type(exc).__name__}: {exc}"
                 if err:
-                    results.append({"run_completion": False, "task_success": False,
-                                    "task_success_defined": True, "patch_produced": False,
-                                    "wall_sec": 0, "error": err})
+                    results.append({"run_completion": False, "task_success": None,
+                                    "task_success_defined": False, "patch_produced": False,
+                                    "wall_sec": 0, "error": err, "status": "ARTIFACT_FAILED"})
                     tokens.append(0)
                     continue
             results.append(
@@ -856,6 +888,7 @@ def run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=Non
             tokens.append(tok)
         n = max(len(results), 1)
         defined = [r for r in results if r.get("task_success_defined")]
+        infra = [r for r in results if r.get("error") and not r.get("task_success_defined")]
         row = {
             "variant": variant,
             "mode": mode,
@@ -870,6 +903,8 @@ def run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=Non
             "patch_rate": sum(1 for r in results if r.get("patch_produced")) / n,
             "mean_wall_sec": sum((r.get("wall_sec") or 0) for r in results) / n,
             "run_completion_rate": sum(1 for r in results if r.get("run_completion")) / n,
+            "error": "; ".join(r["error"] for r in infra if r.get("error")) or None,
+            "infra_failed": len(infra),
         }
         rows.append(row)
     return rows, skipped
@@ -938,6 +973,12 @@ def aggregate(rows):
     # macro: mean of per-repo rates (today's historical aggregate)
     repo_rates = [r["task_success_rate"] for r in rows if r.get("task_success_rate") is not None]
     rec["macro_repo_success"] = (sum(repo_rates) / len(repo_rates)) if repo_rates else None
+    rec["infra_failed"] = sum(r.get("infra_failed") or 0 for r in rows)
+    errors = [r.get("error") for r in rows if r.get("error")]
+    rec["error"] = "; ".join(errors) if errors else None
+    if rec["infra_failed"] or rec["error"]:
+        rec["valid"] = False
+        rec["invalid_reason"] = rec["error"] or "infrastructure failures in aggregate"
     return rec
 
 

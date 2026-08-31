@@ -295,6 +295,9 @@ pub(crate) fn truncate_to(content: &str, cap: usize) -> String {
     }
     const FOOTER: &str = "\n\n… [task hard cap: content truncated to fit budget]\n";
     let footer_tokens = scc_core::estimate_tokens(FOOTER);
+    if footer_tokens > cap {
+        return String::new();
+    }
     let target = cap.saturating_sub(footer_tokens);
     let mut lo = 0usize;
     let mut hi = content.len();
@@ -1484,6 +1487,18 @@ mod tests {
     fn truncate_to_returns_original_when_under_cap() {
         let content = "short\n";
         assert_eq!(truncate_to(content, 1000), content);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-commands.truncate-to-footer-exceeds-cap work=WORK-task-context-transport-parity verifies=REQ-complete-task-context-identical-across-transports,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient exercises=impl.crates-scc-cli-src-commands.truncate-to
+    fn truncate_to_returns_empty_when_footer_exceeds_cap() {
+        let content = "HEADER\nbody that does not fit\n";
+        let out = truncate_to(&content, 1);
+        assert!(
+            out.is_empty(),
+            "footer larger than the cap must not be returned: {out:?} tokens={}",
+            scc_core::estimate_tokens(&out)
+        );
     }
 
     #[test]
