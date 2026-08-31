@@ -39,6 +39,8 @@ jobs:
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
           cargo test --workspace
+      - name: Install TraceLayer
+        run: pip install tracelayer
       - name: Trace policy gate
         run: trace verify
       - name: Context benchmark gate
