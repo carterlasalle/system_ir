@@ -1493,7 +1493,7 @@ mod tests {
     // trace:v1 id=test.scc-cli-commands.truncate-to-footer-exceeds-cap work=WORK-task-context-transport-parity verifies=REQ-complete-task-context-identical-across-transports,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient exercises=impl.crates-scc-cli-src-commands.truncate-to
     fn truncate_to_returns_empty_when_footer_exceeds_cap() {
         let content = "HEADER\nbody that does not fit\n";
-        let out = truncate_to(&content, 1);
+        let out = truncate_to(content, 1);
         assert!(
             out.is_empty(),
             "footer larger than the cap must not be returned: {out:?} tokens={}",
