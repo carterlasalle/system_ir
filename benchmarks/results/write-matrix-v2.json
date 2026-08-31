@@ -3,7 +3,9 @@
     "agent": "codex",
     "mode": "writable",
     "budget": 8000,
-    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+    "note": "scoped real-agent matrix; NOT the full corpus showdown",
+    "valid": false,
+    "invalid_reason": "Invalid experiment: comment-gamable grep evaluators; Python scc-full missing Structural Source; not a single writable runner for raw\u00d7Aider\u00d7Repomix\u00d7SCC; pre-unification protocol."
   },
   "cells": {
     "raw/http-service.rename-transcript-field": {

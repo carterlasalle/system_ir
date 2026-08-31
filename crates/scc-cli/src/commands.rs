@@ -283,11 +283,13 @@ fn record_visible_ids(
 /// Truncate `content` so its estimated token count fits `cap`. Used as the
 /// LAST-RESORT trim step in [`build_task_context`] when dropping Hindsight,
 /// Beads, and the Surface delta still leaves the artifact over the caller's
-/// explicit hard cap (the pack builder only drops whole sections). Cuts at
-/// the first newline boundary at or after the cap so the result stays
-/// readable; returns the original if it already fits.
+/// explicit hard cap (the pack builder only drops whole sections). Prefers a
+/// line boundary that does NOT exceed the cap (backs off to the previous
+/// newline); extending forward to the next newline is only allowed when
+/// the result plus footer still fits. Returns the original if it already
+/// fits.
 // trace:v1 id=impl.crates-scc-cli-src-commands.truncate-to work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-fn truncate_to(content: &str, cap: usize) -> String {
+pub(crate) fn truncate_to(content: &str, cap: usize) -> String {
     if scc_core::estimate_tokens(content) <= cap {
         return content.to_string();
     }
@@ -305,18 +307,47 @@ fn truncate_to(content: &str, cap: usize) -> String {
         if scc_core::estimate_tokens(prefix) <= target {
             lo = mid;
         } else {
-            hi = mid - 1;
+            hi = mid.saturating_sub(1);
         }
     }
     let mut cut = content.floor_char_boundary(lo);
-    // Extend to the next newline so we never split mid-line.
+    // Back off to the previous newline so we never split mid-line AND
+    // never blow past the cap (extending FORWARD to the next newline can
+    // include a line that is far past the budget).
+    let min_chars = content[..cut].chars().count() / 2;
+    if let Some(nl) = content[..cut].rfind('\n') {
+        let prefix_chars = content[..nl].chars().count();
+        if prefix_chars >= min_chars {
+            cut = nl;
+        }
+    }
+    // Extending to the next newline is allowed only when the candidate
+    // still fits the hard cap after the footer is appended.
     if let Some(rest) = content.get(cut..) {
         if let Some(nl) = rest.find('\n') {
-            cut += nl;
+            let extended = cut + nl;
+            let mut candidate = content[..extended].to_string();
+            candidate.push_str(FOOTER);
+            if scc_core::estimate_tokens(&candidate) <= cap {
+                cut = extended;
+            }
         }
     }
     let mut out = content[..cut].to_string();
     out.push_str(FOOTER);
+    // Final belt: if still over (footer + tiny prefix), shrink without
+    // requiring a newline.
+    while scc_core::estimate_tokens(&out) > cap && cut > 0 {
+        cut = content.floor_char_boundary(cut.saturating_sub(1));
+        if let Some(nl) = content[..cut].rfind('\n') {
+            cut = nl;
+        }
+        out = content[..cut].to_string();
+        out.push_str(FOOTER);
+        if cut == 0 {
+            break;
+        }
+    }
     out
 }
 
@@ -1419,6 +1450,41 @@ pub fn cmd_runtime_reconcile(root: &Path, json: bool) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // trace:v1 id=test.scc-cli-commands.truncate-to-hard-cap work=WORK-task-context-transport-parity verifies=REQ-complete-task-context-identical-across-transports,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient exercises=impl.crates-scc-cli-src-commands.truncate-to
+    fn truncate_to_never_exceeds_hard_cap_when_next_newline_is_far_past() {
+        // Binary search finds a fitting prefix, then the old implementation
+        // extended FORWARD to the next newline (`cut += nl`), which blew
+        // past the cap when that newline was far away. A true hard cap
+        // must back off (or re-check after extending).
+        let mut body = String::from("HEADER\n");
+        body.push_str(&"x".repeat(400)); // ~100 tokens before the next newline
+        body.push('\n');
+        body.push_str("TAIL\n");
+        let cap = 40; // far below the long line
+        let out = truncate_to(&body, cap);
+        let tokens = scc_core::estimate_tokens(&out);
+        assert!(
+            tokens <= cap,
+            "truncate_to must honor the hard cap: {tokens} > {cap}\n{out:?}"
+        );
+        assert!(
+            out.contains("task hard cap"),
+            "footer must be present: {out}"
+        );
+        assert!(
+            !out.contains(&"x".repeat(400)),
+            "must not include the line that sits far past the cap"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-commands.truncate-to-fits-already work=WORK-task-context-transport-parity verifies=REQ-complete-task-context-identical-across-transports
+    fn truncate_to_returns_original_when_under_cap() {
+        let content = "short\n";
+        assert_eq!(truncate_to(content, 1000), content);
+    }
 
     #[test]
 // trace:v1 id=impl.crates-scc-cli-src-commands.lessons-add-appends-jsonl-lines work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching

@@ -3,7 +3,9 @@
     "agent": "codex",
     "mode": "writable",
     "budget": 8000,
-    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+    "note": "scoped real-agent matrix; NOT the full corpus showdown",
+    "valid": false,
+    "invalid_reason": "Invalid experiment: comment-gamable grep evaluators; Python scc-full missing Structural Source; no hard cap on the concatenated scc-full artifact; indexed the original fixture tree; native and external variants did not share one writable runner."
   },
   "cells": {
     "raw/http-service.rename-transcript-field": {

@@ -128,7 +128,7 @@ fn tools() -> Vec<Tool> {
             description: "Session-startup artifact: the System Atlas fused with the System Surface Map (the actual callable API layer), model coverage and honest omissions in one deterministic pack. The primary agent startup tool.",
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {"token_budget": {"type": "integer", "description": "Optional token budget (default 20000; atlas:surface split kept at 13:7)"}}
+                "properties": {"token_budget": {"type": "integer", "description": "Optional token budget. Default is the production adaptive startup total; the atlas:surface split is chosen from repository complexity."}}
             }),
         },
         Tool {

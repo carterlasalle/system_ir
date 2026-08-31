@@ -28,7 +28,8 @@
           "type": "symbol",
           "name": "NonexistentParser"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" http-service.rename-transcript-field"
     },
     {
       "id": "http-service.transcript-normalization",
@@ -56,7 +57,8 @@
           "type": "symbol",
           "name": "TranscriptStore"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" http-service.transcript-normalization"
     },
     {
       "id": "http-service.health-check",
@@ -81,7 +83,8 @@
           "type": "symbol",
           "name": "HealthMonitor"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" http-service.health-check"
     },
     {
       "id": "queue-worker.asr-retry",
@@ -105,7 +108,8 @@
           "type": "symbol",
           "name": "Retryer"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" queue-worker.asr-retry"
     },
     {
       "id": "queue-worker.street-vocabulary",
@@ -133,7 +137,8 @@
           "type": "symbol",
           "name": "StreetResolver"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" queue-worker.street-vocabulary"
     },
     {
       "id": "queue-worker.redis-persist",
@@ -160,7 +165,8 @@
           "type": "symbol",
           "name": "TranscriptCache"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" queue-worker.redis-persist"
     },
     {
       "id": "monorepo.rename-transcript-field",
@@ -193,7 +199,8 @@
           "type": "symbol",
           "name": "normalizeField"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" monorepo.rename-transcript-field"
     },
     {
       "id": "monorepo.worker-indexing",
@@ -222,7 +229,8 @@
           "type": "symbol",
           "name": "WorkerPool"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" monorepo.worker-indexing"
     },
     {
       "id": "monorepo.new-field",
@@ -249,7 +257,8 @@
           "type": "symbol",
           "name": "TranscriptField"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" monorepo.new-field"
     },
     {
       "id": "py-queue.classification-fallback",
@@ -276,7 +285,8 @@
           "type": "symbol",
           "name": "ClassifierClient"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" py-queue.classification-fallback"
     },
     {
       "id": "py-queue.store-changes",
@@ -304,7 +314,8 @@
           "type": "symbol",
           "name": "IncidentCache"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" py-queue.store-changes"
     },
     {
       "id": "py-queue.empty-messages",
@@ -328,7 +339,8 @@
           "type": "symbol",
           "name": "NullMessage"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" py-queue.empty-messages"
     },
     {
       "id": "ts-api-web.pagination",
@@ -355,7 +367,8 @@
           "type": "symbol",
           "name": "UserPager"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" ts-api-web.pagination"
     },
     {
       "id": "ts-api-web.contract-field",
@@ -384,7 +397,8 @@
           "type": "symbol",
           "name": "UserViewModel"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" ts-api-web.contract-field"
     },
     {
       "id": "ts-api-web.creation-test",
@@ -411,7 +425,8 @@
           "type": "symbol",
           "name": "CreateUserTest"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" ts-api-web.creation-test"
     },
     {
       "id": "large-ts.new-order-endpoint",
@@ -445,7 +460,8 @@
           "type": "symbol",
           "name": "OrderPager"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" large-ts.new-order-endpoint"
     },
     {
       "id": "large-ts.order-total-invariant",
@@ -472,7 +488,8 @@
           "type": "symbol",
           "name": "TotalValidator"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" large-ts.order-total-invariant"
     },
     {
       "id": "nextjs.transcript-response",
@@ -505,7 +522,8 @@
           "type": "symbol",
           "name": "TranscriptApi"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" nextjs.transcript-response"
     },
     {
       "id": "nextjs.store-pagination",
@@ -530,7 +548,8 @@
           "type": "symbol",
           "name": "TranscriptPager"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" nextjs.store-pagination"
     },
     {
       "id": "polyglot.refund-endpoint",
@@ -559,7 +578,8 @@
           "type": "symbol",
           "name": "RefundService"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" polyglot.refund-endpoint"
     },
     {
       "id": "polyglot.web-payments",
@@ -586,7 +606,8 @@
           "type": "symbol",
           "name": "PaymentWidget"
         }
-      ]
+      ],
+      "validate": "python3 \"$SCC_EVALUATORS/run.py\" polyglot.web-payments"
     }
   ]
 }

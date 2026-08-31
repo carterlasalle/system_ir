@@ -7,29 +7,36 @@ description: Use the System Context Compiler (SCC) to get evidence-backed system
 
 This repository is indexed by the System Context Compiler. On-demand workflow
 guidance for manual semantic drill-down. The lifecycle automation (startup
-capsule, task context, post-edit refresh) is handled automatically by the
-native OMP extension — this skill is for when you want more depth.
+capsule, task context, post-edit refresh, compaction rehydration) is handled
+automatically by the native OMP extension — this skill is for when you want
+more depth.
 
 ## When to call which tool
 
 | Situation | Tool |
 |---|---|
-| Start of a substantial task in an unfamiliar repository | `system_overview` |
+| Start of a substantial task in an unfamiliar repository | `system_context` (fused Atlas + Surface + coverage + omissions; adaptive budget) |
+| The callable API layer for a goal, or globally | `surface_map` (optional `goal`) |
+| Exact declaration headers / per-symbol evidence for files or a goal | `structural_source` |
 | Any repository-changing task, before planning or editing | `task_context` with the goal |
 | Deep dive into one component | `component_context` |
 | Understanding a runtime path end to end | `flow_context` |
 | Cross-layer change (API contract, schema, shared code) | `impact_context` on the touched files |
 | Model may be stale, or before declaring completion | `verify_context` |
 
+`system_overview` and `system_atlas` remain available; prefer `system_context`
+for session startup.
+
 ## Workflow
 
-1. `task_context` with your goal → read the relevant components, flows,
+1. `system_context` at session start (or trust the native extension's injection).
+2. `task_context` with your goal → read the relevant components, flows,
    ownership, contracts, invariants, failure behavior, and tests.
-2. Use the implementation symbols and test names it lists to open exactly
-   the right files.
-3. For cross-layer changes, call `impact_context` on the files you will
+3. Use `surface_map` / `structural_source` when you need the callable layer
+   or exact source headers for the files the task will touch.
+4. For cross-layer changes, call `impact_context` on the files you will
    touch and honor the invariants and downstream consumers it reports.
-4. If the model might be stale (files changed on disk), call
+5. If the model might be stale (files changed on disk), call
    `verify_context` and re-index with `scc index` if it reports staleness.
 
 ## Trust rules

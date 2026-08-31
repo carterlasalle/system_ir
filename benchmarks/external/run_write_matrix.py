@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Scoped REAL writable coding-agent matrix (Part 14 first slice).
+"""Scoped REAL writable coding-agent matrix.
 
-Runs actual coding agents (codex by default) on real corpus tasks in the
-WRITABLE mode: each task gets an isolated disposable repo copy; the agent
-may edit; success is decided by an EVALUATOR (behavioral acceptance
-checks), never by the agent exit code.
+Runs actual coding agents on real corpus tasks in WRITABLE mode: each
+task gets an isolated disposable repo copy; the agent may edit; success
+is decided by a behavioral EVALUATOR (benchmarks/evaluators/run.py),
+never by the agent exit code and never by a comment-gamable grep.
 
-Variants compared (equal-token at DEFAULT_BUDGET):
-  raw      — no context artifact (the agent explores on its own)
-  scc-full — the complete SCC task context artifact (pack + surface delta)
+Variants compared at the shared BUDGET (default 8000, chars/4):
+  raw              — no context artifact
+  aider-repomap    — pinned aider RepoMap
+  repomix-compress  — pinned repomix --compress
+  scc-atlas        — Atlas-only
+  scc-surface      — Surface-only
+  scc-full         — startup + task + Structural Source (`scc context
+                      structural --task`), budget enforced on the FINAL
+                      concatenation. Indexed against the disposable copy.
 
-Metrics per (variant, task): run_completion (process), task_success
-(evaluator), context_tokens, wall time. Paired per task; the report
-includes a paired bootstrap 95% CI for the task-success difference.
+ALL variants go through the same writable runner (`run_write_task`).
 
-HONESTY: this is a SCOPED matrix (subset of the corpus, one agent). It is
-NOT the full 21-task dual-agent showdown and must not be described as one.
+HONESTY: this is a SCOPED matrix unless `--corpus` is passed. Live Codex /
+Claude numbers are NOT checked in; run the documented command with credentials.
 """
 
 import importlib.util
@@ -24,7 +28,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,176 +35,136 @@ spec = importlib.util.spec_from_file_location("rcb", HERE / "run_context_bench.p
 h = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(h)
 
-# Writable codex: edits allowed (the harness owns isolation). NOT the
-# read-only sandbox used by the localization benchmark.
 WRITABLE_AGENT_CMD = (
     "codex exec --json --sandbox workspace-write --skip-git-repo-check "
     "--ephemeral --color never -C . -"
 )
 
-# The scoped corpus: 6 tasks across 4 archetypes. `validate` is the
-# behavioral acceptance check the EVALUATOR runs in the edited repo —
-# task success is this command exiting 0, nothing else.
-#
-# EVALUATOR VALIDITY CONTRACT (audit fix): every validator was checked
-# against the UNTOUCHED fixture — it MUST exit non-zero there (a validator
-# that passes on the untouched repo measures nothing). Each validator
-# asserts the specific behavioral change the goal names, against the
-# fixture's REAL layout (main.py + services/, src/, web/+service/,
-# consumer.py — no invented directories).
+EVALUATOR = 'python3 "$SCC_EVALUATORS/run.py"'
+
+# The scoped corpus: 6 tasks across 4 archetypes. Success is the
+# behavioral evaluator (run.py) exiting 0 — never a grep.
 SCOPED_TASKS = [
     {"repo": "http-service-python", "id": "http-service.rename-transcript-field",
      "goal": "rename the transcript field in the api response",
-     # The API response dict must expose transcriptText and no longer
-     # expose the old transcript key in the route handler's returned dicts.
-     "validate": "! grep -qE '\"transcript\"' main.py && grep -qE 'transcriptText|transcript_text' main.py"},
+     "validate": f'{EVALUATOR} http-service.rename-transcript-field'},
     {"repo": "queue-worker-ts", "id": "queue-worker.asr-retry",
      "goal": "add retry handling to the asr transcription call",
-     # The ASR CALL PATH (src/ingest.ts or a new call site) must gain
-     # retry logic — the decorator on client.ts already exists, so a bare
-     # grep for 'retry' anywhere is a false pass.
-     "validate": "grep -qE 'retry|attempt' src/ingest.ts"},
+     "validate": f'{EVALUATOR} queue-worker.asr-retry'},
     {"repo": "ts-api-web", "id": "ts-api-web.pagination",
      "goal": "add pagination to the users list endpoint",
-     # The users service/endpoint gains page/pageSize params (fixture has
-     # no src/; the users code lives in service/users.ts + server.ts).
-     "validate": "grep -qiE 'page' service/users.ts server.ts"},
+     "validate": f'{EVALUATOR} ts-api-web.pagination'},
     {"repo": "py-queue-service", "id": "py-queue.empty-messages",
      "goal": "make the consumer tolerate empty messages",
-     # consume() must guard empty/blank messages before dispatch.
-     "validate": "grep -qE 'not message|if.*message.*:|strip()' consumer.py && grep -q 'def consume' consumer.py && grep -qE 'if not (message|message.get)' consumer.py"},
+     "validate": f'{EVALUATOR} py-queue.empty-messages'},
     {"repo": "http-service-python", "id": "http-service.health-check",
      "goal": "add a health check endpoint",
-     # A NEW health route: the fixture already HAS /health, so the agent
-     # must extend it to a real readiness payload (status+ok) — a no-op
-     # cannot pass because the validator demands the payload keys.
-     "validate": "grep -qE 'uptime|checks|dependencies' main.py && grep -q '/health' main.py"},
+     "validate": f'{EVALUATOR} http-service.health-check'},
     {"repo": "queue-worker-ts", "id": "queue-worker.street-vocabulary",
      "goal": "change street name resolution to use department vocabulary",
-     # The resolver must APPLY the vocabulary map in its resolution path —
-     # a vocabulary map must exist AND be applied (includes/replace).
-     "validate": "grep -qE 'Map<|DEPARTMENT_VOCAB' src/geo/resolver.ts && grep -qE 'includes|replace' src/geo/resolver.ts"},
+     "validate": f'{EVALUATOR} queue-worker.street-vocabulary'},
 ]
 
 BUDGET = h.DEFAULT_BUDGET
+WRITABLE_VARIANTS = ("raw", "aider-repomap", "repomix-compress", "scc-atlas", "scc-surface", "scc-full")
 
 
-def scc_artifact(repo, goal, workdir, scc_bin):
-    """Build the FULL SCC stack artifact for (repo, goal): the fused
-    startup (Atlas + global Surface + coverage + omissions) followed by
-    the complete task artifact (enriched pack + task-personalized Surface
-    delta). The fixture is INDEXED FIRST into a disposable .scc dir — the
-    checked-in fixtures carry no index, so skipping this yields a framing-
-    only artifact with no repository knowledge. This is what "scc-full"
-    means in the external benchmark; the task pack alone is NOT full SCC."""
-    fixture = h.FIXTURES / repo
-    env = {**os.environ, "SCC_STATE_DIR": str(Path(workdir) / ".scc-state")}
-    def scc(*args):
-        return subprocess.run([scc_bin, "--root", str(fixture), *args],
-                              capture_output=True, text=True, timeout=900, env=env)
-    if scc("index").returncode != 0:
-        return None, 0
-    parts = []
-    startup = scc("context", "startup")
-    if startup.returncode == 0 and startup.stdout.strip():
-        parts.append(startup.stdout.rstrip() + "\n\n")
-    task = scc("context", "task", goal, "--json")
-    if task.returncode == 0:
-        try:
-            art = json.loads(task.stdout)
-            parts.append(art["pack"]["content"])
-            if art.get("delta"):
-                parts.append("\n" + art["delta"])
-        except (ValueError, KeyError):
-            parts.append(task.stdout)
-    elif task.stdout.strip():
-        parts.append(task.stdout)
-    text = "".join(parts)
-    if not text.strip():
-        return None, 0
-    out = Path(workdir) / "scc-full.txt"
-    out.write_text(text)
-    # The shared chars/4 estimator (same rule as the adapters).
-    return out, max(1, len(text) // 4)
-
-
-EXTERNAL_VARIANTS = ("aider-repomap", "repomix-compress")
-
-
-def task_slug(goal):
-    import re
-    return re.sub(r"[^A-Za-z0-9._-]", "_", goal)[:40] or "task"
-
-
-def external_artifact(variant, repo, goal, workdir, budget):
-    """Build the pinned aider/repomix artifact for (repo, goal) via the
-    shared adapters, returning (artifact_path, tokens, error). A missing
-    or unpinned tool yields error (SKIPPED-UNINSTALLED / PIN-MISMATCH /
-    PIN-UNVERIFIED) and a None artifact — the cell is reported, never
-    silently treated as a pass."""
-    adapter = h.BENCHMARKS / "external" / (
-        "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
-    # Aider personalizes per goal (immutable per-task dir); repomix is
-    # task-invariant but regenerating per cell is harmless and keeps the
-    # cell self-contained.
-    art_dir = Path(workdir) / "artifacts" / variant / task_slug(goal)
-    art_dir.mkdir(parents=True, exist_ok=True)
-    argv = [h.bench_python(), str(adapter), str(h.FIXTURES / repo), str(budget), str(art_dir)]
-    if variant == "aider-repomap":
-        argv += ["--goal", goal]
-    else:
-        argv.append("--compress")
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+def git_rev(path):
     try:
-        payload = json.loads(proc.stdout or "{}")
-    except ValueError:
-        return None, 0, f"adapter output not JSON: {proc.stdout[:200]}"
-    if proc.returncode == 2:
-        return None, 0, "SKIPPED-UNINSTALLED"
-    if proc.returncode == 3:
-        return None, 0, "PIN-MISMATCH"
-    if proc.returncode == 4:
-        return None, 0, "PIN-UNVERIFIED"
-    if not payload.get("ok"):
-        return None, 0, payload.get("error", "adapter failed")
-    return Path(payload["artifact"]), int(payload.get("tokens", 0)), None
+        r = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def infer_agent_name(agent_cmd):
+    c = (agent_cmd or "").lower()
+    if "claude" in c:
+        return "claude"
+    if "codex" in c:
+        return "codex"
+    tok = (agent_cmd or "unknown").split()[0]
+    return Path(tok).name or "unknown"
+
+
+def probe_agent_version(agent_cmd):
+    exe = (agent_cmd or "").split()[0]
+    if not exe:
+        return None
+    for flag in ("--version", "-V"):
+        try:
+            r = subprocess.run([exe, flag], capture_output=True, text=True, timeout=15)
+            out = (r.stdout or r.stderr).strip().splitlines()
+            if r.returncode == 0 and out:
+                return out[0][:200]
+        except Exception:
+            continue
+    return None
+
+
+def collect_meta(agent_cmd, scc_bin, extra=None):
+    meta = {
+        "agent": infer_agent_name(agent_cmd),
+        "agent_cmd": agent_cmd,
+        "model": os.environ.get("SCC_BENCH_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("ANTHROPIC_MODEL"),
+        "agent_version": probe_agent_version(agent_cmd),
+        "scc_bin": scc_bin,
+        "scc_revision": git_rev(h.ROOT),
+        "harness_revision": git_rev(h.ROOT),
+        "mode": "writable",
+        "budget": BUDGET,
+        "note": "scoped real-agent matrix unless --corpus; NOT fabricated scores",
+        "live_command": (
+            "python3 benchmarks/external/run_write_matrix.py "
+            "--agent-cmd '<codex|claude writable cmd>' --scc-bin ./target/release/scc "
+            "--out benchmarks/results/write-matrix-live.json"
+        ),
+    }
+    if extra:
+        meta.update(extra)
+    return meta
 
 
 def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
-    """One (variant, task) cell: isolated copy -> agent -> evaluator."""
+    """One (variant, task) cell through the SAME writable runner.
+
+    Isolation, artifact construction (including scc-full Structural
+    Source against the disposable copy), and the evaluator all live in
+    `run_writable_variant` / `run_write_task`. Native and external variants
+    must not take different runners.
+    """
     cell_dir = Path(workdir) / f"{variant}--{task['id']}"
     cell_dir.mkdir(parents=True, exist_ok=True)
-    root = cell_dir / "repo"
-    h.copy_tree(h.FIXTURES / task["repo"], root)
-
-    artifact = None
-    ctx_tokens = 0
-    if variant == "scc-full":
-        artifact, ctx_tokens = scc_artifact(task["repo"], task["goal"], cell_dir, scc_bin)
-        if artifact is None:
-            return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0, "error": "scc artifact failed"}
-    elif variant in EXTERNAL_VARIANTS:
-        artifact, ctx_tokens, err = external_artifact(
-            variant, task["repo"], task["goal"], cell_dir, BUDGET)
-        if artifact is None:
-            return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0, "error": err}
-
-    started = time.monotonic()
-    result = h.run_write_task(
-        agent_cmd, root, task["goal"], validate_cmd=task["validate"],
-        artifact_path=artifact,
-    )
-    wall = round(time.monotonic() - started, 1)
+    grouped = {task["repo"]: [task]}
+    rows, skipped = h.run_writable_variant(
+        variant, grouped, BUDGET, agent_cmd, cell_dir, scc_bin=scc_bin)
+    if skipped:
+        return {"task_success": False, "run_completion": False,
+                "context_tokens": 0, "wall_sec": 0.0, "error": skipped.get("error")}
+    row = rows[0] if rows else {}
     return {
-        "task_success": result["task_success"],
-        "run_completion": result["run_completion"],
-        "context_tokens": ctx_tokens,
-        "patch_produced": result["patch_produced"],
-        "modified_files": len(result["modified_files"]),
-        "wall_sec": wall,
+        "task_success": bool(row.get("tasks_passed")),
+        "run_completion": bool(row.get("run_completion_rate")),
+        "context_tokens": row.get("context_tokens", 0),
+        "patch_produced": bool(row.get("patch_rate")),
+        "modified_files": None,
+        "wall_sec": row.get("mean_wall_sec", 0),
+        "error": row.get("error"),
     }
+
+
+def paired_or_none(a, b):
+    if len(a) != len(b) or not a:
+        return None
+    mean, lo, hi = h.paired_bootstrap_ci(a, b)
+    return {"mean_diff": mean, "ci95": [lo, hi],
+            "note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
+                     else "CI excludes zero (scoped subset only)")}
 
 
 def main(argv):
@@ -212,68 +175,112 @@ def main(argv):
                         help="writable agent command (default: codex workspace-write)")
     parser.add_argument("--out", default=str(HERE.parent / "results" / "write-matrix.json"))
     parser.add_argument("--tasks", help="comma-separated task ids (default: the scoped 6)")
+    parser.add_argument("--corpus", action="store_true",
+                        help="use the full evaluator-backed benchmarks/tasks.json corpus")
+    parser.add_argument("--variants", default=",".join(WRITABLE_VARIANTS),
+                        help="comma-separated variants")
+    parser.add_argument("--skip-live", action="store_true",
+                        help="do not invoke the agent; emit a skipped live-matrix stub")
     args = parser.parse_args(argv)
 
-    tasks = SCOPED_TASKS
-    if args.tasks:
-        wanted = set(args.tasks.split(","))
-        tasks = [t for t in SCOPED_TASKS if t["id"] in wanted]
+    agent_cmd = args.agent_cmd or WRITABLE_AGENT_CMD
+    variants = tuple(v.strip() for v in args.variants.split(",") if v.strip())
+
+    if args.corpus:
+        loaded = h.load_tasks()
+        tasks = []
+        for repo, repo_tasks in loaded.items():
+            for t in repo_tasks:
+                if t.get("validate"):
+                    tasks.append({"repo": repo, **t})
+    else:
+        tasks = SCOPED_TASKS
+        if args.tasks:
+            wanted = set(args.tasks.split(","))
+            tasks = [t for t in SCOPED_TASKS if t["id"] in wanted]
+
+    results = {
+        "meta": collect_meta(agent_cmd, args.scc_bin),
+        "cells": {},
+    }
+
+    if args.skip_live:
+        results["meta"]["skipped"] = True
+        results["meta"]["valid"] = False
+        results["meta"]["invalid_reason"] = "live agent matrix skipped (no credentials / --skip-live)"
+        results["summary"] = {"skipped": True, "n_tasks": len(tasks), "variants": list(variants)}
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2))
+        print(json.dumps(results["summary"], indent=2))
+        return 0
+
     workdir = Path(tempfile.mkdtemp(prefix="scc-write-matrix-"))
-    results = {"meta": {"agent": "codex", "mode": "writable", "budget": BUDGET,
-                        "note": "scoped real-agent matrix; NOT the full corpus showdown"},
-               "cells": {}}
-    variants = ("raw", "scc-full", "aider-repomap", "repomix-compress")
     try:
         for variant in variants:
             for task in tasks:
                 key = f"{variant}/{task['id']}"
                 print(f"[matrix] {key} ...", flush=True)
-                cell = run_variant(variant, task, workdir, args.scc_bin,
-                                   agent_cmd=args.agent_cmd or WRITABLE_AGENT_CMD)
+                cell = run_variant(variant, task, workdir, args.scc_bin, agent_cmd=agent_cmd)
                 results["cells"][key] = cell
-                print(f"          success={cell['task_success']} "
-                      f"completion={cell['run_completion']} wall={cell['wall_sec']}s", flush=True)
+                print(f"          success={cell.get('task_success')} "
+                      f"completion={cell.get('run_completion')} wall={cell.get('wall_sec')}s",
+                      flush=True)
     finally:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
 
-    # Paired report + bootstrap CI (Part 16). Aider/repomix cells whose
-    # artifact could not be built (SKIPPED-UNINSTALLED / PIN-*) are
-    # excluded from the success-rate numerator and reported separately,
-    # so a missing external tool never masquerades as a 0% pass.
     ids = [t["id"] for t in tasks]
-    def success_series(variant):
-        out = 0.0
+
+    def series(variant):
+        vals = []
         n = 0
         for i in ids:
             cell = results["cells"].get(f"{variant}/{i}")
             if cell is None or cell.get("error"):
                 continue
             n += 1
-            out += 1.0 if cell.get("task_success") else 0.0
-        return (out / n) if n else None, n
-    raw_rate, raw_n = success_series("raw")
-    scc_rate, scc_n = success_series("scc-full")
-    aider_rate, aider_n = success_series("aider-repomap")
-    repomix_rate, repomix_n = success_series("repomix-compress")
+            vals.append(1.0 if cell.get("task_success") else 0.0)
+        rate = (sum(vals) / n) if n else None
+        return rate, n, vals
+
+    rates = {v: series(v) for v in variants}
     skipped = {v: sum(1 for i in ids if results["cells"].get(f"{v}/{i}", {}).get("error"))
                for v in variants}
-    mean_diff, lo, hi = h.paired_bootstrap_ci(
-        [1.0 if results["cells"][f"scc-full/{i}"]["task_success"] else 0.0 for i in ids],
-        [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in ids])
+
+    scc_vals = rates.get("scc-full", (None, 0, []))[2]
+    raw_vals = rates.get("raw", (None, 0, []))[2]
+    aider_vals = rates.get("aider-repomap", (None, 0, []))[2]
+    repomix_vals = rates.get("repomix-compress", (None, 0, []))[2]
+
+    # micro = per-task; macro = per-repo mean
+    by_repo = {}
+    for t in tasks:
+        by_repo.setdefault(t["repo"], []).append(t["id"])
+
+    def macro(variant):
+        repo_rates = []
+        for repo, task_ids in by_repo.items():
+            vals = []
+            for i in task_ids:
+                cell = results["cells"].get(f"{variant}/{i}")
+                if cell is None or cell.get("error"):
+                    continue
+                vals.append(1.0 if cell.get("task_success") else 0.0)
+            if vals:
+                repo_rates.append(sum(vals) / len(vals))
+        return (sum(repo_rates) / len(repo_rates)) if repo_rates else None
+
     summary = {
         "n_tasks": len(ids),
         "variants": list(variants),
-        "raw_task_success": raw_rate,
-        "scc_full_task_success": scc_rate,
-        "aider_task_success": aider_rate,
-        "repomix_task_success": repomix_rate,
+        "micro_task_success": {v: rates[v][0] for v in variants},
+        "macro_repo_success": {v: macro(v) for v in variants},
         "skipped_cells": skipped,
-        "paired_mean_diff_scc_minus_raw": mean_diff,
-        "ci95": [lo, hi],
-        "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
-                    else "CI excludes zero (scoped subset only)"),
+        "paired_ci_scc_minus_raw": paired_or_none(scc_vals, raw_vals),
+        "paired_ci_scc_minus_aider": paired_or_none(scc_vals, aider_vals),
+        "paired_ci_scc_minus_repomix": paired_or_none(scc_vals, repomix_vals),
     }
     results["summary"] = summary
     Path(args.out).write_text(json.dumps(results, indent=2))
