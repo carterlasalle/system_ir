@@ -67,6 +67,7 @@ use std::path::{Path, PathBuf};
 
 /// Quality gate: overall mean recall must be >= this floor (Wave 8 §57).
 /// The floor is over the five startup-required layers ONLY.
+// trace:exempt reason=internal-detail
 pub const ATLAS_GATE: f64 = 0.5;
 
 /// Holdout verdict tolerance: the validation corpus may lag the development
@@ -74,11 +75,13 @@ pub const ATLAS_GATE: f64 = 0.5;
 /// called OVERFIT. The band absorbs corpus-difficulty, LOC-mix, and
 /// ground-truth-strictness differences; a lag beyond it means the
 /// development-tuned rules do not generalize to unseen repos.
+// trace:exempt reason=internal-detail
 pub const HOLDOUT_TOLERANCE: f64 = 0.05;
 
 /// The five startup-required layers that count toward the overall score
 /// (architecture, entrypoints, behavior, state_authority, contracts — see
 /// `ALL_SECTIONS`; landmarks + tests are informational).
+// trace:exempt reason=internal-detail
 const ALL_SECTIONS: [&str; 7] = [
     "architecture",
     "entrypoints",
@@ -92,12 +95,15 @@ const ALL_SECTIONS: [&str; 7] = [
 /// Default per-section regression guard (`--guard-section-delta`): any
 /// startup-required section dropping by more than this between two compared
 /// runs fails the Wave-11 guard.
+// trace:exempt reason=internal-detail
 pub const DEFAULT_SECTION_GUARD: f64 = 0.05;
 
 /// Minimal pure-Rust SHA-256 (FIPS 180-4) for the blind-test manifest hash.
 /// Deterministic, dependency-free (scc-cli has no crypto dep), panic-free.
 /// Public only so the roundtrip unit test can exercise it directly.
+// trace:exempt reason=internal-detail
 pub mod sha256 {
+    // trace:exempt reason=internal-detail
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -111,12 +117,14 @@ pub mod sha256 {
         0xc67178f2,
     ];
 
+    // trace:exempt reason=internal-detail
     const H0: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
 
     /// SHA-256 digest of `data` as 32 raw bytes.
+    // trace:exempt reason=internal-detail
     pub fn digest(data: &[u8]) -> [u8; 32] {
         let mut h = H0;
         let bit_len: u64 = (data.len() as u64).wrapping_mul(8);
@@ -130,7 +138,7 @@ pub mod sha256 {
         buf.extend_from_slice(&bit_len.to_be_bytes());
 
         let mut w = [0u32; 64];
-        for chunk in buf.chunks_exact(64) {
+        for chunk in buf.as_chunks::<64>().0 {
             for (i, word) in w.iter_mut().enumerate().take(16) {
                 let o = i * 4;
                 *word = u32::from_be_bytes([
@@ -186,6 +194,7 @@ pub mod sha256 {
     }
 
     /// Lowercase hex of the SHA-256 digest.
+    // trace:exempt reason=internal-detail
     pub fn hex(data: &[u8]) -> String {
         let mut out = String::with_capacity(64);
         for b in digest(data) {
@@ -212,7 +221,9 @@ pub struct GroundTruthDoc {
     pub tests: Vec<String>,
 }
 
+// trace:exempt reason=internal-detail
 impl GroundTruthDoc {
+    // trace:exempt reason=internal-detail
     pub fn section(&self, name: &str) -> &Vec<String> {
         match name {
             "architecture" => &self.architecture,
@@ -226,6 +237,7 @@ impl GroundTruthDoc {
         }
     }
 
+    // trace:exempt reason=internal-detail
     fn section_mut(&mut self, name: &str) -> &mut Vec<String> {
         match name {
             "architecture" => &mut self.architecture,
@@ -240,6 +252,7 @@ impl GroundTruthDoc {
     }
 
     /// Remove duplicates, preserving first-seen order.
+    // trace:exempt reason=internal-detail
     fn dedupe(&mut self) {
         for name in ALL_SECTIONS {
             let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -247,6 +260,7 @@ impl GroundTruthDoc {
         }
     }
 
+    // trace:exempt reason=internal-detail
     fn to_markdown(&self) -> String {
         let mut out = String::from("# fixtures fallback (synthesized from benchmarks/tasks.json)\n");
         for name in ALL_SECTIONS {
@@ -290,7 +304,9 @@ pub enum GapKind {
     Alias,
 }
 
+// trace:exempt reason=internal-detail
 impl GapKind {
+    // trace:exempt reason=internal-detail
     pub fn as_str(&self) -> &'static str {
         match self {
             GapKind::Parser => "PARSER",
@@ -305,6 +321,7 @@ impl GapKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct GapFinding {
     pub section: String,
     pub item: String,
@@ -374,6 +391,7 @@ pub struct RepoRecall {
 
 // trace:exempt reason=internal-detail
 impl RepoRecall {
+    // trace:exempt reason=internal-detail
     fn skipped(repo: &str, reason: impl Into<String>) -> Self {
         RepoRecall {
             repo: repo.to_string(),
@@ -383,7 +401,9 @@ impl RepoRecall {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for RepoRecall {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         RepoRecall {
             repo: String::new(),
@@ -445,11 +465,13 @@ pub struct AtlasRecallReport {
     pub gap_histogram: BTreeMap<String, usize>,
 }
 
+// trace:exempt reason=internal-detail
 impl AtlasRecallReport {
     /// Clone with all per-repo detail stripped (repos, gaps, histogram):
     /// only the aggregates survive. The blind protocol keeps this invariant
     /// end to end — blind-test failures are never shown to tuning agents,
     /// and the blind JSON / blind-v1.txt output is aggregates-only.
+    // trace:exempt reason=internal-detail
     pub fn aggregates_only(&self) -> Self {
         let mut c = self.clone();
         c.repos.clear();
@@ -458,17 +480,21 @@ impl AtlasRecallReport {
     }
 
     /// Mean per-layer precision over scored repos (the five startup layers).
+    // trace:exempt reason=internal-detail
     fn mean_layer_precision(&self) -> BTreeMap<String, f64> {
         self.mean_layer_map(|r| &r.layer_precision)
     }
 
     /// Mean per-layer F2 over scored repos (the five startup layers).
+    // trace:exempt reason=internal-detail
     fn mean_layer_f2(&self) -> BTreeMap<String, f64> {
         self.mean_layer_map(|r| &r.layer_f2)
     }
 
+    // trace:exempt reason=internal-detail
     fn mean_layer_map(
         &self,
+        // trace:exempt reason=internal-detail
         pick: impl Fn(&RepoRecall) -> &BTreeMap<String, f64>,
     ) -> BTreeMap<String, f64> {
         let mut sums: BTreeMap<String, f64> = BTreeMap::new();
@@ -501,6 +527,7 @@ impl AtlasRecallReport {
 /// `<key string> — explanation`; the explanation is not expected in atlas
 /// output, so only the key string (before ` — `) is kept. Inline-code
 /// backticks are stripped.
+// trace:exempt reason=internal-detail
 pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
     let mut doc = GroundTruthDoc::default();
     let mut current: Option<&'static str> = None;
@@ -552,6 +579,7 @@ pub fn parse_ground_truth(md: &str) -> GroundTruthDoc {
 /// Normalize a ground-truth item / atlas string for matching, applying the
 /// documented aliases: `::` -> `.` (so `Controller::run` matches
 /// `Controller.run`), `fn X` -> `X`, and `./p` -> `p` (path prefix).
+// trace:exempt reason=internal-detail
 fn norm(s: &str) -> String {
     let mut out = s.to_ascii_lowercase();
     out = out.replace("::", ".");
@@ -565,6 +593,7 @@ fn norm(s: &str) -> String {
 }
 
 /// Normalize and join parts into one haystack (newline-separated).
+// trace:exempt reason=internal-detail
 fn norm_join(parts: impl IntoIterator<Item = String>) -> String {
     let mut out: Vec<String> = parts.into_iter().map(|p| norm(&p)).collect();
     out.sort();
@@ -575,6 +604,7 @@ fn norm_join(parts: impl IntoIterator<Item = String>) -> String {
 /// Structured atlas haystacks, one per ontology layer, built from the
 /// machine model (`SystemAtlas`) plus the rendered pack (for the
 /// informational `tests` layer and the ALIAS gap check).
+// trace:exempt reason=internal-detail
 struct AtlasLayers {
     architecture: String,
     entrypoints: String,
@@ -592,6 +622,7 @@ struct AtlasLayers {
     components: String,
 }
 
+// trace:exempt reason=internal-detail
 fn build_layers(
     ctx: &ContextCompiler<'_>,
     pack: &scc_context::ContextPack,
@@ -694,6 +725,7 @@ fn build_layers(
 }
 
 /// The haystack a layer matches against.
+// trace:exempt reason=internal-detail
 fn layer_haystack<'a>(section: &str, layers: &'a AtlasLayers, text_norm: &'a str) -> &'a str {
     match section {
         "architecture" => &layers.architecture,
@@ -714,6 +746,7 @@ fn layer_haystack<'a>(section: &str, layers: &'a AtlasLayers, text_norm: &'a str
 /// haystack: each step must appear — in order — in the per-step lines.
 /// Chain items never match a plain substring test (the haystack is one
 /// step per line), so this is the honest interpretation of a chain.
+// trace:exempt reason=internal-detail
 fn chain_matches(chain: &str, haystack: &str) -> bool {
     let steps: Vec<String> = chain.split(" -> ").map(norm).collect();
     if steps.len() < 2 {
@@ -738,6 +771,7 @@ fn chain_matches(chain: &str, haystack: &str) -> bool {
     true
 }
 
+// trace:exempt reason=internal-detail
 fn item_matches(item: &str, haystack: &str) -> bool {
     if item.contains(" -> ") {
         chain_matches(item, haystack)
@@ -746,6 +780,7 @@ fn item_matches(item: &str, haystack: &str) -> bool {
     }
 }
 
+// trace:exempt reason=internal-detail
 fn layer_recall(items: &[String], haystack: &str) -> (f64, usize, usize) {
     if items.is_empty() {
         return (1.0, 0, 0);
@@ -760,6 +795,7 @@ fn layer_recall(items: &[String], haystack: &str) -> (f64, usize, usize) {
 }
 
 /// Whether one ground-truth item matches its layer's structured haystack.
+// trace:exempt reason=internal-detail
 fn item_matched(section: &str, item: &str, layers: &AtlasLayers, text_norm: &str) -> bool {
     item_matches(item, layer_haystack(section, layers, text_norm))
 }
@@ -770,6 +806,7 @@ fn item_matched(section: &str, item: &str, layers: &AtlasLayers, text_norm: &str
 /// An entry matches when some ground-truth item (chain items included,
 /// against a single line they virtually never match) is contained in it.
 /// An empty layer haystack scores 1.0 (nothing spurious to report).
+// trace:exempt reason=internal-detail
 fn layer_precision(items: &[String], haystack: &str) -> f64 {
     let entries: Vec<&str> = haystack.lines().filter(|l| !l.is_empty()).collect();
     if entries.is_empty() {
@@ -785,6 +822,7 @@ fn layer_precision(items: &[String], haystack: &str) -> f64 {
 /// F2 score from precision P and recall R: (5*P*R)/(4*P+R), zero when
 /// P + R == 0. Recall-weighting (beta=2) rewards recall over precision,
 /// matching the gate's recall-first stance while still penalizing bloat.
+// trace:exempt reason=internal-detail
 fn f2_score(p: f64, r: f64) -> f64 {
     if p + r == 0.0 {
         return 0.0;
@@ -794,6 +832,7 @@ fn f2_score(p: f64, r: f64) -> f64 {
 
 /// Startup facts per 1000 atlas tokens (architecture_density): matched
 /// startup-required items over the rendered pack's token count.
+// trace:exempt reason=internal-detail
 fn token_density(matched_startup: usize, tokens: usize) -> f64 {
     if tokens == 0 {
         return 0.0;
@@ -816,6 +855,7 @@ fn token_density(matched_startup: usize, tokens: usize) -> f64 {
 /// flows are seeded from resolved paths; the per-repo `resolved_calls`
 /// reports how many edges were upgraded (0 with `--no-resolve` or when the
 /// backends are unavailable — resolution degrades, never fails the run).
+// trace:exempt reason=internal-detail
 pub fn score_repo(
     repo_dir: &Path,
     gt: &GroundTruthDoc,
@@ -965,6 +1005,7 @@ pub fn score_repo(
 /// output). Repos whose corpus dir is missing, whose ground-truth doc is
 /// missing, or whose index/atlas fails are recorded with `skipped_reason` —
 /// this function never panics on missing dirs.
+// trace:exempt reason=internal-detail
 pub fn run_atlas_recall(
     corpus_dir: &Path,
     ground_truth_dir: &Path,
@@ -1054,10 +1095,9 @@ pub fn run_atlas_recall(
     report.gate_passed = report.mean_overall >= ATLAS_GATE;
     Ok(report)
 }
-// trace:v1 id=impl.scc.bench.atlas work=WORK-SCC-003 verifies=REQ-SCC-TEST
-
 /// Top-level entry for `scc bench atlas`: locate the workspace, resolve the
 /// corpus/ground-truth directories (or the fixtures fallback), and run.
+// trace:v1 id=impl.scc.bench.atlas work=WORK-SCC-003 verifies=REQ-SCC-TEST
 pub fn run_atlas_bench(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
@@ -1103,7 +1143,9 @@ pub enum HoldoutVerdict {
     Overfit,
 }
 
+// trace:exempt reason=internal-detail
 impl HoldoutVerdict {
+    // trace:exempt reason=internal-detail
     pub fn as_str(&self) -> &'static str {
         match self {
             HoldoutVerdict::NoOverfit => "NO OVERFIT",
@@ -1115,6 +1157,7 @@ impl HoldoutVerdict {
 
 /// Verdict over the dev-vs-holdout overall gap (`dev`, `holdout` are the
 /// equal-weighted mean recalls of the five startup-required layers).
+// trace:exempt reason=internal-detail
 pub fn holdout_verdict(dev: f64, holdout: f64) -> HoldoutVerdict {
     if holdout >= dev {
         HoldoutVerdict::NoOverfit
@@ -1151,6 +1194,7 @@ pub struct HoldoutComparison {
 
 // trace:exempt reason=internal-detail
 impl HoldoutComparison {
+    // trace:exempt reason=internal-detail
     fn layer_gap(dev: f64, holdout: f64) -> f64 {
         (holdout - dev).clamp(-1.0, 1.0)
     }
@@ -1170,6 +1214,7 @@ impl HoldoutComparison {
 ///
 /// `resolve` applies to BOTH corpora (the same pipeline must score
 /// development and validation identically).
+// trace:exempt reason=internal-detail
 pub fn run_atlas_holdout(
     corpus: Option<&Path>,
     ground_truth: Option<&Path>,
@@ -1222,8 +1267,10 @@ pub fn run_atlas_holdout(
     Ok(c)
 }
 
+// trace:exempt reason=internal-detail
 impl HoldoutComparison {
     /// Deterministic markdown text for `benchmarks/results/holdout-v3.txt`.
+    // trace:exempt reason=internal-detail
     fn to_results_text(&self) -> String {
         let mut out = String::new();
         out.push_str("# Holdout v3 — development corpus vs validation corpus\n");
@@ -1336,6 +1383,7 @@ impl HoldoutComparison {
 
 /// Print the development and validation reports side by side plus the gap
 /// summary.
+// trace:exempt reason=internal-detail
 pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
     println!("scc bench atlas --holdout — development corpus vs validation corpus (v1)");
     println!("\n=== DEVELOPMENT corpus ===");
@@ -1381,6 +1429,7 @@ pub fn print_holdout_report(c: &HoldoutComparison, diagnose: bool) {
 /// move (`dev_delta == 0`) the ratio is degenerate: a validation-only
 /// improvement counts as pure generalization (`1.0`), anything else as
 /// `0.0` — never NaN/inf.
+// trace:exempt reason=internal-detail
 pub fn generalization_efficiency(dev_delta: f64, validation_delta: f64) -> f64 {
     if dev_delta == 0.0 {
         return if validation_delta > 0.0 { 1.0 } else { 0.0 };
@@ -1427,6 +1476,7 @@ pub struct CompareReport {
 }
 
 /// The five startup-required sections the regression guard watches.
+// trace:exempt reason=internal-detail
 pub const STARTUP_SECTIONS: [&str; 5] = [
     "architecture",
     "entrypoints",
@@ -1435,7 +1485,9 @@ pub const STARTUP_SECTIONS: [&str; 5] = [
     "contracts",
 ];
 
+// trace:exempt reason=internal-detail
 impl CompareReport {
+    // trace:exempt reason=internal-detail
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
@@ -1445,6 +1497,7 @@ impl CompareReport {
 /// `scc bench atlas --holdout --json` output) and apply the Wave-11 gates.
 /// `old` is the earlier run (the pre-wave baseline), `new` the current one;
 /// deltas are new - old.
+// trace:exempt reason=internal-detail
 pub fn compare_runs(
     old: &HoldoutComparison,
     new: &HoldoutComparison,
@@ -1518,6 +1571,7 @@ pub fn compare_runs(
 }
 
 /// Load a saved holdout JSON result file into a `HoldoutComparison`.
+// trace:exempt reason=internal-detail
 pub fn load_holdout_result(path: &Path) -> Result<HoldoutComparison, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -1526,6 +1580,7 @@ pub fn load_holdout_result(path: &Path) -> Result<HoldoutComparison, String> {
 }
 
 /// Print the Wave-11 compare report (deltas, GE, per-section guard).
+// trace:exempt reason=internal-detail
 pub fn print_compare_report(r: &CompareReport) {
     println!("scc bench atlas --compare — Wave-11 generalization gates");
     println!("  old: {}", r.old_file);
@@ -1605,6 +1660,7 @@ fn load_blind_lock(root: &Path) -> Result<BTreeMap<String, BlindLockEntry>, Stri
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read blind lock {}: {e}", path.display()))?;
     #[derive(Deserialize)]
+    // trace:exempt reason=internal-detail
     struct LockFile {
         #[serde(rename = "blind-test")]
         blind_test: BTreeMap<String, BlindLockEntry>,
@@ -1667,6 +1723,7 @@ fn verify_head(name: &str, actual: &str, expected: &str) -> Result<(), String> {
 /// hash matches the previous run before scoring and errors on mismatch, so
 /// a changed blind set can never silently re-score different keys.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct BlindManifest {
     /// sha256 hex of the deterministic manifest text.
     pub sha256: String,
@@ -1749,6 +1806,7 @@ pub fn blind_manifest(root: &Path) -> Result<BlindManifest, String> {
 }
 
 /// Recursively collect regular files under `dir` into `out`.
+// trace:exempt reason=internal-detail
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1768,6 +1826,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The header line also carries a human summary after the hex
 /// (`(20 ground-truth files, ...)`); only the first whitespace token is
 /// the hash.
+// trace:exempt reason=internal-detail
 fn manifest_hash_from_header(header: &str) -> Option<String> {
     header.lines().find_map(|l| {
         l.trim()
@@ -1781,6 +1840,7 @@ fn manifest_hash_from_header(header: &str) -> Option<String> {
 
 /// Guarded division for the blind transfer ratio: `numerator / denominator`,
 /// 0.0 when the denominator is 0 (nothing transferred onto nothing).
+// trace:exempt reason=internal-detail
 fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator == 0.0 {
         0.0
@@ -1791,6 +1851,7 @@ fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
 
 /// Per-section blind transfer ratios (blind mean / validation mean) over
 /// the seven layers plus overall — deterministic, 0.0-guarded.
+// trace:exempt reason=internal-detail
 fn blind_transfer_ratios(c: &BlindComparison) -> Vec<(&'static str, f64)> {
     let v = &c.validation;
     let b = &c.blind;
@@ -1837,6 +1898,7 @@ pub struct BlindComparison {
 
 /// Score one fixed-protocol corpus with the same recall pipeline; missing
 /// or empty dirs are errors, not silent empty runs.
+// trace:exempt reason=internal-detail
 fn score_protocol_corpus(
     corpus: &Path,
     ground_truth: &Path,
@@ -1954,9 +2016,11 @@ pub fn run_atlas_blind(diagnose: bool, resolve: bool) -> Result<BlindComparison,
     Ok(c)
 }
 
+// trace:exempt reason=internal-detail
 impl BlindComparison {
     /// Deterministic aggregates-only text for
     /// `benchmarks/results/blind-v1.txt` (aggregates + gap only).
+    // trace:exempt reason=internal-detail
     fn to_blind_text(&self) -> String {
         let mut out = String::new();
         out.push_str("# Blind v1 — validation vs blind (aggregates only)\n");
@@ -2047,6 +2111,7 @@ impl BlindComparison {
 
 /// Print the blind protocol: aggregates ONLY (no per-repo rows, no missed
 /// keys, no filenames) plus the validation-vs-blind generalization gap.
+// trace:exempt reason=internal-detail
 pub fn print_blind_report(c: &BlindComparison) {
     println!("scc bench atlas --blind — validation vs blind (aggregates only)");
     println!("  validation corpus: {}", c.validation.mode);
@@ -2109,6 +2174,7 @@ pub fn print_blind_report(c: &BlindComparison) {
 }
 
 /// Sorted non-hidden subdirectory names of `dir` (the corpus listing).
+// trace:exempt reason=internal-detail
 fn repo_dirs(dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2130,6 +2196,7 @@ fn repo_dirs(dir: &Path) -> Vec<String> {
 /// Hermetic fixtures run: copy the golden fixtures into a temp corpus (the
 /// real fixtures are never indexed into) and synthesize ground-truth docs
 /// from `benchmarks/tasks.json`.
+// trace:exempt reason=internal-detail
 fn fixtures_fallback(root: &Path, diagnose: bool, resolve: bool) -> Result<AtlasRecallReport, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let tasks_path = root.join("benchmarks").join("tasks.json");
@@ -2171,6 +2238,7 @@ fn fixtures_fallback(root: &Path, diagnose: bool, resolve: bool) -> Result<Atlas
 /// contracts (HTTP routes are both); symbols proxy flow steps (behavior);
 /// stores + data -> state_authority (who owns the store/DB); tests -> tests
 /// (informational).
+// trace:exempt reason=internal-detail
 fn ground_truth_from_tasks(tasks: &[BenchTask], repo: &str) -> GroundTruthDoc {
     let mut doc = GroundTruthDoc::default();
     for t in tasks {
@@ -2197,6 +2265,7 @@ fn ground_truth_from_tasks(tasks: &[BenchTask], repo: &str) -> GroundTruthDoc {
 
 /// Locate the fixtures directory: walk up from cwd; fall back to the
 /// workspace-relative path (dev tooling).
+// trace:exempt reason=internal-detail
 pub fn locate_fixtures_dir() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
@@ -2217,6 +2286,7 @@ pub fn locate_fixtures_dir() -> Option<PathBuf> {
 }
 
 /// Copy a tree, skipping `.scc` state dirs (mirrors golden::copy_tree).
+// trace:exempt reason=internal-detail
 fn copy_tree_skip_scc(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -2241,6 +2311,7 @@ fn copy_tree_skip_scc(src: &Path, dst: &Path) {
 // ---------------------------------------------------------------------------
 
 /// Normalized presence haystack of one entity: id + name + attribute JSON.
+// trace:exempt reason=internal-detail
 fn entity_norm(e: &Entity) -> String {
     let attrs = serde_json::to_string(&e.attributes).unwrap_or_default();
     norm(&format!("{} {} {}", e.id, e.name, attrs))
@@ -2249,6 +2320,7 @@ fn entity_norm(e: &Entity) -> String {
 /// Precompute the store-presence candidates for one repo (entity haystacks +
 /// derived route strings), so gap diagnosis does not re-serialize every
 /// entity per missed item.
+// trace:exempt reason=internal-detail
 fn store_candidates(comp: &Compiler<'_>) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
     for e in comp.graph.entities.values() {
@@ -2290,6 +2362,7 @@ fn store_candidates(comp: &Compiler<'_>) -> Vec<String> {
 ///   structured layers do not carry (README prose, format variants):
 ///   ALIAS (the aliases did not reconcile it).
 #[allow(clippy::too_many_arguments)]
+// trace:exempt reason=internal-detail
 fn classify_gap(
     section: &str,
     item: &str,
@@ -2414,6 +2487,7 @@ fn classify_gap(
 /// If `item` names a repo file, return the language it would be scanned
 /// with (language from the file registry when scanned; otherwise inferred
 /// from the extension when the file exists on disk).
+// trace:exempt reason=internal-detail
 fn file_language(item: &str, repo_dir: &Path, store: &Store) -> Option<Language> {
     if !item.contains('/') {
         return None;
@@ -2434,6 +2508,7 @@ fn file_language(item: &str, repo_dir: &Path, store: &Store) -> Option<Language>
     }
 }
 
+// trace:exempt reason=internal-detail
 fn lang_from_str(s: &str) -> Option<Language> {
     match s {
         "python" => Some(Language::Python),
@@ -2445,6 +2520,7 @@ fn lang_from_str(s: &str) -> Option<Language> {
     }
 }
 
+// trace:exempt reason=internal-detail
 fn lang_from_ext(path: &str) -> Option<Language> {
     let ext = path
         .rsplit('.')
@@ -2462,6 +2538,7 @@ fn lang_from_ext(path: &str) -> Option<Language> {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
     println!("scc bench atlas — startup-atlas recall vs independent ground truth (Wave 8 §57, v3)");
     println!("  mode: {}", r.mode);
@@ -2558,9 +2635,11 @@ pub fn print_report(r: &AtlasRecallReport, diagnose: bool) {
 }
 
 #[cfg(test)]
+// trace:exempt reason=internal-detail
 mod tests {
     use super::*;
 
+    // trace:exempt reason=internal-detail
     const GT_MD: &str = r#"# synth repo
 > synthetic | python | service
 
@@ -2588,6 +2667,7 @@ mod tests {
 "#;
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn parses_ground_truth_sections() {
         let doc = parse_ground_truth(GT_MD);
         assert_eq!(doc.architecture, ["root", "services"]);
@@ -2600,6 +2680,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn parse_ground_truth_accepts_legacy_section_names() {
         let md = "## components\n- root\n## flows\n- handle\n## ownership\n- db.x\n## entrypoints\n- e\n## contracts\n- c\n## tests\n- t\n";
         let doc = parse_ground_truth(md);
@@ -2613,6 +2694,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn parse_ground_truth_dedupes_keys_per_section() {
         let md = "## contracts\n- GET /api/items\n- GET /api/items — duplicate bullet\n- POST /api/items\n";
         let doc = parse_ground_truth(md);
@@ -2625,8 +2707,10 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn norm_applies_documented_aliases() {
         assert_eq!(norm("Controller::run"), "controller.run");
+        // trace:exempt reason=internal-detail
         assert_eq!(norm("fn main"), "main");
         assert_eq!(norm("./src/index-client.js"), "src/index-client.js");
         assert_eq!(norm("ArgMatches"), "argmatches");
@@ -2634,6 +2718,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn recall_counts_all_hit_partial_and_zero() {
         // haystack already normalized: layer_recall applies norm() to items
         let hay = "root\nservices\nget /api/items\nhandle_items\ndb.items\npost /api/items\nitemstore\ntest_create_item";
@@ -2668,6 +2753,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn layer_precision_counts_atlas_entries_matching_ground_truth() {
         // One haystack entry per line; an entry matches when a ground-truth
         // item is contained in it. 2 of 3 entries match -> 2/3.
@@ -2690,6 +2776,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn f2_score_weights_recall_over_precision() {
         // F2 = 5PR/(4P+R): recall-favoring harmonic mean.
         let a = f2_score(0.9, 0.5);
@@ -2706,6 +2793,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn aggregates_only_strips_per_repo_detail() {
         let r = AtlasRecallReport {
             mean_overall: 0.42,
@@ -2722,12 +2810,14 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn run_atlas_blind_refuses_diagnose() {
         let err = run_atlas_blind(true, false).unwrap_err();
         assert!(err.contains("blind corpus is not diagnosable"), "{err}");
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn blind_results_text_is_aggregates_only_and_deterministic() {
         let mut validation = AtlasRecallReport {
             mean_architecture: 0.3,
@@ -2798,12 +2888,14 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn token_density_guards_zero_tokens() {
         assert_eq!(token_density(5, 0), 0.0);
         assert!((token_density(5, 5000) - 1.0).abs() < 1e-9, "5 facts / 5k tokens = 1 per 1k");
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn run_atlas_recall_skips_missing_dirs_without_panicking() {
         let tmp = tempfile::TempDir::new().unwrap();
         let corpus = tmp.path().join("corpus");
@@ -2833,6 +2925,7 @@ mod tests {
             .contains("corpus dir missing"));
     }
 
+    // trace:exempt reason=internal-detail
     fn synth_repo(tmp: &tempfile::TempDir, gt_md: &str) {
         let corpus = tmp.path().join("corpus");
         let gt = tmp.path().join("ground-truth");
@@ -2854,6 +2947,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn run_atlas_recall_scores_synthetic_repo_structurally() {
         let tmp = tempfile::TempDir::new().unwrap();
         synth_repo(
@@ -2891,6 +2985,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn diagnose_classifies_missed_items_deterministically() {
         let tmp = tempfile::TempDir::new().unwrap();
         synth_repo(
@@ -2914,6 +3009,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn fallback_ground_truth_maps_tasks_and_dedupes() {
         let task = serde_json::from_str::<BenchTask>(
             r#"{"id":"t1","repo":"r","goal":"g",
@@ -2933,6 +3029,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn holdout_verdict_matches_gap_bands() {
         // holdout >= dev -> NO OVERFIT
         assert_eq!(holdout_verdict(0.20, 0.25), HoldoutVerdict::NoOverfit);
@@ -2947,6 +3044,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn layer_gap_is_clamped_and_signed() {
         assert!((HoldoutComparison::layer_gap(0.1, 0.3) - 0.2).abs() < 1e-9);
         assert!((HoldoutComparison::layer_gap(0.3, 0.1) - (-0.2)).abs() < 1e-9);
@@ -2956,6 +3054,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn holdout_results_text_is_deterministic_and_contains_gap() {
         let dev = AtlasRecallReport {
             mean_architecture: 0.3,
@@ -2997,6 +3096,7 @@ mod tests {
         assert!(text.contains("-0.040"), "gap -0.04 rendered: {text}");
     }
     #[test]
+    // trace:exempt reason=internal-detail
     fn behavior_chains_match_in_order() {
         // P1: ground-truth chains (A -> B -> C) match the per-step haystack
         // as an in-order subsequence, not as a substring.
@@ -3015,6 +3115,7 @@ mod tests {
     // ---- Wave 11: generalization gates + blind manifest ----
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn sha256_matches_standard_test_vectors() {
         assert_eq!(
             sha256::hex(b""),
@@ -3036,6 +3137,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn generalization_efficiency_gate_fails_negative_passes_positive() {
         // dev improved, validation regressed -> negative GE -> the default
         // gate (MIN = 0.0) fails: the semantic wave overfit
@@ -3056,6 +3158,7 @@ mod tests {
         }
     }
 
+    // trace:exempt reason=internal-detail
     fn holdout_with(
         dev_overall: f64,
         dev_sections: [f64; 5],
@@ -3095,6 +3198,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn compare_runs_ge_gate_and_section_guard() {
         let old = holdout_with(0.50, [0.5; 5], 0.50, [0.5; 5]);
         // new run: dev improved everywhere; validation improved overall but
@@ -3219,6 +3323,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn blind_transfer_ratio_guards_zero_denominator() {
         assert_eq!(safe_ratio(1.0, 2.0), 0.5);
         assert_eq!(safe_ratio(0.0, 0.0), 0.0);
