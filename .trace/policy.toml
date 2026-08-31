@@ -18,4 +18,36 @@ require_coverage_confirmation = true
 require_semantic_audit = true
 
 [exclusions]
-paths = ["crates/scc-indexer/src/adapters.rs","vendor/**", "generated/**", "docs/vendor/**", "benchmarks/blind-lock.json", "fixtures/**", "benchmarks/external-lock.json", "benchmarks/external/**", "benchmarks/results/**", ".omp/**", ".pi/**", ".agents/**", ".hermes/**", ".trace/**", "sdk/typescript/src/test/**", ".DS_Store", "**/.DS_Store", "**/__pycache__/**", "*.pyc", "plugins/hermes/**/__pycache__/**", "crates/scc-indexer/src/lib.rs", "crates/scc-indexer/src/model.rs", "crates/scc-indexer/src/resolve.rs", "plugins/hermes/scc/schemas.py", ".github/**", ".DS_Store", "crates/.DS_Store", "plugins/.DS_Store", "plugins/omp/**", ".gitignore"]
+paths = [
+  "crates/scc-indexer/src/adapters.rs",
+  "vendor/**",
+  "generated/**",
+  "docs/vendor/**",
+  "benchmarks/blind-lock.json",
+  "fixtures/**",
+  "benchmarks/external-lock.json",
+  "benchmarks/external/**",
+  "benchmarks/results/**",
+  ".omp/**",
+  ".pi/**",
+  ".agents/**",
+  ".hermes/**",
+  ".trace/**",
+  "sdk/typescript/src/test/**",
+  ".DS_Store",
+  "**/.DS_Store",
+  "**/__pycache__/**",
+  "*.pyc",
+  "plugins/hermes/**/__pycache__/**",
+  "crates/scc-indexer/src/lib.rs",
+  "crates/scc-indexer/src/model.rs",
+  "crates/scc-indexer/src/resolve.rs",
+  "plugins/hermes/scc/schemas.py",
+  ".github/**",
+  ".DS_Store",
+  "crates/.DS_Store",
+  "plugins/.DS_Store",
+  "plugins/omp/**",
+  ".gitignore",
+  "CHANGELOG.md",
+]
