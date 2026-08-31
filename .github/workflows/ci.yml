@@ -1,8 +1,16 @@
 # trace:exempt reason=infra-config  # CI workflow declaration, not repo behavior; the jobs' behavior is traced at the source modules they run
 name: CI
 on:
+  # PR branches only run pull_request. Running both push and pull_request on
+  # the same SHA attaches two `test` checks; a flake on one leaves the PR
+  # UNSTABLE even when the other is green.
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -45,7 +53,11 @@ jobs:
           # (behavior_resolve drives tsserver through
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
-          cargo test --workspace
+          # Isolate the 50k wall-clock gate: `cargo test --workspace` runs
+          # many integration binaries at once, and the perf binary used to
+          # re-run the golden suite via `mod golden`.
+          cargo test --workspace -- --skip cold_index_50k_loc_under_30s
+          cargo test -p scc-cli --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
       - name: Install TraceLayer
         continue-on-error: true
         run: |
