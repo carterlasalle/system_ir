@@ -1908,6 +1908,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn get_embedding(&self, entity_id: &str) -> Result<Option<(Vec<f32>, String)>> {
         let row = self
             .conn
@@ -1919,7 +1920,7 @@ impl Store {
             .optional()?;
         Ok(row.map(|(bytes, model)| {
             let v = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             (v, model)
