@@ -270,11 +270,17 @@ class NativeRoutingTest(unittest.TestCase):
         orig_ext = h.run_external_variant
         orig_nat = h.run_native_variant
 
-        def fake_ext(variant, tasks, budget, agent_cmd, workdir, mode="equal-token"):
+        def fake_ext(*args, **kwargs):
+            variant = args[0] if args else kwargs.get("variant")
+            budget = args[2] if len(args) > 2 else kwargs.get("budget")
+            mode = kwargs.get("mode", "equal-token")
             calls.append(("ext", variant, budget, mode))
             return [], None
 
-        def fake_nat(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode="equal-token"):
+        def fake_nat(*args, **kwargs):
+            variant = args[0] if args else kwargs.get("variant")
+            budget = args[2] if len(args) > 2 else kwargs.get("budget")
+            mode = kwargs.get("mode", "equal-token")
             calls.append(("nat", variant, budget, mode))
             return [], None
         h.run_external_variant = fake_ext
@@ -298,11 +304,15 @@ class NativeRoutingTest(unittest.TestCase):
         orig_ext = h.run_external_variant
         orig_nat = h.run_native_variant
 
-        def fake_ext(variant, tasks, budget, agent_cmd, workdir, mode="equal-token"):
+        def fake_ext(*args, **kwargs):
+            budget = args[2] if len(args) > 2 else kwargs.get("budget")
+            mode = kwargs.get("mode", "equal-token")
             calls.append((budget, mode))
             return [], None
 
-        def fake_nat(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode="equal-token"):
+        def fake_nat(*args, **kwargs):
+            budget = args[2] if len(args) > 2 else kwargs.get("budget")
+            mode = kwargs.get("mode", "equal-token")
             calls.append((budget, mode))
             return [], None
         h.run_external_variant = fake_ext

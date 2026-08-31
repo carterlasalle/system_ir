@@ -1,4 +1,5 @@
-// TraceLayer × Oh My Pi — native pre-mutation gate and stop gate.
+// TraceLayer × Oh My Pi — native pre-mutation gate, prompt context,
+// session-start, and fail-closed stop gate.
 //
 // This file is the extension entry declared by package.json in this
 // directory. `trace install --agent omp` installs the whole package at:
@@ -8,11 +9,11 @@
 // plugin. Do NOT copy this file loose into extensions/ — the legacy raw
 // layout double-registers the factory and was removed deliberately.
 //
-// Type-only import (erased at runtime): the canonical package name is
-// @earendil-works/pi-coding-agent; older runtimes used @oh-my-pi/... The
-// extension runtime never type-checks this file.
+// Type-only import (erased at runtime): the canonical public package is
+// `@oh-my-pi/pi-coding-agent` (the compiled OMP extension loader exposes
+// this scope; the legacy `@earendil-works/pi-coding-agent` alias is not).
 import { spawnSync } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 // trace:v1 id=impl.omp.trace-gate work=WORK-TL-001
 export default function hook(pi: ExtensionAPI): void {
@@ -20,13 +21,17 @@ export default function hook(pi: ExtensionAPI): void {
   // ignores the `input` option, which silently dropped every hook payload —
   // the gate then ran with an empty body and never blocked. Node's
   // spawnSync writes input to stdin reliably and runs under the Bun host.
+  // TRACE_BIN / `trace` on PATH, then `uv run trace` (the installed layout).
   // trace:exempt reason=internal-helper
   const run = (args: string[], input: string): { code: number; out: string } => {
-    const res = spawnSync("uv", ["run", "trace", ...args], {
-      input,
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-    });
+    const bin = process.env.TRACE_BIN;
+    const res = bin
+      ? spawnSync(bin, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+      : spawnSync("uv", ["run", "trace", ...args], {
+          input,
+          encoding: "utf8",
+          maxBuffer: 64 * 1024 * 1024,
+        });
     const code = res.status ?? -1;
     return { code, out: String(res.stdout ?? "") };
   };
@@ -82,6 +87,56 @@ export default function hook(pi: ExtensionAPI): void {
     return { path, line, payload };
   };
 
+  // Parse a hook JSON body for a human-readable reason / block decision.
+  // trace:exempt reason=internal-helper
+  const parseHook = (out: string): { reason: string; block: boolean; extra: string } => {
+    try {
+      const d = JSON.parse(out) as {
+        output?: string;
+        reason?: string;
+        decision?: string;
+        block?: boolean;
+      };
+      const extra = typeof d.output === "string" ? d.output : "";
+      const reason = (typeof d.reason === "string" && d.reason) || extra || "trace policy blocks this action";
+      const block = d.block === true || d.decision === "block";
+      return { reason, block, extra };
+    } catch {
+      return { reason: "trace policy blocks this action", block: false, extra: "" };
+    }
+  };
+
+  // session.created → session-start (migrated from the inert YAML hooks).
+  pi.on("session_start", async (_event, ctx) => {
+    run(
+      ["hook", "session-start", "--format", "json"],
+      JSON.stringify({ session_id: sessionId(ctx) }),
+    );
+  });
+
+  // user.prompt.submit → prompt-context. before_agent_start is the native
+  // OMP seam that can still inject model-visible context.
+  pi.on("before_agent_start", async (event, ctx) => {
+    const prompt = typeof (event as { prompt?: unknown }).prompt === "string"
+      ? (event as { prompt: string }).prompt
+      : "";
+    const res = run(
+      ["hook", "prompt-context", "--format", "json"],
+      JSON.stringify({ prompt, session_id: sessionId(ctx) }),
+    );
+    if (res.code !== 0) return;
+    const parsed = parseHook(res.out);
+    if (!parsed.extra) return;
+    return {
+      message: {
+        customType: "tracelayer-prompt-context",
+        content: parsed.extra,
+        display: false,
+        details: { source: "tracelayer" },
+      },
+    };
+  });
+
   // Pre-authoring gate: pass the FULL proposed mutation so TraceLayer can
   // simulate the edit (new boundaries, modified untraced behavior).
   pi.on("tool_call", async (event, ctx) => {
@@ -96,14 +151,8 @@ export default function hook(pi: ExtensionAPI): void {
     });
     const res = run(["hook", "pre-mutation", "--format", "json"], body);
     if (res.code !== 0) {
-      let reason = "trace policy blocks this edit";
-      try {
-        const d = JSON.parse(res.out) as { output?: string };
-        if (typeof d.output === "string" && d.output) reason = d.output;
-      } catch {
-        // keep default reason
-      }
-      return { block: true, reason };
+      const parsed = parseHook(res.out);
+      return { block: true, reason: parsed.reason || "trace policy blocks this edit" };
     }
   });
 
@@ -136,6 +185,36 @@ export default function hook(pi: ExtensionAPI): void {
       return { content };
     } catch {
       return;
+    }
+  });
+
+  // session_stop: fail-closed completion gate. OMP documents session_stop
+  // and can return a continuation or `{ decision: "block", reason }`.
+  // package.json already advertises this gate.
+  pi.on("session_stop", async (event, ctx) => {
+    const ev = event as {
+      session_id?: unknown;
+      session_file?: unknown;
+      turn_id?: unknown;
+      last_assistant_message?: unknown;
+    };
+    const body = JSON.stringify({
+      session_id: (typeof ev.session_id === "string" && ev.session_id) || sessionId(ctx),
+      session_file: ev.session_file ?? null,
+      turn_id: ev.turn_id ?? null,
+      last_assistant_message: ev.last_assistant_message ?? null,
+    });
+    const res = run(["hook", "session-stop", "--format", "json"], body);
+    if (res.code !== 0) {
+      const parsed = parseHook(res.out);
+      return { decision: "block", reason: parsed.reason };
+    }
+    const parsed = parseHook(res.out);
+    if (parsed.block) {
+      return { decision: "block", reason: parsed.reason };
+    }
+    if (parsed.extra) {
+      return { continue: true, additionalContext: parsed.extra };
     }
   });
 }
