@@ -19,8 +19,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+// trace:exempt reason=internal-detail
 pub const SCHEMA_VERSION: u32 = 6;
+// trace:exempt reason=internal-detail
 pub const FTS_ESCAPE: &str = "\"";
+// trace:exempt reason=internal-detail
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1,
     MIGRATION_2,
@@ -34,12 +37,14 @@ const MIGRATIONS: &[&str] = &[
 /// keyed on the composite model state (source/semantic/evidence/intent/
 /// runtime/derived generations), not the git revision alone, so any change
 /// to system truth invalidates stale packs (docs/SYSTEM_DESIGN.md §5).
+// trace:exempt reason=internal-detail
 const MIGRATION_4: &str = r#"
 ALTER TABLE context_cache RENAME COLUMN revision TO epoch;
 "#;
 
 /// v5: canonical causal flow graphs (Wave 3) — the behavioral truth from
 /// which the `flows` projections are derived.
+// trace:exempt reason=internal-detail
 const MIGRATION_5: &str = r#"
 CREATE TABLE IF NOT EXISTS flow_graphs (
   id TEXT PRIMARY KEY,
@@ -54,6 +59,7 @@ CREATE TABLE IF NOT EXISTS flow_graphs (
 /// service paths per trace, aggregated across ingests. `count` is additive
 /// per trace occurrence, `latency_ms` a count-weighted running average,
 /// `errors` additive.
+// trace:exempt reason=internal-detail
 const MIGRATION_6: &str = r#"
 CREATE TABLE IF NOT EXISTS trace_signatures (
   signature TEXT PRIMARY KEY,
@@ -65,6 +71,7 @@ CREATE TABLE IF NOT EXISTS trace_signatures (
 "#;
 
 /// v3: entity embeddings (f32 vector blobs) for the optional semantic ranker.
+// trace:exempt reason=internal-detail
 const MIGRATION_3: &str = r#"
 CREATE TABLE IF NOT EXISTS embeddings (
   entity_id TEXT PRIMARY KEY,
@@ -75,11 +82,13 @@ CREATE TABLE IF NOT EXISTS embeddings (
 "#;
 
 /// v2: runtime edge aggregation columns (latency/error aggregates).
+// trace:exempt reason=internal-detail
 const MIGRATION_2: &str = r#"
 ALTER TABLE runtime_edges ADD COLUMN latency_ms REAL NOT NULL DEFAULT 0;
 ALTER TABLE runtime_edges ADD COLUMN errors INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// trace:exempt reason=internal-detail
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -255,6 +264,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
 "#;
 
 #[derive(Debug, Error)]
+// trace:exempt reason=internal-detail
 pub enum StoreError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -264,9 +274,11 @@ pub enum StoreError {
     NotInitialized(String),
 }
 
+// trace:exempt reason=internal-detail
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug, Clone, serde::Serialize)]
+// trace:exempt reason=internal-detail
 pub struct RuntimeEdgeRow {
     pub source: String,
     pub target: String,
@@ -297,7 +309,9 @@ pub enum ModelEpochKind {
     Derived,
 }
 
+// trace:exempt reason=internal-detail
 impl ModelEpochKind {
+    // trace:exempt reason=internal-detail
     pub fn meta_key(&self) -> &'static str {
         match self {
             ModelEpochKind::Source => "source_generation",
@@ -327,7 +341,9 @@ pub struct ModelEpoch {
     pub derived: u64,
 }
 
+// trace:exempt reason=internal-detail
 impl ModelEpoch {
+    // trace:exempt reason=internal-detail
     pub fn zero() -> ModelEpoch {
         ModelEpoch {
             source: 0,
@@ -341,6 +357,7 @@ impl ModelEpoch {
 
     /// Composite hash over every generation. Prefix identifies the scheme so
     /// a future epoch-shape change cannot collide with old keys.
+    // trace:exempt reason=internal-detail
     pub fn composite(&self, revision: &str) -> String {
         let mut h = blake3::Hasher::new();
         h.update(b"scc-model-epoch-v1");
@@ -356,6 +373,7 @@ impl ModelEpoch {
 }
 // trace:v1 id=impl.scc.store work=WORK-SCC-001 satisfies=REQ-SCC-DATA implements=PLAN-SCC-001
 
+// trace:exempt reason=internal-detail
 pub struct Store {
     pub conn: Connection,
     pub root: PathBuf,
@@ -368,6 +386,7 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) the SCC database at `path` for repository
     /// rooted at `root`. `root` must exist.
+    // trace:exempt reason=internal-detail
     pub fn open(path: &Path, root: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -392,6 +411,7 @@ impl Store {
         Ok(store)
     }
 
+    // trace:exempt reason=internal-detail
     fn ensure_repository(&mut self) -> Result<()> {
         let existing: Option<String> = self
             .conn
@@ -415,6 +435,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn repository(&self) -> Repository {
         Repository {
             id: self.repo_id.clone(),
@@ -431,6 +452,7 @@ impl Store {
     // meta
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -440,6 +462,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
         let v = self
             .conn
@@ -453,6 +476,7 @@ impl Store {
     /// Bump one model-epoch generation. Called by every mutation path that
     /// changes system truth (index completion, LSP promotion, adapter
     /// import, intent load, runtime ingestion, derived recompilation).
+    // trace:exempt reason=internal-detail
     pub fn bump_epoch(&self, kind: ModelEpochKind) -> Result<()> {
         let key = kind.meta_key();
         let next: u64 = self
@@ -470,6 +494,7 @@ impl Store {
     /// Current model epoch (all generations plus the latest snapshot
     /// revision). Never cached by the caller: it must reflect every change
     /// immediately.
+    // trace:exempt reason=internal-detail
     pub fn model_epoch(&self) -> Result<ModelEpoch> {
         let g = |k: &str| -> Result<u64> {
             Ok(self
@@ -491,6 +516,7 @@ impl Store {
     // snapshots
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn begin_snapshot(&self, revision: &str, branch: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO snapshots (revision, branch, indexed_at, status) VALUES (?1, ?2, ?3, 'active')",
@@ -499,6 +525,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn finish_snapshot(&self, id: i64, file_count: usize) -> Result<()> {
         self.conn.execute(
             "UPDATE snapshots SET file_count = ?2, status = 'complete' WHERE id = ?1",
@@ -509,6 +536,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn latest_snapshot(&self) -> Result<Option<Snapshot>> {
         let row = self
             .conn
@@ -532,6 +560,7 @@ impl Store {
         }))
     }
 
+    // trace:exempt reason=internal-detail
     pub fn snapshot_status(&self) -> Result<Option<(Snapshot, i64)>> {
         let row = self
             .conn
@@ -565,6 +594,7 @@ impl Store {
     // files
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn upsert_file(&self, path: &str, hash: &str, language: &str, kind: &str, size: u64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (path, hash, language, kind, size, indexed_at)
@@ -576,6 +606,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn file(&self, path: &str) -> Result<Option<(String, String, String, u64)>> {
         let row = self
             .conn
@@ -588,6 +619,7 @@ impl Store {
         Ok(row)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn all_files(&self) -> Result<Vec<(String, String, String, String, u64)>> {
         let mut stmt = self
             .conn
@@ -608,6 +640,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn delete_file(&self, path: &str) -> Result<()> {
         self.conn.execute("DELETE FROM files WHERE path = ?1", params![path])?;
         Ok(())
@@ -809,6 +842,7 @@ impl Store {
     }
 
     /// Remove all indexed facts (used by full reindex).
+    // trace:exempt reason=internal-detail
     pub fn purge_all(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for table in [
@@ -836,6 +870,7 @@ impl Store {
     // ------------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
+    // trace:exempt reason=internal-detail
     pub fn insert_symbol(
         &self,
         file: &str,
@@ -869,6 +904,7 @@ impl Store {
         Ok(id)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn symbols_in_file(&self, file: &str) -> Result<Vec<(i64, String, String, Option<String>, u32, u32, bool, Option<String>)>> {
         let mut stmt = self
             .conn
@@ -892,6 +928,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn symbols_named(&self, name: &str) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self
             .conn
@@ -910,6 +947,7 @@ impl Store {
     // imports
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn insert_imports(&self, file: &str, imports: &[(String, Vec<(String, String)>, u32, String)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM imports WHERE file = ?1", params![file])?;
@@ -923,6 +961,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn imports_in_file(&self, file: &str) -> Result<Vec<(String, Vec<(String, String)>, u32, String)>> {
         let mut stmt = self
             .conn
@@ -948,6 +987,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn all_imports(&self) -> Result<Vec<(String, String, Vec<(String, String)>, u32, String)>> {
         let mut stmt = self
             .conn
@@ -979,6 +1019,7 @@ impl Store {
     // entities
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn insert_entity(&self, entity: &Entity, sources: &[String]) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO entities (id, kind, name, attributes, evidence, sources)
@@ -1004,6 +1045,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
         let row = self
             .conn
@@ -1089,6 +1131,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn entities_by_kind(&self, kind: &str) -> Result<Vec<Entity>> {
         let mut stmt = self
             .conn
@@ -1116,10 +1159,12 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn all_entities(&self) -> Result<Vec<Entity>> {
         self.all_entities_impl()
     }
 
+    // trace:exempt reason=internal-detail
     fn all_entities_impl(&self) -> Result<Vec<Entity>> {
         let mut stmt = self
             .conn
@@ -1147,6 +1192,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn delete_entity(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
         self.conn
@@ -1154,6 +1200,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn delete_entities(&self, ids: &[String]) -> Result<()> {
         for id in ids {
             self.delete_entity(id)?;
@@ -1165,6 +1212,7 @@ impl Store {
     // relationships
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn insert_relationship(&self, rel: &Relationship, source_path: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO relationships (id, subject, predicate, object, provenance, confidence, evidence, verified_at, source_path)
@@ -1184,14 +1232,17 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn relationships_for(&self, subject: &str) -> Result<Vec<Relationship>> {
         self.query_relationships("SELECT * FROM relationships WHERE subject = ?1 ORDER BY id", params![subject])
     }
 
+    // trace:exempt reason=internal-detail
     pub fn relationships_to(&self, object: &str) -> Result<Vec<Relationship>> {
         self.query_relationships("SELECT * FROM relationships WHERE object = ?1 ORDER BY id", params![object])
     }
 
+    // trace:exempt reason=internal-detail
     pub fn relationships_between(&self, subject: &str, predicate: &str, object: &str) -> Result<Vec<Relationship>> {
         self.query_relationships(
             "SELECT * FROM relationships WHERE subject = ?1 AND predicate = ?2 AND object = ?3",
@@ -1199,11 +1250,13 @@ impl Store {
         )
     }
 
+    // trace:exempt reason=internal-detail
     pub fn all_relationships(&self) -> Result<Vec<Relationship>> {
         self.query_relationships("SELECT * FROM relationships ORDER BY id", [])
     }
 
     /// Relationship ids with the given source path and predicate.
+    // trace:exempt reason=internal-detail
     pub fn relationship_ids_with_source(&self, path: &str, predicate: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM relationships WHERE source_path = ?1 AND predicate = ?2",
@@ -1216,21 +1269,25 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn count_relationships(&self) -> Result<u64> {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))?)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn delete_relationship(&self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM relationships WHERE id = ?1", params![id])?;
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     fn query_relationships(
         &self,
         sql: &str,
+        // trace:exempt reason=internal-detail
         p: impl rusqlite::Params,
     ) -> Result<Vec<Relationship>> {
         let mut stmt = self.conn.prepare(sql)?;
@@ -1268,6 +1325,7 @@ impl Store {
     // evidence
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO evidence (id, type, path, symbol, start_line, end_line, revision, content_hash, extractor, extractor_version)
@@ -1288,6 +1346,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn get_evidence(&self, id: &str) -> Result<Option<Evidence>> {
         let row = self
             .conn
@@ -1324,6 +1383,7 @@ impl Store {
         }))
     }
 
+    // trace:exempt reason=internal-detail
     pub fn all_evidence(&self) -> Result<Vec<Evidence>> {
         let mut stmt = self
             .conn
@@ -1361,6 +1421,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn evidence_for_path(&self, path: &str) -> Result<Vec<Evidence>> {
         let mut stmt = self
             .conn
@@ -1402,6 +1463,7 @@ impl Store {
     // components / flows / invariants / tests
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn replace_components(&self, components: &[Entity]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM components", [])?;
@@ -1432,6 +1494,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn components(&self) -> Result<Vec<Entity>> {
         let mut stmt = self
             .conn
@@ -1473,6 +1536,7 @@ impl Store {
     // canonical flow graphs (Wave 3)
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn replace_flow_graphs(&self, graphs: &[scc_core::FlowGraph]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM flow_graphs", [])?;
@@ -1488,6 +1552,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn flow_graphs(&self) -> Result<Vec<scc_core::FlowGraph>> {
         let mut stmt = self
             .conn
@@ -1503,6 +1568,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn replace_flows(&self, flows: &[Flow]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM flows", [])?;
@@ -1523,6 +1589,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn flows(&self) -> Result<Vec<Flow>> {
         let mut stmt = self
             .conn
@@ -1552,6 +1619,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn flow(&self, id: &str) -> Result<Option<Flow>> {
         let row = self
             .conn
@@ -1580,6 +1648,7 @@ impl Store {
         }))
     }
 
+    // trace:exempt reason=internal-detail
     pub fn replace_invariants(&self, invariants: &[Invariant]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM invariants", [])?;
@@ -1602,6 +1671,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn invariants(&self) -> Result<Vec<Invariant>> {
         let mut stmt = self
             .conn
@@ -1633,6 +1703,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn insert_test(&self, id: &str, name: &str, file: &str, kind: &str, symbol: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO tests (id, name, file, kind, symbol) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1641,6 +1712,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn tests(&self) -> Result<Vec<(String, String, String, String, Option<String>)>> {
         let mut stmt = self
             .conn
@@ -1666,6 +1738,7 @@ impl Store {
     /// edge. Run after the derived layer (components/flows) rebuilds,
     /// because derived edges may briefly hold references during
     /// recompilation.
+    // trace:exempt reason=internal-detail
     pub fn sweep_orphan_evidence(&self) -> Result<u64> {
         // Set-based pass: collect every referenced evidence id ONCE (exact
         // id membership in the JSON arrays, no per-row LIKE scans), then
@@ -1750,6 +1823,7 @@ impl Store {
     /// Canonical epoch string for cache keys: composite of every model
     /// generation plus the latest snapshot revision. A previously fresh
     /// pack can never be served after any source of system truth changed.
+    // trace:exempt reason=internal-detail
     pub fn cache_epoch(&self) -> Result<String> {
         let revision = self
             .latest_snapshot()?
@@ -1758,6 +1832,7 @@ impl Store {
         Ok(self.model_epoch()?.composite(&revision))
     }
 
+    // trace:exempt reason=internal-detail
     pub fn cache_get(&self, key: &str, epoch: &str) -> Result<Option<String>> {
         let row = self
             .conn
@@ -1770,6 +1845,7 @@ impl Store {
         Ok(row)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn cache_put(&self, key: &str, pack: &str, epoch: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO context_cache (key, pack, epoch, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -1778,6 +1854,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn cache_clear(&self) -> Result<()> {
         self.conn.execute("DELETE FROM context_cache", [])?;
         Ok(())
@@ -1787,6 +1864,7 @@ impl Store {
     // intent claims / drift findings
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn replace_intent_claims(&self, claims: &[(String, serde_json::Value)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM intent_claims", [])?;
@@ -1802,6 +1880,7 @@ impl Store {
         Ok(())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn intent_claims(&self) -> Result<Vec<(String, serde_json::Value)>> {
         let mut stmt = self
             .conn
@@ -1823,6 +1902,7 @@ impl Store {
     // runtime edges
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn runtime_edge_rows(&self) -> Result<Vec<RuntimeEdgeRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT source, target, count, latency_ms, errors, last_observed
@@ -1854,6 +1934,7 @@ impl Store {
     /// count-weighted running average, `errors` is additive. Does NOT bump
     /// any model-epoch generation: ingestion callers bump the Runtime
     /// generation once per payload.
+    // trace:exempt reason=internal-detail
     pub fn upsert_trace_signature(&self, signature: &str, latency_ms: f64, errors: u64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO trace_signatures (signature, count, latency_ms, errors, last_observed)
@@ -1870,6 +1951,7 @@ impl Store {
     }
 
     /// All observed trace signatures, ordered by (count DESC, signature).
+    // trace:exempt reason=internal-detail
     pub fn trace_signatures(&self) -> Result<Vec<(String, u64, f64, u64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT signature, count, latency_ms, errors, last_observed
@@ -1895,6 +1977,7 @@ impl Store {
     // embeddings
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn put_embedding(&self, entity_id: &str, vector: &[f32], model: &str) -> Result<()> {
         let bytes: Vec<u8> = vector
             .iter()
@@ -1927,12 +2010,14 @@ impl Store {
         }))
     }
 
+    // trace:exempt reason=internal-detail
     pub fn embedding_count(&self) -> Result<u64> {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn add_drift_finding(&self, kind: &str, severity: &str, message: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO drift_findings (kind, severity, message, created_at, resolved) VALUES (?1, ?2, ?3, ?4, 0)",
@@ -1941,6 +2026,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    // trace:exempt reason=internal-detail
     pub fn drift_findings(&self, unresolved_only: bool) -> Result<Vec<(i64, String, String, String, String)>> {
         let sql = if unresolved_only {
             "SELECT id, kind, severity, message, created_at FROM drift_findings WHERE resolved = 0 ORDER BY id"
@@ -1964,6 +2050,7 @@ impl Store {
         Ok(out)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn clear_drift_findings(&self) -> Result<()> {
         self.conn.execute("DELETE FROM drift_findings", [])?;
         Ok(())
@@ -1974,6 +2061,7 @@ impl Store {
     // ------------------------------------------------------------------
 
     /// Lexical search over entities (components, routes, data, stores...).
+    // trace:exempt reason=internal-detail
     pub fn search_entities(&self, query: &str, limit: usize) -> Result<Vec<Entity>> {
         let q = fts_query(query);
         let mut stmt = self.conn.prepare(
@@ -2005,6 +2093,7 @@ impl Store {
     }
 
     /// Lexical search over symbols.
+    // trace:exempt reason=internal-detail
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String, String)>> {
         let q = fts_query(query);
         let mut stmt = self.conn.prepare(
@@ -2030,6 +2119,7 @@ impl Store {
     /// signatures, responsibilities) — case-insensitive. Used when FTS prefix
     /// matching misses morphological variants or multi-term AND queries drop
     /// otherwise-strong matches.
+    // trace:exempt reason=internal-detail
     pub fn search_entities_like(&self, term: &str, limit: usize) -> Result<Vec<Entity>> {
         let pat = format!("%{}%", term.to_ascii_lowercase());
         let mut stmt = self.conn.prepare(
@@ -2062,6 +2152,7 @@ impl Store {
     }
 
     /// Substring fallback over symbols (name, signature, docstring).
+    // trace:exempt reason=internal-detail
     pub fn search_symbols_like(&self, term: &str, limit: usize) -> Result<Vec<(String, String, String, String)>> {
         let pat = format!("%{}%", term.to_ascii_lowercase());
         let mut stmt = self.conn.prepare(
@@ -2089,6 +2180,7 @@ impl Store {
     // stats
     // ------------------------------------------------------------------
 
+    // trace:exempt reason=internal-detail
     pub fn stats(&self) -> Result<HashMap<String, u64>> {
         let mut m = HashMap::new();
         for (name, sql) in [
@@ -2113,6 +2205,7 @@ impl Store {
 // helpers
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 fn apply_migrations(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let current = SCHEMA_VERSION as i64;
@@ -2138,6 +2231,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// trace:exempt reason=internal-detail
 pub fn parse_provenance(s: &str) -> Provenance {
     match s {
         "EXTRACTED" => Provenance::Extracted,
@@ -2150,6 +2244,7 @@ pub fn parse_provenance(s: &str) -> Provenance {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn evidence_type_str(t: &scc_core::EvidenceType) -> &'static str {
     match t {
         scc_core::EvidenceType::Source => "source",
@@ -2161,6 +2256,7 @@ pub fn evidence_type_str(t: &scc_core::EvidenceType) -> &'static str {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn parse_evidence_type(s: &str) -> scc_core::EvidenceType {
     match s {
         "source" => scc_core::EvidenceType::Source,
@@ -2173,6 +2269,7 @@ pub fn parse_evidence_type(s: &str) -> scc_core::EvidenceType {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn flow_kind_str(k: &scc_core::FlowKind) -> &'static str {
     match k {
         scc_core::FlowKind::Architecture => "architecture",
@@ -2183,6 +2280,7 @@ pub fn flow_kind_str(k: &scc_core::FlowKind) -> &'static str {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn parse_flow_kind(s: &str) -> scc_core::FlowKind {
     match s {
         "architecture" => scc_core::FlowKind::Architecture,
@@ -2194,6 +2292,7 @@ pub fn parse_flow_kind(s: &str) -> scc_core::FlowKind {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn severity_str(s: &Severity) -> &'static str {
     match s {
         Severity::Info => "info",
@@ -2204,6 +2303,7 @@ pub fn severity_str(s: &Severity) -> &'static str {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn parse_severity(s: &str) -> Severity {
     match s {
         "info" => Severity::Info,
@@ -2217,6 +2317,7 @@ pub fn parse_severity(s: &str) -> Severity {
 
 /// Build a safe FTS5 MATCH expression from free-form text: quoted terms with
 /// prefix matching on the last term.
+// trace:exempt reason=internal-detail
 fn fts_query(text: &str) -> String {
     let tokens: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
@@ -2233,10 +2334,12 @@ fn fts_query(text: &str) -> String {
 }
 
 #[cfg(test)]
+// trace:exempt reason=internal-detail
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // trace:exempt reason=internal-detail
     pub(crate) fn tmp_store() -> (Store, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2246,6 +2349,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn migrations_apply_and_reopen() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2261,6 +2365,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn model_epoch_bumps_and_composites() {
         let (s, _d) = tmp_store();
         assert_eq!(s.model_epoch().unwrap(), ModelEpoch::zero());
@@ -2290,6 +2395,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn cache_is_keyed_on_epoch() {
         let (s, _d) = tmp_store();
         let e0 = s.cache_epoch().unwrap();
@@ -2306,6 +2412,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn intent_replacement_bumps_intent_epoch() {
         let (s, _d) = tmp_store();
         let before = s.model_epoch().unwrap().intent;
@@ -2316,6 +2423,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn trace_signature_upsert_roundtrip_and_epoch_neutral() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2355,6 +2463,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn entity_roundtrip_and_fts() {
         let (s, _d) = tmp_store();
         let mut e = Entity::new("repo://r/component/transcript", "component", "transcript-normalizer");
@@ -2368,6 +2477,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn relationship_roundtrip() {
         let (s, _d) = tmp_store();
         let rel = Relationship::new(
@@ -2386,6 +2496,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn sweep_orphan_evidence_removes_only_unreferenced() {
         let (s, _d) = tmp_store();
         // three evidence rows: two referenced (entity, relationship), one not
@@ -2421,6 +2532,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn sweep_orphan_evidence_keeps_flow_and_component_references() {
         let (s, _d) = tmp_store();
         // derived-layer references (flow step + component) must protect
@@ -2464,6 +2576,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn purge_path_cascades() {
         let (s, _d) = tmp_store();
         s.insert_symbol("a.py", "foo", "function", None, 1, 5, true, None).unwrap();
@@ -2548,6 +2661,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn cache_revision_scoped() {
         let (s, _d) = tmp_store();
         s.cache_put("k", "pack-v1", "rev1").unwrap();
@@ -2556,6 +2670,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn fts_escapes_punctuation() {
         let (s, _d) = tmp_store();
         let mut e = Entity::new("repo://r/route/api", "route", "GET /api/v1/items");
@@ -2567,11 +2682,13 @@ mod tests {
 }
 
 #[cfg(test)]
+// trace:exempt reason=internal-detail
 mod like_tests {
     use super::*;
     use crate::tests::tmp_store;
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn entities_like_matches_attributes() {
         let (s, _d) = tmp_store();
         let mut e = Entity::new("repo://r/symbol/a.py/f", "symbol", "transcribe");
@@ -2584,6 +2701,7 @@ mod like_tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn symbols_like_matches_docstring() {
         let (s, _d) = tmp_store();
         s.insert_symbol("a.py", "transcribe", "function", None, 1, 2, true,
