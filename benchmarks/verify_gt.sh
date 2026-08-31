@@ -1,4 +1,5 @@
 #!/bin/bash
+# trace:v1 id=ops.benchmark-ground-truth-verify-script title="Atlas-aware ground-truth verifier for benchmark corpora"
 # Atlas-aware ground-truth verifier.
 # A key passes if ANY of:
 #  V1. verbatim in repo source (git grep -F), after stripping backticks
@@ -13,7 +14,7 @@ GT="$(cd "$1" && pwd)"; CORPUS="$(cd "$2" && pwd)"
 total=0; fail=0; : > /tmp/gt_misses.txt
 
 key_ok() { # $1=key $2=repodir
-  local key="$1" repo="$2" path t
+  local key="$1" repo="$2" t
   key="${key//\`/}"
   # alternatives: "A / B" -> first (only when slash is surrounded by spaces)
   key="$(printf '%s' "$key" | sed 's| * / *| / |' | cut -d'/' -f1 | sed 's| *$||')"
@@ -33,7 +34,8 @@ key_ok() { # $1=key $2=repodir
     git -C "$repo" grep -qF -- "$p" 2>/dev/null && return 0
   fi
   # V3 Type.method / Type::method: verify both parts and a dot call site
-  local dot="$(printf '%s' "$key" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[.:]\([A-Za-z_][A-Za-z0-9_]*\)$/\1.\2/p')"
+  local dot
+  dot="$(printf '%s' "$key" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[.:]\([A-Za-z_][A-Za-z0-9_]*\)$/\1.\2/p')"
   if [ -n "$dot" ]; then
     local t="${dot%%.*}" m="${dot##*.}"
     git -C "$repo" grep -qF -- "$t" 2>/dev/null && git -C "$repo" grep -qF -- "$m" 2>/dev/null && return 0

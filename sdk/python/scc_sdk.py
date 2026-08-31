@@ -7,10 +7,12 @@ then ``scc`` on PATH. A non-zero exit raises :class:`SCCError` with the
 process's stderr.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # trace:v1 id=impl.scc.sdk.python work=WORK-SCC-014 satisfies=REQ-SCC-IR
 
@@ -24,12 +26,12 @@ class SCC:
     """Client for the ``scc`` CLI (thin subprocess wrapper)."""
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.init work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def __init__(self, bin: Optional[str] = None, cwd: Optional[str] = None) -> None:
+    def __init__(self, bin: str | None = None, cwd: str | None = None) -> None:
         self._bin = bin or os.environ.get("SCC_BIN") or "scc"
         self._cwd = cwd or os.getcwd()
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.run work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def _run(self, args: List[str]) -> subprocess.CompletedProcess:
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
         proc = subprocess.run(
             [self._bin, "--root", self._cwd, *args],
             capture_output=True,
@@ -37,19 +39,19 @@ class SCC:
             check=False,
         )
         if proc.returncode != 0:
-            message = proc.stderr.strip() or "{} exited with code {}".format(
-                self._bin, proc.returncode
+            message = (
+                proc.stderr.strip() or f"{self._bin} exited with code {proc.returncode}"
             )
             raise SCCError(message)
         return proc
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.run-json work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def _run_json(self, args: List[str]) -> Dict[str, Any]:
+    def _run_json(self, args: list[str]) -> dict[str, Any]:
         proc = self._run(args)
         return json.loads(proc.stdout)
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.system-overview work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def systemOverview(self) -> Dict[str, Any]:
+    def systemOverview(self) -> dict[str, Any]:
         """Compile the system overview capsule."""
         return self._run_json(["overview", "--json"])
 
@@ -57,10 +59,10 @@ class SCC:
     def taskContext(
         self,
         goal: str,
-        files: Optional[List[str]] = None,
-        symbols: Optional[List[str]] = None,
-        tokenBudget: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        files: list[str] | None = None,
+        symbols: list[str] | None = None,
+        tokenBudget: int | None = None,
+    ) -> dict[str, Any]:
         """Compile the complete task context artifact for a goal: the enriched
         task pack plus its task-personalized Surface delta.
 
@@ -83,19 +85,19 @@ class SCC:
         return self._run_json(args)
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.component-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def componentContext(self, id: str) -> Dict[str, Any]:
+    def componentContext(self, id: str) -> dict[str, Any]:
         """Compile the context pack for one component (by id or name)."""
         return self._run_json(["context", "component", id, "--json"])
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.flow-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def flowContext(self, id: str) -> Dict[str, Any]:
+    def flowContext(self, id: str) -> dict[str, Any]:
         """Compile the context pack for one flow (by id or name)."""
         return self._run_json(["context", "flow", id, "--json"])
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.impact-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def impactContext(
-        self, files: Optional[List[str]] = None, symbols: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+        self, files: list[str] | None = None, symbols: list[str] | None = None
+    ) -> dict[str, Any]:
         """Compile an impact analysis pack for a set of files/symbols."""
         args = ["impact"]
         if files:
@@ -106,7 +108,7 @@ class SCC:
         return self._run_json(args)
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.verify-context work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def verifyContext(self) -> Dict[str, Any]:
+    def verifyContext(self) -> dict[str, Any]:
         """Run the freshness/evidence verification.
 
         ``scc verify`` has no JSON mode, so the pack is synthesized from its
@@ -131,7 +133,7 @@ class SCC:
         }
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.context-startup work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def contextStartup(self, budget: Optional[int] = None) -> Dict[str, Any]:
+    def contextStartup(self, budget: int | None = None) -> dict[str, Any]:
         """Compile the fused session-startup artifact (Atlas + Surface +
         coverage + omissions).
 
@@ -156,8 +158,8 @@ class SCC:
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.surface-map work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def surfaceMap(
-        self, goal: Optional[str] = None, budget: Optional[int] = None
-    ) -> Dict[str, Any]:
+        self, goal: str | None = None, budget: int | None = None
+    ) -> dict[str, Any]:
         """Compile the System Surface Map, global or task-personalized.
 
         ``scc surface`` has no JSON mode, so the pack is synthesized from
@@ -184,10 +186,10 @@ class SCC:
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.structural-source work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
     def structuralSource(
         self,
-        files: Optional[List[str]] = None,
-        goal: Optional[str] = None,
-        budget: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        files: list[str] | None = None,
+        goal: str | None = None,
+        budget: int | None = None,
+    ) -> dict[str, Any]:
         """Compile the Structural Source representation of files (explicit
         ``files`` or the files matched to a ``goal`` via the PPR->Surface
         pipeline).
@@ -216,7 +218,7 @@ class SCC:
         }
 
     # trace:v1 id=impl.sdk-python-scc-sdk-scc.index work=WORK-task-context-transport-parity satisfies=REQ-SCC-IR
-    def index(self) -> Dict[str, bool]:
+    def index(self) -> dict[str, bool]:
         """Index the repository (idempotent; incremental after the first run)."""
         self._run(["index"])
         return {"ok": True}

@@ -3,7 +3,7 @@ import { OrderService } from "../src/domain/orders";
 
 describe("OrderService", () => {
   it("computes order totals from line items", async () => {
-    const svc = new OrderService({ list: async () => [], get: async () => ({}), insert: async () => ({}) });
+    const svc = new OrderService({ list: async () => [], get: async () => ({}), insert: async () => ({}) } as unknown as OrderService["repo"]);
     expect(typeof svc.createOrder).toBe("function");
   });
 });

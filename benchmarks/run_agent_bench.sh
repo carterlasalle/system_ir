@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# trace:v1 id=ops.agent-bench-runner-script title="Codex agent benchmark runner (variants A/E/F)"
+# shellcheck disable=SC2016  # SCC_GOAL/ATLAS are deliberately literal: the bench-harness shell expands them per task
 # §56 agent benchmark runner (Wave 8): compares Codex with and without SCC
 # context over the 21-task fixture corpus via the `scc bench agent` harness.
 #
