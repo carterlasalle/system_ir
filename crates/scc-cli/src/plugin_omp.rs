@@ -182,9 +182,41 @@ fn write_agents_rules(root: &Path) -> crate::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds the process-wide SCC_BIN lock for the lifetime of setup/merge
+    /// tests. `mcp_json_honors_scc_bin_at_setup` mutates the env; any parallel
+    /// test that reads SCC_BIN without this guard will flake (CI PR job:
+    /// `mcp_merge_preserves_existing_servers` saw `/opt/custom/scc`).
+    // trace:exempt reason=internal-helper
+    struct SccBinGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    // trace:exempt reason=internal-helper
+    impl Drop for SccBinGuard {
+        // trace:exempt reason=internal-helper
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("SCC_BIN", v),
+                None => std::env::remove_var("SCC_BIN"),
+            }
+        }
+    }
+
+    // trace:exempt reason=internal-helper
+    fn lock_scc_bin(value: Option<&str>) -> SccBinGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("SCC_BIN").ok();
+        match value {
+            Some(v) => std::env::set_var("SCC_BIN", v),
+            None => std::env::remove_var("SCC_BIN"),
+        }
+        SccBinGuard { _lock: lock, prev }
+    }
 
     // trace:exempt reason=internal-helper
     fn installed_extension(root: &Path) -> String {
@@ -194,6 +226,7 @@ mod tests {
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.installs-extension-and-mcp work=WORK-SCC-001 verifies=REQ-SCC-API
     fn installs_extension_and_mcp() {
+        let _env = lock_scc_bin(None);
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -232,6 +265,7 @@ mod tests {
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.mcp-merge-preserves-existing work=WORK-SCC-001 verifies=REQ-SCC-API
     fn mcp_merge_preserves_existing_servers() {
+        let _env = lock_scc_bin(None);
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -308,6 +342,7 @@ mod tests {
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.extension-index-uses-paths work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
     fn generated_extension_invokes_index_paths_and_does_not_treat_failure_as_success() {
+        let _env = lock_scc_bin(None);
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -350,18 +385,11 @@ mod tests {
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.scc-bin-honored-in-mcp work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
     fn mcp_json_honors_scc_bin_at_setup() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = lock_scc_bin(Some("/opt/custom/scc"));
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        let prev = std::env::var("SCC_BIN").ok();
-        std::env::set_var("SCC_BIN", "/opt/custom/scc");
-        let setup = cmd_setup_omp(&root);
-        match prev {
-            Some(v) => std::env::set_var("SCC_BIN", v),
-            None => std::env::remove_var("SCC_BIN"),
-        }
-        setup.unwrap();
+        cmd_setup_omp(&root).unwrap();
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".omp/mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["scc"]["command"], "/opt/custom/scc");
