@@ -31,7 +31,7 @@ def scc_bin() -> str:
     if found:
         return found
     sys.stderr.write("scc binary not found (build first or set SCC_BIN)\n")
-        sys.exit(1)
+    sys.exit(1)
 
 
 # trace:exempt reason=internal-helper
