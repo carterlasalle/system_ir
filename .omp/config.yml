@@ -1,4 +1,0 @@
-modelRoles:
-  task: 9router/tokenrouter/moonshotai/kimi-k3-free:auto
-  smol: omni-router/tokenrouter/z-ai/glm-5.3-free:max
-  default: omni-router/tokenrouter/z-ai/glm-5.3-free:max

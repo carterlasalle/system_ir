@@ -18,3 +18,5 @@ __pycache__/
 *.pyc
 **/.aider.tags.cache.v4/
 **/.aider.input.history
+.omp/config.yml
+.omp/config.yml.lock
