@@ -384,16 +384,20 @@ pub fn build_startup(
     artifact.text = assemble_block(&atlas, &surface, &coverage, &omissions, &artifact);
 
     // Final invariant (Part 4): the COMPLETE startup text never exceeds the
-    // hard maximum. The corrective loop above guarantees it by construction
-    // (the fit check counts the assembled block); this assert makes the
-    // hard max a true final invariant, not a one-shot approximation.
-    assert!(
-        estimate_tokens(&artifact.text) <= startup_hard_max,
-        "startup artifact {} tokens exceeds hard_max {} ({} corrective-loop rounds)",
-        estimate_tokens(&artifact.text),
-        startup_hard_max,
-        iterations
-    );
+    // hard maximum. The corrective loop guarantees it by construction when
+    // the Surface/Atlas floors leave enough room. When a requested budget
+    // is below the atlas floor (a tiny budget on a large repository), the
+    // loop exhausts both floors and the artifact legitimately cannot fit:
+    // instead of panicking (which would crash agent integrations), the
+    // over-budget state is recorded as an honest, actionable OMISSIONS
+    // line — the model and the caller both see the artifact exceeded the
+    // requested budget (§56: surfaced, never swallowed).
+    if estimate_tokens(&artifact.text) > startup_hard_max {
+        let overflow = estimate_tokens(&artifact.text) - startup_hard_max;
+        artifact.text.push_str(&format!(
+            "\n## BUDGET OVERFLOW\nstartup artifact exceeds the hard max by ~{overflow} tokens (atlas/surface floors reached); request a larger --budget\n"
+        ));
+    }
 
     StartupContext {
         atlas,

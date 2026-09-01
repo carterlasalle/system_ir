@@ -60,6 +60,38 @@ rules, security boundaries, contractual config, verification tests). Do
 NOT trace imports, trivial getters/setters, local loops, formatting
 changes, or generated code.
 
+## Boundary accounting: three ways to satisfy TL012/TL013
+
+A changed behavioral boundary is trace-accounted by exactly one of:
+
+1. A canonical `trace:v1` marker attached directly above the boundary
+   (code: within 3 comment/decorator lines above the symbol; markdown:
+   within the heading's 5-line marker window below it, or directly
+   above the heading).
+2. Explicit inheritance: `trace:inherit <trace-id> reason=<why>`
+   directly above the boundary. The target must be an active node in
+   the same file and the boundary's structural parent (a class whose
+   range encloses a method, a section heading, a parent config key).
+   A bare or unresolvable declaration is not accounting.
+3. Explicit exemption: `# trace:exempt reason=<why>` (language-
+   appropriate comment prefix) directly above the boundary, or — for
+   files with no recognized boundaries at all (shell scripts, plain
+   text) — anywhere in the file. The reason must be non-empty; bare
+   `trace:exempt` is ignored so no one can shortcut the gate without
+   an auditable cause.
+
+Files with no boundaries and no marker need a node claiming the file
+(`trace new operation ...` + a file-level `trace:v1` marker), or a
+policy exclusion (`trace ignore <path>`).
+
+## Config and policy files
+
+Changing `.trace/policy.toml` or `.trace/trace.toml` emits TL063
+(WARNING) even though `.trace/**` is policy-excluded: enforcement-
+configuration changes alter gate semantics, so the gate deliberately
+surfaces them. This is intended behavior, not an exclusion bug.
+
+
 # Artifact Types
 
 | Type | Category | Description |

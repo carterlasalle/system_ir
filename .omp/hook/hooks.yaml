@@ -1,18 +1,18 @@
-# TraceLayer × Oh My Pi — YAML hooks (pi-yaml-hooks)
 #
 # ⚠️ INACTIVE — DO NOT TRUST THIS FILE.
 #
-# This YAML hook file is INERT in the current OMP runtime: the
-# pi-yaml-hooks plugin that interprets it is NOT installed, and the OMP
-# runtime does not natively read `.omp/hook/hooks.yaml`. It is retained
-# only as a historical reference.
+# This YAML hook file is INERT in the current OMP runtime: no YAML hook
+# loader exists in OMP 18.x (verified against the 18.0.11 binary — the
+# ambient hooks scan accepts only `.ts`/`.js` files, plugin manifest
+# loading reads `extensions` arrays only, and no `pi-yaml-hooks` plugin
+# is installed). It is retained only as a historical reference for
+# runtimes that DID support this layout.
 #
 # All TraceLayer lifecycle behavior is implemented by the NATIVE extension
 # at `.omp/extensions/tracelayer/trace-gate.ts`, which registers the
-# `tool_call` pre-mutation gate and `tool_result` post-edit coaching via
-# OMP's native extension events (the current public API has no
-# `session_stop` event, so the fail-closed completion gate does not run in
-# this runtime). The extension is the single source of truth; this YAML is
+# `tool_call` pre-mutation gate, `tool_result` post-edit coaching, and the
+# fail-closed `session_stop` completion gate via OMP's native extension
+# events. The extension is the single source of truth; this YAML is
 # NOT loaded.
 #
 # To remove it entirely: delete this file. It is kept only so the layout

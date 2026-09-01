@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Scoped REAL writable coding-agent matrix (Part 14 first slice).
+"""Scoped REAL writable coding-agent matrix.
 
-Runs actual coding agents (codex by default) on real corpus tasks in the
-WRITABLE mode: each task gets an isolated disposable repo copy; the agent
-may edit; success is decided by an EVALUATOR (behavioral acceptance
-checks), never by the agent exit code.
+One writable runner for every variant (mission §21): isolated repo copy ->
+context generation -> SAME agent -> SAME evaluator -> SAME metrics. Variants:
+raw / scc-full / aider-repomap / repomix-compress.
 
-Variants compared (equal-token at DEFAULT_BUDGET):
-  raw      — no context artifact (the agent explores on its own)
-  scc-full — the complete SCC task context artifact (pack + surface delta)
+Task corpus: derived from benchmarks/tasks.json by task id (§28) — one
+canonical source; the evaluators live in evaluators.py and satisfy the
+four-way meta-contract (§25: untouched FAIL, comment-only FAIL,
+plausible-wrong FAIL, known-good PASS — enforced by test_evaluators.py in
+CI before any experiment runs).
 
-Metrics per (variant, task): run_completion (process), task_success
-(evaluator), context_tokens, wall time. Paired per task; the report
-includes a paired bootstrap 95% CI for the task-success difference.
-
-HONESTY: this is a SCOPED matrix (subset of the corpus, one agent). It is
-NOT the full 21-task dual-agent showdown and must not be described as one.
+Metadata (§33): every cell records agent label/command/version, model,
+SCC/bench/harness commits, corpus hash, mode, requested budget, actual
+context tokens, per-task outcome and error TYPE (§32: agent-completed-
+incorrectly vs infrastructure failure are never conflated).
 """
-
+import hashlib
 import importlib.util
 import json
 import os
@@ -39,90 +38,55 @@ WRITABLE_AGENT_CMD = (
     "--ephemeral --color never -C . -"
 )
 
-# The scoped corpus: 6 tasks across 4 archetypes. `validate` is the
-# behavioral acceptance check the EVALUATOR runs in the edited repo —
-# task success is this command exiting 0, nothing else.
-#
-# EVALUATOR VALIDITY CONTRACT (audit fix): every validator was checked
-# against the UNTOUCHED fixture — it MUST exit non-zero there (a validator
-# that passes on the untouched repo measures nothing). Each validator
-# asserts the specific behavioral change the goal names, against the
-# fixture's REAL layout (main.py + services/, src/, web/+service/,
-# consumer.py — no invented directories).
-SCOPED_TASKS = [
-    {"repo": "http-service-python", "id": "http-service.rename-transcript-field",
-     "goal": "rename the transcript field in the api response",
-     # The API response dict must expose transcriptText and no longer
-     # expose the old transcript key in the route handler's returned dicts.
-     "validate": "! grep -qE '\"transcript\"' main.py && grep -qE 'transcriptText|transcript_text' main.py"},
-    {"repo": "queue-worker-ts", "id": "queue-worker.asr-retry",
-     "goal": "add retry handling to the asr transcription call",
-     # The ASR CALL PATH (src/ingest.ts or a new call site) must gain
-     # retry logic — the decorator on client.ts already exists, so a bare
-     # grep for 'retry' anywhere is a false pass.
-     "validate": "grep -qE 'retry|attempt' src/ingest.ts"},
-    {"repo": "ts-api-web", "id": "ts-api-web.pagination",
-     "goal": "add pagination to the users list endpoint",
-     # The users service/endpoint gains page/pageSize params (fixture has
-     # no src/; the users code lives in service/users.ts + server.ts).
-     "validate": "grep -qiE 'page' service/users.ts server.ts"},
-    {"repo": "py-queue-service", "id": "py-queue.empty-messages",
-     "goal": "make the consumer tolerate empty messages",
-     # consume() must guard empty/blank messages before dispatch.
-     "validate": "grep -qE 'not message|if.*message.*:|strip()' consumer.py && grep -q 'def consume' consumer.py && grep -qE 'if not (message|message.get)' consumer.py"},
-    {"repo": "http-service-python", "id": "http-service.health-check",
-     "goal": "add a health check endpoint",
-     # A NEW health route: the fixture already HAS /health, so the agent
-     # must extend it to a real readiness payload (status+ok) — a no-op
-     # cannot pass because the validator demands the payload keys.
-     "validate": "grep -qE 'uptime|checks|dependencies' main.py && grep -q '/health' main.py"},
-    {"repo": "queue-worker-ts", "id": "queue-worker.street-vocabulary",
-     "goal": "change street name resolution to use department vocabulary",
-     # The resolver must APPLY the vocabulary map in its resolution path —
-     # a vocabulary map must exist AND be applied (includes/replace).
-     "validate": "grep -qE 'Map<|DEPARTMENT_VOCAB' src/geo/resolver.ts && grep -qE 'includes|replace' src/geo/resolver.ts"},
-]
+# Canonical corpus (§28): the writable tasks are the canonical tasks.json
+# ids that have REGISTERED evaluators. SCOPED_TASKS is derived, never a
+# divergent copy. `validate` shell snippets are GONE: the registry
+# evaluators (behavioral where the fixture runs; explicitly classified
+# structural otherwise) are the single source of acceptance truth.
+import evaluators as _ev
+
+def canonical_writable_tasks():
+    tasks = []
+    for t in _ev.load_tasks():
+        if t["id"] in _ev.EVALUATORS:
+            tasks.append({"repo": t["repo"], "id": t["id"], "goal": t["goal"],
+                          "structural": _ev.is_structural(t["id"])})
+    return tasks
+
+SCOPED_TASKS = canonical_writable_tasks()
 
 BUDGET = h.DEFAULT_BUDGET
 
 
-def scc_artifact(repo, goal, workdir, scc_bin):
-    """Build the FULL SCC stack artifact for (repo, goal): the fused
-    startup (Atlas + global Surface + coverage + omissions) followed by
-    the complete task artifact (enriched pack + task-personalized Surface
-    delta). The fixture is INDEXED FIRST into a disposable .scc dir — the
-    checked-in fixtures carry no index, so skipping this yields a framing-
-    only artifact with no repository knowledge. This is what "scc-full"
-    means in the external benchmark; the task pack alone is NOT full SCC."""
-    fixture = h.FIXTURES / repo
-    env = {**os.environ, "SCC_STATE_DIR": str(Path(workdir) / ".scc-state")}
-    def scc(*args):
-        return subprocess.run([scc_bin, "--root", str(fixture), *args],
-                              capture_output=True, text=True, timeout=900, env=env)
-    if scc("index").returncode != 0:
-        return None, 0
-    parts = []
-    startup = scc("context", "startup")
-    if startup.returncode == 0 and startup.stdout.strip():
-        parts.append(startup.stdout.rstrip() + "\n\n")
-    task = scc("context", "task", goal, "--json")
-    if task.returncode == 0:
-        try:
-            art = json.loads(task.stdout)
-            parts.append(art["pack"]["content"])
-            if art.get("delta"):
-                parts.append("\n" + art["delta"])
-        except (ValueError, KeyError):
-            parts.append(task.stdout)
-    elif task.stdout.strip():
-        parts.append(task.stdout)
-    text = "".join(parts)
-    if not text.strip():
-        return None, 0
-    out = Path(workdir) / "scc-full.txt"
-    out.write_text(text)
-    # The shared chars/4 estimator (same rule as the adapters).
-    return out, max(1, len(text) // 4)
+def scc_artifact(repo, goal, workdir, scc_bin, budget=None):
+    """Build the FULL SCC artifact through the AUTHORITATIVE CLI builder
+    (`scc bench external --artifact-only`, mission §18/§40): fused startup
+    (Atlas + Surface) + task pack + goal-selected Structural Source, with
+    the FINAL-artifact budget enforced by the CLI (startup N/2, task N/4,
+    structural remainder, hard shrink). The harness never reconstructs
+    SCC semantics in Python. Returns (artifact_path, tokens); raises
+    RuntimeError on failure (infra error)."""
+    out_dir = Path(workdir) / "artifacts" / "scc-full"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    argv = [scc_bin, "bench", "external",
+            "--variant", "scc-full", "--repo", repo,
+            "--artifact-only", goal, "--workdir", str(out_dir)]
+    if budget is not None:
+        argv += ["--budget", str(budget)]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0:
+        raise RuntimeError(f"scc artifact builder failed: {(proc.stderr or proc.stdout)[:300]}")
+    payload = json.loads(proc.stdout)
+    tokens = int(payload.get("tokens", 0))
+    # §19 postcondition: the shared estimator on the FINAL artifact must
+    # be within the requested budget (the CLI enforces it; assert here so
+    # a regression is loud, not silent).
+    if budget is not None:
+        text = Path(payload["artifact"]).read_text()
+        actual = max(1, len(text) // 4)
+        assert actual <= budget, f"equal-token violation: artifact {actual} > budget {budget}"
+        assert tokens == actual or tokens <= budget, (tokens, actual, budget)
+    return Path(payload["artifact"]), tokens
 
 
 EXTERNAL_VARIANTS = ("aider-repomap", "repomix-compress")
@@ -167,8 +131,16 @@ def external_artifact(variant, repo, goal, workdir, budget):
     return Path(payload["artifact"]), int(payload.get("tokens", 0)), None
 
 
-def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
-    """One (variant, task) cell: isolated copy -> agent -> evaluator."""
+def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
+                agent_label=None, model_label=None, budget=None):
+    """One (variant, task) cell: isolated copy -> agent -> evaluator.
+
+    Error typing (§32): `error` is set ONLY for infrastructure failures
+    (artifact generation, missing tool); an agent that completed the task
+    incorrectly has task_success=False and error=None. Infra-failed cells
+    are excluded from success-rate numerators AND from the paired sets
+    (reported separately, never masquerading as a coding failure).
+    """
     cell_dir = Path(workdir) / f"{variant}--{task['id']}"
     cell_dir.mkdir(parents=True, exist_ok=True)
     root = cell_dir / "repo"
@@ -176,31 +148,52 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None):
 
     artifact = None
     ctx_tokens = 0
+    error = None
     if variant == "scc-full":
-        artifact, ctx_tokens = scc_artifact(task["repo"], task["goal"], cell_dir, scc_bin)
-        if artifact is None:
+        try:
+            artifact, ctx_tokens = scc_artifact(
+                task["repo"], task["goal"], cell_dir, scc_bin, budget=budget)
+        except (RuntimeError, AssertionError, ValueError) as exc:
             return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0, "error": "scc artifact failed"}
+                    "context_tokens": 0, "wall_sec": 0.0,
+                    "error": f"scc-artifact-generation-failed: {str(exc)[:200]}",
+                    "error_type": "infrastructure"}
     elif variant in EXTERNAL_VARIANTS:
         artifact, ctx_tokens, err = external_artifact(
-            variant, task["repo"], task["goal"], cell_dir, BUDGET)
+            variant, task["repo"], task["goal"], cell_dir,
+            budget if budget is not None else BUDGET)
         if artifact is None:
             return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0, "error": err}
+                    "context_tokens": 0, "wall_sec": 0.0,
+                    "error": err, "error_type": "infrastructure"}
 
     started = time.monotonic()
     result = h.run_write_task(
-        agent_cmd, root, task["goal"], validate_cmd=task["validate"],
+        agent_cmd, root, task["goal"],
+        validate_cmd=None, tests_cmd=None,
         artifact_path=artifact,
     )
     wall = round(time.monotonic() - started, 1)
+
+    # The evaluator is the CANONICAL registry (never an inline snippet):
+    # evaluate() raises KeyError for unknown ids, and its own four-way
+    # contract is enforced by test_evaluators.py.
+    try:
+        task_success = _ev.evaluate(task["id"], root)
+        eval_err = None
+    except Exception as exc:  # evaluator crashed = infra failure, not a coding failure
+        task_success, eval_err = False, f"evaluator-crash: {type(exc).__name__}: {exc}"[:300]
     return {
-        "task_success": result["task_success"],
+        "task_success": task_success,
         "run_completion": result["run_completion"],
         "context_tokens": ctx_tokens,
         "patch_produced": result["patch_produced"],
         "modified_files": len(result["modified_files"]),
         "wall_sec": wall,
+        "error": eval_err or result.get("eval_output_error") or None,
+        "error_type": ("evaluator-infrastructure" if eval_err else
+                       ("agent-infrastructure" if not result["run_completion"] else None)),
+        "evaluator_structural": task.get("structural", False),
     }
 
 
@@ -210,26 +203,68 @@ def main(argv):
     parser.add_argument("--scc-bin", default=os.environ.get("SCC_BIN") or "scc")
     parser.add_argument("--agent-cmd", default=None,
                         help="writable agent command (default: codex workspace-write)")
+    parser.add_argument("--agent-label", default=None,
+                        help="label for the agent (recorded in metadata; NEVER inferred — a claude command must never be recorded as codex)")
+    parser.add_argument("--model-label", default=None,
+                        help="label for the model, if the agent command does not encode it")
+    parser.add_argument("--budget", type=int, default=None,
+                        help="equal-token context budget (default: None = native-default mode; §20)")
     parser.add_argument("--out", default=str(HERE.parent / "results" / "write-matrix.json"))
-    parser.add_argument("--tasks", help="comma-separated task ids (default: the scoped 6)")
+    parser.add_argument("--tasks", help="comma-separated canonical task ids (default: all evaluator-backed)")
+    parser.add_argument("--variants", default="raw,scc-full,aider-repomap,repomix-compress",
+                        help="comma-separated variants")
     args = parser.parse_args(argv)
 
     tasks = SCOPED_TASKS
     if args.tasks:
         wanted = set(args.tasks.split(","))
+        unknown = wanted - {t["id"] for t in SCOPED_TASKS}
+        if unknown:
+            print(f"unknown task ids (no evaluator): {sorted(unknown)}", file=sys.stderr)
+            return 2
         tasks = [t for t in SCOPED_TASKS if t["id"] in wanted]
+    variants = tuple(v.strip() for v in args.variants.split(",") if v.strip())
+    agent_cmd = args.agent_cmd or WRITABLE_AGENT_CMD
+    agent_label = args.agent_label or agent_cmd.split()[0]
+
+    # Reproducibility metadata (§33).
+    def _git(cwd, *a):
+        try:
+            return subprocess.run(["git", *a], cwd=cwd, capture_output=True,
+                                  text=True, timeout=30).stdout.strip()
+        except Exception:
+            return "unknown"
+    scc_root = HERE.parent.parent
+    tasks_hash = hashlib.sha256((HERE.parent / "tasks.json").read_bytes()).hexdigest()[:16]
+    evaluators_hash = hashlib.sha256((HERE / "evaluators.py").read_bytes()).hexdigest()[:16]
+    meta = {
+        "schema": 2,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "agent_label": agent_label,
+        "agent_cmd": agent_cmd,
+        "model_label": args.model_label,
+        "scc_commit": _git(scc_root, "rev-parse", "HEAD"),
+        "scc_dirty": bool(_git(scc_root, "status", "--porcelain")),
+        "benchmark_harness_commit": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
+        "tasks_corpus_hash": tasks_hash,
+        "evaluators_hash": evaluators_hash,
+        "mode": "writable-equal-token" if args.budget is not None else "writable-native-default",
+        "requested_budget": args.budget if args.budget is not None else BUDGET,
+    }
+
     workdir = Path(tempfile.mkdtemp(prefix="scc-write-matrix-"))
-    results = {"meta": {"agent": "codex", "mode": "writable", "budget": BUDGET,
-                        "note": "scoped real-agent matrix; NOT the full corpus showdown"},
-               "cells": {}}
-    variants = ("raw", "scc-full", "aider-repomap", "repomix-compress")
+    results = {"meta": meta, "cells": {}}
     try:
         for variant in variants:
             for task in tasks:
                 key = f"{variant}/{task['id']}"
                 print(f"[matrix] {key} ...", flush=True)
                 cell = run_variant(variant, task, workdir, args.scc_bin,
-                                   agent_cmd=args.agent_cmd or WRITABLE_AGENT_CMD)
+                                   agent_cmd=agent_cmd,
+                                   agent_label=agent_label,
+                                   model_label=args.model_label,
+                                   budget=args.budget)
+                cell["requested_budget"] = args.budget if args.budget is not None else None
                 results["cells"][key] = cell
                 print(f"          success={cell['task_success']} "
                       f"completion={cell['run_completion']} wall={cell['wall_sec']}s", flush=True)
@@ -238,43 +273,53 @@ def main(argv):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
 
-    # Paired report + bootstrap CI (Part 16). Aider/repomix cells whose
-    # artifact could not be built (SKIPPED-UNINSTALLED / PIN-*) are
-    # excluded from the success-rate numerator and reported separately,
-    # so a missing external tool never masquerades as a 0% pass.
+    # Paired statistics (§31): join cells by EXACT task id; the paired set
+    # for a comparison is the INTERSECTION of non-infra-error cells. A
+    # cell with an infrastructure error never enters a paired array.
     ids = [t["id"] for t in tasks]
-    def success_series(variant):
-        out = 0.0
-        n = 0
-        for i in ids:
-            cell = results["cells"].get(f"{variant}/{i}")
-            if cell is None or cell.get("error"):
-                continue
-            n += 1
-            out += 1.0 if cell.get("task_success") else 0.0
-        return (out / n) if n else None, n
-    raw_rate, raw_n = success_series("raw")
-    scc_rate, scc_n = success_series("scc-full")
-    aider_rate, aider_n = success_series("aider-repomap")
-    repomix_rate, repomix_n = success_series("repomix-compress")
-    skipped = {v: sum(1 for i in ids if results["cells"].get(f"{v}/{i}", {}).get("error"))
-               for v in variants}
-    mean_diff, lo, hi = h.paired_bootstrap_ci(
-        [1.0 if results["cells"][f"scc-full/{i}"]["task_success"] else 0.0 for i in ids],
-        [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in ids])
-    summary = {
-        "n_tasks": len(ids),
-        "variants": list(variants),
-        "raw_task_success": raw_rate,
-        "scc_full_task_success": scc_rate,
-        "aider_task_success": aider_rate,
-        "repomix_task_success": repomix_rate,
-        "skipped_cells": skipped,
-        "paired_mean_diff_scc_minus_raw": mean_diff,
-        "ci95": [lo, hi],
-        "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
-                    else "CI excludes zero (scoped subset only)"),
-    }
+
+    def paired_ids(*variant_names):
+        ok = set(ids)
+        for v in variant_names:
+            for i in ids:
+                cell = results["cells"].get(f"{v}/{i}")
+                if cell is None or cell.get("error"):
+                    ok.discard(i)
+        return sorted(ok)
+
+    def series(v, paired):
+        vals = [1.0 if results["cells"][f"{v}/{i}"]["task_success"] else 0.0 for i in paired]
+        return (sum(vals) / len(vals)) if vals else None, len(vals)
+
+    summary = {"n_tasks": len(ids)}
+    for v in variants:
+        rate, n = series(v, paired_ids(v))
+        summary[f"{v}_task_success"] = rate
+        summary[f"{v}_n"] = n
+    summary["skipped_cells"] = {
+        v: {i: results["cells"][f"{v}/{i}"].get("error")
+            for i in ids if results["cells"].get(f"{v}/{i}", {}).get("error")}
+        for v in variants}
+
+    # Paired deltas + bootstrap CI for each comparison vs raw.
+    for other in variants:
+        if other == "raw":
+            continue
+        pair = paired_ids("raw", other)
+        if not pair:
+            summary[f"paired_{other}_minus_raw"] = None
+            continue
+        a = [1.0 if results["cells"][f"{other}/{i}"]["task_success"] else 0.0 for i in pair]
+        b = [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in pair]
+        mean_diff, lo, hi = h.paired_bootstrap_ci(a, b)
+        summary[f"paired_{other}_minus_raw"] = {
+            "n_paired": len(pair),
+            "mean_diff": mean_diff,
+            "ci95": [lo, hi],
+            "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
+                        else "CI excludes zero"),
+        }
+
     results["summary"] = summary
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(json.dumps(summary, indent=2))

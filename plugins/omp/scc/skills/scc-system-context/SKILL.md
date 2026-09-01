@@ -15,7 +15,11 @@ native OMP extension — this skill is for when you want more depth.
 | Situation | Tool |
 |---|---|
 | Start of a substantial task in an unfamiliar repository | `system_overview` |
+| The full four-level stack in one artifact (Atlas + Surface + Structural Source) | `system_context` |
+| Architecture deep-dive (Level 0: components, flows, ownership) | `system_atlas` |
 | Any repository-changing task, before planning or editing | `task_context` with the goal |
+| The callable API layer (Level 1: routes, endpoints, public functions) | `surface_map` |
+| Structural signatures of specific files without opening full source (Level 2) | `structural_source` |
 | Deep dive into one component | `component_context` |
 | Understanding a runtime path end to end | `flow_context` |
 | Cross-layer change (API contract, schema, shared code) | `impact_context` on the touched files |

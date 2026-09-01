@@ -19,6 +19,7 @@ pub mod workflow;
 
 pub use trust::{TrustedGraphView, TrustPolicy};
 
+// trace:v1 id=impl.scc-graph.reality-graph work=WORK-SCC-004 satisfies=REQ-SCC-IR
 impl RealityGraph {
     pub fn empty() -> RealityGraph {
         RealityGraph {
@@ -48,6 +49,7 @@ pub enum GraphError {
 pub type Result<T> = std::result::Result<T, GraphError>;
 
 /// In-memory view of the reality graph.
+// trace:v1 id=impl.scc-graph.reality-graph-struct work=WORK-SCC-004 satisfies=REQ-SCC-IR
 pub struct RealityGraph {
     pub repo_id: String,
     pub entities: HashMap<String, Entity>,
@@ -150,6 +152,7 @@ pub fn symbol_component_map(graph: &RealityGraph) -> HashMap<String, String> {
 /// bumped *before* the first write so cached context packs are invalidated
 /// even if a stage fails mid-pipeline (fail closed — no stale trusted pack
 /// survives a partial recompile).
+// trace:v1 id=impl.scc-graph.compilation-pipeline work=WORK-SCC-004 satisfies=REQ-SCC-IR
 pub struct CompilationPipeline<'a> {
     store: &'a Store,
 }
@@ -380,11 +383,16 @@ mod tests {
         );
     }
 
+    // trace:exempt reason=test-helper  # hermetic git fixture factory (test-only)
     fn git_init(dir: &std::path::Path) {
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "SCC Test"],
+            // Hermetic: a user's global commit.gpgsign=true must not leak
+            // into test repos (gpg-agent exhaustion under parallel load
+            // made commits flaky).
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             let out = std::process::Command::new("git")
                 .args(&args)

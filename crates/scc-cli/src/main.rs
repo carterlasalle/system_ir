@@ -395,6 +395,13 @@ enum BenchSub {
         /// Emit the metric row as JSON
         #[arg(long)]
         json: bool,
+        /// Generate ONLY the context artifact for ONE goal in --repo and
+        /// print {artifact, tokens, budget} as JSON (the authoritative
+        /// builder, reused by external harnesses — e.g. the writable
+        /// coding matrix — so they never reconstruct SCC semantics in
+        /// Python). No agent runs.
+        #[arg(long)]
+        artifact_only: Option<String>,
     },
 }
 
@@ -773,8 +780,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => Err(scc_cli::CliError::Other(e)),
                 }
             }
-            BenchSub::External { variant, repo, budget, cmd, workdir, json } => {
+            BenchSub::External { variant, repo, budget, cmd, workdir, json, artifact_only } => {
                 let v = variant.as_str();
+                if let Some(goal) = artifact_only {
+                    if !NATIVE_VARIANTS.contains(&v) {
+                        return Err(scc_cli::CliError::Other(format!(
+                            "--artifact-only supports native variants only, got {v:?}"
+                        ))
+                        .into());
+                    }
+                    let repo = repo.ok_or_else(|| {
+                        scc_cli::CliError::Other("--artifact-only requires --repo".into())
+                    })?;
+                    let workdir = workdir
+                        .clone()
+                        .unwrap_or_else(|| std::env::temp_dir().join("scc-artifact-only"));
+                    std::fs::create_dir_all(&workdir)
+                        .map_err(|e| scc_cli::CliError::Other(e.to_string()))?;
+                    let task = scc_cli::benchagent::VariantTask {
+                        id: format!("{repo}--artifact-only"),
+                        repo: repo.clone(),
+                        goal: goal.clone(),
+                        files: vec![],
+                        plan_keys: vec![],
+                    };
+                    // Generate against the FIXTURE repo (the same corpus
+                    // the read-only benchmark uses), not the harness cwd.
+                    let fixtures = scc_cli::benchctx::locate_fixtures_dir()
+                        .ok_or_else(|| scc_cli::CliError::Other(
+                            "cannot locate fixtures/ directory".into(),
+                        ))?;
+                    let root = fixtures.join(&repo);
+                    let (path, tokens) = generate_variant_artifact(
+                        v, &task, &root, budget, &workdir,
+                    )
+                    .map_err(scc_cli::CliError::Other)?;
+                    let _ = json; // artifact-only always prints JSON
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "artifact": path,
+                            "tokens": tokens,
+                            "budget": budget,
+                            "variant": v,
+                            "goal": goal,
+                            "repo": repo,
+                        })
+                    );
+                    return Ok(());
+                }
                 if EXTERNAL_VARIANTS.contains(&v) {
                     run_external_python_delegation(v, repo.as_deref(), budget, cmd.as_deref(), json)
                 } else if NATIVE_VARIANTS.contains(&v) {

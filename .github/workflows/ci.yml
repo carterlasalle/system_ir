@@ -18,20 +18,33 @@ jobs:
       # green on a cold runner.
       - name: Build
         run: cargo build --workspace
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (deny warnings, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # uv for Python tooling (the pinned TraceLayer install below and the
+      # SDK/benchmark steps) — installed hermetically via the official
+      # setup action, no pip.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - name: Python SDK tests
         run: |
-          cd sdk/python && SCC_BIN=$PWD/../../target/debug/scc python3 -m unittest test_scc_sdk.py
+          cd sdk/python && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_scc_sdk.py
       - name: TypeScript SDK build + tests
         run: |
           cd sdk/typescript
           npm install --no-audit --no-fund
           npm run build
           SCC_BIN=$PWD/../../target/debug/scc npm test
-      - name: External benchmark harness + adapter self-tests (no network)
+      # Benchmark regression + evaluator meta-contract tests (§25/§29/§36):
+      # the four-way contract (untouched/comment-only/wrong FAIL,
+      # known-good PASS) must hold for EVERY evaluator before any agent
+      # experiment can be trusted; CI enforces it on every push.
+      - name: Benchmark harness + adapter self-tests (no network)
         run: |
-          cd benchmarks/external && python3 -m unittest test_harness.py test_aider_fairness.py
+          cd benchmarks/external && uv run python -m unittest test_harness.py test_aider_fairness.py
+      - name: Evaluator four-way meta-contract tests
+        run: |
+          cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_evaluators.py
       - name: Test
         run: |
           # resolution-in-the-bench tests need the semantic backends
@@ -39,8 +52,11 @@ jobs:
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
           cargo test --workspace
-      - name: Install TraceLayer
-        run: pip install tracelayer
+      # HERMETIC TraceLayer (§37): pinned version, installed via uv — no
+      # unpinned pip, no continue-on-error. The gate must fail CI when
+      # trace verification genuinely fails.
+      - name: Install TraceLayer (pinned)
+        run: uv tool install tracelayer==0.2.39
       - name: Trace policy gate
         run: trace verify
       - name: Context benchmark gate

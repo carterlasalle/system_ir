@@ -1,0 +1,6 @@
+pyproject.toml
+scc_sdk.py
+scc_sdk.egg-info/PKG-INFO
+scc_sdk.egg-info/SOURCES.txt
+scc_sdk.egg-info/dependency_links.txt
+scc_sdk.egg-info/top_level.txt

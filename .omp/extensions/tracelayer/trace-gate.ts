@@ -9,10 +9,11 @@
 // layout double-registers the factory and was removed deliberately.
 //
 // Type-only import (erased at runtime): the canonical package name is
-// @earendil-works/pi-coding-agent; older runtimes used @oh-my-pi/... The
-// extension runtime never type-checks this file.
+// @oh-my-pi/pi-coding-agent (omp 18.x); legacy runtimes used
+// @earendil-works/pi-coding-agent. The extension runtime never type-checks
+// this file.
 import { spawnSync } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 // trace:v1 id=impl.omp.trace-gate work=WORK-TL-001
 export default function hook(pi: ExtensionAPI): void {
@@ -136,6 +137,28 @@ export default function hook(pi: ExtensionAPI): void {
       return { content };
     } catch {
       return;
+    }
+  });
+
+  // Fail-closed completion gate: block while trace obligations or verify
+  // fail. SessionStopEventResult carries decision/reason (or continuation
+  // fields) — not a `block` property. The engine's stop hook ALSO runs the
+  // merge-grade auto-finalizer internally.
+  pi.on("session_stop", async (event, _ctx) => {
+    const body = JSON.stringify({ lifecycle: "wip", session_id: event.session_id });
+    const res = run(["hook", "stop", "--format", "json"], body);
+    if (res.code !== 0) {
+      let reason = "trace verification has blocking failures";
+      try {
+        const d = JSON.parse(res.out) as { output?: string };
+        if (typeof d.output === "string" && d.output) reason = d.output;
+      } catch {
+        // keep default reason
+      }
+      // Diagnostics go to stderr (the OMP log); the block reason is returned
+      // to the session result.
+      console.error(`trace gate: ${reason}`);
+      return { decision: "block", reason };
     }
   });
 }

@@ -50,6 +50,7 @@ pub struct CochangePair {
 /// `min_commits` shared commits are filtered out. Not a git repository (or
 /// git unavailable) yields `Ok(empty)`. Deterministic: sorted by commits
 /// descending, then `a`, then `b`.
+// trace:v1 id=impl.scc-graph.cochange-pairs work=WORK-SCC-004 satisfies=REQ-SCC-IR
 pub fn cochange_pairs(root: &Path, min_commits: u32) -> Result<Vec<CochangePair>, String> {
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -298,11 +299,17 @@ mod tests {
         (store, tmp)
     }
 
+    // trace:exempt reason=test-helper  # hermetic git fixture factory (test-only)
     fn git_init(dir: &Path) {
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "SCC Test"],
+            // A user's global commit.gpgsign=true must not leak into test
+            // repos: gpg-agent exhaustion under parallel test load made
+            // commits flaky ("Cannot allocate memory"). Repo-local config
+            // keeps the test hermetic.
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             let out = Command::new("git").args(&args).current_dir(dir).output().unwrap();
             assert!(out.status.success(), "git {args:?} failed");

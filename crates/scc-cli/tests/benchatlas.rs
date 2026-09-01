@@ -46,7 +46,8 @@ fn git_repo(dir: &Path) -> String {
         &["init", "-q"][..],
         &["add", "-A"][..],
         &[
-            "-c", "user.email=bench@test", "-c", "user.name=bench", "commit", "-q", "-m",
+            "-c", "user.email=bench@test", "-c", "user.name=bench",
+            "-c", "commit.gpgsign=false", "commit", "-q", "-m",
             "fixture",
         ][..],
     ] {

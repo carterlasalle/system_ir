@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: scc-sdk
+Version: 0.1.0
+Summary: Thin Python SDK for the scc (System Context Compiler) CLI
+License: MIT
+Requires-Python: >=3.9

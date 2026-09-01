@@ -29,14 +29,20 @@ const EXTENSION_PACKAGE: &str = include_str!("../../../plugins/omp/scc/package.j
 const SKILL_MD: &str = include_str!("../../../plugins/omp/scc/skills/scc-system-context/SKILL.md");
 
 // trace:exempt reason=const-data (behavior boundary is write_agents_rules)
+// The canonical fused startup command. If a root AGENTS.md exists, it is
+// preserved via OMP's supported `@`-import (relative file import in
+// context files) because `.omp/AGENTS.md` (native provider, priority
+// 100) shadows a root AGENTS.md (agents-md provider, priority 10) at the
+// same project depth in OMP 18.x context discovery.
 const AGENTS_RULES: &str = "<!-- SCC-SECTION -->\n\
 # SCC (System Context Compiler)\n\
 This repository is indexed by SCC. Durable rules:\n\
 - The native SCC extension injects the startup architecture once per session\n\
   and a task-specific context pack per prompt. Work within the injected task\n\
   context; it is the authoritative system slice for the current goal.\n\
-- For the system architecture at session start, `scc atlas` is the\n\
-  authoritative startup source.\n\
+- For the fused startup architecture (Atlas + Surface + coverage),\n\
+  `scc context startup` is the canonical command; `scc atlas` is only its\n\
+  Level-0 Atlas component.\n\
 - `scc verify` reports freshness and drift — do not trust stale facts;\n\
   re-index with `scc index` first.\n\
 - Authority ordering: source/runtime > SCC System IR > checkpoint > Hindsight\n\
@@ -49,10 +55,15 @@ This repository is indexed by SCC. Durable rules:\n\
 // trace:v1 id=impl.crates-scc-cli-src-plugin-omp.cmd-setup-omp work=WORK-SCC-001 satisfies=REQ-SCC-API
 pub fn cmd_setup_omp(root: &Path) -> crate::Result<()> {
     let omp_dir = root.join(".omp");
-    // 1. Native extension package.
+    // 1. Native extension package. The installed copy must NOT carry the
+    // source repo's authoring markers: they reference system_ir's work
+    // and requirement nodes, which do not exist in a user's repository
+    // and would leave dangling TL002 edges under TraceLayer. The
+    // installed artifact is tooling, so its marker is rewritten to an
+    // exempt comment with a reason.
     let ext_dir = omp_dir.join("extensions/scc");
     std::fs::create_dir_all(&ext_dir)?;
-    std::fs::write(ext_dir.join("index.ts"), extension_ts())?;
+    std::fs::write(ext_dir.join("index.ts"), installable_extension_ts())?;
     std::fs::write(ext_dir.join("package.json"), extension_package())?;
     println!("wrote {}", ext_dir.join("index.ts").display());
 
@@ -82,9 +93,17 @@ pub fn cmd_setup_omp(root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+
+/// The extension source with authoring markers rewritten to exempt
+/// comments: the installed artifact runs in a user's repository, where
+/// system_ir's work/requirement nodes do not exist (dangling TL002
+/// edges under TraceLayer otherwise).
 // trace:exempt reason=internal-helper
-fn extension_ts() -> &'static str {
-    EXTENSION_TS
+fn installable_extension_ts() -> String {
+    EXTENSION_TS.replace(
+        "// trace:v1 id=impl.omp.scc work=WORK-SCC-001 satisfies=REQ-SCC-API",
+        "// trace:exempt reason=scc-installed-tooling (marker from the SCC source repo removed at install)",
+    )
 }
 
 // trace:exempt reason=internal-helper
@@ -123,11 +142,6 @@ fn merge_mcp_json(omp_dir: &Path) -> crate::Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
-
-/// Write the durable SCC rules into `.omp/AGENTS.md`, preserving any user
-/// content and never duplicating the SCC section (idempotent). The native
-/// `.omp/AGENTS.md` takes provider priority over the root `AGENTS.md`, so
-/// SCC writes its durable rules here and leaves the root file untouched.
 // trace:v1 id=impl.crates-scc-cli-src-plugin-omp.write-agents-rules work=WORK-SCC-001 satisfies=REQ-SCC-API
 fn write_agents_rules(omp_dir: &Path) -> crate::Result<()> {
     let path = omp_dir.join("AGENTS.md");
@@ -138,11 +152,31 @@ fn write_agents_rules(omp_dir: &Path) -> crate::Result<()> {
         Some(idx) => existing[..idx].trim_end().to_string(),
         None => existing.trim().to_string(),
     };
+    // Root AGENTS.md preservation: OMP 18.x context discovery keys
+    // context files by project depth — `.omp/AGENTS.md` (native provider,
+    // priority 100) shadows a root `AGENTS.md` (agents-md provider,
+    // priority 10) at the same depth, so the root file's content would be
+    // silently dropped. OMP context files support `@path` relative imports
+    // (verified in the 18.0.11 loader). Imports resolve RELATIVE TO THE
+    // IMPORTING FILE'S DIRECTORY (.omp/), so the root file is
+    // `@../AGENTS.md` — an unqualified `@AGENTS.md` resolves to
+    // .omp/AGENTS.md itself (cyclic; OMP skips it with a debug log).
+    let root_agents = omp_dir.parent().unwrap_or(omp_dir).join("AGENTS.md");
+    let root_import = if root_agents.exists()
+        && !user_part.contains("@AGENTS.md")
+        && !user_part.contains("@./AGENTS.md")
+        && !user_part.contains("@../AGENTS.md")
+    {
+        "@../AGENTS.md\n\n"
+    } else {
+        ""
+    };
     let mut out = String::new();
     if !user_part.is_empty() {
         out.push_str(&user_part);
         out.push_str("\n\n");
     }
+    out.push_str(root_import);
     out.push_str(AGENTS_RULES);
     std::fs::write(&path, out)?;
     Ok(())
@@ -221,5 +255,42 @@ mod tests {
             second.matches("SCC (System Context Compiler)").count(),
             "SCC rules must not duplicate on reinstall"
         );
+    }
+
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.root-agents-preserved-via-import work=WORK-SCC-001 verifies=REQ-SCC-API
+    fn root_agents_preserved_via_import() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# user content\nkeep me\n").unwrap();
+        let omp = root.join(".omp");
+        std::fs::create_dir_all(&omp).unwrap();
+        write_agents_rules(&omp).unwrap();
+        let text = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
+        // The shadowed root AGENTS.md must be re-included via OMP's
+        // supported @-import so its content is NOT lost.
+        assert!(text.contains("@../AGENTS.md"), "root AGENTS.md must be re-imported (relative to .omp/): {text}");
+        // Fused startup language, not atlas-only.
+        assert!(text.contains("scc context startup"), "fused startup: {text}");
+        assert!(!text.contains("authoritative startup source"), "no stale atlas-only claim: {text}");
+        // Idempotent: reinstall does not duplicate the import.
+        write_agents_rules(&omp).unwrap();
+        let again = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
+        assert_eq!(again.matches("@../AGENTS.md").count(), 1, "import not duplicated: {again}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.no-root-import-when-absent work=WORK-SCC-001 verifies=REQ-SCC-API
+    fn no_root_import_when_root_agents_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let omp = root.join(".omp");
+        std::fs::create_dir_all(&omp).unwrap();
+        write_agents_rules(&omp).unwrap();
+        let text = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
+        assert!(!text.contains("@../AGENTS.md"), "no import when root AGENTS.md absent: {text}");
     }
 }

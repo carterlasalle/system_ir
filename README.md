@@ -78,7 +78,7 @@ cd /path/to/your/repo
 scc init                                  # .scc/config.yaml + database
 scc index                                 # cold index; incremental afterwards
 scc overview                              # compact startup capsule
-scc atlas                                 # FULL system architecture (agent startup)
+scc context startup                       # fused startup: Atlas + Surface + coverage
 scc context task "change transcript normalization"
 scc setup claude                          # automatic Claude Code hooks
 ```

@@ -50,4 +50,8 @@ paths = [
   "plugins/omp/**",
   ".gitignore",
   "CHANGELOG.md",
+  "README.md",
+  "benchmarks/tasks.json",
+  "sdk/python/scc_sdk.egg-info/**",
+  "sdk/python/uv.lock",
 ]
