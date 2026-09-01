@@ -1,17 +1,17 @@
 {
   "meta": {
     "schema": 2,
-    "timestamp": "2026-09-01T07:43:45Z",
-    "agent_label": "codex",
-    "agent_cmd": "codex exec --json --sandbox workspace-write --skip-git-repo-check --ephemeral --color never -C . -",
-    "model_label": "gpt-5.2-codex",
-    "scc_commit": "1b2eb2adc3e8063f3ea755ee789b5302db931d5d",
+    "timestamp": "2026-09-01T16:17:59Z",
+    "agent_label": "claude",
+    "agent_cmd": "claude -p --model claude-sonnet-4-5 --dangerously-skip-permissions",
+    "model_label": "claude-sonnet-4-5",
+    "scc_commit": "713c766340293833ed3f6ae3279198f3636ea459",
     "scc_dirty": true,
-    "benchmark_harness_commit": "1b2eb2adc3e8063f3ea755ee789b5302db931d5d",
+    "benchmark_harness_commit": "713c766340293833ed3f6ae3279198f3636ea459",
     "tasks_corpus_hash": "741107fb533987ad",
     "evaluators_hash": "96729e9e61f267e4",
-    "mode": "writable-equal-token",
-    "requested_budget": 16000
+    "mode": "writable-native-default",
+    "requested_budget": 8000
   },
   "cells": {
     "raw/http-service.rename-transcript-field": {
@@ -19,228 +19,228 @@
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 24.9,
+      "modified_files": 0,
+      "wall_sec": 12.2,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/http-service.transcript-normalization": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 24.4,
+      "modified_files": 0,
+      "wall_sec": 16.3,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/http-service.health-check": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 23.8,
+      "modified_files": 0,
+      "wall_sec": 22.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/queue-worker.asr-retry": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 26.0,
+      "modified_files": 0,
+      "wall_sec": 13.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/queue-worker.street-vocabulary": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 24.1,
+      "modified_files": 0,
+      "wall_sec": 12.2,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/py-queue.classification-fallback": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.0,
+      "modified_files": 0,
+      "wall_sec": 5.6,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/py-queue.store-changes": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 34.4,
+      "modified_files": 0,
+      "wall_sec": 8.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/py-queue.empty-messages": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.9,
+      "modified_files": 0,
+      "wall_sec": 8.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "raw/ts-api-web.pagination": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 0,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 31.8,
+      "modified_files": 0,
+      "wall_sec": 12.4,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/http-service.rename-transcript-field": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 552,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 33.1,
+      "modified_files": 0,
+      "wall_sec": 11.3,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/http-service.transcript-normalization": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 575,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.5,
+      "modified_files": 0,
+      "wall_sec": 15.6,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/http-service.health-check": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 565,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 32.5,
+      "modified_files": 0,
+      "wall_sec": 9.7,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/queue-worker.asr-retry": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 544,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 34.7,
+      "modified_files": 0,
+      "wall_sec": 8.2,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/queue-worker.street-vocabulary": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 549,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 34.5,
+      "modified_files": 0,
+      "wall_sec": 9.9,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/py-queue.classification-fallback": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 544,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 31.2,
+      "modified_files": 0,
+      "wall_sec": 48.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/py-queue.store-changes": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 543,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 31.0,
+      "modified_files": 0,
+      "wall_sec": 4.4,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/py-queue.empty-messages": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 540,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 30.2,
+      "modified_files": 0,
+      "wall_sec": 5.7,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "scc-full/ts-api-web.pagination": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 557,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 27.7,
+      "modified_files": 0,
+      "wall_sec": 6.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/http-service.rename-transcript-field": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 178,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.0,
+      "modified_files": 0,
+      "wall_sec": 16.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/http-service.transcript-normalization": {
       "task_success": false,
@@ -248,71 +248,71 @@
       "context_tokens": 178,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 24.4,
+      "wall_sec": 20.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/http-service.health-check": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 178,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 26.3,
+      "modified_files": 0,
+      "wall_sec": 15.2,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/queue-worker.asr-retry": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 333,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 34.8,
+      "modified_files": 0,
+      "wall_sec": 9.9,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/queue-worker.street-vocabulary": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 333,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 23.6,
+      "modified_files": 0,
+      "wall_sec": 12.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/py-queue.classification-fallback": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 158,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.9,
+      "modified_files": 0,
+      "wall_sec": 12.6,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/py-queue.store-changes": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 158,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 26.7,
+      "modified_files": 0,
+      "wall_sec": 9.0,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/py-queue.empty-messages": {
       "task_success": false,
@@ -320,83 +320,83 @@
       "context_tokens": 158,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 24.9,
+      "wall_sec": 6.4,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "aider-repomap/ts-api-web.pagination": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 158,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 26.8,
+      "modified_files": 0,
+      "wall_sec": 9.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/http-service.rename-transcript-field": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 516,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 29.3,
+      "modified_files": 0,
+      "wall_sec": 7.6,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/http-service.transcript-normalization": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 516,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 30.4,
+      "modified_files": 0,
+      "wall_sec": 7.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/http-service.health-check": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 516,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 35.6,
+      "modified_files": 0,
+      "wall_sec": 11.1,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/queue-worker.asr-retry": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 490,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 36.8,
+      "modified_files": 0,
+      "wall_sec": 6.3,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/queue-worker.street-vocabulary": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 490,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 34.7,
+      "modified_files": 0,
+      "wall_sec": 4.7,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/py-queue.classification-fallback": {
       "task_success": false,
@@ -404,47 +404,47 @@
       "context_tokens": 407,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 30.2,
+      "wall_sec": 4.8,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/py-queue.store-changes": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 407,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 28.7,
+      "modified_files": 0,
+      "wall_sec": 4.5,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/py-queue.empty-messages": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 407,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 27.2,
+      "modified_files": 0,
+      "wall_sec": 4.7,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": false,
-      "requested_budget": 16000
+      "requested_budget": null
     },
     "repomix-compress/ts-api-web.pagination": {
       "task_success": false,
       "run_completion": false,
       "context_tokens": 339,
       "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 24.8,
+      "modified_files": 0,
+      "wall_sec": 4.5,
       "error": null,
       "error_type": "agent-infrastructure",
       "evaluator_structural": true,
-      "requested_budget": 16000
+      "requested_budget": null
     }
   },
   "summary": {
@@ -493,6 +493,6 @@
   },
   "validity": {
     "valid": false,
-    "invalid_reason": "codex usage limit hit mid-run: most non-raw cells are agent-infrastructure failures (quota), not coding failures. Rerun after quota reset. The 4k matrix (36/36, 0 infra errors) is the valid equal-token run."
+    "invalid_reason": "historical: claude spend limit hit: 36/36 agent-infrastructure cells \u2014 rerun after quota reset"
   }
 }

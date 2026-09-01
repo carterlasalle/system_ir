@@ -52,6 +52,7 @@ paths = [
   "CHANGELOG.md",
   "README.md",
   "benchmarks/tasks.json",
+  "docs/MISSION_FINAL_REPORT.md",
   "sdk/python/scc_sdk.egg-info/**",
   "sdk/python/uv.lock",
 ]
