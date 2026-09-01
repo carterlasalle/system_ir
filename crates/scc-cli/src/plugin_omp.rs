@@ -136,7 +136,14 @@ fn merge_mcp_json(omp_dir: &Path) -> crate::Result<()> {
         .unwrap_or_default();
     let mut servers = servers;
     servers.entry("scc".to_string()).or_insert_with(|| {
-        serde_json::json!({"command": "scc", "args": ["mcp"]})
+        // ABSOLUTE path: OMP's MCP spawn does not resolve a bare "scc"
+        // from the project PATH (verified in a real OMP 18.0.11 session:
+        // `Executable not found in $PATH: "scc"` even with scc on PATH).
+        // SCC_BIN (agent integrations) or the current exe pins it.
+        let bin = std::env::var("SCC_BIN").ok().or_else(|| {
+            std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned())
+        }).unwrap_or_else(|| "scc".to_string());
+        serde_json::json!({"command": bin, "args": ["mcp"]})
     });
     v["mcpServers"] = serde_json::Value::Object(servers);
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
@@ -206,7 +213,7 @@ mod tests {
         // mcp.json has the scc server.
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".omp/mcp.json")).unwrap()).unwrap();
-        assert_eq!(mcp["mcpServers"]["scc"]["command"], "scc");
+        assert!(mcp["mcpServers"]["scc"]["command"].is_string(), "absolute scc path or SCC_BIN");
         assert_eq!(mcp["mcpServers"]["scc"]["args"][0], "mcp");
 
         // AGENTS.md has the SCC rules.
@@ -231,7 +238,7 @@ mod tests {
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(omp.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["existing"]["command"], "foo", "existing server must be preserved");
-        assert_eq!(mcp["mcpServers"]["scc"]["command"], "scc", "scc server must be added");
+        assert!(mcp["mcpServers"]["scc"]["command"].is_string(), "absolute scc path or SCC_BIN");
     }
 
     #[test]

@@ -1,0 +1,126 @@
+{
+  "meta": {
+    "schema": 2,
+    "timestamp": "2026-09-01T08:37:37Z",
+    "agent_label": "claude",
+    "agent_cmd": "claude -p --model claude-sonnet-4-5 --dangerously-skip-permissions",
+    "model_label": "claude-sonnet-4-5",
+    "scc_commit": "1b2eb2adc3e8063f3ea755ee789b5302db931d5d",
+    "scc_dirty": true,
+    "benchmark_harness_commit": "1b2eb2adc3e8063f3ea755ee789b5302db931d5d",
+    "tasks_corpus_hash": "741107fb533987ad",
+    "evaluators_hash": "96729e9e61f267e4",
+    "mode": "writable-equal-token",
+    "requested_budget": 4000
+  },
+  "cells": {
+    "raw/http-service.rename-transcript-field": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 104.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/http-service.transcript-normalization": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 6,
+      "wall_sec": 115.7,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 64.8,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 130.3,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 4000
+    },
+    "raw/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 94.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 4000
+    },
+    "raw/py-queue.classification-fallback": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 88.5,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/py-queue.store-changes": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 67.0,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 54.7,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 4000
+    },
+    "raw/ts-api-web.pagination": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 48.2,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 4000
+    }
+  }
+}

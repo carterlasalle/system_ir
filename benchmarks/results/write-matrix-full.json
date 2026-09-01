@@ -223,5 +223,9 @@
       0.5
     ],
     "ci_note": "CI crosses zero \u2014 no superiority claim"
+  },
+  "validity": {
+    "valid": false,
+    "invalid_reason": "historical: pre-evaluator-contract 4-variant run (grep validators, no Structural Source in scc-full, hardcoded agent label) \u2014 superseded by schema 2 runs"
   }
 }
