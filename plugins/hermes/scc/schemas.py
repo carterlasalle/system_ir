@@ -162,7 +162,7 @@ SYSTEM_CONTEXT = {
         "properties": {
             "token_budget": {
                 "type": "integer",
-                "description": "Optional token budget (default 20000; the atlas:surface split is kept at 13:7)",
+                "description": "Optional token budget (default is the production adaptive startup total; the atlas:surface split is chosen from repository complexity)",
             }
         },
     },

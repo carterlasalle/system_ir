@@ -224,16 +224,6 @@ pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
     let capsule = capsule_markdown(root)?;
     let path = root.join("AGENTS.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let user_part = if existing.is_empty() {
-        String::new()
-    } else {
-        // strip a previous SCC section, keep everything BEFORE it (user content)
-        match existing.find("<!-- SCC-SECTION") {
-            Some(idx) => existing[..idx].trim_end().to_string(),
-            None => existing.clone(),
-        }
-    };
-
     let section = format!(
         "<!-- SCC-SECTION -->\n{capsule}\n## SCC usage rules\n\
          - The repository is indexed by SCC. For a task, run: `scc context task \"<goal>\"` and work within it.\n\
@@ -243,13 +233,10 @@ pub fn cmd_setup_codex(root: &Path) -> crate::Result<()> {
          - Drift and invariants: `scc drift`, `scc ci check`, and `scc impact <files>` before cross-layer edits.\n\
          <!-- /SCC-SECTION -->\n"
     );
-
-    let mut out = String::new();
-    if !user_part.trim().is_empty() {
-        out.push_str(user_part.trim_start());
-        out.push_str("\n\n");
-    }
-    out.push_str(&section);
+    // Marker-aware replacement: keep user text BEFORE the opening marker
+    // AND everything AFTER the closing marker (the previous rewrite
+    // dropped later user edits).
+    let out = crate::agents_md::replace_scc_section(&existing, &section);
     std::fs::write(&path, out)?;
     println!("wrote {}", path.display());
     println!("AGENTS.md now carries the system capsule; normal Codex sessions start with system understanding.");
@@ -354,5 +341,28 @@ mod tests {
             text.contains("source/runtime > SCC System IR > checkpoint > Hindsight > model assumption"),
             "authority ordering: {text}"
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-compress.codex-preserves-after-marker work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
+    fn codex_setup_preserves_text_after_closing_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.py"), "def helper():\n    pass\n").unwrap();
+        crate::commands::cmd_index(&root, true).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# user before\n<!-- SCC-SECTION -->\nold\n<!-- /SCC-SECTION -->\n# user after — keep me too\n",
+        )
+        .unwrap();
+        cmd_setup_codex(&root).unwrap();
+        let text = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(text.contains("user before"), "{text}");
+        assert!(
+            text.contains("user after — keep me too"),
+            "text after the closing marker must survive: {text}"
+        );
+        assert!(!text.contains("\nold\n"), "{text}");
     }
 }

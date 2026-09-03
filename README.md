@@ -1,5 +1,6 @@
 <div align="center">
 
+<!-- trace:v1 id=doc.scc.readme documents=REQ-SCC-API -->
 # System Context Compiler
 
 **Compile repositories into evidence-backed system context for coding agents.**
@@ -7,7 +8,7 @@
 [![CI](https://github.com/carterlasalle/system_ir/actions/workflows/ci.yml/badge.svg)](https://github.com/carterlasalle/system_ir/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-stable-DEA584?logo=rust&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-WAL%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)
-![MCP](https://img.shields.io/badge/MCP-6%20tools-000000?logo=modelcontextprotocol&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-10%20tools-000000?logo=modelcontextprotocol&logoColor=white)
 
 [Getting started](docs/IMPLEMENTATION_PLAN.md) · [Context packs](docs/CONTEXT_COMPILER.md) · [System IR schema](docs/SYSTEM_IR_SCHEMA.md) · [Adapters](docs/API_AND_INTEGRATIONS.md) · [Benchmarks](docs/TEST_PLAN.md) · [Contributing](CONTRIBUTING.md)
 
@@ -55,7 +56,7 @@ Inferred claims are labeled with confidence and evidence and never silently prom
 | Context | Six agent-facing operations with hard token budgets that never cut invariants, ownership, or failure behavior; optional semantic ranking via any OpenAI-compatible embedding endpoint plus a separate `/rerank` model |
 | Freshness | Content-hash invalidation, incremental indexing with full↔incremental equivalence guarantees, staleness detection, intent↔reality drift, CI gates |
 | Runtime | OpenTelemetry trace ingestion, static-vs-observed edge reconciliation, replay-verified aggregates |
-| Integrations | Claude Code hooks, Codex AGENTS.md, OpenCode MCP config, Hermes plugin, MCP server, HTTP API, TypeScript and Python SDKs, Beads/CBM/Hindsight/Context7 adapters |
+| Integrations | Claude Code hooks, Codex AGENTS.md, Oh My Pi native extension, OpenCode MCP config, Hermes plugin, MCP server, HTTP API, TypeScript and Python SDKs, Beads/CBM/Hindsight/Context7 adapters |
 | Security | Local-first, secret redaction, path sandboxing, untrusted-text labeling, adapter capability manifests, no telemetry |
 
 ## Quick start
@@ -81,6 +82,7 @@ scc overview                              # compact startup capsule
 scc context startup                       # fused startup: Atlas + Surface + coverage
 scc context task "change transcript normalization"
 scc setup claude                          # automatic Claude Code hooks
+scc setup omp                             # Oh My Pi native extension + MCP
 ```
 
 The full command surface is in the [CLI reference](docs/API_AND_INTEGRATIONS.md#cli) and `scc --help`.
@@ -107,7 +109,7 @@ The local daemon implements [`docs/openapi.yaml`](docs/openapi.yaml) on loopback
 | Surface | How to reach it |
 |---|---|
 | HTTP API | `scc serve` → `http://127.0.0.1:7777` (`/v1/system`, `/v1/context/task`, `/v1/components/{id}`, `/v1/flows/{id}`, `/v1/impact`, `/v1/verify`, `/v1/index`, `/v1/index/status`, `/v1/runtime/traces`) |
-| MCP server | `scc mcp` on stdio — the seven semantic tools (`system_atlas`, `system_overview`, `task_context`, `component_context`, `flow_context`, `impact_context`, `verify_context`), repository read-only |
+| MCP server | `scc mcp` on stdio — ten semantic tools (`system_atlas`, `system_overview`, `task_context`, `component_context`, `flow_context`, `impact_context`, `verify_context`, `system_context`, `surface_map`, `structural_source`), repository read-only |
 | Health | `scc serve` → `http://127.0.0.1:7777/healthz` |
 
 ### Agent integrations
@@ -117,7 +119,8 @@ The local daemon implements [`docs/openapi.yaml`](docs/openapi.yaml) on loopback
 | Claude Code | `scc setup claude` | SessionStart capsule, task-pack injection, post-edit refresh, PreCompact checkpoint + rehydration |
 | Codex | `scc setup codex` | AGENTS.md with capsule, usage rules, authority ordering |
 | OpenCode | `scc setup opencode` | AGENTS.md + `.opencode/opencode.json` wiring the SCC MCP server |
-| Hermes | `scc setup hermes` | Native plugin: seven tools + bundled `scc-system-context` skill |
+| Hermes | `scc setup hermes` | Native plugin: ten tools + bundled `scc-system-context` skill |
+| Oh My Pi (OMP) | `scc setup omp` | Native extension: fused startup + task packs, `scc index --paths` after edits and opaque mutations, compaction rehydration, MCP, skill |
 
 SDKs: TypeScript (`sdk/typescript`, `@scc/sdk`) and Python (`sdk/python`, `scc-sdk`) wrapping the CLI.
 
@@ -146,7 +149,7 @@ crates/
   scc-cli/         CLI, daemon, MCP, plugins, benchmarks
 adapters/          External evidence importers (beads, cbm, hindsight, context7)
 sdk/               TypeScript and Python SDKs
-plugins/           Hermes plugin package
+plugins/           Hermes and Oh My Pi plugin packages
 fixtures/          8 golden repositories with ground-truth expectations
 benchmarks/        tasks.json — 21 ground-truth tasks + hallucination probes
 docs/              The full specification this implements

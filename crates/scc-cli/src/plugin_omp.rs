@@ -5,22 +5,29 @@
 //!   1. `.omp/extensions/scc/index.ts` + `package.json` — ONE native
 //!      extension module that registers ALL ordering-dependent SCC
 //!      lifecycle behavior (`session_start`, `before_agent_start`,
-//!      `tool_result`, `session_before_compact`, `session_compact`).
+//!      `tool_result`, `session_before_compact`, `session.compacting`).
 //!   2. `.omp/mcp.json` — merged (preserving existing servers) wiring the
-//!      SCC MCP server (`scc mcp`) for manual semantic drill-down.
+//!      SCC MCP server (`scc mcp`) for manual semantic drill-down. The
+//!      command honors `SCC_BIN` when set at setup time.
 //!   3. `.omp/skills/scc-system-context/SKILL.md` — on-demand workflow
 //!      guidance (no hard rules live only in the skill).
-//!   4. `.omp/AGENTS.md` — SCC DURABLE RULES ONLY (never generated
-//!      Atlas/Surface facts). Native `.omp/AGENTS.md` has higher provider
-//!      priority than the standalone root `AGENTS.md`, so SCC writes its
-//!      rules there and never touches the root file (which may be the
-//!      user's or `scc setup codex`'s).
+//!   4. AGENTS.md — SCC DURABLE RULES ONLY (never generated Atlas/Surface
+//!      facts). Native `.omp/AGENTS.md` has higher provider priority than
+//!      the standalone root `AGENTS.md`. The installer patches the
+//!      winning existing file and never silently creates a shadowing
+//!      `.omp/AGENTS.md` when only the root file exists.
 //!
-//! The extension uses `pi.exec("scc", [...])` argument arrays (never shell
-//! interpolation), preserves arg boundaries, captures exit/stdout/stderr,
-//! catches errors, and never crashes the OMP session.
+//! The extension uses `pi.exec(process.env.SCC_BIN ?? "scc", [...])`
+//! argument arrays (never shell interpolation), preserves arg boundaries,
+//! captures exit/stdout/stderr, catches errors, and never crashes the OMP
+//! session.
 
 use std::path::Path;
+
+use crate::agents_md::{
+    replace_scc_section_in, resolve_omp_agents_path, AgentsTarget,
+    SCC_OMP_SECTION_CLOSE, SCC_OMP_SECTION_OPEN,
+};
 
 // The native extension entry: ONE module registers every ordering-dependent
 // SCC lifecycle behavior (OMP does not promise filename/module ordering).
@@ -29,12 +36,7 @@ const EXTENSION_PACKAGE: &str = include_str!("../../../plugins/omp/scc/package.j
 const SKILL_MD: &str = include_str!("../../../plugins/omp/scc/skills/scc-system-context/SKILL.md");
 
 // trace:exempt reason=const-data (behavior boundary is write_agents_rules)
-// The canonical fused startup command. If a root AGENTS.md exists, it is
-// preserved via OMP's supported `@`-import (relative file import in
-// context files) because `.omp/AGENTS.md` (native provider, priority
-// 100) shadows a root AGENTS.md (agents-md provider, priority 10) at the
-// same project depth in OMP 18.x context discovery.
-const AGENTS_RULES: &str = "<!-- SCC-SECTION -->\n\
+const AGENTS_RULES: &str = "<!-- SCC-OMP-SECTION -->\n\
 # SCC (System Context Compiler)\n\
 This repository is indexed by SCC. Durable rules:\n\
 - The native SCC extension injects the startup architecture once per session\n\
@@ -43,24 +45,17 @@ This repository is indexed by SCC. Durable rules:\n\
 - For the fused startup architecture (Atlas + Surface + coverage),\n\
   `scc context startup` is the canonical command; `scc atlas` is only its\n\
   Level-0 Atlas component.\n\
-- `scc verify` reports freshness and drift — do not trust stale facts;\n\
-  re-index with `scc index` first.\n\
 - Authority ordering: source/runtime > SCC System IR > checkpoint > Hindsight\n\
   > model assumption.\n\
 - Drift and invariants: `scc drift`, `scc ci check`, and `scc impact <files>`\n\
   before cross-layer edits.\n\
-<!-- /SCC-SECTION -->\n";
+<!-- /SCC-OMP-SECTION -->\n";
 
 /// `scc setup omp` — install the native OMP integration.
 // trace:v1 id=impl.crates-scc-cli-src-plugin-omp.cmd-setup-omp work=WORK-SCC-001 satisfies=REQ-SCC-API
 pub fn cmd_setup_omp(root: &Path) -> crate::Result<()> {
     let omp_dir = root.join(".omp");
-    // 1. Native extension package. The installed copy must NOT carry the
-    // source repo's authoring markers: they reference system_ir's work
-    // and requirement nodes, which do not exist in a user's repository
-    // and would leave dangling TL002 edges under TraceLayer. The
-    // installed artifact is tooling, so its marker is rewritten to an
-    // exempt comment with a reason.
+    // 1. Native extension package.
     let ext_dir = omp_dir.join("extensions/scc");
     std::fs::create_dir_all(&ext_dir)?;
     std::fs::write(ext_dir.join("index.ts"), installable_extension_ts())?;
@@ -76,33 +71,36 @@ pub fn cmd_setup_omp(root: &Path) -> crate::Result<()> {
     std::fs::write(skill_dir.join("SKILL.md"), skill_md())?;
     println!("wrote {}", skill_dir.join("SKILL.md").display());
 
-    // 4. Durable rules in native `.omp/AGENTS.md` (higher priority than the
-    // root AGENTS.md; never touch the root file).
-    write_agents_rules(&omp_dir)?;
+    // 4. Durable rules: patch the OMP-winning instruction file; never
+    // silently introduce a shadowing `.omp/AGENTS.md` when only the
+    // root AGENTS.md exists.
+    let agents_path = write_agents_rules(root)?;
 
     println!();
     println!("OMP integration installed:");
     println!("  extension  -> {}", ext_dir.join("index.ts").display());
     println!("  mcp.json   -> {}", omp_dir.join("mcp.json").display());
     println!("  skill      -> {}", skill_dir.join("SKILL.md").display());
-    println!("  AGENTS.md  -> {}", omp_dir.join("AGENTS.md").display());
+    println!("  AGENTS.md  -> {}", agents_path.display());
     println!();
-    println!("Restart OMP (or run `/extensions` to reload) for the SCC extension");
-    println!("to take effect. Verify with `/mcp reload` then `/mcp test scc`.");
-    println!("The `scc` binary must be on PATH (or set SCC_BIN).");
+    println!("Restart OMP, then run `/extensions` to verify the SCC extension");
+    println!("is loaded (`/extensions` is an inspector, not a reload).");
+    println!("Verify MCP with `/mcp reload` then `/mcp test scc`.");
+    println!(
+        "The `scc` binary must be on PATH, or set SCC_BIN (the extension reads process.env.SCC_BIN)."
+    );
     Ok(())
 }
 
-
-/// The extension source with authoring markers rewritten to exempt
-/// comments: the installed artifact runs in a user's repository, where
-/// system_ir's work/requirement nodes do not exist (dangling TL002
+/// The extension source with system_ir's authoring markers rewritten to
+/// exempt comments: the installed artifact runs in a user's repository,
+/// where this repo's work/requirement nodes do not exist (dangling TL002
 /// edges under TraceLayer otherwise).
 // trace:exempt reason=internal-helper
 fn installable_extension_ts() -> String {
     EXTENSION_TS.replace(
         "// trace:v1 id=impl.omp.scc work=WORK-SCC-001 satisfies=REQ-SCC-API",
-        "// trace:exempt reason=scc-installed-tooling (marker from the SCC source repo removed at install)",
+        "// trace:exempt reason=scc-installed-tooling (authoring marker from the SCC source repo removed at install)",
     )
 }
 
@@ -116,10 +114,30 @@ fn skill_md() -> &'static str {
     SKILL_MD
 }
 
+// trace:exempt reason=internal-helper
+fn scc_bin() -> String {
+    if let Ok(v) = std::env::var("SCC_BIN") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // Absolute path only when the current exe IS the scc binary (exact
+    // file-stem match — a test-harness or build-tool exe path must never
+    // leak into generated configs).
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_stem().map(|n| n == "scc").unwrap_or(false) {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
+    "scc".to_string()
+}
+
 /// Merge the SCC MCP server into `.omp/mcp.json`, preserving any existing
 /// servers. The format is the standard MCP config: `{ "mcpServers": {
 /// "<name>": { "command": ..., "args": [...] } } }`. Idempotent: if the
-/// `scc` server is already present, it is left unchanged.
+/// `scc` server is already present, it is left unchanged unless SCC_BIN
+/// is set (then the command is updated to the known static path).
 // trace:v1 id=impl.crates-scc-cli-src-plugin-omp.merge-mcp-json work=WORK-SCC-001 satisfies=REQ-SCC-API
 fn merge_mcp_json(omp_dir: &Path) -> crate::Result<()> {
     let path = omp_dir.join("mcp.json");
@@ -135,67 +153,103 @@ fn merge_mcp_json(omp_dir: &Path) -> crate::Result<()> {
         .cloned()
         .unwrap_or_default();
     let mut servers = servers;
-    servers.entry("scc".to_string()).or_insert_with(|| {
-        // ABSOLUTE path: OMP's MCP spawn does not resolve a bare "scc"
-        // from the project PATH (verified in a real OMP 18.0.11 session:
-        // `Executable not found in $PATH: "scc"` even with scc on PATH).
-        // SCC_BIN (agent integrations) or the current exe pins it.
-        let bin = std::env::var("SCC_BIN").ok().or_else(|| {
-            std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned())
-        }).unwrap_or_else(|| "scc".to_string());
-        serde_json::json!({"command": bin, "args": ["mcp"]})
-    });
+    let cmd = scc_bin();
+    match servers.get_mut("scc") {
+        Some(existing) => {
+            if std::env::var("SCC_BIN").map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                existing["command"] = serde_json::Value::String(cmd);
+            }
+        }
+        None => {
+            servers.insert(
+                "scc".to_string(),
+                serde_json::json!({"command": cmd, "args": ["mcp"]}),
+            );
+        }
+    }
     v["mcpServers"] = serde_json::Value::Object(servers);
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
+
+/// Write the durable SCC rules into the OMP-winning AGENTS.md, preserving
+/// user content on BOTH sides of the managed section (idempotent).
 // trace:v1 id=impl.crates-scc-cli-src-plugin-omp.write-agents-rules work=WORK-SCC-001 satisfies=REQ-SCC-API
-fn write_agents_rules(omp_dir: &Path) -> crate::Result<()> {
-    let path = omp_dir.join("AGENTS.md");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // Strip a previous SCC section (everything between the markers),
-    // preserving any user content BEFORE it.
-    let user_part = match existing.find("<!-- SCC-SECTION") {
-        Some(idx) => existing[..idx].trim_end().to_string(),
-        None => existing.trim().to_string(),
-    };
-    // Root AGENTS.md preservation: OMP 18.x context discovery keys
-    // context files by project depth — `.omp/AGENTS.md` (native provider,
-    // priority 100) shadows a root `AGENTS.md` (agents-md provider,
-    // priority 10) at the same depth, so the root file's content would be
-    // silently dropped. OMP context files support `@path` relative imports
-    // (verified in the 18.0.11 loader). Imports resolve RELATIVE TO THE
-    // IMPORTING FILE'S DIRECTORY (.omp/), so the root file is
-    // `@../AGENTS.md` — an unqualified `@AGENTS.md` resolves to
-    // .omp/AGENTS.md itself (cyclic; OMP skips it with a debug log).
-    let root_agents = omp_dir.parent().unwrap_or(omp_dir).join("AGENTS.md");
-    let root_import = if root_agents.exists()
-        && !user_part.contains("@AGENTS.md")
-        && !user_part.contains("@./AGENTS.md")
-        && !user_part.contains("@../AGENTS.md")
-    {
-        "@../AGENTS.md\n\n"
-    } else {
-        ""
-    };
-    let mut out = String::new();
-    if !user_part.is_empty() {
-        out.push_str(&user_part);
-        out.push_str("\n\n");
+fn write_agents_rules(root: &Path) -> crate::Result<std::path::PathBuf> {
+    let resolution = resolve_omp_agents_path(root);
+    if resolution.both_exist {
+        eprintln!(
+            "warning: both .omp/AGENTS.md and AGENTS.md exist; OMP prefers .omp/AGENTS.md \
+             (higher-priority same-scope context) and will shadow the root file. \
+             Patching .omp/AGENTS.md. Remove one of the files if that precedence is unintended."
+        );
     }
-    out.push_str(root_import);
-    out.push_str(AGENTS_RULES);
+    let path = match resolution.target {
+        AgentsTarget::Omp => root.join(".omp").join("AGENTS.md"),
+        AgentsTarget::Root => root.join("AGENTS.md"),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let out = replace_scc_section_in(
+        &existing,
+        AGENTS_RULES,
+        SCC_OMP_SECTION_OPEN,
+        SCC_OMP_SECTION_CLOSE,
+    );
     std::fs::write(&path, out)?;
-    Ok(())
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds the process-wide SCC_BIN lock for the lifetime of setup/merge
+    /// tests. `mcp_json_honors_scc_bin_at_setup` mutates the env; any parallel
+    /// test that reads SCC_BIN without this guard will flake (CI PR job:
+    /// `mcp_merge_preserves_existing_servers` saw `/opt/custom/scc`).
+    // trace:exempt reason=internal-helper
+    struct SccBinGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    // trace:exempt reason=internal-helper
+    impl Drop for SccBinGuard {
+        // trace:exempt reason=internal-helper
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("SCC_BIN", v),
+                None => std::env::remove_var("SCC_BIN"),
+            }
+        }
+    }
+
+    // trace:exempt reason=internal-helper
+    fn lock_scc_bin(value: Option<&str>) -> SccBinGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("SCC_BIN").ok();
+        match value {
+            Some(v) => std::env::set_var("SCC_BIN", v),
+            None => std::env::remove_var("SCC_BIN"),
+        }
+        SccBinGuard { _lock: lock, prev }
+    }
+
+    // trace:exempt reason=internal-helper
+    fn installed_extension(root: &Path) -> String {
+        std::fs::read_to_string(root.join(".omp/extensions/scc/index.ts")).unwrap()
+    }
 
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.installs-extension-and-mcp work=WORK-SCC-001 verifies=REQ-SCC-API
     fn installs_extension_and_mcp() {
+        let _env = lock_scc_bin(None);
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -205,7 +259,7 @@ mod tests {
         assert!(root.join(".omp/extensions/scc/index.ts").exists());
         assert!(root.join(".omp/extensions/scc/package.json").exists());
         // The extension imports the resolvable package.
-        let ts = std::fs::read_to_string(root.join(".omp/extensions/scc/index.ts")).unwrap();
+        let ts = installed_extension(&root);
         assert!(ts.contains("@oh-my-pi/pi-coding-agent"), "extension must import the canonical resolvable package");
         assert!(ts.contains("before_agent_start"), "extension must wire before_agent_start");
         assert!(ts.contains("session_start"), "extension must wire session_start");
@@ -213,17 +267,28 @@ mod tests {
         // mcp.json has the scc server.
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".omp/mcp.json")).unwrap()).unwrap();
-        assert!(mcp["mcpServers"]["scc"]["command"].is_string(), "absolute scc path or SCC_BIN");
+        assert_eq!(mcp["mcpServers"]["scc"]["command"], "scc");
         assert_eq!(mcp["mcpServers"]["scc"]["args"][0], "mcp");
 
-        // AGENTS.md has the SCC rules.
-        let agents = std::fs::read_to_string(root.join(".omp/AGENTS.md")).unwrap();
+        // Neither file existed: canonical root AGENTS.md, no shadowing .omp/AGENTS.md.
+        assert!(root.join("AGENTS.md").exists(), "canonical instruction file is root AGENTS.md");
+        assert!(
+            !root.join(".omp/AGENTS.md").exists(),
+            "must not create shadowing .omp/AGENTS.md when root did not exist"
+        );
+        let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
         assert!(agents.contains("SCC (System Context Compiler)"), "AGENTS.md must carry SCC durable rules");
+        let skill = std::fs::read_to_string(root.join(".omp/skills/scc-system-context/SKILL.md")).unwrap();
+        assert!(skill.contains("`system_context`"), "skill must teach system_context");
+        assert!(skill.contains("`surface_map`"), "skill must teach surface_map");
+        assert!(skill.contains("`structural_source`"), "skill must teach structural_source");
+        assert!(!skill.contains("| `system_overview` |"), "skill table must not lead with the retired startup tool");
     }
 
     #[test]
     // trace:v1 id=test.scc-cli-plugin-omp.mcp-merge-preserves-existing work=WORK-SCC-001 verifies=REQ-SCC-API
     fn mcp_merge_preserves_existing_servers() {
+        let _env = lock_scc_bin(None);
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -238,7 +303,7 @@ mod tests {
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(omp.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["existing"]["command"], "foo", "existing server must be preserved");
-        assert!(mcp["mcpServers"]["scc"]["command"].is_string(), "absolute scc path or SCC_BIN");
+        assert_eq!(mcp["mcpServers"]["scc"]["command"], "scc", "scc server must be added");
     }
 
     #[test]
@@ -250,12 +315,12 @@ mod tests {
         let omp = root.join(".omp");
         std::fs::create_dir_all(&omp).unwrap();
         std::fs::write(omp.join("AGENTS.md"), "USER CONTENT\n").unwrap();
-        write_agents_rules(&omp).unwrap();
+        write_agents_rules(&root).unwrap();
         let first = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
         assert!(first.starts_with("USER CONTENT"), "user content must be preserved");
         assert!(first.contains("SCC (System Context Compiler)"), "SCC rules must be appended");
         // Idempotent: a second run does not duplicate the SCC section.
-        write_agents_rules(&omp).unwrap();
+        write_agents_rules(&root).unwrap();
         let second = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
         assert_eq!(
             first.matches("SCC (System Context Compiler)").count(),
@@ -264,40 +329,141 @@ mod tests {
         );
     }
 
-
     #[test]
-    // trace:v1 id=test.scc-cli-plugin-omp.root-agents-preserved-via-import work=WORK-SCC-001 verifies=REQ-SCC-API
-    fn root_agents_preserved_via_import() {
+    // trace:v1 id=test.scc-cli-plugin-omp.agents-preserves-after-marker work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
+    fn agents_rewrite_preserves_text_after_closing_marker() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("AGENTS.md"), "# user content\nkeep me\n").unwrap();
-        let omp = root.join(".omp");
-        std::fs::create_dir_all(&omp).unwrap();
-        write_agents_rules(&omp).unwrap();
-        let text = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
-        // The shadowed root AGENTS.md must be re-included via OMP's
-        // supported @-import so its content is NOT lost.
-        assert!(text.contains("@../AGENTS.md"), "root AGENTS.md must be re-imported (relative to .omp/): {text}");
-        // Fused startup language, not atlas-only.
-        assert!(text.contains("scc context startup"), "fused startup: {text}");
-        assert!(!text.contains("authoritative startup source"), "no stale atlas-only claim: {text}");
-        // Idempotent: reinstall does not duplicate the import.
-        write_agents_rules(&omp).unwrap();
-        let again = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
-        assert_eq!(again.matches("@../AGENTS.md").count(), 1, "import not duplicated: {again}");
+        std::fs::create_dir_all(root.join(".omp")).unwrap();
+        std::fs::write(
+            root.join(".omp/AGENTS.md"),
+            "BEFORE\n<!-- SCC-OMP-SECTION -->\nold managed\n<!-- /SCC-OMP-SECTION -->\nKEEP AFTER\n",
+        )
+        .unwrap();
+        write_agents_rules(&root).unwrap();
+        let text = std::fs::read_to_string(root.join(".omp/AGENTS.md")).unwrap();
+        assert!(text.contains("BEFORE"), "{text}");
+        assert!(text.contains("KEEP AFTER"), "text after the closing marker must survive: {text}");
+        assert!(!text.contains("old managed"), "{text}");
     }
 
     #[test]
-    // trace:v1 id=test.scc-cli-plugin-omp.no-root-import-when-absent work=WORK-SCC-001 verifies=REQ-SCC-API
-    fn no_root_import_when_root_agents_absent() {
+    // trace:v1 id=test.scc-cli-plugin-omp.agents-patches-root-not-shadow work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
+    fn agents_patches_existing_root_and_does_not_create_shadow() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        let omp = root.join(".omp");
-        std::fs::create_dir_all(&omp).unwrap();
-        write_agents_rules(&omp).unwrap();
-        let text = std::fs::read_to_string(omp.join("AGENTS.md")).unwrap();
-        assert!(!text.contains("@../AGENTS.md"), "no import when root AGENTS.md absent: {text}");
+        std::fs::write(root.join("AGENTS.md"), "# project rules\nkeep me\n").unwrap();
+        let path = write_agents_rules(&root).unwrap();
+        assert_eq!(path, root.join("AGENTS.md"));
+        assert!(!root.join(".omp/AGENTS.md").exists(), "must not create shadowing .omp/AGENTS.md");
+        let text = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(text.contains("keep me"), "{text}");
+        assert!(text.contains("SCC (System Context Compiler)"), "{text}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.omp-codex-sections-coexist work=WORK-SCC-001 verifies=REQ-SCC-API
+    fn omp_and_codex_sections_coexist_in_one_file() {
+        // The OMP and Codex installers share instruction files; each owns
+        // a DISTINCT marker pair so neither installer deletes the other's
+        // section (last-writer-wins data loss). Order-independent.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# user\n<!-- SCC-SECTION -->\ncodex capsule\n<!-- /SCC-SECTION -->\n",
+        )
+        .unwrap();
+        write_agents_rules(&root).unwrap();
+        let text = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(text.contains("codex capsule"), "codex section must survive OMP setup: {text}");
+        assert!(text.contains("SCC-OMP-SECTION"), "OMP section must be installed: {text}");
+        // Reinstall: both sections still present exactly once.
+        write_agents_rules(&root).unwrap();
+        let again = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert_eq!(again.matches("SCC-OMP-SECTION").count(), 2, "one OMP section: {again}");
+        assert!(again.contains("codex capsule"), "codex section survives reinstall: {again}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.extension-index-uses-paths work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
+    fn generated_extension_invokes_index_paths_and_does_not_treat_failure_as_success() {
+        let _env = lock_scc_bin(None);
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        cmd_setup_omp(&root).unwrap();
+        let ts = installed_extension(&root);
+        assert!(
+            ts.contains("\"--paths\"") || ts.contains("[\"index\", \"--paths\""),
+            "generated extension must invoke `scc index --paths` (plural): {ts}"
+        );
+        assert!(
+            !ts.contains("\"--path\""),
+            "must not pass the rejected singular --path flag: {ts}"
+        );
+        assert!(
+            ts.contains("index --paths failed") || ts.contains("did not succeed"),
+            "failed index must be reported, not treated as success: {ts}"
+        );
+        assert!(
+            ts.contains("session.compacting") && ts.contains("session_before_compact"),
+            "compaction must save on session_before_compact and inject on session.compacting: {ts}"
+        );
+        assert!(
+            ts.contains("checkpoint") && ts.contains("load") && ts.contains("--inject"),
+            "compacting must load the checkpoint with --inject: {ts}"
+        );
+        assert!(
+            ts.contains("process.env.SCC_BIN") || ts.contains("SCC_BIN"),
+            "extension must honor SCC_BIN: {ts}"
+        );
+        assert!(
+            ts.contains("session_switch") && ts.contains("session_branch") && ts.contains("session_tree"),
+            "injection marker must reset on switch/branch/tree: {ts}"
+        );
+        assert!(
+            ts.contains("hash-object") || ts.contains("porcelain"),
+            "opaque mutations must snapshot dirty files: {ts}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.scc-bin-honored-in-mcp work=WORK-SCC-001 verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient
+    fn mcp_json_honors_scc_bin_at_setup() {
+        let _env = lock_scc_bin(Some("/opt/custom/scc"));
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        cmd_setup_omp(&root).unwrap();
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".omp/mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["scc"]["command"], "/opt/custom/scc");
+        let ts = installed_extension(&root);
+        assert!(ts.contains("process.env.SCC_BIN"), "{ts}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-plugin-omp.setup-says-restart-then-verify work=WORK-SCC-001 verifies=REQ-SCC-API
+    fn setup_instructions_do_not_claim_extensions_reloads() {
+        // The installer prints to stdout; capture by checking the source
+        // contract the user sees after setup (the function's println!s).
+        let src = include_str!("plugin_omp.rs");
+        assert!(
+            src.contains("Restart OMP, then run `/extensions` to verify"),
+            "instructions must say restart, then /extensions to verify"
+        );
+        assert!(
+            src.contains("`/extensions` is an inspector, not a reload"),
+            "must say /extensions is an inspector"
+        );
+        // The user-facing installer must not tell operators that /extensions reloads.
+        let installer = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !installer.contains("or run `/extensions` to reload"),
+            "/extensions is an inspector, not a reload"
+        );
     }
 }

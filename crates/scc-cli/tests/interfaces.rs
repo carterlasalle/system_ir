@@ -162,6 +162,90 @@ fn mcp_server_exposes_ten_semantic_tools() {
 }
 
 #[test]
+// trace:v1 id=test.scc.interfaces.mcp-stdio-2025-11-25-initialize-then-tools-list verifies=REQ-SCC-API,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient exercises=impl.scc.mcp
+fn mcp_stdio_negotiates_2025_11_25_then_lists_tools() {
+    // Real stdio subprocess E2E: initialize 2025-11-25 → notifications/initialized
+    // → tools/list. The negotiate_protocol unit test is not this contract.
+    let repo = copy_fixture("http-service-python");
+    run_ok(&workdir(repo.path()), &["index", "--quiet"]);
+
+    let mut child = Command::new(scc())
+        .arg("mcp")
+        .current_dir(workdir(repo.path()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let send = |stdin: &mut std::process::ChildStdin, msg: &str| {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"omp-e2e"}}}"#,
+    );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    drop(stdin);
+
+    let mut stdout = String::new();
+    use std::io::Read;
+    child.stdout.take().unwrap().read_to_string(&mut stdout).unwrap();
+    let _ = child.wait();
+
+    let mut by_id: std::collections::BTreeMap<i64, serde_json::Value> = Default::default();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+            by_id.insert(id, v);
+        }
+    }
+    assert!(by_id.contains_key(&1), "initialize answered: {stdout}");
+    assert_eq!(
+        by_id[&1]["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25"),
+        "server must echo 2025-11-25: {stdout}"
+    );
+    assert!(by_id.contains_key(&2), "tools/list answered after initialized: {stdout}");
+    let tools = &by_id[&2]["result"]["tools"];
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"system_context"), "{names:?}");
+    assert!(names.contains(&"surface_map"), "{names:?}");
+    assert!(names.contains(&"structural_source"), "{names:?}");
+    let ctx_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "system_context")
+        .unwrap();
+    let desc = ctx_tool["description"].as_str().unwrap_or("");
+    let budget_desc = ctx_tool["inputSchema"]["properties"]["token_budget"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !budget_desc.contains("13:7") && !desc.contains("13:7"),
+        "system_context must not advertise the retired 13:7 split: {budget_desc} / {desc}"
+    );
+    assert!(
+        budget_desc.contains("adaptive") || budget_desc.contains("complexity"),
+        "system_context budget description must name adaptive allocation: {budget_desc}"
+    );
+}
+
+#[test]
 // trace:v1 id=test.crates-scc-cli-tests-interfaces.mcp-unknown-tool-returns-error work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn mcp_unknown_tool_returns_error() {
     let repo = copy_fixture("http-service-python");

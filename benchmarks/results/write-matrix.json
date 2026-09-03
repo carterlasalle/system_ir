@@ -3,7 +3,9 @@
     "agent": "codex",
     "mode": "writable",
     "budget": 8000,
-    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+    "note": "scoped real-agent matrix; NOT the full corpus showdown",
+    "valid": false,
+    "invalid_reason": "Invalid experiment: comment-gamable grep evaluators (comment-only patches passed); Python scc-full was startup+task.pack+delta without Structural Source; native variants used the Rust read-only runner while Aider/Repomix used a different writable path; context artifact was not injected into every writable variant; equal-token BUDGET not enforced on the final concat; index targeted the original fixture tree rather than the disposable edit copy."
   },
   "cells": {
     "raw/http-service.rename-transcript-field": {

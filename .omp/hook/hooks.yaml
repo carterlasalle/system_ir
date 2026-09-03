@@ -9,11 +9,13 @@
 # runtimes that DID support this layout.
 #
 # All TraceLayer lifecycle behavior is implemented by the NATIVE extension
-# at `.omp/extensions/tracelayer/trace-gate.ts`, which registers the
-# `tool_call` pre-mutation gate, `tool_result` post-edit coaching, and the
-# fail-closed `session_stop` completion gate via OMP's native extension
-# events. The extension is the single source of truth; this YAML is
-# NOT loaded.
+# at `.omp/extensions/tracelayer/trace-gate.ts`, which registers:
+#   session_start      → trace hook session-start
+#   before_agent_start → trace hook prompt-context
+#   tool_call          → pre-mutation gate (edit/write)
+#   tool_result        → post-mutation coaching (edit/write/bash/patch)
+#   session_stop       → fail-closed completion gate
+# The extension is the single source of truth; this YAML is NOT loaded.
 #
 # To remove it entirely: delete this file. It is kept only so the layout
 # is not mistaken for active configuration.
@@ -33,3 +35,6 @@ hooks:
   - event: file.changed
     actions:
       - bash: uv run trace index --changed
+  - event: session.stop
+    actions:
+      - bash: uv run trace hook session-stop --format json

@@ -94,6 +94,17 @@ NATIVE_VARIANTS = [
     "ppr-optimizer",
 ]
 EXTERNAL_VARIANTS = ["aider-repomap", "repomix-compress"]
+# Writable coding experiment (P0): the SAME runner for raw × Aider ×
+# Repomix × SCC Atlas/Surface/Full. PPR ablations stay read-only.
+WRITABLE_CODING_VARIANTS = [
+    "raw",
+    "aider-repomap",
+    "repomix-compress",
+    "scc-atlas",
+    "scc-surface",
+    "scc-atlas-surface",
+    "scc-full",
+]
 BUDGETS = [4000, 8000, 16000, 24000]
 DEFAULT_BUDGET = 8000
 
@@ -372,6 +383,93 @@ def copy_tree(src, dst):
             shutil.copy2(entry, target)
 
 
+def estimate_shared_tokens(text):
+    """Deterministic chars/4 — the same rule as the adapters and the Rust arm."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _scc_run(scc_bin, repo_root, args, env, timeout=900):
+    return subprocess.run(
+        [scc_bin, "--root", str(repo_root), *args],
+        capture_output=True, text=True, timeout=timeout, env=env,
+    )
+
+
+def build_scc_variant_artifact(variant, repo_root, goal, workdir, scc_bin, budget):
+    """Build a native SCC context artifact against the disposable copy the
+    agent will edit (`repo_root`), never the original fixture tree.
+
+    `scc-full` is startup + task pack + Structural Source
+    (`scc context structural --task ...`), with the declared budget enforced
+    on the FINAL concatenated artifact (same piece sizing as the Rust
+    `generate_variant_artifact`).
+    """
+    env = {**os.environ, "SCC_STATE_DIR": str(Path(workdir) / ".scc-state")}
+    if _scc_run(scc_bin, repo_root, ["index", "--quiet"], env).returncode != 0:
+        return None, 0, "scc index failed"
+    budget = int(budget or DEFAULT_BUDGET)
+    budget_s = str(budget)
+    if variant == "raw":
+        return None, 0, None
+    if variant == "scc-atlas":
+        proc = _scc_run(scc_bin, repo_root, ["atlas", "--budget", budget_s], env)
+        text = proc.stdout if proc.returncode == 0 else ""
+    elif variant == "scc-surface":
+        proc = _scc_run(scc_bin, repo_root, ["surface", "--budget", budget_s], env)
+        text = proc.stdout if proc.returncode == 0 else ""
+    elif variant == "scc-atlas-surface":
+        proc = _scc_run(scc_bin, repo_root, ["context", "startup", "--budget", budget_s], env)
+        text = proc.stdout if proc.returncode == 0 else ""
+    elif variant == "scc-full":
+        startup_budget = max(1, budget // 2)
+        startup = _scc_run(
+            scc_bin, repo_root, ["context", "startup", "--budget", str(startup_budget)], env
+        )
+        startup_text = startup.stdout if startup.returncode == 0 else ""
+        est_s = estimate_shared_tokens(startup_text)
+        remaining = max(0, budget - est_s)
+        task_budget = max(1, min(budget // 4, max(1, remaining // 2)))
+        task = _scc_run(
+            scc_bin, repo_root, ["context", "task", goal, "--budget", str(task_budget)], env
+        )
+        task_text = task.stdout if task.returncode == 0 else ""
+        est_t = estimate_shared_tokens(task_text)
+        structural_budget = max(0, budget - est_s - est_t)
+        structural_text = ""
+        if structural_budget > 0:
+            st = _scc_run(
+                scc_bin, repo_root,
+                ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
+                env,
+            )
+            if st.returncode == 0:
+                structural_text = st.stdout
+        text = "\n\n".join(p for p in (startup_text, task_text, structural_text) if p and p.strip())
+        # Hard enforcement on the concatenated artifact: shrink structural.
+        while estimate_shared_tokens(text) > budget and structural_budget > 0:
+            over = estimate_shared_tokens(text) - budget + 1
+            structural_budget = max(0, structural_budget - over)
+            st = _scc_run(
+                scc_bin, repo_root,
+                ["context", "structural", "--task", goal, "--budget", str(structural_budget)],
+                env,
+            )
+            structural_text = st.stdout if st.returncode == 0 else ""
+            text = "\n\n".join(p for p in (startup_text, task_text, structural_text) if p and p.strip())
+        if estimate_shared_tokens(text) > budget:
+            # Last-resort byte cap so the declared budget is never exceeded.
+            text = text[: budget * 4]
+    else:
+        return None, 0, f"unsupported native variant {variant}"
+    if not text or not str(text).strip():
+        return None, 0, f"{variant} artifact empty"
+    out = Path(workdir) / f"{variant}.txt"
+    out.write_text(text)
+    return out, estimate_shared_tokens(text), None
+
+
 def run_task_via_protocol(agent_cmd, artifact_path, goal, gt_files, plan_keys, root):
     """Run one task with the benchagent protocol: SCC_GOAL env, repo cwd,
     artifact + goal piped to the agent on stdin, JSONL events parsed from
@@ -488,7 +586,8 @@ def run_write_task(agent_cmd, root, goal, validate_cmd=None, tests_cmd=None, art
     started = time.monotonic()
     proc = _sp.run(
         ["sh", "-c", f"{prompt} | sh -c {quoted}"],
-        cwd=root, env={**os.environ, "SCC_GOAL": goal},
+        cwd=root, env={**os.environ, "SCC_GOAL": goal,
+                       "SCC_EVALUATORS": str(BENCHMARKS / "evaluators")},
         capture_output=True, text=True, timeout=3600,
     )
     elapsed = round(time.monotonic() - started, 2)
@@ -555,17 +654,16 @@ def paired_bootstrap_ci(a, b, rng_seed=1234, n=10000):
     return (sum(diffs) / n_pairs, lo, hi)
 
 
-def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal-token", writable=False):
+def run_external_variant(variant, tasks, budget, agent_cmd, workdir, mode="equal-token", writable=False, scc_bin=None):
     """aider-repomap / repomix-compress over the tasks. Returns (rows,
     skipped) where rows is a list of per-repo metric dicts and skipped is
     None, or a dict {"status": ..., "error": ...} for the first
     SKIPPED-UNINSTALLED / PIN-MISMATCH outcome. `writable=True` uses the
     Part 13 writable coding protocol (isolated editable repo copies +
-    evaluator-driven task_success).
-
-    Artifacts are per-task: aider personalizes the repo map with the task
-    goal (mentioned_idents), the same goal the SCC task variants
-    personalize with — fair Aider-vs-task-SCC."""
+    evaluator-driven task_success) via the SAME runner as native variants.
+    """
+    if writable:
+        return run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=scc_bin, mode=mode)
     rows = []
     skipped = None
     # Native mode has no shared budget: label the artifact root "native"
@@ -671,6 +769,7 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equa
         row["task_success_rate"] = (sum(1 for r in defined if r["task_success"]) / len(defined)
                                     if defined else None)
         row["tasks_with_evaluator"] = len(defined)
+        row["tasks_passed"] = sum(1 for r in defined if r["task_success"])
         row["patch_rate"] = sum(1 for r in results if r.get("patch_produced")) / n
         row["mean_wall_sec"] = sum((r.get("wall_sec") or 0) for r in results) / n
         row["run_completion_rate"] = sum(1 for r in results if r.get("run_completion")) / n
@@ -690,7 +789,95 @@ def _row_for(repo_tasks, artifacts, agent_cmd, repo, variant, budget, mode="equa
 # scc-native variants -> `scc bench external`
 # --------------------------------------------------------------------------
 
-def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode="equal-token"):
+def run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=None, mode="equal-token"):
+    """ONE writable runner for raw / Aider / Repomix / SCC Atlas/Surface/Full.
+
+    Every variant: copy fixture → build artifact against THAT copy →
+    `run_write_task`. Native SCC artifacts are never routed through the
+    read-only `scc bench external` arm.
+    """
+    rows = []
+    skipped = None
+    budget_or_default = budget if budget is not None else DEFAULT_BUDGET
+    for repo, repo_tasks in sorted(tasks.items()):
+        results = []
+        tokens = []
+        for task in repo_tasks:
+            cell = Path(workdir) / "writable" / str(variant) / repo / task["id"]
+            cell.mkdir(parents=True, exist_ok=True)
+            root = cell / "repo"
+            copy_tree(FIXTURES / repo, root)
+            artifact, tok, err = None, 0, None
+            if variant in EXTERNAL_VARIANTS:
+                adapter = BENCHMARKS / "external" / (
+                    "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
+                art_dir = cell / "artifact"
+                art_dir.mkdir(parents=True, exist_ok=True)
+                argv = [bench_python(), str(adapter), str(root), str(budget_or_default), str(art_dir)]
+                if mode == "native-default":
+                    argv.append("--native")
+                if variant == "aider-repomap":
+                    argv += ["--goal", task["goal"]]
+                else:
+                    argv.append("--compress")
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+                try:
+                    payload = json.loads(proc.stdout or "{}")
+                except ValueError:
+                    payload = {"ok": False, "error": proc.stdout[:200]}
+                if proc.returncode == 2:
+                    return rows, {"status": "SKIPPED-UNINSTALLED", "error": payload.get("error", "")}
+                if proc.returncode == 3:
+                    return rows, {"status": "PIN-MISMATCH", "error": payload.get("error", "")}
+                if proc.returncode == 4:
+                    return rows, {"status": "PIN-UNVERIFIED", "error": payload.get("error", "")}
+                if not payload.get("ok"):
+                    err = payload.get("error", "adapter failed")
+                    results.append({"run_completion": False, "task_success": False,
+                                    "task_success_defined": True, "patch_produced": False,
+                                    "wall_sec": 0, "error": err})
+                    tokens.append(0)
+                    continue
+                artifact, tok = Path(payload["artifact"]), int(payload.get("tokens", 0))
+            elif variant != "raw":
+                artifact, tok, err = build_scc_variant_artifact(
+                    variant, root, task["goal"], cell, scc_bin or "scc", budget_or_default)
+                if err:
+                    results.append({"run_completion": False, "task_success": False,
+                                    "task_success_defined": True, "patch_produced": False,
+                                    "wall_sec": 0, "error": err})
+                    tokens.append(0)
+                    continue
+            results.append(
+                run_write_task(agent_cmd, root, task["goal"],
+                               validate_cmd=task.get("validate"), tests_cmd=task.get("tests"),
+                               artifact_path=artifact)
+            )
+            tokens.append(tok)
+        n = max(len(results), 1)
+        defined = [r for r in results if r.get("task_success_defined")]
+        row = {
+            "variant": variant,
+            "mode": mode,
+            "budget": budget,
+            "repo": repo,
+            "tasks": len(results),
+            "context_tokens": (sum(tokens) // max(len(tokens), 1)) if tokens else 0,
+            "task_success_rate": (sum(1 for r in defined if r["task_success"]) / len(defined)
+                                   if defined else None),
+            "tasks_with_evaluator": len(defined),
+            "tasks_passed": sum(1 for r in defined if r["task_success"]),
+            "patch_rate": sum(1 for r in results if r.get("patch_produced")) / n,
+            "mean_wall_sec": sum((r.get("wall_sec") or 0) for r in results) / n,
+            "run_completion_rate": sum(1 for r in results if r.get("run_completion")) / n,
+        }
+        rows.append(row)
+    return rows, skipped
+
+
+def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode="equal-token", writable=False):
+    if writable:
+        return run_writable_variant(variant, tasks, budget, agent_cmd, workdir, scc_bin=scc_bin, mode=mode)
     rows = []
     for repo in sorted(tasks):
         argv = [
@@ -725,22 +912,32 @@ def run_native_variant(variant, tasks, budget, agent_cmd, scc_bin, workdir, mode
 def aggregate(rows):
     """Aggregate row dicts that may be either the read-only shape (exploration
     metrics) or the writable coding shape (task_success_rate/patch_rate).
-    Keys absent from a shape are averaged as absent (not fabricated 0)."""
+    Keys absent from a shape are averaged as absent (not fabricated 0).
+
+    Writable rates are emitted as BOTH:
+      micro_task_success — each evaluator-backed task weighted equally
+      macro_repo_success — each repo's task_success_rate weighted equally
+    """
     n = max(len(rows), 1)
     rec = {"variant": rows[0]["variant"] if rows else "",
            "budget": rows[0]["budget"] if rows else 0,
            "repos": len(rows),
-           "tasks": sum(r["tasks"] for r in rows),
-           "run_completion_rate": sum(r["run_completion_rate"] for r in rows) / n,
-           "context_tokens": sum(r["context_tokens"] for r in rows) / n}
+           "tasks": sum(r.get("tasks", 0) for r in rows),
+           "run_completion_rate": sum(r.get("run_completion_rate", 0) for r in rows) / n,
+           "context_tokens": sum(r.get("context_tokens", 0) for r in rows) / n}
     mean_keys = ["mean_exploration", "first_plan_accuracy", "mean_files_opened",
                  "mean_search_tool_calls", "mean_files_opened_before_first_correct",
                  "task_success_rate", "patch_rate", "mean_wall_sec"]
     for key in mean_keys:
         present = [r for r in rows if r.get(key) is not None]
-        # mean over the rows that actually carry this shape's key; a row of a
-        # different shape must not dilute (or be filtered from) the metric.
         rec[key] = sum(r.get(key) or 0 for r in present) / len(present) if present else None
+    # micro: sum of per-task passes / evaluator-backed tasks
+    passed = sum(r.get("tasks_passed") or 0 for r in rows)
+    eval_n = sum(r.get("tasks_with_evaluator") or 0 for r in rows)
+    rec["micro_task_success"] = (passed / eval_n) if eval_n else None
+    # macro: mean of per-repo rates (today's historical aggregate)
+    repo_rates = [r["task_success_rate"] for r in rows if r.get("task_success_rate") is not None]
+    rec["macro_repo_success"] = (sum(repo_rates) / len(repo_rates)) if repo_rates else None
     return rec
 
 
@@ -810,6 +1007,8 @@ def main(argv):
     # its native configuration. No synthetic "-native" variants, no zero
     # budgets.
     variants = [args.variant] if args.variant else VARIANTS
+    if args.writable and args.variant is None:
+        variants = list(WRITABLE_CODING_VARIANTS)
     if args.mode == "native-default":
         # One pass per variant — each tool picks its own native sizes. The
         # budget is None (no shared cap); the adapters honor --native and
@@ -823,7 +1022,7 @@ def main(argv):
     for variant in variants:
         for budget in budgets:
             if variant in EXTERNAL_VARIANTS:
-                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode, writable=args.writable)
+                rows, skipped = run_external_variant(variant, tasks, budget, args.agent_cmd, workdir, mode=args.mode, writable=args.writable, scc_bin=scc_bin)
                 if skipped is not None:
                     status = skipped.get("status", "SKIPPED-UNINSTALLED")
                     skipped_status = {"variant": variant, "budget": budget, "status": status, "detail": skipped.get("error", "")}
@@ -839,7 +1038,7 @@ def main(argv):
                     return 0
                 all_rows.append(aggregate(rows))
             else:
-                rows, skipped = run_native_variant(variant, tasks, budget, args.agent_cmd, scc_bin, workdir, mode=args.mode)
+                rows, skipped = run_native_variant(variant, tasks, budget, args.agent_cmd, scc_bin, workdir, mode=args.mode, writable=args.writable)
                 if args.single:
                     print(json.dumps(aggregate(rows)))
                     return 0

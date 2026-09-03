@@ -58,18 +58,23 @@ SCOPED_TASKS = canonical_writable_tasks()
 BUDGET = h.DEFAULT_BUDGET
 
 
-def scc_artifact(repo, goal, workdir, scc_bin, budget=None):
-    """Build the FULL SCC artifact through the AUTHORITATIVE CLI builder
-    (`scc bench external --artifact-only`, mission §18/§40): fused startup
-    (Atlas + Surface) + task pack + goal-selected Structural Source, with
-    the FINAL-artifact budget enforced by the CLI (startup N/2, task N/4,
-    structural remainder, hard shrink). The harness never reconstructs
-    SCC semantics in Python. Returns (artifact_path, tokens); raises
-    RuntimeError on failure (infra error)."""
-    out_dir = Path(workdir) / "artifacts" / "scc-full"
+NATIVE_SCC_VARIANTS = ("scc-full", "scc-atlas", "scc-surface", "scc-atlas-surface")
+
+
+def scc_artifact(repo, goal, workdir, scc_bin, budget=None, variant="scc-full"):
+    """Build an SCC artifact through the AUTHORITATIVE CLI builder
+    (`scc bench external --artifact-only`, mission §18/§40). `scc-full` is
+    the headline variant: fused startup (Atlas + Surface) + task pack +
+    goal-selected Structural Source, with the FINAL-artifact budget
+    enforced by the CLI (startup N/2, task N/4, structural remainder, hard
+    shrink). Ablations (`scc-atlas`, `scc-surface`, `scc-atlas-surface`)
+    are opt-in via --variants for secondary analysis. The harness never
+    reconstructs SCC semantics in Python. Returns (artifact_path, tokens);
+    raises RuntimeError on failure (infra error)."""
+    out_dir = Path(workdir) / "artifacts" / variant
     out_dir.mkdir(parents=True, exist_ok=True)
     argv = [scc_bin, "bench", "external",
-            "--variant", "scc-full", "--repo", repo,
+            "--variant", variant, "--repo", repo,
             "--artifact-only", goal, "--workdir", str(out_dir)]
     if budget is not None:
         argv += ["--budget", str(budget)]
@@ -149,10 +154,11 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
     artifact = None
     ctx_tokens = 0
     error = None
-    if variant == "scc-full":
+    if variant in NATIVE_SCC_VARIANTS:
         try:
             artifact, ctx_tokens = scc_artifact(
-                task["repo"], task["goal"], cell_dir, scc_bin, budget=budget)
+                task["repo"], task["goal"], cell_dir, scc_bin, budget=budget,
+                variant=variant)
         except (RuntimeError, AssertionError, ValueError) as exc:
             return {"task_success": False, "run_completion": False,
                     "context_tokens": 0, "wall_sec": 0.0,

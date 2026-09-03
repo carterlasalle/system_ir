@@ -1,5 +1,6 @@
 //! System Context Compiler CLI, daemon, MCP server, and Claude Code plugin.
 
+pub mod agents_md;
 pub mod bench;
 pub mod benchagent;
 pub mod benchatlas;

@@ -3,7 +3,9 @@
     "agent": "codex",
     "mode": "writable",
     "budget": 8000,
-    "note": "scoped real-agent matrix; NOT the full corpus showdown"
+    "note": "scoped real-agent matrix; NOT the full corpus showdown",
+    "valid": false,
+    "invalid_reason": "Invalid experiment: meta.agent is hardcoded 'codex' for a Claude run (wrong agent label); comment-gamable grep evaluators; Python scc-full missing Structural Source; not the unified writable protocol (same runner, same evaluators, same token regime)."
   },
   "cells": {
     "raw/http-service.rename-transcript-field": {

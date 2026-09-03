@@ -1,14 +1,25 @@
 # trace:exempt reason=infra-config  # CI workflow declaration, not repo behavior; the jobs' behavior is traced at the source modules they run
 name: CI
 on:
+  # PR branches only run pull_request. Running both push and pull_request on
+  # the same SHA attaches two `test` checks; a flake on one leaves the PR
+  # UNSTABLE even when the other is green.
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -39,26 +50,35 @@ jobs:
       # the four-way contract (untouched/comment-only/wrong FAIL,
       # known-good PASS) must hold for EVERY evaluator before any agent
       # experiment can be trusted; CI enforces it on every push.
+      # Benchmark regression + evaluator meta-contract tests: the
+      # four-way contract (untouched/comment-only/wrong FAIL, known-good
+      # PASS) must hold for EVERY evaluator before any agent experiment
+      # can be trusted; CI enforces it on every push. Both evaluator
+      # suites run (external/ registry + evaluators/ contract).
       - name: Benchmark harness + adapter self-tests (no network)
         run: |
-          cd benchmarks/external && uv run python -m unittest test_harness.py test_aider_fairness.py
-      - name: Evaluator four-way meta-contract tests
+          cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py
+          uv run python benchmarks/evaluators/test_contract.py
+      - name: OMP setup + generated-extension smoke
         run: |
-          cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_evaluators.py
+          python3 scripts/omp_smoke.py
       - name: Test
         run: |
           # resolution-in-the-bench tests need the semantic backends
           # (behavior_resolve drives tsserver through
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
-          cargo test --workspace
-      # HERMETIC TraceLayer (§37): pinned version, installed via uv — no
-      # unpinned pip, no continue-on-error. The gate must fail CI when
-      # trace verification genuinely fails.
+          # Isolate the 50k wall-clock gate: `cargo test --workspace` runs
+          # many integration binaries at once, and the perf binary used to
+          # re-run the golden suite via `mod golden`.
+          cargo test --workspace -- --skip cold_index_50k_loc_under_30s
+          cargo test -p scc-cli --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
+      # HERMETIC TraceLayer: pinned version via uv — no unpinned pip, no
+      # continue-on-error. The gate fails CI when verification fails.
       - name: Install TraceLayer (pinned)
-        run: uv tool install tracelayer==0.2.39
+        run: uv tool install tracelayer==0.2.40
       - name: Trace policy gate
-        run: trace verify
+        run: trace verify --changed
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test

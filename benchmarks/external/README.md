@@ -191,6 +191,61 @@ CI runs, use the mock agent from `crates/scc-cli/tests/external_bench.rs`
 (a fixed JSONL event stream) — every variant runs under the SAME agent
 command, so the only variable is the context artifact.
 
+## Writable coding experiment (evaluator-backed)
+
+`--writable` (and `run_write_matrix.py`) send **raw × Aider × Repomix ×
+SCC Atlas/Surface/Full** through the **same** writable runner. Each cell
+copies the fixture, builds the variant artifact against **that copy**
+(scc-full = startup + task + `scc context structural --task`, concatenation
+capped at `--budget`, default 8000 chars/4 tokens), then runs the agent
+and scores `task_success` with `benchmarks/evaluators/run.py` — never the
+agent exit code, never a comment/grep detector.
+
+Do **not** check in fabricated Codex/Claude scores. Live runs need
+credentials; without them skip the matrix:
+
+```sh
+# skip live agents (no credentials) — does not write a valid result file
+python3 benchmarks/external/run_write_matrix.py --skip-live \
+  --scc-bin ./target/release/scc \
+  --out /tmp/write-matrix-skipped.json
+
+# live Codex (workspace-write; records agent_cmd, model, versions, SCC rev)
+python3 benchmarks/external/run_write_matrix.py \
+  --agent-cmd 'codex exec --json --sandbox workspace-write --skip-git-repo-check --ephemeral --color never -C . -' \
+  --scc-bin ./target/release/scc \
+  --out benchmarks/results/write-matrix-live-codex.json
+
+# live Claude (same tasks, same variants, same evaluators, same budget)
+python3 benchmarks/external/run_write_matrix.py \
+  --agent-cmd 'claude --print' \
+  --scc-bin ./target/release/scc \
+  --out benchmarks/results/write-matrix-live-claude.json
+
+# full 21-task evaluator-backed corpus (not the scoped 6)
+python3 benchmarks/external/run_write_matrix.py --corpus \
+  --agent-cmd '<writable agent cmd>' \
+  --scc-bin ./target/release/scc \
+  --out benchmarks/results/write-matrix-corpus.json
+```
+
+Checked-in `benchmarks/results/write-matrix*.json` files from before this
+protocol are marked `"valid": false` with `invalid_reason` (comment-gamable
+evaluators, wrong agent label, Python scc-full missing Structural Source,
+split runners). Aggregation emits `micro_task_success` and
+`macro_repo_success` plus paired CIs for SCC−raw, SCC−Aider, and
+SCC−Repomix.
+
+Self-tests (no network, no agent):
+
+```sh
+cd benchmarks/external && python3 -m unittest \
+  test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py
+```
+
+The original 22 adapter/harness tests must still pass. `test_evaluators.py`
+is a red gate: comment-only patches fail all six scoped tasks.
+
 ## Ground truth
 
 `benchmarks/external/ground-truth.yaml` holds per-repo tasks for fixture

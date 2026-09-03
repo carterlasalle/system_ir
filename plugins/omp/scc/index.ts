@@ -6,64 +6,63 @@
 // owns ALL ordering-dependent SCC lifecycle behavior via native OMP
 // events — there is no cross-module or filename-ordering dependence.
 //
-// Lifecycle events wired here (verified against the installed OMP 18.0.11
-// binary's actual emit/result contracts):
-//   session_start          -> reset per-session state (NOT model-visible)
-//   session_switch/_branch/_tree -> same reset: new conversation context
-//   before_agent_start     -> the ONLY per-turn model-visible injection:
-//                             startup (once/session) + task context
-//   session.compacting     -> compaction REHYDRATION: fresh startup +
-//                             checkpoint injected as extraContext so the
-//                             summarizer carries SCC forward
-//   session_before_compact -> `scc checkpoint save` (persist state)
-//   session_compact        -> clear startup marker (post-compaction
-//                             context no longer holds it)
-//   tool_result (edit/write) -> `scc index --paths <path> --quiet`
-//   tool_result (bash/patch) -> git snapshot diff -> `scc index --paths
-//                             <changed...> --quiet`, full-index fallback
-//                             when change detection is unavailable.
+// Lifecycle events wired here (verified against the current OMP API):
+//   session_start / session_switch / session_branch / session_tree
+//                          -> reset the startup-injection marker
+//   before_agent_start     -> the ONLY model-visible injection point for
+//                             normal turns: startup (once per branch)
+//                             + task context/prompt
+//   tool_call              -> snapshot dirty files before opaque tools
+//   tool_result            -> post-edit `scc index --paths` (edit/write
+//                             AND opaque bash/patch/generator mutations);
+//                             index failure is retried then reported
+//   session_before_compact  -> `scc checkpoint save`
+//   session.compacting      -> inject startup + checkpoint into the
+//                             compaction result (`{ context: [...] }`)
+//   session_compact        -> fallback reset if compacting did not run
 //
-// The canonical public type is `ExtensionAPI` from
-// `@oh-my-pi/pi-coding-agent` — the @oh-my-pi scope is the one exposed by
-// the compiled OMP binary's extension loader.
+// The canonical public type is `ExtensionAPI`. The runtime resolves the
+// `@oh-my-pi/pi-coding-agent` package (verified in the bundled binary's
+// virtual-module map — the `@oh-my-pi` scope is canonical).
 import type {
   BeforeAgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
-  SessionCompactingEvent,
   SessionCompactEvent,
   SessionStartEvent,
   ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent";
 
-// Sessions that already received the startup capsule this process. The
-// startup capsule is injected ONCE per session (duplicate-on-resume is
-// acceptable, but never on every prompt). Dynamic membership (runtime
-// insert/delete keyed by session id) — a Set, not a static lookup table.
-const startupInjected = new Set<string>();
-// Last SCC model epoch injected per session (runtime insert/update — Map).
-const lastEpoch = new Map<string, string>();
+// Honor SCC_BIN (claimed by `scc setup omp`) — never hard-code "scc" as
+// the only lookup. A static path may also be written into .omp/mcp.json
+// at setup time when SCC_BIN is set in the installer environment.
+// trace:exempt reason=const-data
+const SCC_BIN = process.env.SCC_BIN || "scc";
 
-// Does the RESUMED conversation already carry an SCC startup capsule?
-const sessionHasStartup = (ctx: ExtensionContext): boolean => {
-  try {
-    const entries = ctx.sessionManager.getEntries();
-    if (!Array.isArray(entries)) return false;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const e = entries[i] as {
-        type?: unknown;
-        customType?: unknown;
-        details?: { hasStartup?: unknown };
-      };
-      // Persisted custom entries carry customType/details at the TOP
-      // level (verified against 18.0.11 session files), not nested.
-      if (e?.type !== "custom_message" || e.customType !== "scc-context") continue;
-      if (e.details?.hasStartup === true) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
+// Sessions/branches that already received the startup capsule this process.
+// Keyed by session id PLUS the active leaf/file when available: a Set of
+// session IDs is not enough when the session id stays the same but the
+// active branch no longer contains the injected message (switch/branch/tree
+// /resume/compaction).
+const startupInjected = new Set<string>();
+
+// toolCallId -> fingerprint map captured on tool_call for opaque tools.
+const dirtySnapshots = new Map<string, Map<string, string>>();
+
+// True when session.compacting already rehydrated the compacted context
+// so session_compact (post-notification) must not wipe the marker.
+let compactingRehydrated = false;
+
+// trace:exempt reason=internal-helper
+const onEvent = (
+  pi: ExtensionAPI,
+  event: string,
+  handler: (event: unknown, ctx: ExtensionContext) => unknown,
+): void => {
+  (pi.on as unknown as (type: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => void)(
+    event,
+    handler,
+  );
 };
 
 // trace:exempt reason=internal-helper
@@ -71,9 +70,28 @@ const scc = async (
   pi: ExtensionAPI,
   args: string[],
   cwd: string,
+): Promise<{ code: number; out: string; err: string }> => {
+  try {
+    const res = await pi.exec(SCC_BIN, args, { cwd });
+    return {
+      code: res.code,
+      out: String(res.stdout ?? ""),
+      err: String(res.stderr ?? ""),
+    };
+  } catch (e) {
+    return { code: -1, out: "", err: e instanceof Error ? e.message : String(e) };
+  }
+};
+
+// trace:exempt reason=internal-helper
+const execBin = async (
+  pi: ExtensionAPI,
+  bin: string,
+  args: string[],
+  cwd: string,
 ): Promise<{ code: number; out: string }> => {
   try {
-    const res = await pi.exec("scc", args, { cwd });
+    const res = await pi.exec(bin, args, { cwd });
     return { code: res.code, out: String(res.stdout ?? "") };
   } catch {
     return { code: -1, out: "" };
@@ -86,105 +104,241 @@ const isConversational = (prompt: string): boolean => {
   if (p === "") return true;
   return /^(hi|hey|hello|yo|thanks|thank you|ok|okay|yes|no|bye|cool|nice|good|great|sure)[.!?\s]*$/i.test(p);
 };
+
+// Read-only tools never mutate the working tree. Everything else is treated
+// as potentially opaque (bash, patch, generators, formatters, scripts).
 // trace:exempt reason=internal-helper
-const editedPath = (input: Record<string, unknown>): string => {
-  if (typeof input.path === "string") return input.path;
-  // Current OMP edit tool: the model passes a structured edit-command
-  // DSL string (`{"input": "[path#tag]\nPUT ...", "i": "..."}`). The
-  // target path is embedded in the first `[path#tag]` bracket prefix.
-  // Runtime narrowing per the no-any rule.
-  const dsl = input.input;
-  if (typeof dsl === "string") {
-    const m = /^\[([^\]#]+)(#[^\]]+)?\]/.exec(dsl);
-    if (m) return m[1];
-  }
-  const legacy = input.file_path;
-  return typeof legacy === "string" ? legacy : "";
-};
+const READ_ONLY_TOOLS = new Set([
+  "read",
+  "grep",
+  "glob",
+  "find",
+  "ls",
+  "search",
+  "semsearch",
+  "websearch",
+  "webfetch",
+]);
 
 // trace:exempt reason=internal-helper
 const isFileMutation = (toolName: string): boolean =>
   toolName === "edit" || toolName === "write";
 
-// Opaque-mutation change detection: `git status --porcelain -z` snapshot
-// lines. Two successive snapshots diff into the precise changed paths
-// (new/deleted/renamed all appear as porcelain entries).
 // trace:exempt reason=internal-helper
-const gitSnapshot = async (
-  pi: ExtensionAPI,
-  cwd: string,
-): Promise<string[]> => {
+const isOpaqueMutation = (toolName: string): boolean =>
+  !READ_ONLY_TOOLS.has(toolName) && !isFileMutation(toolName);
+
+// trace:exempt reason=internal-helper
+const editedPath = (input: Record<string, unknown>): string => {
+  if (typeof input.path === "string") return input.path;
+  // Current OMP edit tool: the model passes a structured edit-command
+  // DSL string (`{"input": "[path#tag]\nPUT ...", "i": "..."}`). Without
+  // this branch the post-edit reindex NEVER fires (verified against a
+  // real 18.0.11 session log: STALE after every edit).
+  const dsl = input.input;
+  if (typeof dsl === "string") {
+    const m = /^\[([^\]#]+)(#[^\]]+)?\]/.exec(dsl);
+    if (m) return m[1];
+  }
+  if (typeof input.file_path === "string") return input.file_path;
+  return "";
+};
+
+// Does the RESUMED conversation already carry an SCC startup capsule?
+// Scans session entries for a prior scc-context custom message with
+// details.hasStartup. Persisted entries carry customType/details at the
+// TOP level (verified against 18.0.11 session files), not nested.
+// trace:exempt reason=internal-helper
+const sessionHasStartup = (ctx: ExtensionContext): boolean => {
   try {
-    const res = await pi.exec("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd });
-    if (res.code !== 0) return [];
-    return String(res.stdout ?? "").split("\0").filter((l) => l.length > 0);
+    const entries = ctx.sessionManager.getEntries();
+    if (!Array.isArray(entries)) return false;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i] as {
+        type?: unknown;
+        customType?: unknown;
+        details?: { hasStartup?: unknown };
+      };
+      if (e?.type !== "custom_message" || e.customType !== "scc-context") continue;
+      if (e.details?.hasStartup === true) return true;
+    }
+    return false;
   } catch {
-    return [];
+    return false;
   }
 };
 
-// Parse `git status --porcelain -z` entries into repo-relative paths.
-// Each entry is `XY <path>`; with -z, rename pairs arrive as two
-// consecutive entries (orig then new) — both count as changed paths.
+// Composite injection key: session id stays stable across branch/tree
+// navigation, so the leaf/file identity is required to know whether the
+// injected startup message is still on the active branch.
 // trace:exempt reason=internal-helper
-const porcelainPaths = (entries: string[]): string[] => {
+const injectionKey = (ctx: ExtensionContext): string => {
+  const sid = ctx.sessionManager.getSessionId();
+  const sm = ctx.sessionManager as unknown as {
+    getLeafId?: () => unknown;
+    getSessionFile?: () => unknown;
+    sessionFile?: unknown;
+  };
+  let leaf = "";
+  try {
+    const id = sm.getLeafId?.();
+    if (typeof id === "string" && id) leaf = id;
+  } catch {
+    // fall through
+  }
+  if (!leaf) {
+    try {
+      const file = sm.getSessionFile?.() ?? sm.sessionFile;
+      if (typeof file === "string" && file) leaf = file;
+    } catch {
+      // fall through
+    }
+  }
+  return leaf ? `${sid}::${leaf}` : sid;
+};
+
+// trace:exempt reason=internal-helper
+const resetInjection = (ctx: ExtensionContext): void => {
+  const sid = ctx.sessionManager.getSessionId();
+  for (const k of [...startupInjected]) {
+    if (k === sid || k.startsWith(`${sid}::`)) startupInjected.delete(k);
+  }
+};
+
+// Porcelain + untracked + vs-HEAD names, fingerprinted with git hash-object
+// so an already-dirty file that bash mutates further is still detected.
+// trace:exempt reason=internal-helper
+const parsePorcelainPaths = (out: string): string[] => {
+  const paths: string[] = [];
+  for (const line of out.split("\n")) {
+    if (line.length < 4) continue;
+    let rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    if (arrow >= 0) rest = rest.slice(arrow + 4);
+    const p = rest.trim().replace(/^"|"$/g, "");
+    if (p) paths.push(p);
+  }
+  return paths;
+};
+
+// trace:exempt reason=internal-helper
+const snapshotDirty = async (pi: ExtensionAPI, cwd: string): Promise<Map<string, string>> => {
+  const map = new Map<string, string>();
+  const status = await execBin(pi, "git", ["status", "--porcelain=v1", "-uall"], cwd);
+  const names = new Set<string>(parsePorcelainPaths(status.out));
+  const diff = await execBin(pi, "git", ["diff", "--name-only", "HEAD"], cwd);
+  if (diff.code === 0) {
+    for (const p of diff.out.split("\n")) {
+      if (p.trim()) names.add(p.trim());
+    }
+  }
+  for (const p of names) {
+    const h = await execBin(pi, "git", ["hash-object", "--", p], cwd);
+    map.set(p, h.code === 0 && h.out.trim() ? h.out.trim() : "missing");
+  }
+  return map;
+};
+
+// trace:exempt reason=internal-helper
+const dirtySince = (
+  before: Map<string, string>,
+  after: Map<string, string>,
+): string[] => {
   const out: string[] = [];
-  for (const e of entries) {
-    if (e.length < 4) continue;
-    out.push(e.slice(3));
+  for (const [p, hash] of after) {
+    if (before.get(p) !== hash) out.push(p);
+  }
+  for (const p of before.keys()) {
+    if (!after.has(p)) out.push(p);
   }
   return out;
 };
+
+// Index failure is NEVER treated as success: retry once, then report.
+// trace:exempt reason=internal-helper
+const indexPaths = async (
+  pi: ExtensionAPI,
+  cwd: string,
+  paths: string[],
+): Promise<{ ok: boolean; err: string }> => {
+  const unique = [...new Set(paths.filter(Boolean))];
+  if (!unique.length) return { ok: true, err: "" };
+  const args = ["index", "--paths", ...unique, "--quiet"];
+  let r = await scc(pi, args, cwd);
+  if (r.code !== 0) {
+    r = await scc(pi, args, cwd);
+  }
+  if (r.code !== 0) {
+    const err = `scc index --paths failed (exit ${r.code}): ${r.err || r.out || "no output"}`;
+    try {
+      pi.logger?.error?.(err);
+    } catch {
+      // logger is optional
+    }
+    return { ok: false, err };
+  }
+  return { ok: true, err: "" };
+};
+
+// trace:exempt reason=internal-helper
+const loadStartupAndCheckpoint = async (
+  pi: ExtensionAPI,
+  cwd: string,
+): Promise<string[]> => {
+  const lines: string[] = [];
+  const startup = await scc(pi, ["context", "startup"], cwd);
+  if (startup.code === 0 && startup.out.trim()) lines.push(startup.out.trim());
+  const checkpoint = await scc(pi, ["checkpoint", "load", "--inject"], cwd);
+  if (checkpoint.code === 0 && checkpoint.out.trim()) lines.push(checkpoint.out.trim());
+  return lines;
+};
+
 // trace:v1 id=impl.omp.scc work=WORK-SCC-001 satisfies=REQ-SCC-API
 export default function hook(pi: ExtensionAPI): void {
-  // session_start: precompute/state only. This is a notification — it
-  // CANNOT return model context. We only reset the once-per-session
-  // startup marker (a fresh session re-injects startup on its first real
-  // prompt) and do a lightweight state-path presence check. Never kick a
-  // huge cold index from this 30-second event.
-  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    startupInjected.delete(ctx.sessionManager.getSessionId());
+  const resetHandler = async (_event: unknown, ctx: ExtensionContext) => {
+    resetInjection(ctx);
     await scc(pi, ["state-path"], ctx.cwd);
-  });
+  };
 
-  // before_agent_start: THE model-visible injection point. Returns a
-  // CustomMessage that the model sees in TUI/print/RPC/headless.
+  // session_start: precompute/state only. This is a notification — it
+  // CANNOT return model context. Reset the injection marker (a fresh
+  // session, resume, or newly loaded session re-injects startup on its
+  // first real prompt) and do a lightweight state-path presence check.
+  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
+    await resetHandler(_event, ctx);
+  });
+  onEvent(pi, "session_switch", resetHandler);
+  onEvent(pi, "session_branch", resetHandler);
+  onEvent(pi, "session_tree", resetHandler);
+
+  // before_agent_start: THE model-visible injection point for normal turns.
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
     const prompt = event.prompt;
-    // A conversational greeting does not need a task pack (never blanket
-    // length filter — only obvious acknowledgements).
     if (isConversational(prompt)) return;
 
     let content = "";
-    let epoch = "";
     let injectedStartup = false;
-    // 1. Startup capsule: once per session (keyed by session id). A
-    // resumed conversation that already carries an SCC startup capsule
-    // (same process via the Set, or a prior session via the entry scan)
-    // does not duplicate it; anything else re-injects — favoring
-    // correctness over dedup means a missing architecture is the only
-    // unacceptable outcome.
-    const sid = ctx.sessionManager.getSessionId();
-    if (!startupInjected.has(sid) && !sessionHasStartup(ctx)) {
+    // Startup capsule: once per branch (branch-aware key) AND skipped on
+    // resumed conversations that already carry an SCC startup capsule
+    // (a `-c`/`-r` resume in a fresh process has an empty Set but the
+    // architecture is already in context — verified via the session
+    // entry scan; re-injecting ~7k tokens would pure-duplicate it).
+    const key = injectionKey(ctx);
+    if (!startupInjected.has(key) && !sessionHasStartup(ctx)) {
       const startup = await scc(pi, ["context", "startup"], ctx.cwd);
       if (startup.code === 0 && startup.out.trim()) {
         content += startup.out.trim() + "\n\n";
-        // The artifact header renders `epoch:epoch:<hex>` (label + value
-        // that itself carries an `epoch:` prefix) — capture the hex.
-        const m = /epoch:epoch:([0-9a-f]+)/.exec(startup.out) ?? /epoch:([0-9a-f]+)/.exec(startup.out);
-        if (m) epoch = m[1];
-        startupInjected.add(sid);
+        startupInjected.add(key);
         injectedStartup = true;
-        lastEpoch.set(sid, epoch);
       }
     }
-    // 2. Task context for this prompt. No `--hook`: that flag is the
-    // passive Claude-hook opt-in gate (silent unless
-    // context.inject_task_focus=true in .scc/config.yaml). This
-    // extension IS the injection decision-maker, so it calls the
-    // command directly with the same 1500-token focus budget the hook
-    // mode would use.
     if (prompt) {
+      // No `--hook`: that flag is the passive Claude-hook opt-in gate
+      // (silent no-op unless context.inject_task_focus=true, default
+      // false) — with it, task context NEVER reaches the model (verified:
+      // `--hook` prints nothing, the direct call prints the pack). This
+      // extension IS the injection decision-maker; the 1500-token focus
+      // budget matches hook mode's cap.
       const task = await scc(pi, ["context", "task", prompt, "--budget", "1500"], ctx.cwd);
       if (task.code === 0 && task.out.trim()) {
         content += task.out.trim();
@@ -196,106 +350,78 @@ export default function hook(pi: ExtensionAPI): void {
         customType: "scc-context",
         content,
         display: false,
-        details: {
-          source: "scc",
-          injectedAt: Date.now(),
-          hasStartup: injectedStartup,
-          epoch: epoch || lastEpoch.get(sid) || "",
-        },
+        details: { source: "scc", injectedAt: Date.now(), hasStartup: injectedStartup },
       },
     };
   });
 
-  // tool_result: post-mutation incremental refresh.
-  //  - edit/write: known path -> `scc index --paths <path> --quiet`
-  //  - bash/patch: opaque mutation -> diff git porcelain snapshots
-  //    taken on successive opaque mutations; precise paths when the
-  //    delta is known, full quiet index only when git change detection
-  //    is unavailable. A failed reindex after a successful source
-  //    mutation is surfaced on stderr (never silently ignored).
-  pi.on("tool_result", async (event: ToolResultEvent, ctx: ExtensionContext) => {
-    if (isFileMutation(event.toolName)) {
-      const path = editedPath(event.input);
-      if (!path) return;
-      const res = await scc(pi, ["index", "--paths", path, "--quiet"], ctx.cwd);
-      if (res.code !== 0) {
-        console.error(`scc: post-edit reindex failed for ${path} (exit ${res.code})`);
-      }
-      return;
-    }
-    if (event.toolName !== "bash" && event.toolName !== "patch") return;
-    // Opaque mutation: snapshot git status now and diff against the last
-    // snapshot (kept per cwd — runtime insert/update Map). The first
-    // opaque mutation in a process only establishes the baseline.
-    const now = await gitSnapshot(pi, ctx.cwd);
-    const prev = opaqueSnapshot.get(ctx.cwd);
-    opaqueSnapshot.set(ctx.cwd, now);
-    if (prev === undefined) return;
-    const before = new Set(porcelainPaths(prev));
-    const changed = porcelainPaths(now).filter((p) => !before.has(p));
-    if (changed.length > 0) {
-      const res = await scc(pi, ["index", "--paths", ...changed, "--quiet"], ctx.cwd);
-      if (res.code !== 0) {
-        console.error(`scc: post-bash reindex failed for ${changed.length} path(s) (exit ${res.code})`);
-      }
-      return;
-    }
-    // No git-visible delta and empty snapshots on both sides: git change
-    // detection is unavailable (non-Git SCC project) — safe full-index
-    // fallback. Two NON-empty snapshots with no delta means the command
-    // did not touch tracked/untracked source; nothing to do.
-    if (now.length === 0 && prev.length === 0) {
-      const res = await scc(pi, ["index", "--quiet"], ctx.cwd);
-      if (res.code !== 0) {
-        console.error(`scc: fallback full reindex failed (exit ${res.code})`);
-      }
-    }
+  // tool_call: snapshot dirty files before opaque mutations so the post
+  // hook can index whatever bash/patch/generators actually changed.
+  pi.on("tool_call", async (event, ctx) => {
+    if (!isOpaqueMutation(event.toolName)) return;
+    const id = event.toolCallId || `${event.toolName}:${Date.now()}`;
+    dirtySnapshots.set(id, await snapshotDirty(pi, ctx.cwd));
   });
 
-  // Per-cwd git snapshots for opaque-mutation change detection.
-  const opaqueSnapshot = new Map<string, string[]>();
+  // tool_result: post-mutation incremental refresh. edit/write index the
+  // touched path; opaque tools index the dirty-fingerprint diff. A failed
+  // index is retried then surfaced to the model — never silently ignored.
+  pi.on("tool_result", async (event: ToolResultEvent, ctx: ExtensionContext) => {
+    const paths: string[] = [];
+    if (isFileMutation(event.toolName)) {
+      const path = editedPath(event.input as Record<string, unknown>);
+      if (path) paths.push(path);
+    }
+    if (isOpaqueMutation(event.toolName) || isFileMutation(event.toolName)) {
+      const id = event.toolCallId;
+      const before = id ? dirtySnapshots.get(id) : undefined;
+      if (id) dirtySnapshots.delete(id);
+      const after = await snapshotDirty(pi, ctx.cwd);
+      if (before) {
+        paths.push(...dirtySince(before, after));
+      } else if (isOpaqueMutation(event.toolName)) {
+        // No pre-snapshot (tool_call missed): index everything currently dirty.
+        paths.push(...after.keys());
+      }
+    }
+    if (!paths.length) return;
+    const result = await indexPaths(pi, ctx.cwd, paths);
+    if (result.ok) return;
+    const content = Array.isArray(event.content) ? [...event.content] : [];
+    content.push({
+      type: "text",
+      text: `\n\n<SCC>\n${result.err}\nPost-edit index did not succeed; subsequent task context may be stale. Re-run \`scc index --paths\`.\n</SCC>`,
+    });
+    return { content };
+  });
 
-  // session_switch / session_branch / session_tree: the conversation
-  // context changed wholesale — reset the marker so the next real prompt
-  // re-injects. (A duplicate startup is cheap; missing architecture is
-  // not.)
-  const resetSession = (_e: unknown, ctx: ExtensionContext) => {
-    startupInjected.delete(ctx.sessionManager.getSessionId());
-  };
-  pi.on("session_switch", resetSession);
-  pi.on("session_branch", resetSession);
-  pi.on("session_tree", resetSession);
-
-  // session_before_compact: persist a checkpoint so the architecture
-  // survives compaction.
-  pi.on("session_before_compact", async (_event, ctx: ExtensionContext) => {
+  // session_before_compact: persist a checkpoint so architecture + task
+  // state can be restored into the compaction result. Registered via
+  // onEvent because older published typings omit this event name.
+  onEvent(pi, "session_before_compact", async (_event: unknown, ctx: ExtensionContext) => {
     await scc(pi, ["checkpoint", "save"], ctx.cwd);
   });
 
-  // session.compacting: REAL rehydration. OMP injects the returned
-  // `context` entries as <additional-context> into the compaction
-  // summarizer prompt, so the compacted summary carries the SCC
-  // architecture and task state forward instead of dropping them.
-  pi.on("session.compacting", async (_event: SessionCompactingEvent, ctx: ExtensionContext) => {
-    const context: string[] = [];
-    const startup = await scc(pi, ["context", "startup"], ctx.cwd);
-    if (startup.code === 0 && startup.out.trim()) {
-      context.push(`<scc-startup>\n${startup.out.trim()}\n</scc-startup>`);
+  // session.compacting: the compaction-result seam. Inject startup +
+  // checkpoint NOW so architecture/task state survive immediately — do
+  // not wait for the next user prompt. Returns { context: string[] }.
+  onEvent(pi, "session.compacting", async (_event: unknown, ctx: ExtensionContext) => {
+    const lines = await loadStartupAndCheckpoint(pi, ctx.cwd);
+    compactingRehydrated = lines.length > 0;
+    if (lines.length) {
+      startupInjected.add(injectionKey(ctx));
+      return { context: lines };
     }
-    const checkpoint = await scc(pi, ["checkpoint", "load"], ctx.cwd);
-    if (checkpoint.code === 0 && checkpoint.out.trim()) {
-      context.push(`<scc-checkpoint>\n${checkpoint.out.trim()}\n</scc-checkpoint>`);
-    }
-    if (context.length === 0) return;
-    return { context };
+    return {};
   });
 
-  // session_compact: after compaction the startup capsule is gone from
-  // context; clear the once-per-session marker so the next real prompt
-  // re-injects startup. The compacted summary carries the architecture
-  // (via session.compacting), so this re-injection is the fused artifact
-  // refresh, not a duplicate.
+  // session_compact: post-compaction notification. If session.compacting
+  // already put SCC context into the summary, keep the injection marker.
+  // Otherwise clear it so the next real prompt re-injects (older OMP).
   pi.on("session_compact", (_event: SessionCompactEvent, ctx: ExtensionContext) => {
-    startupInjected.delete(ctx.sessionManager.getSessionId());
+    if (!compactingRehydrated) {
+      resetInjection(ctx);
+    }
+    compactingRehydrated = false;
   });
 }
