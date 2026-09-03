@@ -20,3 +20,4 @@ __pycache__/
 **/.aider.input.history
 .omp/config.yml
 .omp/config.yml.lock
+.omp/.trace/
