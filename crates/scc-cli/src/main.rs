@@ -226,6 +226,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+// trace:v1 id=impl.crates-scc-cli-src-main.runtime-sub work=WORK-SCC-001 satisfies=REQ-SCC-API
 enum RuntimeSub {
     /// List ingested runtime edges (aggregates)
     Status {
@@ -240,6 +241,7 @@ enum RuntimeSub {
 }
 
 #[derive(Subcommand)]
+// trace:v1 id=impl.crates-scc-cli-src-main.ci-sub work=WORK-SCC-001 satisfies=REQ-SCC-API
 enum CiSub {
     /// Check invariants and drift; exit nonzero on violation
     Check {
@@ -495,6 +497,7 @@ enum ContextSub {
 }
 
 #[derive(Subcommand)]
+// trace:v1 id=impl.crates-scc-cli-src-main.checkpoint-sub work=WORK-SCC-001 satisfies=REQ-SCC-API
 enum CheckpointSub {
     /// Capture the current task state
     Save {
@@ -511,6 +514,7 @@ enum CheckpointSub {
 }
 
 #[derive(Subcommand)]
+// trace:v1 id=impl.crates-scc-cli-src-main.lessons-sub work=WORK-SCC-001 satisfies=REQ-SCC-API
 enum LessonsSub {
     /// Append a lesson to .scc/lessons.jsonl (ingest with `scc import hindsight .scc/lessons.jsonl`)
     Add {

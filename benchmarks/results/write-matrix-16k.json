@@ -1,0 +1,469 @@
+{
+  "meta": {
+    "schema": 2,
+    "timestamp": "2026-09-03T23:15:49Z",
+    "agent_label": "codex",
+    "agent_cmd": "codex exec --json --sandbox workspace-write --skip-git-repo-check --ephemeral --color never -C . -",
+    "model_label": "gpt-5.2-codex",
+    "scc_commit": "a610093af996c02f868f9d589e3eb42dd30816e1",
+    "scc_dirty": false,
+    "benchmark_harness_commit": "a610093af996c02f868f9d589e3eb42dd30816e1",
+    "tasks_corpus_hash": "29eaac2e6747a53d",
+    "evaluators_hash": "96729e9e61f267e4",
+    "mode": "writable-equal-token",
+    "requested_budget": 16000
+  },
+  "cells": {
+    "raw/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 205.3,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/http-service.transcript-normalization": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 112.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/http-service.health-check": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 223.1,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 139.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "raw/queue-worker.street-vocabulary": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 121.8,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "raw/py-queue.classification-fallback": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 1,
+      "wall_sec": 148.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/py-queue.store-changes": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 43.3,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 121.8,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "raw/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 0,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 141.6,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "scc-full/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 552,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 182.2,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/http-service.transcript-normalization": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 575,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 121.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 565,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 141.1,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 544,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 168.2,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "scc-full/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 549,
+      "patch_produced": true,
+      "modified_files": 1,
+      "wall_sec": 116.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "scc-full/py-queue.classification-fallback": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 544,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 162.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/py-queue.store-changes": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 543,
+      "patch_produced": false,
+      "modified_files": 1,
+      "wall_sec": 32.0,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 540,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 112.2,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "scc-full/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 557,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 167.8,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "aider-repomap/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 178,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 132.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/http-service.transcript-normalization": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 178,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 135.3,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/http-service.health-check": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 178,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 138.0,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 333,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 111.7,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "aider-repomap/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 333,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 106.0,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "aider-repomap/py-queue.classification-fallback": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 127.4,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/py-queue.store-changes": {
+      "task_success": false,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": false,
+      "modified_files": 0,
+      "wall_sec": 33.0,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/py-queue.empty-messages": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 94.6,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": false,
+      "requested_budget": 16000
+    },
+    "aider-repomap/ts-api-web.pagination": {
+      "task_success": true,
+      "run_completion": true,
+      "context_tokens": 158,
+      "patch_produced": true,
+      "modified_files": 3,
+      "wall_sec": 230.9,
+      "error": null,
+      "error_type": null,
+      "evaluator_structural": true,
+      "requested_budget": 16000
+    },
+    "repomix-compress/http-service.rename-transcript-field": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/http-service.transcript-normalization": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/http-service.health-check": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/queue-worker.asr-retry": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/queue-worker.street-vocabulary": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/py-queue.classification-fallback": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/py-queue.store-changes": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/py-queue.empty-messages": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    },
+    "repomix-compress/ts-api-web.pagination": {
+      "task_success": false,
+      "run_completion": false,
+      "context_tokens": 0,
+      "wall_sec": 0.0,
+      "error": "PIN-MISMATCH",
+      "error_type": "infrastructure",
+      "requested_budget": 16000
+    }
+  },
+  "summary": {
+    "n_tasks": 9,
+    "raw_task_success": 0.5555555555555556,
+    "raw_n": 9,
+    "scc-full_task_success": 0.3333333333333333,
+    "scc-full_n": 9,
+    "aider-repomap_task_success": 0.3333333333333333,
+    "aider-repomap_n": 9,
+    "repomix-compress_task_success": null,
+    "repomix-compress_n": 0,
+    "skipped_cells": {
+      "raw": {},
+      "scc-full": {},
+      "aider-repomap": {},
+      "repomix-compress": {
+        "http-service.rename-transcript-field": "PIN-MISMATCH",
+        "http-service.transcript-normalization": "PIN-MISMATCH",
+        "http-service.health-check": "PIN-MISMATCH",
+        "queue-worker.asr-retry": "PIN-MISMATCH",
+        "queue-worker.street-vocabulary": "PIN-MISMATCH",
+        "py-queue.classification-fallback": "PIN-MISMATCH",
+        "py-queue.store-changes": "PIN-MISMATCH",
+        "py-queue.empty-messages": "PIN-MISMATCH",
+        "ts-api-web.pagination": "PIN-MISMATCH"
+      }
+    },
+    "paired_scc-full_minus_raw": {
+      "n_paired": 9,
+      "mean_diff": -0.2222222222222222,
+      "ci95": [
+        -0.5555555555555556,
+        0.0
+      ],
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
+    },
+    "paired_aider-repomap_minus_raw": {
+      "n_paired": 9,
+      "mean_diff": -0.2222222222222222,
+      "ci95": [
+        -0.5555555555555556,
+        0.0
+      ],
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
+    },
+    "paired_repomix-compress_minus_raw": null
+  }
+}
