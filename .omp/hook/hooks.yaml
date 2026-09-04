@@ -1,24 +1,6 @@
-#
-# ⚠️ INACTIVE — DO NOT TRUST THIS FILE.
-#
-# This YAML hook file is INERT in the current OMP runtime: no YAML hook
-# loader exists in OMP 18.x (verified against the 18.0.11 binary — the
-# ambient hooks scan accepts only `.ts`/`.js` files, plugin manifest
-# loading reads `extensions` arrays only, and no `pi-yaml-hooks` plugin
-# is installed). It is retained only as a historical reference for
-# runtimes that DID support this layout.
-#
-# All TraceLayer lifecycle behavior is implemented by the NATIVE extension
-# at `.omp/extensions/tracelayer/trace-gate.ts`, which registers:
-#   session_start      → trace hook session-start
-#   before_agent_start → trace hook prompt-context
-#   tool_call          → pre-mutation gate (edit/write)
-#   tool_result        → post-mutation coaching (edit/write/bash/patch)
-#   session_stop       → fail-closed completion gate
-# The extension is the single source of truth; this YAML is NOT loaded.
-#
-# To remove it entirely: delete this file. It is kept only so the layout
-# is not mistaken for active configuration.
+# TraceLayer × Oh My Pi — YAML hooks (pi-yaml-hooks)
+# Copy to .omp/hook/hooks.yaml (project) or ~/.omp/agent/hook/hooks.yaml (global).
+# Trust with /hooks-trust; validate with /hooks-validate.
 hooks:
   - event: session.created
     actions:
@@ -35,6 +17,3 @@ hooks:
   - event: file.changed
     actions:
       - bash: uv run trace index --changed
-  - event: session.stop
-    actions:
-      - bash: uv run trace hook session-stop --format json
