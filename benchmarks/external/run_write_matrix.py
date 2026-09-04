@@ -290,31 +290,40 @@ def main(argv):
     # for a comparison is the INTERSECTION of non-infra-error cells. A
     # cell with an infrastructure error never enters a paired array.
     ids = [t["id"] for t in tasks]
+    results["summary"] = compute_summary(results["cells"], ids, list(variants))
+    results["summary"]["n_tasks"] = len(ids)
 
+    Path(args.out).write_text(json.dumps(results, indent=2))
+    print(json.dumps(results["summary"], indent=2))
+    return 0
+
+
+def compute_summary(cells, ids, variants):
+    """Paired statistics (§31) over a cells dict. Shared by main() and
+    the cell-merge tooling so refills recompute identical summaries."""
     def paired_ids(*variant_names):
         ok = set(ids)
         for v in variant_names:
             for i in ids:
-                cell = results["cells"].get(f"{v}/{i}")
+                cell = cells.get(f"{v}/{i}")
                 if cell is None or cell.get("error"):
                     ok.discard(i)
         return sorted(ok)
 
     def series(v, paired):
-        vals = [1.0 if results["cells"][f"{v}/{i}"]["task_success"] else 0.0 for i in paired]
+        vals = [1.0 if cells[f"{v}/{i}"]["task_success"] else 0.0 for i in paired]
         return (sum(vals) / len(vals)) if vals else None, len(vals)
 
-    summary = {"n_tasks": len(ids)}
+    summary = {}
     for v in variants:
         rate, n = series(v, paired_ids(v))
         summary[f"{v}_task_success"] = rate
         summary[f"{v}_n"] = n
     summary["skipped_cells"] = {
-        v: {i: results["cells"][f"{v}/{i}"].get("error")
-            for i in ids if results["cells"].get(f"{v}/{i}", {}).get("error")}
+        v: {i: cells.get(f"{v}/{i}", {}).get("error")
+            for i in ids if cells.get(f"{v}/{i}", {}).get("error")}
         for v in variants}
 
-    # Paired deltas + bootstrap CI for each comparison vs raw.
     for other in variants:
         if other == "raw":
             continue
@@ -322,8 +331,8 @@ def main(argv):
         if not pair:
             summary[f"paired_{other}_minus_raw"] = None
             continue
-        a = [1.0 if results["cells"][f"{other}/{i}"]["task_success"] else 0.0 for i in pair]
-        b = [1.0 if results["cells"][f"raw/{i}"]["task_success"] else 0.0 for i in pair]
+        a = [1.0 if cells[f"{other}/{i}"]["task_success"] else 0.0 for i in pair]
+        b = [1.0 if cells[f"raw/{i}"]["task_success"] else 0.0 for i in pair]
         mean_diff, lo, hi = h.paired_bootstrap_ci(a, b)
         summary[f"paired_{other}_minus_raw"] = {
             "n_paired": len(pair),
@@ -332,11 +341,7 @@ def main(argv):
             "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
                         else "CI excludes zero"),
         }
-
-    results["summary"] = summary
-    Path(args.out).write_text(json.dumps(results, indent=2))
-    print(json.dumps(summary, indent=2))
-    return 0
+    return summary
 
 
 if __name__ == "__main__":
