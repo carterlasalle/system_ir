@@ -465,5 +465,9 @@
       "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
     "paired_repomix-compress_minus_raw": null
+  },
+  "validity": {
+    "valid": false,
+    "invalid_reason": "claude spend limit: 36/36 agent-infrastructure \u2014 rerun after reset"
   }
 }

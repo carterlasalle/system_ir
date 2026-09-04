@@ -255,16 +255,21 @@ VALID matrices (36/36 cells, 0 infra errors unless noted):
 |---|---|---|---|---|---|
 | codex 4k | 33.3% | 44.4% | 44.4% | 44.4% | +11.1pp [0, +33.3] crosses zero |
 | codex 8k+ | 44.4% | 33.3% | 44.4% | 44.4% | -11.1pp [-44.4, +22.2] crosses zero |
+| codex 16k++ | 55.6% | 33.3% | 33.3% | - (infra) | -22.2pp [-55.6, 0] crosses zero |
 | claude 4k | 33.3% | 11.1% | 22.2% | 11.1% | -22.2pp [-55.6, 0] crosses zero |
 | claude 8k | 22.2% | 55.6% | 11.1% | 22.2% | **+33.3pp [+11.1, +66.7] EXCLUDES ZERO** |
+| claude 16k++ | 11.1% | 33.3% | 11.1% | - (infra) | +22.2pp [-22.2, +66.7] crosses zero |
 
 + 35/36 completed (1 disclosed infra cell, excluded from numerators/pairs).
+++ PARTIAL-valid: repomix 0/9 infra (watchdog-PATH env breakage, since
+fixed) + 4 aider cells quota-interrupted on claude; all raw/scc-full
+pairings complete (n=9) so the scc-raw comparison is valid. Repomix
+reruns queued.
 
-16k/24k: every attempt so far was quota-poisoned (codex died again right
-after completing 8k; Claude's spend limit persisted) - preserved as
-machine-classified INVALID files. Both agents' quotas are the binding
+24k/native: attempts so far quota-poisoned - preserved as
+machine-classified INVALID files. Agent quotas remain the binding
 external constraint; the resumable drivers regenerate only missing
-budgets, so the remaining matrices need only agent quota, no human step.
+budgets.
 
 ## 11. Native-Default Benchmark Results
 
@@ -298,11 +303,15 @@ capacity).
   **claude 8k: scc-full - raw = +33.3pp, CI [+11.1, +66.7]** - SCC full
   context improved Claude's task success at the 8k equal-token budget on
   this 9-task corpus.
-- Every other comparison crosses zero; two show scc numerically BELOW
-  raw (codex 8k, claude 4k) - reported as such.
-- Honest summary: **no consistent direction across agents/budgets; one
-  significant positive; n=9 makes CIs wide.** The claude-8k effect needs
-  replication at 16k/24k and on more tasks before any product claim.
+- Every other comparison crosses zero. Directional pattern (not
+  significant): Claude gains from SCC context at 8k (+33.3pp) and 16k
+  (+22.2pp) but lost at 4k (-22.2pp); Codex shows no gain at any budget
+  (4k +11.1pp, 8k -11.1pp, 16k -22.2pp, all crossing zero). Hypothesis
+  for follow-up: context-hungry models benefit more from precompiled
+  context; it is NOT a claim.
+- Honest summary: **one significant positive (claude 8k); n=9 makes CIs
+  wide.** The claude-8k effect needs replication at 24k and on more
+  tasks before any product claim.
 
 ## 15. Remaining Limitations
 

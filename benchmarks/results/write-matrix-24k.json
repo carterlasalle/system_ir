@@ -465,5 +465,9 @@
       "ci_note": "CI excludes zero"
     },
     "paired_repomix-compress_minus_raw": null
+  },
+  "validity": {
+    "valid": false,
+    "invalid_reason": "quota interrupted: 24/36 infra (aider 9/9, repomix 9/9, scc 6/9); only raw complete \u2014 rerun remaining via watchdog"
   }
 }
