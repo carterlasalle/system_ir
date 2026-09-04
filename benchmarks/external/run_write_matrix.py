@@ -126,11 +126,11 @@ def external_artifact(variant, repo, goal, workdir, budget):
     except ValueError:
         return None, 0, f"adapter output not JSON: {proc.stdout[:200]}"
     if proc.returncode == 2:
-        return None, 0, "SKIPPED-UNINSTALLED"
+        return None, 0, f"SKIPPED-UNINSTALLED: {payload.get('error', '')[:200]}"
     if proc.returncode == 3:
-        return None, 0, "PIN-MISMATCH"
+        return None, 0, f"PIN-MISMATCH: {payload.get('error', '')[:200]}"
     if proc.returncode == 4:
-        return None, 0, "PIN-UNVERIFIED"
+        return None, 0, f"PIN-UNVERIFIED: {payload.get('error', '')[:200]}"
     if not payload.get("ok"):
         return None, 0, payload.get("error", "adapter failed")
     return Path(payload["artifact"]), int(payload.get("tokens", 0)), None
