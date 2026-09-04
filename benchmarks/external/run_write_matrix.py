@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -259,6 +260,11 @@ def main(argv):
     }
 
     workdir = Path(tempfile.mkdtemp(prefix="scc-write-matrix-"))
+    # Disk hygiene: the workdir holds one isolated repo copy per cell
+    # (GBs per full matrix). Results are fully captured in the output JSON
+    # (patch text, modified files, evaluator output), so the workdir is
+    # removed when the run finishes writing — including on failure, after
+    # the partial results are persisted.
     results = {"meta": meta, "cells": {}}
     try:
         for variant in variants:
@@ -278,6 +284,7 @@ def main(argv):
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
+        shutil.rmtree(workdir, ignore_errors=True)
 
     # Paired statistics (§31): join cells by EXACT task id; the paired set
     # for a comparison is the INTERSECTION of non-infra-error cells. A
