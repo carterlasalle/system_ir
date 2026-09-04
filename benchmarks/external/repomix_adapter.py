@@ -130,8 +130,16 @@ def locate_repomix_package():
     if npx_cache.is_dir():
         cands.extend(sorted(npx_cache.glob("*/node_modules/repomix")))
     for cand in cands:
-        pkg_json = cand if cand.name == "package.json" else cand / "package.json"
-        if pkg_json.is_file():
+        # A resolved binary path (e.g. <pkg>/bin/repomix) is not the
+        # package root: walk up looking for the owning package.json.
+        # Without this, envs where `npm root -g` fails (thin PATH) can
+        # resolve the binary yet never find its package, misclassifying a
+        # healthy install as missing.
+        chain = [cand] + list(cand.parents)[:4]
+        for base in chain:
+            pkg_json = base if base.name == "package.json" else base / "package.json"
+            if not pkg_json.is_file():
+                continue
             try:
                 meta = json.loads(pkg_json.read_text())
             except ValueError:
@@ -150,7 +158,10 @@ def verify_repomix_pin():
     passing pin)."""
     pkg_dir = locate_repomix_package()
     if pkg_dir is None:
-        raise PinMismatch("no repomix install found to verify against the lock")
+        # No install found at all: this is a MISSING tool, not a wrong
+        # commit. Misclassifying it as PIN-MISMATCH hides environment
+        # breakage (e.g. thin-PATH watchdog shells) behind a pin verdict.
+        raise RepomixMissing("no repomix install found to verify against the lock")
     try:
         meta = json.loads((pkg_dir / "package.json").read_text())
     except (OSError, ValueError) as exc:
@@ -223,6 +234,10 @@ def verify_repomix_pin():
     )
 
 
+class RepomixMissing(Exception):
+    """No repomix install discoverable in this environment → SKIPPED."""
+
+
 class PinMismatch(Exception):
     pass
 
@@ -262,6 +277,8 @@ def run_repomix(argv):
     # never a passing pin.
     try:
         verify_repomix_pin()
+    except RepomixMissing as exc:
+        return {"ok": False, "error": f"SKIPPED-UNINSTALLED: {exc}"}, 2
     except PinUnverified as exc:
         return {"ok": False, "error": f"PIN-UNVERIFIED: {exc}"}, 4
     except PinMismatch as exc:
