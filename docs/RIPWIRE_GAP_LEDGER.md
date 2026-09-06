@@ -105,6 +105,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - TESTS section is tests_to_run with reasons (`direct` / `import` / `contract` / `state`).
 - Fixed-percent rollover allocator (20/25/30/10/10/5) is implemented and tested; production packer stays adaptive-priority until ablation prefers rollover. `finish_with_rollover` discloses `quota:<bucket>` truncation.
 - Stack/error FILE:LINE loci seed Task Context (mapped files + innermost enclosing symbol); unmapped frames are disclosed, not fabricated.
+- Task packs append an **EXACT SOURCE** section last (priority 1, first dropped). Truncation is disclosed (`shown=`/`total=`/`capped=`). Not a fifth context level.
 
 <!-- trace:exempt reason=document-structure -->
 ## Phase 4 started (honest language matrix)

@@ -921,6 +921,14 @@ pub fn task_with_rankers(
         sections.push(Section::new("ANALYSIS QUALITY", q.compact_line() + "\n", 4));
     }
 
+    // Exact source last: bodies fill leftover budget and are the first
+    // section dropped. Never a fifth context level — this is Level 3
+    // inside Task Context, after semantic sections.
+    let exact = exact_source_tail(ctx, files, &candidates);
+    if !exact.is_empty() {
+        sections.push(Section::new("EXACT SOURCE", exact, 1));
+    }
+
     let warnings = ctx_warnings(ctx);
     let stale_note = ctx
         .stale_paths
@@ -943,6 +951,69 @@ pub fn task_with_rankers(
     }
     pack.compression_policy = Some(compression_policy(goal));
     pack
+}
+
+const EXACT_SOURCE_FILES: usize = 6;
+const EXACT_SOURCE_LINES: usize = 40;
+
+/// Level-3 exact excerpts for Task Context. Truncation is disclosed
+/// (`shown=`/`total=`/`capped=`). Priority 1 so semantic sections win.
+// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance
+fn exact_source_tail(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+) -> String {
+    let mut paths: Vec<String> = Vec::new();
+    let mut push = |p: &str| {
+        if p.is_empty() {
+            return;
+        }
+        if !paths.iter().any(|x| x == p) {
+            paths.push(p.to_string());
+        }
+    };
+    for f in files {
+        push(f);
+    }
+    for c in candidates {
+        if c.kind != kinds::SYMBOL {
+            continue;
+        }
+        if let Some(f) = ctx
+            .view
+            .entity(&c.id)
+            .and_then(|e| e.attributes.get("file"))
+            .and_then(|v| v.as_str())
+        {
+            push(f);
+        }
+    }
+    paths.truncate(EXACT_SOURCE_FILES);
+    let mut body = String::new();
+    let root = &ctx.store.root;
+    for path in &paths {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        let total = text.lines().count();
+        if total == 0 {
+            continue;
+        }
+        let shown = total.min(EXACT_SOURCE_LINES);
+        let capped = u8::from(shown < total);
+        body.push_str(&format!(
+            "# {path} shown={shown} total={total} capped={capped}\n"
+        ));
+        for (i, line) in text.lines().enumerate() {
+            if i >= shown {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    body
 }
 
 /// RTK output-compression policy derived from the task (docs §49/§11):
@@ -2264,5 +2335,53 @@ mod tests {
             pack.content
         );
         assert!(pack.content.contains("historical; not EXTRACTED impact"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.exact-source-last verifies=REQ-exact-source-dominance exercises=impl.scc.context.exact-source-last
+    fn task_pack_puts_exact_source_last_and_drops_it_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "def handle_list():\n    return [1, 2, 3]\n";
+        std::fs::write(root.join("src/a.py"), src).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mut se = Entity::new("s:fn", kinds::SYMBOL, "handle_list");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let fat = task(&ctx, "handle list", &["src/a.py".into()], &[], 50_000);
+        let idx_exact = fat
+            .content
+            .find("EXACT SOURCE")
+            .expect("exact source must appear when budget allows");
+        let idx_task = fat.content.find("TASK").expect("task header");
+        assert!(
+            idx_exact > idx_task,
+            "exact source must follow semantic sections"
+        );
+        assert!(
+            fat.content.contains("shown=2 total=2 capped=0"),
+            "{}",
+            fat.content
+        );
+        assert!(fat.content.contains("def handle_list()"), "{}", fat.content);
+        let thin = task(&ctx, "handle list", &["src/a.py".into()], &[], 80);
+        assert!(
+            thin.dropped_sections.iter().any(|s| s == "EXACT SOURCE"),
+            "exact source is priority 1 and must drop first: {:?}",
+            thin.dropped_sections
+        );
+        assert!(
+            !thin.content.contains("EXACT SOURCE"),
+            "dropped exact source must not remain in content: {}",
+            thin.content
+        );
     }
 }
