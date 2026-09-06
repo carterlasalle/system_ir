@@ -91,11 +91,12 @@ pub const LANGUAGE_REGISTRY: &[LanguageCapability] = &[
     cap("lua", "Lua", LanguageTier::IndexSearch, &["lua"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
     cap("swift", "Swift", LanguageTier::IndexSearch, &["swift"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
     cap("kotlin", "Kotlin", LanguageTier::IndexSearch, &["kt", "kts"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
+    cap("protobuf", "Protocol Buffers", LanguageTier::DataConfig, &["proto"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, "service/rpc → CONTRACT; no AST extractor"),
 ];
 
 /// Authoritative language-support rows. Scan, CLI `scc languages`, and
 /// tests must read this rather than a second hand-maintained list.
-// trace:v1 id=impl.scc.core.language-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-language-support-matrix
+// trace:v1 id=impl.scc.core.language-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-cross-lang-semantic-bridges,REQ-language-support-matrix
 pub fn language_registry() -> &'static [LanguageCapability] {
     LANGUAGE_REGISTRY
 }

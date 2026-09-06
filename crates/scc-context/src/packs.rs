@@ -8,7 +8,10 @@
 use crate::rank::terms;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
-use scc_core::{entity_id, estimate_tokens, path_matches_locus, route_query, truncate_to_budget, Provenance, Severity};
+use scc_core::{
+    entity_id, estimate_tokens, path_matches_locus, route_query, truncate_to_budget, Provenance,
+    Severity,
+};
 use scc_graph::TrustedGraphView;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -43,6 +46,7 @@ struct RenderOutcome {
     exceeded_soft_budget: bool,
 }
 
+// trace:exempt reason=internal-detail
 fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (String, RenderOutcome) {
     let mut sections = sections;
     let mut outcome = RenderOutcome {
@@ -55,11 +59,7 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
     let mut content = assemble(&sections);
     let mut tokens = estimate_tokens(&content);
     while tokens > budget {
-        let min_priority = sections
-            .iter()
-            .map(|s| s.priority)
-            .min()
-            .unwrap_or(10);
+        let min_priority = sections.iter().map(|s| s.priority).min().unwrap_or(10);
         if min_priority >= 9 {
             break; // cannot drop anything else
         }
@@ -147,7 +147,10 @@ pub(crate) fn finish_with_rollover(
     pack.tokens = estimate_tokens(&pack.content);
     pack.original_tokens = original;
     pack.dropped_sections = dropped;
-    pack.hard_truncated = pack.dropped_sections.iter().any(|d| d.starts_with("quota:"));
+    pack.hard_truncated = pack
+        .dropped_sections
+        .iter()
+        .any(|d| d.starts_with("quota:"));
     pack.exceeded_soft_budget = pack.tokens > budget;
     pack.truncated = pack.hard_truncated || pack.exceeded_soft_budget;
 }
@@ -155,7 +158,12 @@ pub(crate) fn finish_with_rollover(
 // trace:exempt reason=internal-detail
 fn quota_bucket(title: &str) -> usize {
     match title {
-        "TASK" | "SYSTEM ROLE" | "RELEVANT COMPONENTS" | "DATA OWNERSHIP" | "LOCUS" | "IDENTITY"
+        "TASK"
+        | "SYSTEM ROLE"
+        | "RELEVANT COMPONENTS"
+        | "DATA OWNERSHIP"
+        | "LOCUS"
+        | "IDENTITY"
         | "COMPONENTS" => 0,
         "UPSTREAM" | "DOWNSTREAM" | "CONTRACTS" => 1,
         "IMPLEMENTATION" => 2,
@@ -183,18 +191,13 @@ fn component_short(view: &TrustedGraphView, id: &str) -> String {
     name.to_string()
 }
 
-fn format_evidence_tags(
-    ctx: &ContextCompiler,
-    entity_ids: &[String],
-) -> String {
+// trace:exempt reason=internal-detail
+fn format_evidence_tags(ctx: &ContextCompiler, entity_ids: &[String]) -> String {
     let counts = ctx.evidence_summary(entity_ids);
     if counts.is_empty() {
         return String::new();
     }
-    let mut parts: Vec<String> = counts
-        .iter()
-        .map(|(k, v)| format!("{v} {k}"))
-        .collect();
+    let mut parts: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
     parts.sort();
     format!("[evidence: {}]", parts.join(", "))
 }
@@ -457,13 +460,7 @@ pub fn task_with_rankers(
 
     // ---- candidate generation ----
     let candidates = crate::rank::collect_lexical_candidates_full(
-        ctx.store,
-        &ctx.view,
-        goal,
-        symbols,
-        24,
-        scorer,
-        reranker,
+        ctx.store, &ctx.view, goal, symbols, 24, scorer, reranker,
     );
     let entity_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
 
@@ -484,9 +481,7 @@ pub fn task_with_rankers(
     // symbol -> component
     let mut symbol_component: HashMap<String, String> = HashMap::new();
     for (sid, f) in &symbol_files {
-        if let Some(cid) = file_component
-            .get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f))
-        {
+        if let Some(cid) = file_component.get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f)) {
             symbol_component.insert(sid.clone(), cid.clone());
         }
     }
@@ -632,9 +627,7 @@ pub fn task_with_rankers(
     };
     sections.push(Section::new(
         "TASK",
-        format!(
-            "Goal: {goal}\nExplicit files: {files_disp}\nExplicit symbols: {symbols_disp}",
-        ),
+        format!("Goal: {goal}\nExplicit files: {files_disp}\nExplicit symbols: {symbols_disp}",),
         10,
     ));
     if let Some(loc) = &locus {
@@ -830,10 +823,7 @@ pub fn task_with_rankers(
                 .and_then(|i| i.get("paths"))
                 .and_then(|p| p.as_array())
             {
-                let ps: Vec<&str> = paths
-                    .iter()
-                    .filter_map(|p| p.as_str())
-                    .collect();
+                let ps: Vec<&str> = paths.iter().filter_map(|p| p.as_str()).collect();
                 if !ps.is_empty() {
                     impl_body.push_str(&format!("{}: {}\n", c.name, ps.join(", ")));
                 }
@@ -992,6 +982,7 @@ fn compression_policy(goal: &str) -> serde_json::Value {
 // component_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     let mut pack = ContextPack::new("component", &ctx.revision());
     let comp = ctx
@@ -1001,10 +992,9 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .into_iter()
         .find(|c| c.id == id_or_name || c.name == id_or_name);
     let Some(comp) = comp else {
-        pack.content = format!(
-            "# COMPONENT NOT FOUND\nNo component matches '{id_or_name}'.\n"
-        );
-        pack.warnings.push(format!("unknown component: {id_or_name}"));
+        pack.content = format!("# COMPONENT NOT FOUND\nNo component matches '{id_or_name}'.\n");
+        pack.warnings
+            .push(format!("unknown component: {id_or_name}"));
         return pack;
     };
     pack.entity_ids.push(comp.id.clone());
@@ -1027,7 +1017,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "RESPONSIBILITY",
-        if resp.is_empty() { "(none)".into() } else { format!("{}\n", resp.join("\n")) },
+        if resp.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", resp.join("\n"))
+        },
         10,
     ));
 
@@ -1036,14 +1030,22 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .get("implementation")
         .and_then(|i| i.get("paths"))
         .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let symbols: Vec<String> = comp
         .attributes
         .get("implementation")
         .and_then(|i| i.get("symbols"))
         .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let mut impl_body = String::new();
     if !paths.is_empty() {
@@ -1066,7 +1068,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "OWNS",
-        if owned.is_empty() { "(none)".into() } else { format!("{}\n", owned.join(", ")) },
+        if owned.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", owned.join(", "))
+        },
         10,
     ));
 
@@ -1086,7 +1092,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "DEPENDS_ON",
-        if deps.is_empty() { "(none)".into() } else { format!("{}\n", deps.join("\n")) },
+        if deps.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", deps.join("\n"))
+        },
         8,
     ));
 
@@ -1094,7 +1104,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .attributes
         .get("retries")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     if !retries.is_empty() {
         sections.push(Section::new(
@@ -1108,7 +1122,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     let mut flows: Vec<String> = Vec::new();
     for f in &ctx.view.flows() {
         if f.steps.iter().any(|s| s.actor.contains(&comp.id)) {
-            flows.push(format!("- {} [{}]", f.name, f.trigger.clone().unwrap_or_default()));
+            flows.push(format!(
+                "- {} [{}]",
+                f.name,
+                f.trigger.clone().unwrap_or_default()
+            ));
         }
     }
     if !flows.is_empty() {
@@ -1129,11 +1147,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     tests.sort();
     tests.dedup();
     if !tests.is_empty() {
-        sections.push(Section::new(
-            "TESTS",
-            format!("{}\n", tests.join("\n")),
-            7,
-        ));
+        sections.push(Section::new("TESTS", format!("{}\n", tests.join("\n")), 7));
     }
 
     sections.push(Section::new(
@@ -1150,6 +1164,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 // flow_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
     let flows = ctx.view.flows();
     let Some(f) = flows.iter().find(|f| f.id == fid) else {
@@ -1198,10 +1213,7 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
         if ev_tags.is_empty() {
             body.push_str("(none)");
         } else {
-            let parts: Vec<String> = ev_tags
-                .iter()
-                .map(|(k, v)| format!("{v} {k}"))
-                .collect();
+            let parts: Vec<String> = ev_tags.iter().map(|(k, v)| format!("{v} {k}")).collect();
             body.push_str(&parts.join(", "));
         }
         body.push('\n');
@@ -1244,6 +1256,7 @@ pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 // impact_context
 // ---------------------------------------------------------------------------
 
+// trace:v1 id=impl.scc.context.impact-forgotten work=WORK-ripwire-lessons-phase6 satisfies=REQ-forgotten-impact-partners
 pub fn impact(
     ctx: &ContextCompiler,
     files: &[String],
@@ -1354,18 +1367,22 @@ pub fn impact(
         .collect();
     sections.push(Section::new(
         "CONTRACTS",
-        if contracts.is_empty() { "(none)".into() } else { format!("{}\n", contracts.join(", ")) },
+        if contracts.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", contracts.join(", "))
+        },
         9,
     ));
 
-    let data: Vec<String> = imp
-        .data
-        .iter()
-        .map(|d| entity_name(&ctx.view, d))
-        .collect();
+    let data: Vec<String> = imp.data.iter().map(|d| entity_name(&ctx.view, d)).collect();
     sections.push(Section::new(
         "DATA",
-        if data.is_empty() { "(none)".into() } else { format!("{}\n", data.join(", ")) },
+        if data.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", data.join(", "))
+        },
         9,
     ));
 
@@ -1396,11 +1413,29 @@ pub fn impact(
         .collect();
     sections.push(Section::new(
         "TESTS",
-        if tests.is_empty() { "(none)".into() } else { format!("{}\n", tests.join(", ")) },
+        if tests.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", tests.join(", "))
+        },
         7,
     ));
 
-    sections.push(Section::new("RISK", format!("{}\n", imp.risk.to_uppercase()), 10));
+    sections.push(Section::new(
+        "RISK",
+        format!("{}\n", imp.risk.to_uppercase()),
+        10,
+    ));
+    if !imp.forgotten_partners.is_empty() {
+        let mut body = String::new();
+        for p in &imp.forgotten_partners {
+            body.push_str(&format!(
+                "{} ({} ×{} with {}) — historical; not EXTRACTED impact\n",
+                p.partner, p.reason, p.commits, p.file
+            ));
+        }
+        sections.push(Section::new("FORGOTTEN PARTNERS", body, 6));
+    }
     if !imp.notes.is_empty() {
         sections.push(Section::new(
             "NOTES",
@@ -1418,6 +1453,7 @@ pub fn impact(
 // verify_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     let mut pack = ContextPack::new("verify", &ctx.revision());
     let mut sections: Vec<Section> = Vec::new();
@@ -1484,13 +1520,19 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
         if !known(&r.subject) {
             dangling += 1;
             if dangling <= 5 {
-                inv.push_str(&format!("dangling subject: {} — {}\n", r.subject, r.predicate));
+                inv.push_str(&format!(
+                    "dangling subject: {} — {}\n",
+                    r.subject, r.predicate
+                ));
             }
         }
         if !known(&r.object) {
             dangling += 1;
             if dangling <= 5 {
-                inv.push_str(&format!("dangling object: {} — {}\n", r.predicate, r.object));
+                inv.push_str(&format!(
+                    "dangling object: {} — {}\n",
+                    r.predicate, r.object
+                ));
             }
         }
     }
@@ -1502,9 +1544,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
             no_evidence += 1;
         }
     }
-    inv.push_str(&format!(
-        "RESOLVED facts without evidence: {no_evidence}\n"
-    ));
+    inv.push_str(&format!("RESOLVED facts without evidence: {no_evidence}\n"));
     // 3. critical invariants unenforced
     let unenforced = ctx
         .view
@@ -1512,7 +1552,9 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
         .iter()
         .filter(|i| i.severity == Severity::Critical && i.enforced_by.is_empty())
         .count();
-    inv.push_str(&format!("Critical invariants without enforcing tests: {unenforced}\n"));
+    inv.push_str(&format!(
+        "Critical invariants without enforcing tests: {unenforced}\n"
+    ));
     // 4. inferred claims
     let inferred = ctx
         .view
@@ -1640,13 +1682,16 @@ fn resolve_goal_loci(ctx: &crate::ContextCompiler, goal: &str) -> Option<LocusHi
             .map(|e| e.name.clone())
             .find(|p| path_matches_locus(p, &loc.path));
         let mapped_file = mapped_file.or_else(|| {
-            ctx.view.entities_of_kind(kinds::SYMBOL).into_iter().find_map(|e| {
-                e.attributes
-                    .get("file")
-                    .and_then(|v| v.as_str())
-                    .filter(|p| path_matches_locus(p, &loc.path))
-                    .map(|p| p.to_string())
-            })
+            ctx.view
+                .entities_of_kind(kinds::SYMBOL)
+                .into_iter()
+                .find_map(|e| {
+                    e.attributes
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .filter(|p| path_matches_locus(p, &loc.path))
+                        .map(|p| p.to_string())
+                })
         });
         match mapped_file {
             None => {
@@ -1666,10 +1711,9 @@ fn resolve_goal_loci(ctx: &crate::ContextCompiler, goal: &str) -> Option<LocusHi
                     }
                 }
                 match enclosed {
-                    Some(name) => body.push_str(&format!(
-                        "- {path}:{} → symbol {name}\n",
-                        loc.line
-                    )),
+                    Some(name) => {
+                        body.push_str(&format!("- {path}:{} → symbol {name}\n", loc.line))
+                    }
                     None => body.push_str(&format!(
                         "- {path}:{} → file (no enclosing symbol)\n",
                         loc.line
@@ -1733,7 +1777,10 @@ fn collect_tests_to_run(
         for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
             tests.entry(r.object.clone()).or_default().insert("direct");
         }
-        for pred in [scc_core::predicates::HANDLES, scc_core::predicates::IMPLEMENTS] {
+        for pred in [
+            scc_core::predicates::HANDLES,
+            scc_core::predicates::IMPLEMENTS,
+        ] {
             for r in ctx.view.out_pred(sid, pred) {
                 let Some(target) = ctx.view.entity(&r.object) else {
                     continue;
@@ -1741,8 +1788,14 @@ fn collect_tests_to_run(
                 if target.kind != kinds::CONTRACT && target.kind != kinds::ROUTE {
                     continue;
                 }
-                for t in ctx.view.out_pred(&r.object, scc_core::predicates::TESTED_BY) {
-                    tests.entry(t.object.clone()).or_default().insert("contract");
+                for t in ctx
+                    .view
+                    .out_pred(&r.object, scc_core::predicates::TESTED_BY)
+                {
+                    tests
+                        .entry(t.object.clone())
+                        .or_default()
+                        .insert("contract");
                 }
             }
         }
@@ -1892,7 +1945,9 @@ mod tests {
         store.insert_entity(&se, &["src/a.py".into()]).unwrap();
         let mut te = Entity::new(&tid, kinds::TEST, "test_handle_list");
         te.attr("file", serde_json::json!("tests/test_a.py"));
-        store.insert_entity(&te, &["tests/test_a.py".into()]).unwrap();
+        store
+            .insert_entity(&te, &["tests/test_a.py".into()])
+            .unwrap();
         let rel = Relationship::new(
             "rel:tb",
             sid.clone(),
@@ -1910,7 +1965,9 @@ mod tests {
         );
         let affected: HashSet<&String> = [&sid].into_iter().collect();
         let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
-        let reasons = found.get(&tid).expect("direct TESTED_BY must list the test");
+        let reasons = found
+            .get(&tid)
+            .expect("direct TESTED_BY must list the test");
         assert!(reasons.contains("direct"));
         let line = format_test_to_run(&ctx, &tid, reasons);
         assert!(line.contains("direct"), "{line}");
@@ -1932,7 +1989,9 @@ mod tests {
         store.insert_entity(&se, &["src/a.py".into()]).unwrap();
         let mut te = Entity::new(&tid, kinds::TEST, "test_via_import");
         te.attr("file", serde_json::json!("tests/test_a.py"));
-        store.insert_entity(&te, &["tests/test_a.py".into()]).unwrap();
+        store
+            .insert_entity(&te, &["tests/test_a.py".into()])
+            .unwrap();
         store
             .insert_test(&tid, "test_via_import", "tests/test_a.py", "unit", None)
             .unwrap();
@@ -1951,7 +2010,9 @@ mod tests {
         );
         let affected: HashSet<&String> = [&sid].into_iter().collect();
         let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
-        let reasons = found.get(&tid).expect("import of affected file must list the test");
+        let reasons = found
+            .get(&tid)
+            .expect("import of affected file must list the test");
         assert!(reasons.contains("import"));
         assert!(!reasons.contains("direct"));
     }
@@ -1970,11 +2031,16 @@ mod tests {
         se.attr("file", serde_json::json!("src/a.py"));
         store.insert_entity(&se, &["src/a.py".into()]).unwrap();
         store
-            .insert_entity(&Entity::new(&cid, kinds::CONTRACT, "GET /list"), &["src/a.py".into()])
+            .insert_entity(
+                &Entity::new(&cid, kinds::CONTRACT, "GET /list"),
+                &["src/a.py".into()],
+            )
             .unwrap();
         let mut te = Entity::new(&tid, kinds::TEST, "test_list_route");
         te.attr("file", serde_json::json!("tests/test_routes.py"));
-        store.insert_entity(&te, &["tests/test_routes.py".into()]).unwrap();
+        store
+            .insert_entity(&te, &["tests/test_routes.py".into()])
+            .unwrap();
         store
             .insert_relationship(
                 &Relationship::new(
@@ -2008,7 +2074,9 @@ mod tests {
         );
         let affected: HashSet<&String> = [&sid].into_iter().collect();
         let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
-        let reasons = found.get(&tid).expect("contract TESTED_BY must list the test");
+        let reasons = found
+            .get(&tid)
+            .expect("contract TESTED_BY must list the test");
         assert!(reasons.contains("contract"));
         assert!(!reasons.contains("direct"));
     }
@@ -2024,16 +2092,30 @@ mod tests {
         let st = "state:orders_db".to_string();
         let tid = "t:state".to_string();
         store
-            .insert_entity(&Entity::new(&comp, kinds::COMPONENT, "orders"), &["src/a.py".into()])
+            .insert_entity(
+                &Entity::new(&comp, kinds::COMPONENT, "orders"),
+                &["src/a.py".into()],
+            )
             .unwrap();
         store
-            .insert_entity(&Entity::new(&st, kinds::STATE, "orders_db"), &["src/a.py".into()])
+            .insert_entity(
+                &Entity::new(&st, kinds::STATE, "orders_db"),
+                &["src/a.py".into()],
+            )
             .unwrap();
         let mut te = Entity::new(&tid, kinds::TEST, "test_orders_state");
         te.attr("file", serde_json::json!("tests/test_state.py"));
-        store.insert_entity(&te, &["tests/test_state.py".into()]).unwrap();
         store
-            .insert_test(&tid, "test_orders_state", "tests/test_state.py", "unit", None)
+            .insert_entity(&te, &["tests/test_state.py".into()])
+            .unwrap();
+        store
+            .insert_test(
+                &tid,
+                "test_orders_state",
+                "tests/test_state.py",
+                "unit",
+                None,
+            )
             .unwrap();
         store
             .insert_relationship(
@@ -2130,5 +2212,57 @@ mod tests {
         );
         assert!(pack.truncated);
         assert!(pack.content.contains("truncated") || pack.hard_truncated);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.impact-forgotten verifies=REQ-forgotten-impact-partners exercises=impl.scc.context.impact-forgotten
+    fn impact_pack_discloses_forgotten_partners_without_merging_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        fn git(root: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "SCC Test"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        for i in 0..2 {
+            std::fs::write(root.join("src/a.py"), format!("a = {i}\n")).unwrap();
+            std::fs::write(root.join("src/b.py"), format!("b = {i}\n")).unwrap();
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let pack = impact(&ctx, &["src/a.py".into()], &[], None);
+        assert!(
+            pack.content.contains("FORGOTTEN PARTNERS"),
+            "missing section: {}",
+            pack.content
+        );
+        assert!(pack.content.contains("src/b.py"), "{}", pack.content);
+        assert!(pack.content.contains("cochange"), "{}", pack.content);
+        assert!(
+            !pack.content.contains("AFFECTED COMPONENTS\nsrc/b.py"),
+            "partner must not become affected: {}",
+            pack.content
+        );
+        assert!(pack.content.contains("historical; not EXTRACTED impact"));
     }
 }

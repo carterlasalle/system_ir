@@ -69,6 +69,7 @@ pub struct ConfigExtraction {
     pub readme_purpose: Option<String>,
 }
 
+// trace:exempt reason=internal-detail
 pub fn extract_config_file(path: &str, content: &str, repo_id: &str) -> ConfigExtraction {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     let mut out = ConfigExtraction::default();
@@ -82,6 +83,8 @@ pub fn extract_config_file(path: &str, content: &str, repo_id: &str) -> ConfigEx
         out.intent = serde_yaml::from_str(content).ok();
     } else if path.eq_ignore_ascii_case("readme.md") {
         out.readme_purpose = readme_purpose(content);
+    } else if name.ends_with(".proto") {
+        extract_proto(path, content, repo_id, &mut out);
     }
     out
 }
@@ -224,6 +227,83 @@ fn extract_env(_path: &str, content: &str, repo_id: &str, out: &mut ConfigExtrac
             e.attr("secret", serde_json::json!(true));
         }
         out.entities.push(e);
+    }
+}
+
+/// Parse `service Name { rpc Foo (...) returns (...); }` into CONTRACT
+/// entities. Not an AST extractor — identifier syntax only.
+// trace:v1 id=impl.scc.index.proto-contracts work=WORK-ripwire-lessons-phase6 satisfies=REQ-cross-lang-semantic-bridges
+pub fn extract_proto(path: &str, content: &str, repo_id: &str, out: &mut ConfigExtraction) {
+    let mut service: Option<String> = None;
+    let mut depth: i32 = 0;
+    for (i, raw) in content.lines().enumerate() {
+        let line = strip_proto_comment(raw);
+        if let Some(name) = parse_proto_service(&line) {
+            service = Some(name);
+        }
+        let opens = line.bytes().filter(|b| *b == b'{').count() as i32;
+        let closes = line.bytes().filter(|b| *b == b'}').count() as i32;
+        depth += opens - closes;
+        if let (Some(svc), Some(rpc)) = (service.as_ref(), parse_proto_rpc(&line)) {
+            let key = format!("{svc}.{rpc}");
+            let id = scc_core::entity_id(repo_id, kinds::CONTRACT, &key);
+            let mut e = Entity::new(id.clone(), kinds::CONTRACT, key.clone());
+            e.attr("kind", serde_json::json!("rpc"));
+            e.attr("service", serde_json::json!(svc));
+            e.attr("rpc", serde_json::json!(rpc));
+            e.attr("file", serde_json::json!(path));
+            e.attr("line", serde_json::json!(i as u32 + 1));
+            out.entities.push(e);
+            let file_id = scc_core::entity_id(repo_id, kinds::FILE, path);
+            let rel = Relationship::new(
+                crate::write::rel_id(&["contains", &file_id, &id]),
+                file_id,
+                scc_core::predicates::CONTAINS,
+                id,
+                Provenance::Extracted,
+            );
+            out.relationships.push((rel, path.to_string()));
+        }
+        if depth <= 0 {
+            service = None;
+            depth = 0;
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn strip_proto_comment(line: &str) -> String {
+    match line.find("//") {
+        Some(i) => line[..i].to_string(),
+        None => line.to_string(),
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn parse_proto_service(line: &str) -> Option<String> {
+    ident_after_keyword(line, "service")
+}
+
+// trace:exempt reason=internal-detail
+fn parse_proto_rpc(line: &str) -> Option<String> {
+    ident_after_keyword(line, "rpc")
+}
+
+// trace:exempt reason=internal-detail
+fn ident_after_keyword(line: &str, keyword: &str) -> Option<String> {
+    let t = line.trim();
+    let rest = t
+        .strip_prefix(keyword)
+        .filter(|r| r.starts_with(' ') || r.starts_with('\t'))?;
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -372,6 +452,7 @@ services:
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn env_only_references() {
         let content = "DATABASE_URL=postgres://u:p@h/db\nPORT=8080\n";
         let out = extract_config_file(".env", content, "repo");
@@ -380,13 +461,18 @@ services:
             .iter()
             .map(|e| (e.name.clone(), e.kind.clone()))
             .collect();
-        assert_eq!(kinds_map.get("DATABASE_URL").unwrap(), kinds::SECRET_REFERENCE);
+        assert_eq!(
+            kinds_map.get("DATABASE_URL").unwrap(),
+            kinds::SECRET_REFERENCE
+        );
         assert_eq!(kinds_map.get("PORT").unwrap(), kinds::CONFIGURATION);
         // values never persisted
         assert!(out
             .entities
             .iter()
-            .all(|e| !serde_json::to_string(&e.attributes).unwrap().contains("postgres://")));
+            .all(|e| !serde_json::to_string(&e.attributes)
+                .unwrap()
+                .contains("postgres://")));
     }
 
     #[test]
@@ -413,10 +499,38 @@ flows:
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn readme_purpose_extracted() {
-        let content = "# My App\n\nThis app processes radio\naudio into incidents.\n\n## Install\n...";
+        let content =
+            "# My App\n\nThis app processes radio\naudio into incidents.\n\n## Install\n...";
         let purpose = readme_purpose(content).unwrap();
         assert!(purpose.contains("processes radio audio"));
         assert!(!purpose.contains("## Install"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.proto-contracts verifies=REQ-cross-lang-semantic-bridges exercises=impl.scc.index.proto-contracts
+    fn proto_rpc_becomes_contract_not_a_call() {
+        let content = r#"
+syntax = "proto3";
+package demo.v1;
+service Orders {
+  rpc GetOrder (GetOrderRequest) returns (GetOrderResponse);
+  rpc ListOrders (ListOrdersRequest) returns (ListOrdersResponse); // comment
+}
+"#;
+        let out = extract_config_file("contracts/orders.proto", content, "repo");
+        let names: Vec<&str> = out.entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Orders.GetOrder"), "{names:?}");
+        assert!(names.contains(&"Orders.ListOrders"), "{names:?}");
+        assert!(out.entities.iter().all(|e| e.kind == kinds::CONTRACT));
+        assert!(out
+            .entities
+            .iter()
+            .all(|e| { e.attributes.get("kind").and_then(|v| v.as_str()) == Some("rpc") }));
+        assert!(out
+            .relationships
+            .iter()
+            .all(|(r, _)| r.predicate == scc_core::predicates::CONTAINS));
     }
 }

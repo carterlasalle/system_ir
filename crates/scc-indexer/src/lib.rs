@@ -11,12 +11,13 @@
 
 // trace:exempt reason=module-facade  # pub mod re-exports only; behavior traced per module
 pub mod adapters;
+pub mod bridges;
 pub mod config;
 pub mod configrefs;
 pub mod configs;
+pub mod conflicts;
 pub mod embed;
 pub mod facts;
-pub mod conflicts;
 pub mod failures;
 pub mod git;
 pub mod go;
@@ -27,12 +28,12 @@ pub mod lsp_ts;
 pub mod mentions;
 pub mod model;
 pub mod python;
-pub mod redact;
 pub mod recv;
+pub mod redact;
 pub mod resolve;
 pub mod resolver;
-pub mod rust;
 pub mod runtime;
+pub mod rust;
 pub mod scan;
 pub mod typescript;
 pub mod write;
@@ -179,7 +180,13 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
+            if lang == "python"
+                || lang == "typescript"
+                || lang == "javascript"
+                || lang == "go"
+                || lang == "java"
+                || lang == "rust"
+            {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }
@@ -262,9 +269,16 @@ impl Indexer {
             let hash = scan::hash_bytes(content.as_bytes());
             writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
             record_file_quality(&self.store, path, &resolved_calls)?;
-            self.store.upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
-            configrefs::apply_config_refs(&self.store, path, f.language.as_str(), &content, cfg_hits.clone())
-                .map_err(IndexError::ConfigRefs)?;
+            self.store
+                .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
+            configrefs::apply_config_refs(
+                &self.store,
+                path,
+                f.language.as_str(),
+                &content,
+                cfg_hits.clone(),
+            )
+            .map_err(IndexError::ConfigRefs)?;
             failures::apply_failures(&self.store, path, f.language.as_str(), fail_hits.clone())
                 .map_err(IndexError::Failures)?;
             report.indexed += 1;
@@ -284,11 +298,14 @@ impl Indexer {
                     | Language::Yaml
                     | Language::Dockerfile
                     | Language::Terraform
-            ) || path == ".scc/intent.yaml"
+            ) || lang.is_config_extract()
+                || path == ".scc/intent.yaml"
                 || is_readme(path)
             {
                 let full = self.store.root.join(path);
-                let Ok(content) = std::fs::read_to_string(&full) else { continue };
+                let Ok(content) = std::fs::read_to_string(&full) else {
+                    continue;
+                };
                 let mut out = configs::extract_config_file(path, &content, &self.store.repo_id);
                 let infra = crate::infra::extract_infra_file(path, &content, &self.store.repo_id);
                 out.entities.extend(infra.entities);
@@ -299,7 +316,8 @@ impl Indexer {
                 if let Some(purpose) = out.readme_purpose {
                     self.store.meta_set("purpose", &purpose)?;
                 }
-                let _writer = write::Writer::new(&self.store, &self.store.repo_id, &report.revision);
+                let _writer =
+                    write::Writer::new(&self.store, &self.store.repo_id, &report.revision);
                 for e in out.entities {
                     self.store.insert_entity(&e, std::slice::from_ref(path))?;
                 }
@@ -308,7 +326,11 @@ impl Indexer {
                 }
                 for ep in out.entrypoints {
                     let mut se = scc_core::Entity::new(
-                        scc_core::entity_id(&self.store.repo_id, kinds::SYMBOL, &format!("{path}/{}", ep.symbol)),
+                        scc_core::entity_id(
+                            &self.store.repo_id,
+                            kinds::SYMBOL,
+                            &format!("{path}/{}", ep.symbol),
+                        ),
                         kinds::SYMBOL,
                         ep.symbol.clone(),
                     );
@@ -334,6 +356,7 @@ impl Indexer {
         }
 
         apply_doc_mentions(&self.store)?;
+        bridges::link_rpc_bridges(&self.store)?;
 
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
@@ -349,9 +372,7 @@ impl Indexer {
             Language::Python if self.config.language_enabled(Language::Python) => {
                 self.python.extract(&file)
             }
-            Language::Go if self.config.language_enabled(Language::Go) => {
-                self.go.extract(&file)
-            }
+            Language::Go if self.config.language_enabled(Language::Go) => self.go.extract(&file),
             Language::TypeScript | Language::JavaScript
                 if self.config.language_enabled(Language::TypeScript) =>
             {
@@ -367,7 +388,7 @@ impl Indexer {
         }
     }
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
     fn load_symbols(&self, path: &str) -> Result<Vec<model::Symbol>, scc_store::StoreError> {
         let rows = self.store.symbols_in_file(path)?;
         Ok(rows
@@ -400,10 +421,11 @@ impl Indexer {
     /// Refresh specific paths (watch events / post-edit). Unknown paths are
     /// ignored. Returns the number of files re-indexed.
     pub fn refresh_paths(&self, paths: &[String]) -> Result<IndexReport, IndexError> {
-        let scanned: HashMap<String, ScannedFile> = scan::scan_repo(&self.store.root, &self.config.index)?
-            .into_iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
+        let scanned: HashMap<String, ScannedFile> =
+            scan::scan_repo(&self.store.root, &self.config.index)?
+                .into_iter()
+                .map(|f| (f.path.clone(), f))
+                .collect();
         let git_info = git::resolve_git(&self.store.root);
         self.store.meta_set("revision", &git_info.revision)?;
         let snapshot_id = self
@@ -474,7 +496,13 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
+            if lang == "python"
+                || lang == "typescript"
+                || lang == "javascript"
+                || lang == "go"
+                || lang == "java"
+                || lang == "rust"
+            {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }
@@ -547,8 +575,14 @@ impl Indexer {
             record_file_quality(&self.store, path, &resolved_calls)?;
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
-            configrefs::apply_config_refs(&self.store, path, f.language.as_str(), &content, cfg_hits.clone())
-                .map_err(IndexError::ConfigRefs)?;
+            configrefs::apply_config_refs(
+                &self.store,
+                path,
+                f.language.as_str(),
+                &content,
+                cfg_hits.clone(),
+            )
+            .map_err(IndexError::ConfigRefs)?;
             failures::apply_failures(&self.store, path, f.language.as_str(), fail_hits.clone())
                 .map_err(IndexError::Failures)?;
             report.indexed += 1;
@@ -557,18 +591,11 @@ impl Indexer {
         // config extraction for changed config files
         let mut intent: Option<configs::Intent> = None;
         for (path, (f, _ef, _cfg, _fail)) in &extracted {
-            if matches!(
-                f.language,
-                Language::Env
-                    | Language::Json
-                    | Language::Yaml
-                    | Language::Dockerfile
-                    | Language::Terraform
-            ) || path == ".scc/intent.yaml"
-                || is_readme(path)
-            {
+            if f.language.is_config_extract() || path == ".scc/intent.yaml" || is_readme(path) {
                 let full = self.store.root.join(path);
-                let Ok(content) = std::fs::read_to_string(&full) else { continue };
+                let Ok(content) = std::fs::read_to_string(&full) else {
+                    continue;
+                };
                 let mut out = configs::extract_config_file(path, &content, &self.store.repo_id);
                 let infra = crate::infra::extract_infra_file(path, &content, &self.store.repo_id);
                 out.entities.extend(infra.entities);
@@ -602,6 +629,7 @@ impl Indexer {
         // tested_by edges derived from changed files must be relinked
         self.relink_tests_for(changed_paths, revision)?;
         apply_doc_mentions(&self.store)?;
+        bridges::link_rpc_bridges(&self.store)?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
         persist_bm25_corpus(&self.store)?;
         Ok(report)
@@ -622,7 +650,13 @@ impl Indexer {
         let changed: HashSet<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
         let mut index = SymbolIndex::new(&self.store.repo_id);
         for (path, _h, lang, _kind, _size) in self.store.all_files()? {
-            if lang == "python" || lang == "typescript" || lang == "javascript" || lang == "go" || lang == "java" || lang == "rust" {
+            if lang == "python"
+                || lang == "typescript"
+                || lang == "javascript"
+                || lang == "go"
+                || lang == "java"
+                || lang == "rust"
+            {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
             }
@@ -866,11 +900,12 @@ mod tests {
         // §26: native resolution is evidence-grade (EXTRACTED candidate),
         // never RESOLVED — semantic engines (LSP/SCIP) provide RESOLVED
         assert!(
-            rels.iter().any(|r| r.predicate == scc_core::predicates::CALLS
-                && matches!(
-                    r.provenance,
-                    scc_core::Provenance::Extracted | scc_core::Provenance::Resolved
-                )),
+            rels.iter()
+                .any(|r| r.predicate == scc_core::predicates::CALLS
+                    && matches!(
+                        r.provenance,
+                        scc_core::Provenance::Extracted | scc_core::Provenance::Resolved
+                    )),
             "expected an evidence-grade call edge"
         );
         assert!(
@@ -888,7 +923,10 @@ mod tests {
             .unwrap()
             .expect("persisted");
         let parsed: scc_core::AnalysisQuality = serde_json::from_str(&stored).unwrap();
-        assert_eq!(parsed.calls.resolved, report.analysis_quality.calls.resolved);
+        assert_eq!(
+            parsed.calls.resolved,
+            report.analysis_quality.calls.resolved
+        );
         assert_eq!(parsed.files.parsed, report.analysis_quality.files.parsed);
     }
 
@@ -911,7 +949,10 @@ mod tests {
         let stored = idx.store.meta_get("analysis_quality").unwrap().unwrap();
         assert!(stored.contains("resolved"), "{stored}");
         assert!(
-            idx.store.meta_get("analysis_quality_files").unwrap().is_some(),
+            idx.store
+                .meta_get("analysis_quality_files")
+                .unwrap()
+                .is_some(),
             "per-file gauges live in store meta"
         );
         for e in idx.store.all_entities().unwrap() {
@@ -984,7 +1025,15 @@ mod tests {
             .all_relationships()
             .unwrap()
             .iter()
-            .map(|r| format!("{} {} {} {}", r.subject, r.predicate, r.object, r.provenance.as_str()))
+            .map(|r| {
+                format!(
+                    "{} {} {} {}",
+                    r.subject,
+                    r.predicate,
+                    r.object,
+                    r.provenance.as_str()
+                )
+            })
             .collect();
 
         // incremental edit sequence
@@ -1002,7 +1051,15 @@ mod tests {
             .all_relationships()
             .unwrap()
             .iter()
-            .map(|r| format!("{} {} {} {}", r.subject, r.predicate, r.object, r.provenance.as_str()))
+            .map(|r| {
+                format!(
+                    "{} {} {} {}",
+                    r.subject,
+                    r.predicate,
+                    r.object,
+                    r.provenance.as_str()
+                )
+            })
             .collect();
         assert_eq!(cold_facts, incr_facts, "incremental must equal cold");
 
@@ -1014,7 +1071,15 @@ mod tests {
             .all_relationships()
             .unwrap()
             .iter()
-            .map(|r| format!("{} {} {} {}", r.subject, r.predicate, r.object, r.provenance.as_str()))
+            .map(|r| {
+                format!(
+                    "{} {} {} {}",
+                    r.subject,
+                    r.predicate,
+                    r.object,
+                    r.provenance.as_str()
+                )
+            })
             .collect();
         assert_eq!(incr_facts, final_facts, "full vs incremental equivalence");
     }
@@ -1081,8 +1146,7 @@ mod tests {
         let rels = idx.store.all_relationships().unwrap();
         assert!(
             rels.iter().any(|r| {
-                r.predicate == scc_core::predicates::IMPORTS
-                    && r.object.contains("renamed.py")
+                r.predicate == scc_core::predicates::IMPORTS && r.object.contains("renamed.py")
             }),
             "import must point at the renamed file"
         );

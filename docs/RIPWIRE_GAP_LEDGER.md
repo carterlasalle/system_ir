@@ -116,6 +116,14 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - `scc bench loop` compares baseline (lexical file overlap) vs SCC `task_context` vs black-box Ripwire `--pack-task`. Metrics are clustered by fixture repo. Missing Ripwire is `skipped`, not a win. Substitution rate is 1.0 for the SCC locator arm and 0.0 for baseline.
 
 <!-- trace:exempt reason=document-structure -->
+## Phase 6 started (system moat)
+
+- Per-function store R/W/query/publish lines feed State Authority; component `owns` stays write-derived; readers are not owners.
+- Runtime matching CALLS gain `OBSERVED_AS`; EXTRACTED/RESOLVED CALLS are not rewritten; observed-only traffic is not invented as CALLS.
+- Impact discloses forgotten co-change partners without merging them into EXTRACTED impact sets.
+- `.proto` is DataConfig; rpc CONTRACTs link via INVOKES/IMPLEMENTS. Cross-language CALLS are not emitted.
+
+<!-- trace:exempt reason=document-structure -->
 ## Working order
 
 1. Truth foundation (this PR)
