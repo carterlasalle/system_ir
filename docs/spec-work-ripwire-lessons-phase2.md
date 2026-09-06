@@ -57,3 +57,9 @@ Git co-change pairs may appear on the experimental relevance lens as extra candi
 <!-- trace:v1 id=REQ-retrieval-eval type=requirement work=WORK-ripwire-lessons-phase2 -->
 
 A retrieval harness must compute Recall@1/5/10 and MRR against `benchmarks/tasks.json` gold (files, symbols, components, routes) for inspectable ranking arms including ProductionBlended (today's surface), LexicalThenGraph, and QueryRouted. `scc bench retrieval` prints the table. Production ranking must not change because an arm looks better on this corpus alone.
+
+### REQ-bm25-persist — Corpus BM25 stats live in store meta
+
+<!-- trace:v1 id=REQ-bm25-persist type=requirement work=WORK-ripwire-lessons-phase2 -->
+
+Index persists BM25 corpus statistics (`n`, `avgdl`, per-term `df`, per-doc `dl`) in store meta key `bm25_corpus`, never on FILE entity attributes. Scoring a document set with those stats must match cold `bm25_scores` when the set *is* the corpus. Using corpus IDF on a candidate slice is allowed on the experimental lens only. Production `build_surface` must not read this meta.

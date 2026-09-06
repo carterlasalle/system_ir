@@ -21,3 +21,9 @@ The task pack TESTS section is a `tests_to_run` list. Each row names the test, i
 <!-- trace:v1 id=REQ-budget-rollover type=requirement work=WORK-ripwire-lessons-phase3 -->
 
 A budget allocator splits a token budget into buckets whose percents sum to 100 (Atlas 20, Surface 25, Structural-exact 30, Call-flow 10, Verify 10, Uncertainty 5). Unused quota in a bucket rolls forward to the next. Truncation of a bucket that exceeded its (rolled) quota is disclosed. Production task packs keep adaptive priority dropping until an ablation prefers this allocator; both strategies must remain callable.
+
+### REQ-stack-locus-ingest — Stack/error FILE:LINE seeds Task Context
+
+<!-- trace:v1 id=REQ-stack-locus-ingest type=requirement work=WORK-ripwire-lessons-phase3 -->
+
+When the task goal is a stack trace or error message with extracted FILE:LINE loci, Task Context must treat matching indexed files as affected (suffix path match, never `extra.py` for `a.py`) and, when line ranges exist, the innermost enclosing symbol. A LOCUS section discloses the frames and whether they mapped. Unmapped frames are skipped, not fabricated. Production ranking is unchanged; this is pack seed selection.

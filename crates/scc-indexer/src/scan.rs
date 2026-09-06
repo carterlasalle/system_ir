@@ -26,10 +26,21 @@ pub enum Language {
     Markdown,
     Shell,
     Sql,
+    C,
+    Cpp,
+    Objc,
+    Csharp,
+    Ruby,
+    Php,
+    Lua,
+    Swift,
+    Kotlin,
     Other,
 }
 
+// trace:exempt reason=internal-detail
 impl Language {
+    // trace:exempt reason=internal-detail
     pub fn as_str(&self) -> &'static str {
         match self {
             Language::Python => "python",
@@ -48,6 +59,15 @@ impl Language {
             Language::Markdown => "markdown",
             Language::Shell => "shell",
             Language::Sql => "sql",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Objc => "objc",
+            Language::Csharp => "csharp",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
+            Language::Lua => "lua",
+            Language::Swift => "swift",
+            Language::Kotlin => "kotlin",
             Language::Other => "other",
         }
     }
@@ -70,6 +90,15 @@ impl Language {
         Language::Markdown,
         Language::Shell,
         Language::Sql,
+        Language::C,
+        Language::Cpp,
+        Language::Objc,
+        Language::Csharp,
+        Language::Ruby,
+        Language::Php,
+        Language::Lua,
+        Language::Swift,
+        Language::Kotlin,
         Language::Other,
     ];
 }
@@ -162,6 +191,7 @@ fn is_test_path(path: &Path, language: Language) -> bool {
     }
 }
 
+// trace:exempt reason=internal-detail
 fn classify(path: &Path) -> Option<(Language, FileKind)> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lname = name.to_ascii_lowercase();
@@ -185,6 +215,15 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
             "md" | "mdx" | "rst" => Language::Markdown,
             "sh" | "bash" | "zsh" => Language::Shell,
             "sql" => Language::Sql,
+            "c" | "h" => Language::C,
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" => Language::Cpp,
+            "m" | "mm" => Language::Objc,
+            "cs" => Language::Csharp,
+            "rb" => Language::Ruby,
+            "php" => Language::Php,
+            "lua" => Language::Lua,
+            "swift" => Language::Swift,
+            "kt" | "kts" => Language::Kotlin,
             "env" => Language::Env,
             "" => {
                 if lname == "dockerfile" {
@@ -377,6 +416,14 @@ mod tests {
         }
         assert!(scc_core::language_by_id("c").is_some());
         assert!(!scc_core::language_by_id("c").unwrap().extractor);
+        assert_eq!(classify(Path::new("src/foo.c")).unwrap().0, Language::C);
+        assert_eq!(classify(Path::new("src/foo.cpp")).unwrap().0, Language::Cpp);
+        assert_eq!(classify(Path::new("src/foo.rb")).unwrap().0, Language::Ruby);
+        assert!(!scc_core::language_by_id("c").unwrap().extractor);
+        assert_eq!(
+            scc_core::language_by_id("c").unwrap().tier,
+            scc_core::LanguageTier::IndexSearch
+        );
     }
 
     #[test]
@@ -410,6 +457,23 @@ mod tests {
             classify(Path::new("Dockerfile")).unwrap().0,
             Language::Dockerfile
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.scan.indexsearch-classified verifies=REQ-scan-classifies-registry-languages exercises=impl.scc.core.language-registry
+    fn indexsearch_registry_languages_are_scan_classified() {
+        for cap in scc_core::language_registry() {
+            if cap.tier != scc_core::LanguageTier::IndexSearch {
+                continue;
+            }
+            let ext = cap
+                .extensions
+                .first()
+                .expect("index/search languages list an extension");
+            let (lang, _) = classify(Path::new(&format!("src/sample.{ext}"))).expect("classified");
+            assert_eq!(lang.as_str(), cap.id, "scan vs registry id for .{ext}");
+            assert!(!cap.extractor, "{} must not claim an extractor", cap.id);
+        }
     }
 
     #[test]

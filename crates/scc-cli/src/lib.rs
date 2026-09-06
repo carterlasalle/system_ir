@@ -5,6 +5,7 @@ pub mod bench;
 pub mod benchagent;
 pub mod benchatlas;
 pub mod benchctx;
+pub mod benchloop;
 pub mod benchres;
 pub mod benchret;
 pub mod checkpoint;
@@ -154,6 +155,7 @@ pub fn compiler<'a>(
             config.inference.embedding_model,
             config.inference.rerank_model
         ),
+        pack_allocator: scc_context::PackAllocator::AdaptivePriority,
     };
     Ok(Compiler {
         store,

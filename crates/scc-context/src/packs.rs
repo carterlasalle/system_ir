@@ -8,10 +8,11 @@
 use crate::rank::terms;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
-use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
+use scc_core::{entity_id, estimate_tokens, path_matches_locus, route_query, truncate_to_budget, Provenance, Severity};
 use scc_graph::TrustedGraphView;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+#[derive(Debug, Clone)]
 // trace:exempt reason=internal-detail
 pub(crate) struct Section {
     pub(crate) title: String,
@@ -103,6 +104,65 @@ pub(crate) fn finish(
     pack.exceeded_soft_budget = outcome.exceeded_soft_budget;
     pack.truncated =
         pack.hard_truncated || !pack.dropped_sections.is_empty() || pack.exceeded_soft_budget;
+}
+
+/// Inspectable fixed-quota packer. Production [`finish`] stays adaptive.
+/// Truncated buckets are named in `dropped_sections` as `quota:<bucket>`.
+// trace:v1 id=impl.scc.context.finish-rollover work=WORK-ripwire-lessons-phase3 satisfies=REQ-budget-rollover
+pub(crate) fn finish_with_rollover(
+    pack: &mut ContextPack,
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+) {
+    let original = estimate_tokens(&assemble(&sections));
+    let mut buckets: [Vec<Section>; 6] = Default::default();
+    for s in sections {
+        buckets[quota_bucket(&s.title)].push(s);
+    }
+    let used: [usize; 6] = std::array::from_fn(|i| estimate_tokens(&assemble(&buckets[i])));
+    let filled = crate::budget::fill_task_context_quotas(budget, &used);
+    let mut kept: Vec<Section> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (i, secs) in buckets.into_iter().enumerate() {
+        let assembled = assemble(&secs);
+        let grant = filled[i].granted;
+        if filled[i].truncated > 0 {
+            dropped.push(format!("quota:{}", filled[i].name));
+            let fitted = truncate_to_budget(&assembled, grant.max(1));
+            kept.push(Section::new(
+                &format!("{} (truncated)", filled[i].name),
+                fitted,
+                5,
+            ));
+        } else {
+            kept.extend(secs);
+        }
+    }
+    for w in warnings {
+        kept.push(Section::new("WARNING", format!("{w}\n"), 10));
+    }
+    pack.content = assemble(&kept);
+    pack.budget = budget;
+    pack.tokens = estimate_tokens(&pack.content);
+    pack.original_tokens = original;
+    pack.dropped_sections = dropped;
+    pack.hard_truncated = pack.dropped_sections.iter().any(|d| d.starts_with("quota:"));
+    pack.exceeded_soft_budget = pack.tokens > budget;
+    pack.truncated = pack.hard_truncated || pack.exceeded_soft_budget;
+}
+
+// trace:exempt reason=internal-detail
+fn quota_bucket(title: &str) -> usize {
+    match title {
+        "TASK" | "SYSTEM ROLE" | "RELEVANT COMPONENTS" | "DATA OWNERSHIP" | "LOCUS" | "IDENTITY"
+        | "COMPONENTS" => 0,
+        "UPSTREAM" | "DOWNSTREAM" | "CONTRACTS" => 1,
+        "IMPLEMENTATION" => 2,
+        "PRIMARY FLOW" | "SECONDARY FLOWS" | "FLOWS" => 3,
+        "TESTS" | "INVARIANTS" => 4,
+        _ => 5,
+    }
 }
 
 fn assemble(sections: &[Section]) -> String {
@@ -377,6 +437,24 @@ pub fn task_with_rankers(
     let mut pack = ContextPack::new("task", &ctx.revision());
     let goal_terms = terms(goal);
 
+    let locus = resolve_goal_loci(ctx, goal);
+    let mut files_buf: Vec<String> = files.to_vec();
+    let mut symbols_buf: Vec<String> = symbols.to_vec();
+    if let Some(loc) = &locus {
+        for f in &loc.files {
+            if !files_buf.iter().any(|x| x == f) {
+                files_buf.push(f.clone());
+            }
+        }
+        for s in &loc.symbols {
+            if !symbols_buf.iter().any(|x| x == s) {
+                symbols_buf.push(s.clone());
+            }
+        }
+    }
+    let files = files_buf.as_slice();
+    let symbols = symbols_buf.as_slice();
+
     // ---- candidate generation ----
     let candidates = crate::rank::collect_lexical_candidates_full(
         ctx.store,
@@ -559,6 +637,9 @@ pub fn task_with_rankers(
         ),
         10,
     ));
+    if let Some(loc) = &locus {
+        sections.push(Section::new("LOCUS", loc.body.clone(), 9));
+    }
 
     // SYSTEM ROLE
     let purpose = ctx
@@ -862,7 +943,14 @@ pub fn task_with_rankers(
     pack.entity_ids = ids;
     pack.evidence_summary = ev_summary;
     pack.analysis_quality = analysis_quality;
-    finish(&mut pack, sections, budget, all_warnings);
+    match ctx.settings.pack_allocator {
+        crate::PackAllocator::AdaptivePriority => {
+            finish(&mut pack, sections, budget, all_warnings);
+        }
+        crate::PackAllocator::FixedRollover => {
+            finish_with_rollover(&mut pack, sections, budget, all_warnings);
+        }
+    }
     pack.compression_policy = Some(compression_policy(goal));
     pack
 }
@@ -1527,6 +1615,111 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     pack
 }
 
+// trace:exempt reason=internal-detail
+struct LocusHits {
+    files: Vec<String>,
+    symbols: Vec<String>,
+    body: String,
+}
+
+/// Map stack/error FILE:LINE frames onto indexed files and innermost symbols.
+// trace:v1 id=impl.scc.context.stack-locus work=WORK-ripwire-lessons-phase3 satisfies=REQ-stack-locus-ingest
+fn resolve_goal_loci(ctx: &crate::ContextCompiler, goal: &str) -> Option<LocusHits> {
+    let plan = route_query(goal);
+    if !plan.prefer_locus || plan.loci.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for loc in &plan.loci {
+        let mapped_file = ctx
+            .view
+            .entities_of_kind(kinds::FILE)
+            .into_iter()
+            .map(|e| e.name.clone())
+            .find(|p| path_matches_locus(p, &loc.path));
+        let mapped_file = mapped_file.or_else(|| {
+            ctx.view.entities_of_kind(kinds::SYMBOL).into_iter().find_map(|e| {
+                e.attributes
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .filter(|p| path_matches_locus(p, &loc.path))
+                    .map(|p| p.to_string())
+            })
+        });
+        match mapped_file {
+            None => {
+                body.push_str(&format!(
+                    "- {}:{} — unmapped (not fabricated)\n",
+                    loc.path, loc.line
+                ));
+            }
+            Some(path) => {
+                if !files.iter().any(|f| f == &path) {
+                    files.push(path.clone());
+                }
+                let enclosed = innermost_enclosing_symbol(ctx, &path, loc.line);
+                if let Some(name) = &enclosed {
+                    if !symbols.iter().any(|s| s == name) {
+                        symbols.push(name.clone());
+                    }
+                }
+                match enclosed {
+                    Some(name) => body.push_str(&format!(
+                        "- {path}:{} → symbol {name}\n",
+                        loc.line
+                    )),
+                    None => body.push_str(&format!(
+                        "- {path}:{} → file (no enclosing symbol)\n",
+                        loc.line
+                    )),
+                }
+            }
+        }
+    }
+    Some(LocusHits {
+        files,
+        symbols,
+        body,
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn innermost_enclosing_symbol(
+    ctx: &crate::ContextCompiler,
+    file: &str,
+    line: u32,
+) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for e in ctx.view.entities_of_kind(kinds::SYMBOL) {
+        let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !path_matches_locus(f, file) && f != file {
+            continue;
+        }
+        let start = e
+            .attributes
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let end = e
+            .attributes
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(start)) as u32;
+        if start == 0 || line < start || line > end {
+            continue;
+        }
+        let span = end.saturating_sub(start);
+        if best.as_ref().map(|(s, _)| span < *s).unwrap_or(true) {
+            best = Some((span, e.name.clone()));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 /// tests_to_run: test id → reasons (`direct`, `import`, `contract`, `state`).
 // trace:v1 id=impl.scc.context.tests-to-run work=WORK-ripwire-lessons-phase3 satisfies=REQ-tests-to-run-reasons
 fn collect_tests_to_run(
@@ -1723,5 +1916,219 @@ mod tests {
         assert!(line.contains("direct"), "{line}");
         assert!(line.contains("test_handle_list"), "{line}");
         assert!(line.contains("tests/test_a.py"), "{line}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-import verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_import_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:fn".to_string();
+        let tid = "t:import_test".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_via_import");
+        te.attr("file", serde_json::json!("tests/test_a.py"));
+        store.insert_entity(&te, &["tests/test_a.py".into()]).unwrap();
+        store
+            .insert_test(&tid, "test_via_import", "tests/test_a.py", "unit", None)
+            .unwrap();
+        store
+            .insert_imports(
+                "tests/test_a.py",
+                &[("src.a".into(), vec![], 1, "module".into())],
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found.get(&tid).expect("import of affected file must list the test");
+        assert!(reasons.contains("import"));
+        assert!(!reasons.contains("direct"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-contract verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_contract_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:handler".to_string();
+        let cid = "c:list".to_string();
+        let tid = "t:contract".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        store
+            .insert_entity(&Entity::new(&cid, kinds::CONTRACT, "GET /list"), &["src/a.py".into()])
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_list_route");
+        te.attr("file", serde_json::json!("tests/test_routes.py"));
+        store.insert_entity(&te, &["tests/test_routes.py".into()]).unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:h",
+                    sid.clone(),
+                    scc_core::predicates::HANDLES,
+                    cid.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:ct",
+                    cid.clone(),
+                    scc_core::predicates::TESTED_BY,
+                    tid.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_routes.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found.get(&tid).expect("contract TESTED_BY must list the test");
+        assert!(reasons.contains("contract"));
+        assert!(!reasons.contains("direct"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-state verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_state_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let comp = "comp:orders".to_string();
+        let st = "state:orders_db".to_string();
+        let tid = "t:state".to_string();
+        store
+            .insert_entity(&Entity::new(&comp, kinds::COMPONENT, "orders"), &["src/a.py".into()])
+            .unwrap();
+        store
+            .insert_entity(&Entity::new(&st, kinds::STATE, "orders_db"), &["src/a.py".into()])
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_orders_state");
+        te.attr("file", serde_json::json!("tests/test_state.py"));
+        store.insert_entity(&te, &["tests/test_state.py".into()]).unwrap();
+        store
+            .insert_test(&tid, "test_orders_state", "tests/test_state.py", "unit", None)
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:owns",
+                    comp.clone(),
+                    scc_core::predicates::OWNS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:rd",
+                    tid.clone(),
+                    scc_core::predicates::READS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_state.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let comps: BTreeSet<String> = [comp].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &HashSet::new(), &comps, &BTreeSet::new());
+        let reasons = found.get(&tid).expect("state READS must list the test");
+        assert!(reasons.contains("state"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.stack-locus verifies=REQ-stack-locus-ingest exercises=impl.scc.context.stack-locus
+    fn stack_locus_seeds_file_and_innermost_symbol() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def inner():\n    x = 1\n").unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let fe = Entity::new("f:app", kinds::FILE, "src/app.py");
+        store.insert_entity(&fe, &["src/app.py".into()]).unwrap();
+        let mut outer = Entity::new("s:outer", kinds::SYMBOL, "outer");
+        outer.attr("file", serde_json::json!("src/app.py"));
+        outer.attr("start_line", serde_json::json!(1u32));
+        outer.attr("end_line", serde_json::json!(20u32));
+        store.insert_entity(&outer, &["src/app.py".into()]).unwrap();
+        let mut inner = Entity::new("s:inner", kinds::SYMBOL, "inner");
+        inner.attr("file", serde_json::json!("src/app.py"));
+        inner.attr("start_line", serde_json::json!(10u32));
+        inner.attr("end_line", serde_json::json!(12u32));
+        store.insert_entity(&inner, &["src/app.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let goal = "Traceback (most recent call last):\n  File \"src/app.py\", line 11, in inner\nValueError: boom\n";
+        let hits = resolve_goal_loci(&ctx, goal).expect("locus");
+        assert!(hits.files.iter().any(|f| f == "src/app.py"));
+        assert_eq!(hits.symbols, vec!["inner".to_string()]);
+        assert!(hits.body.contains("inner"));
+        let miss = resolve_goal_loci(
+            &ctx,
+            "Traceback (most recent call last):\n  File \"src/missing.py\", line 1, in x\nValueError: x\n",
+        )
+        .unwrap();
+        assert!(miss.body.contains("unmapped"));
+        assert!(miss.files.is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.finish-rollover verifies=REQ-budget-rollover exercises=impl.scc.context.finish-rollover
+    fn finish_with_rollover_discloses_truncated_quota() {
+        let mut pack = ContextPack::new("task", "rev");
+        let huge = "word ".repeat(4000);
+        let sections = vec![
+            Section::new("TASK", "goal\n".into(), 10),
+            Section::new("IMPLEMENTATION", huge, 7),
+        ];
+        finish_with_rollover(&mut pack, sections, 200, Vec::new());
+        assert!(
+            pack.dropped_sections.iter().any(|d| d == "quota:source"),
+            "{:?}",
+            pack.dropped_sections
+        );
+        assert!(pack.truncated);
+        assert!(pack.content.contains("truncated") || pack.hard_truncated);
     }
 }

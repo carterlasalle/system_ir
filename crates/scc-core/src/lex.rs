@@ -213,6 +213,121 @@ pub fn bm25_scores(query: &str, docs: &[LexDoc]) -> Vec<f64> {
     scores
 }
 
+/// Persisted corpus-wide BM25 statistics (Ripwire warm lexindex). IDF and
+/// average length come from the full indexed corpus, not the candidate slice.
+/// Stored in store meta (`bm25_corpus`), never on FILE entity attributes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+// trace:exempt reason=internal-detail
+pub struct Bm25CorpusStats {
+    pub n: u32,
+    pub avgdl: f64,
+    /// Term → document frequency (docs containing the term at least once).
+    pub df: std::collections::BTreeMap<String, u32>,
+    /// Document id → weighted length.
+    pub dl: std::collections::BTreeMap<String, u32>,
+}
+
+// trace:exempt reason=internal-detail
+impl Bm25CorpusStats {
+    /// Build corpus-wide stats. Document order does not affect `df`/`dl`
+    /// maps; `n` is `docs.len()`.
+    // trace:v1 id=impl.scc.core.bm25-persist work=WORK-ripwire-lessons-phase2 satisfies=REQ-bm25-persist
+    pub fn from_docs(docs: &[LexDoc]) -> Self {
+        let mut df: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut dl: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for doc in docs {
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut len = 0u32;
+            for field in &doc.fields {
+                if field.weight == 0 {
+                    continue;
+                }
+                for tok in subtokens(&field.text) {
+                    len = len.saturating_add(field.weight);
+                    seen.insert(tok);
+                }
+            }
+            dl.insert(doc.id.clone(), len);
+            for tok in seen {
+                *df.entry(tok).or_insert(0) += 1;
+            }
+        }
+        let n = docs.len() as u32;
+        let avgdl = if n == 0 {
+            1.0
+        } else {
+            let sum: f64 = dl.values().map(|d| *d as f64).sum();
+            let a = sum / n as f64;
+            if a > 0.0 {
+                a
+            } else {
+                1.0
+            }
+        };
+        Bm25CorpusStats { n, avgdl, df, dl }
+    }
+}
+
+/// BM25 using persisted corpus IDF/`avgdl`. Term frequencies still come from
+/// `docs`. When `docs` is the same corpus `stats` was built from, scores match
+/// [`bm25_scores`].
+// trace:exempt reason=internal-detail
+pub fn bm25_scores_with_stats(query: &str, docs: &[LexDoc], stats: &Bm25CorpusStats) -> Vec<f64> {
+    let q_toks = subtokens(query);
+    let n_docs = docs.len();
+    if q_toks.is_empty() || n_docs == 0 || stats.n == 0 {
+        return vec![0.0; n_docs];
+    }
+    let mut unique: Vec<String> = Vec::new();
+    let mut q_index: Vec<usize> = Vec::with_capacity(q_toks.len());
+    for t in &q_toks {
+        if let Some(i) = unique.iter().position(|u| u == t) {
+            q_index.push(i);
+        } else {
+            q_index.push(unique.len());
+            unique.push(t.clone());
+        }
+    }
+    let u_count = unique.len();
+    let mut dl = vec![0u32; n_docs];
+    let mut tf = vec![0u32; n_docs * u_count];
+    for (i, doc) in docs.iter().enumerate() {
+        dl[i] = stats.dl.get(&doc.id).copied().unwrap_or(0);
+        for field in &doc.fields {
+            if field.weight == 0 {
+                continue;
+            }
+            for tok in subtokens(&field.text) {
+                if !stats.dl.contains_key(&doc.id) {
+                    dl[i] = dl[i].saturating_add(field.weight);
+                }
+                if let Some(u) = unique.iter().position(|t| t == &tok) {
+                    tf[i * u_count + u] = tf[i * u_count + u].saturating_add(field.weight);
+                }
+            }
+        }
+    }
+    let avgdl = if stats.avgdl > 0.0 { stats.avgdl } else { 1.0 };
+    let n = stats.n as f64;
+    let mut scores = vec![0.0; n_docs];
+    for i in 0..n_docs {
+        let mut sc = 0.0;
+        let doc_len = if dl[i] == 0 { 1.0 } else { dl[i] as f64 };
+        for &u in &q_index {
+            let term_tf = tf[i * u_count + u] as f64;
+            if term_tf == 0.0 {
+                continue;
+            }
+            let n_df = stats.df.get(&unique[u]).copied().unwrap_or(0) as f64;
+            let idf = ((n - n_df + 0.5) / (n_df + 0.5) + 1.0).ln();
+            let denom = term_tf + BM25_K1 * (1.0 - BM25_B + BM25_B * doc_len / avgdl);
+            sc += idf * (term_tf * (BM25_K1 + 1.0)) / denom;
+        }
+        scores[i] = sc;
+    }
+    scores
+}
+
 /// Rank documents by BM25 descending, id ascending. Deterministic.
 // trace:exempt reason=internal-detail
 pub fn bm25_rank(query: &str, docs: &[LexDoc]) -> Vec<(String, f64)> {
@@ -478,6 +593,21 @@ pub fn extract_loci(query: &str) -> Vec<QueryLocus> {
         }
     }
     out
+}
+
+/// Indexed path matches a stack-frame path: equal, or a `/`-anchored suffix.
+/// `extra.py` does not match locus `a.py`.
+// trace:v1 id=impl.scc.core.path-matches-locus work=WORK-ripwire-lessons-phase3 satisfies=REQ-stack-locus-ingest
+pub fn path_matches_locus(indexed: &str, locus: &str) -> bool {
+    fn norm(p: &str) -> String {
+        p.trim().trim_start_matches("./").replace('\\', "/")
+    }
+    let a = norm(indexed);
+    let b = norm(locus);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
 }
 
 // trace:exempt reason=internal-detail
@@ -1053,5 +1183,40 @@ mod tests {
             path_hits.iter().find(|h| h.id == "file").unwrap().exact_anchor,
             "path mention must anchor the named file"
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.core.bm25-persist verifies=REQ-bm25-persist exercises=impl.scc.core.bm25-persist
+    fn persisted_corpus_stats_match_cold_bm25_on_same_docs() {
+        let docs = vec![
+            LexDoc::from_parts("a", "handleList", "src/a.py", "list handler", "def handle_list"),
+            LexDoc::from_parts("b", "other", "src/b.py", "unrelated", "def other"),
+            LexDoc::from_parts("c", "handleThing", "src/c.py", "", "def handle_thing"),
+        ];
+        let stats = Bm25CorpusStats::from_docs(&docs);
+        assert_eq!(stats.n, 3);
+        assert!(stats.df.contains_key("handle"));
+        let cold = bm25_scores("handleList", &docs);
+        let warm = bm25_scores_with_stats("handleList", &docs, &stats);
+        assert_eq!(cold.len(), warm.len());
+        for (c, w) in cold.iter().zip(warm.iter()) {
+            assert!((c - w).abs() < 1e-9, "cold={c} warm={w}");
+        }
+        let subset = vec![docs[0].clone()];
+        let subset_cold = bm25_scores("handleList", &subset);
+        let subset_warm = bm25_scores_with_stats("handleList", &subset, &stats);
+        assert!(
+            (subset_cold[0] - subset_warm[0]).abs() > 1e-12,
+            "full-corpus IDF must differ from 1-document slice IDF"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.core.path-matches-locus verifies=REQ-stack-locus-ingest exercises=impl.scc.core.path-matches-locus
+    fn path_suffix_match_does_not_hit_extra_py() {
+        assert!(path_matches_locus("src/app.py", "app.py"));
+        assert!(path_matches_locus("src/app.py", "src/app.py"));
+        assert!(!path_matches_locus("src/extra.py", "a.py"));
+        assert!(!path_matches_locus("src/ba.py", "a.py"));
     }
 }

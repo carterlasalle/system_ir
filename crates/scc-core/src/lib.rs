@@ -20,10 +20,11 @@ pub use languages::{
     LanguageCapability, LanguageTier, LANGUAGE_REGISTRY,
 };
 pub use lex::{
-    bm25_rank, bm25_scores, classify_query, extract_query_mentions, is_exact_anchor,
-    mention_matches_doc, ranking_arm_ids, relevance_hits, route_query, subtokens, LexDoc, LexField,
-    QueryLocus, QueryMention, QueryShape, RankingArm, RelevanceHit, RetrievalPlan, BM25_B, BM25_K1,
-    QUERY_MENTION_MAX_RAW, WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
+    bm25_rank, bm25_scores, bm25_scores_with_stats, classify_query, extract_query_mentions,
+    is_exact_anchor, mention_matches_doc, path_matches_locus, ranking_arm_ids, relevance_hits,
+    route_query, subtokens, Bm25CorpusStats, LexDoc, LexField, QueryLocus, QueryMention, QueryShape,
+    RankingArm, RelevanceHit, RetrievalPlan, BM25_B, BM25_K1, QUERY_MENTION_MAX_RAW, WEIGHT_BODY,
+    WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
 };
 pub use resolution::{
     choose_representation, AnalysisQuality, CallQuality, FileQuality, RecvKind,

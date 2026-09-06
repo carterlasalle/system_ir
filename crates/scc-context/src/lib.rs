@@ -43,9 +43,24 @@ pub struct ContextSettings {
     /// configuration so enabling/disabling embeddings invalidates cached
     /// packs.
     pub rank_salt: String,
+    /// Production default is adaptive-priority dropping. FixedRollover is
+    /// the inspectable Ripwire-style allocator; do not switch default
+    /// without ablation.
+    pub pack_allocator: PackAllocator,
 }
 
+/// How task packs spend their token budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// trace:exempt reason=internal-detail
+pub enum PackAllocator {
+    #[default]
+    AdaptivePriority,
+    FixedRollover,
+}
+
+// trace:exempt reason=internal-detail
 impl Default for ContextSettings {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         ContextSettings {
             startup_tokens: 6000,
@@ -53,6 +68,7 @@ impl Default for ContextSettings {
             atlas_tokens: 15000,
             include_low_confidence_inference: false,
             rank_salt: String::new(),
+            pack_allocator: PackAllocator::AdaptivePriority,
         }
     }
 }
@@ -139,6 +155,7 @@ pub struct ContextCompiler<'a> {
     evidence: std::cell::RefCell<Option<std::collections::HashMap<String, scc_core::Evidence>>>,
 }
 
+// trace:exempt reason=internal-detail
 impl<'a> ContextCompiler<'a> {
     pub fn new(
         store: &'a Store,
@@ -306,6 +323,7 @@ impl<'a> ContextCompiler<'a> {
     }
 
     /// `task_context` with optional semantic scorer and reranker (SCC-071).
+    // trace:exempt reason=internal-detail
     pub fn task_context_with_rankers(
         &self,
         goal: &str,
@@ -333,6 +351,10 @@ impl<'a> ContextCompiler<'a> {
             }
             h.update(budget.to_string().as_bytes());
             h.update(self.settings.rank_salt.as_bytes());
+            h.update(match self.settings.pack_allocator {
+                PackAllocator::AdaptivePriority => b"alloc:adaptive",
+                PackAllocator::FixedRollover => b"alloc:rollover",
+            });
             h.update(epoch.as_bytes());
             let mut stale: Vec<&String> = self.stale_paths.iter().collect();
             stale.sort();

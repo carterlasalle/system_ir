@@ -338,6 +338,7 @@ impl Indexer {
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
+        persist_bm25_corpus(&self.store)?;
         report.duration_ms = started.elapsed().as_millis() as u64;
         Ok(report)
     }
@@ -602,6 +603,7 @@ impl Indexer {
         self.relink_tests_for(changed_paths, revision)?;
         apply_doc_mentions(&self.store)?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
+        persist_bm25_corpus(&self.store)?;
         Ok(report)
     }
 
@@ -772,6 +774,67 @@ fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, 
     Ok(q)
 }
 
+const BM25_META: &str = "bm25_corpus";
+
+/// Persist corpus-wide BM25 stats in store meta (never FILE attributes).
+// trace:v1 id=impl.scc.index.persist-bm25 work=WORK-ripwire-lessons-phase2 satisfies=REQ-bm25-persist
+fn persist_bm25_corpus(store: &Store) -> Result<(), IndexError> {
+    const KINDS: &[&str] = &[
+        kinds::SYMBOL,
+        kinds::COMPONENT,
+        kinds::ROUTE,
+        kinds::CONTRACT,
+        kinds::STATE,
+        kinds::FILE,
+        kinds::FLOW,
+        kinds::SCHEMA,
+    ];
+    let entities = store.all_entities()?;
+    let docs: Vec<scc_core::LexDoc> = entities
+        .iter()
+        .filter(|e| KINDS.contains(&e.kind.as_str()))
+        .map(|e| {
+            let mut path = e
+                .attributes
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() {
+                path = e
+                    .attributes
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+            }
+            if path.is_empty() && e.kind == kinds::FILE {
+                path = e.name.as_str();
+            }
+            let doc = e
+                .attributes
+                .get("docstring")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut body = e
+                .attributes
+                .get("signature")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if body.is_empty() {
+                body = e
+                    .attributes
+                    .get("responsibility")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+            }
+            scc_core::LexDoc::from_parts(&e.id, &e.name, path, doc, body)
+        })
+        .collect();
+    let stats = scc_core::Bm25CorpusStats::from_docs(&docs);
+    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+    store.meta_set(BM25_META, &json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,6 +920,41 @@ mod tests {
                     !e.attributes.contains_key("analysis_quality"),
                     "gauges must not live on FILE entities (breaks incremental≡cold): {}",
                     e.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.bm25-persist verifies=REQ-bm25-persist exercises=impl.scc.index.persist-bm25
+    fn bm25_corpus_stats_persist_in_meta_not_file_entities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/calc.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let stored = idx
+            .store
+            .meta_get("bm25_corpus")
+            .unwrap()
+            .expect("bm25_corpus meta");
+        let stats: scc_core::Bm25CorpusStats = serde_json::from_str(&stored).unwrap();
+        assert!(stats.n >= 1, "expected indexed entities in BM25 corpus");
+        assert!(
+            stats.df.contains_key("add") || stats.df.keys().any(|k| k.contains("add")),
+            "df should include extracted identifier tokens: {:?}",
+            stats.df.keys().take(12).collect::<Vec<_>>()
+        );
+        for e in idx.store.all_entities().unwrap() {
+            if e.kind == scc_core::kinds::FILE {
+                assert!(
+                    !e.attributes.contains_key("bm25_corpus"),
+                    "BM25 stats must not live on FILE entities"
                 );
             }
         }

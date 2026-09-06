@@ -1,6 +1,6 @@
 # PLAN-ripwire-lessons-phase2
 
-<!-- trace:v1 id=PLAN-ripwire-lessons-phase2 type=plan work=WORK-ripwire-lessons-phase2 implements=REQ-subtoken-bm25,REQ-query-shape-router,REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-declared-mentions,REQ-cochange-retrieval-evidence,REQ-retrieval-eval -->
+<!-- trace:v1 id=PLAN-ripwire-lessons-phase2 type=plan work=WORK-ripwire-lessons-phase2 implements=REQ-subtoken-bm25,REQ-query-shape-router,REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-declared-mentions,REQ-cochange-retrieval-evidence,REQ-retrieval-eval,REQ-bm25-persist -->
 
 <!-- trace:exempt reason=document-structure -->
 ## Steps
@@ -15,3 +15,4 @@
 8. Index markdown backticks as DECLARED_AS to known entities; unmatched names are gauges, not CALLS.
 9. Attach co-change partners as inspectable relevance candidates; NoCochange skips them.
 10. Add Recall@k / MRR plus `scc bench retrieval` over fixture gold; do not switch production ranking.
+11. Persist BM25 corpus stats in store meta (`bm25_corpus`); warm scores on the full corpus match cold.

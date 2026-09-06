@@ -290,6 +290,27 @@ enum BenchSub {
         #[arg(long)]
         json: bool,
     },
+    /// Locator loop vs baseline and Ripwire (clustered localization).
+    /// Does not change production ranking. Missing Ripwire is skipped.
+    Loop {
+        /// Comma-separated arms: baseline,scc,ripwire
+        #[arg(long, default_value = "baseline,scc,ripwire")]
+        arms: String,
+        /// Files opened per task
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Optional fixture repo filter
+        #[arg(long)]
+        repo: Option<String>,
+        /// Ripwire binary (else RIPWIRE_BIN / PATH / vendored build)
+        #[arg(long)]
+        ripwire_bin: Option<PathBuf>,
+        /// Fail when SCC clustered localization is below baseline by more than this
+        #[arg(long, default_value_t = 0.0)]
+        min_delta: f64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Agent-run recorder (SCC-002): run the corpus through an external
     /// agent command and record outcome metrics
     Agent {
@@ -770,6 +791,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => Err(scc_cli::CliError::Other(e)),
                     }
+                }
+            },
+            BenchSub::Loop {
+                arms,
+                k,
+                repo,
+                ripwire_bin,
+                min_delta,
+                json,
+            } => {
+                let parsed: Vec<scc_cli::benchloop::LoopArm> = arms
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        scc_cli::benchloop::LoopArm::parse(s).ok_or_else(|| {
+                            scc_cli::CliError::Other(format!("unknown loop arm {s}"))
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let opts = scc_cli::benchloop::LoopOptions {
+                    k,
+                    repo_filter: repo,
+                    ripwire_bin,
+                };
+                match scc_cli::benchloop::run_agent_loop(&parsed, &opts) {
+                    Ok(summary) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&summary)?);
+                        } else {
+                            scc_cli::benchloop::print_loop_summary(&summary);
+                        }
+                        let gate_fail = if min_delta != 0.0 {
+                            let base = summary.arms.iter().find(|a| a.arm == "baseline");
+                            let scc = summary.arms.iter().find(|a| a.arm == "scc");
+                            match (base, scc) {
+                                (Some(b), Some(s))
+                                    if s.clustered_localization + min_delta
+                                        < b.clustered_localization =>
+                                {
+                                    Some(format!(
+                                        "agent-loop gate failed: SCC clustered {:.3} < baseline {:.3} + {min_delta}",
+                                        s.clustered_localization, b.clustered_localization
+                                    ))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match gate_fail {
+                            Some(msg) => Err(scc_cli::CliError::Other(msg)),
+                            None => Ok(()),
+                        }
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
                 }
             },
             BenchSub::Context { min_recall } => match scc_cli::benchctx::run_context_benchmark(min_recall)
