@@ -45,7 +45,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 | MCP tools | **Exactly 10** intent-level tools. | **31 verbs** (`mcpverbs.h`). | Fine-grained latency/token control. | Agents don't orchestrate 8 tools for one impact question. | No 31-tool clone | Enrich internals of existing tools. Lower-level only for fetch/edit/diagnostics. | Skill/tool overhead (Ripwire pilot). | `tools().len() == 10`. | P18 |
 | Task packs | Adaptive sections; critical never cut; dropped_sections disclosed. | Fixed quotas (rank 40 / bodies 30 / callers 15 / notes 5 / tests 10) + rollover; bodies last. | Simple robust allocation; tests_to_run. | Atlas + contracts + provenance in the pack. | Benchmark both | Budget allocator abstraction (Phase 3). Do not assume adaptive wins. | Silent cap. | Truncation disclosure tests. | P5 / P6 / Phase 3 |
 | Change-risk / git | Co-change CLI exists (`cmd_cochange`); git revision on snapshot. | gitmine, cochange, whereis, stray_content, merge_scout, dirty-tree situ. | Mature change intelligence. | Semantic impact (contracts/state/flows) possible. | Selective | Co-change as historical evidence, never override current semantics. Forgotten partners in impact_context. Skip generic git utilities. | History overriding truth. | Co-change fixtures. | P4 / P15 / Phase 2–3 |
-| tests_to_run | Tests extracted; tested_by relink on change. Pack lists tests weakly. | `testmap.h` + pack `tests_to_run`. | Actionable verify list with reasons. | Can reason via contracts/state/flows. | Yes | Phase 3: tests_to_run with reasons (direct, contract, state, co-change, e2e). | Filename-only lists. | Behavioral fixtures. | P16 / Phase 3 |
+| tests_to_run | Tests extracted; tested_by relink on change. Pack lists tests with reasons (`direct` / `import` / `contract` / `state`). | `testmap.h` + pack `tests_to_run`. | Actionable verify list with reasons. | Can reason via contracts/state/flows. | Yes | Phase 3: tests_to_run with reasons (direct, contract, state, import). Filename-only is not a reason. | Filename-only lists. | Behavioral fixtures. | P16 / Phase 3 |
 | Tests / evals | Deterministic 21-task behavioral corpus; atlas recall; resolution bench; golden incremental. | locbench, agentloop (baseline / ripwire_cli / ripwire_skills), contamination, clustered stats. | Real agent-loop outcomes. | Stronger semantic corpus + Atlas GT. | Mandatory add | Keep 21-task. Add SWE-bench-style agent-loop vs baseline + Ripwire (Phase 5). | Contamination; model substitution. | Multi-seed, clustered stats, resolved primary. | P20 / Phase 5 |
 | BM25 / lexical | **Now:** experimental `scc-core` subtoken BM25 lens (name/path/doc/body weights, k1=1.5, b=0.75) + query-shape router + RankingArm A–I. Production fused ranker **unchanged**. | Custom BM25: camel/snake split, field weights, persisted stats, top-K prune. | Measured retrieval; persisted stats. | Semantic + graph + Atlas. | Yes as separate lens | Implemented tokenizer+BM25+router; do not fuse into PPR without ablation evidence. Persist stats later. | Embeddings cargo-cult; silent fusion. | Acronym pins; BM25 determinism; production arm emits nothing from BM25 lens. | P3 / Phase 2 |
 | Anchors / mentions | Goal terms / explicit files/symbols. No doc→symbol mention index. | Query anchors; doc mentions. | Name-first when the query names a symbol. | Heterogeneous anchors (component, route, contract, …). | Yes | Phase 2: resolve anchor first; mentions as DECLARED evidence, degradable. | Docs as truth. | Mention vs code contradiction tests. | P4 / Phase 2 / P33 |
@@ -92,7 +92,17 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - Query-shape router (conservative: one `path:line` is not a stack trace).
 - RankingArm A–I; `collect_relevance_candidates` returns empty for ProductionBlended.
 - Exact-name anchors are a boolean, not mixed into the BM25 number.
-- Not yet: persisted lexical stats, mentions/co-change ranking, production switch, retrieval Recall@k harness over holdout gold.
+- Query-text mentions (path / dotted / backtick) mark corpus matches as anchors; plain prose never qualifies.
+- Markdown backticks become `DECLARED_AS` (provenance DECLARED), never CALLS, never PPR.
+- Co-change partners are inspectable relevance candidates (`cochange` / `cochange-surprise`); `NoCochange` skips them.
+- `scc bench retrieval` reports Recall@1/5/10 and MRR over `benchmarks/tasks.json` gold. Production fused ranker is unchanged.
+- Not yet: persisted lexical stats, production switch on ablation evidence.
+
+<!-- trace:exempt reason=document-structure -->
+## Phase 3 started (task context)
+
+- TESTS section is tests_to_run with reasons (`direct` / `import` / `contract` / `state`).
+- Fixed-percent rollover allocator (20/25/30/10/10/5) is implemented and tested; production packer stays adaptive-priority until ablation prefers rollover.
 
 <!-- trace:exempt reason=document-structure -->
 ## Working order

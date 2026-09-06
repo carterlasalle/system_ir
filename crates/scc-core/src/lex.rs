@@ -610,6 +610,11 @@ impl RankingArm {
             RankingArm::NoGlobalPpr,
         ]
     }
+
+    // trace:exempt reason=internal-detail
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|a| a.as_str() == s)
+    }
 }
 
 /// A relevance hit. BM25 and exact-anchor are separate numbers/flags.
@@ -620,6 +625,183 @@ pub struct RelevanceHit {
     pub bm25: f64,
     pub exact_anchor: bool,
     pub shape: QueryShape,
+}
+
+/// Cap on extracted mention tokens (Ripwire `kMentionMaxRawTokens`).
+pub const QUERY_MENTION_MAX_RAW: usize = 16;
+
+/// One explicit mention extracted from query/task text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// trace:exempt reason=internal-detail
+pub struct QueryMention {
+    pub segments: Vec<String>,
+    pub is_path: bool,
+    pub backticked: bool,
+}
+
+// trace:exempt reason=internal-detail
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+// trace:exempt reason=internal-detail
+fn is_mention_token_char(c: char) -> bool {
+    is_ident_char(c) || c == '.' || c == '/' || c == '-'
+}
+
+/// Extract path / dotted / backtick mentions from task text.
+/// Plain prose words never qualify.
+// trace:v1 id=impl.scc.core.query-mentions work=WORK-ripwire-lessons-phase2 satisfies=REQ-query-mentions
+pub fn extract_query_mentions(task: &str) -> Vec<QueryMention> {
+    let bytes: Vec<char> = task.chars().collect();
+    let mut raw = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() && raw.len() < QUERY_MENTION_MAX_RAW {
+        if !is_mention_token_char(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_mention_token_char(bytes[i]) {
+            i += 1;
+        }
+        let mut tok: String = bytes[start..i].iter().collect();
+        let backticked = start > 0
+            && bytes[start - 1] == '`'
+            && i < bytes.len()
+            && bytes[i] == '`';
+        while tok.ends_with('.') || tok.ends_with('/') || tok.ends_with('-') {
+            tok.pop();
+        }
+        while tok.starts_with('.') || tok.starts_with('/') || tok.starts_with('-') {
+            tok.remove(0);
+        }
+        if tok.len() < 3 || tok.len() > 200 {
+            continue;
+        }
+        let has_slash = tok.contains('/');
+        let has_dot = tok.contains('.');
+        if !has_slash && !has_dot && !backticked {
+            continue;
+        }
+        let joiner = if has_slash { '/' } else { '.' };
+        let mut segments: Vec<String> = Vec::new();
+        let mut malformed = false;
+        let mut max_seg = 0usize;
+        for seg in tok.split(joiner) {
+            if seg.is_empty() {
+                if has_slash {
+                    continue;
+                }
+                malformed = true;
+                break;
+            }
+            max_seg = max_seg.max(seg.len());
+            segments.push(seg.to_string());
+        }
+        if malformed || segments.is_empty() {
+            continue;
+        }
+        if !has_slash && !backticked {
+            if segments.len() < 2 || max_seg < 3 {
+                continue;
+            }
+            if segments
+                .iter()
+                .all(|s| s.chars().all(|c| c.is_ascii_digit()))
+            {
+                continue;
+            }
+        }
+        if has_slash && segments.len() > 3 {
+            segments = segments.split_off(segments.len() - 3);
+        }
+        raw.push(QueryMention {
+            segments,
+            is_path: has_slash,
+            backticked,
+        });
+    }
+    raw
+}
+
+// trace:exempt reason=internal-detail
+fn path_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+// trace:exempt reason=internal-detail
+fn strip_ext(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    }
+}
+
+/// Path-suffix match: mention segments are a tail of whole path components
+/// (extension-agnostic on the last).
+// trace:exempt reason=internal-detail
+fn path_suffix_matches(path: &str, segments: &[String]) -> bool {
+    if segments.is_empty() {
+        return false;
+    }
+    let mut comps: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if comps.is_empty() {
+        return false;
+    }
+    let last = *comps.last().unwrap();
+    let want_last = segments.last().unwrap().as_str();
+    if last != want_last && strip_ext(last) != want_last {
+        return false;
+    }
+    comps.pop();
+    let earlier = &segments[..segments.len() - 1];
+    if earlier.len() > comps.len() {
+        return false;
+    }
+    let tail = &comps[comps.len() - earlier.len()..];
+    tail.iter().zip(earlier.iter()).all(|(c, s)| *c == s.as_str())
+}
+
+/// True when a mention names this document's entity name or path.
+// trace:v1 id=impl.scc.core.mention-matches-doc work=WORK-ripwire-lessons-phase2 satisfies=REQ-query-mentions
+pub fn mention_matches_doc(name: &str, path: &str, mention: &QueryMention) -> bool {
+    let joined = mention.segments.join(if mention.is_path { "/" } else { "." });
+    if !name.is_empty() {
+        if name == joined || name.eq_ignore_ascii_case(&joined) {
+            return true;
+        }
+        if let Some(last) = mention.segments.last() {
+            if name == last.as_str()
+                || name.ends_with(&format!(".{last}"))
+                || name.ends_with(&format!("::{last}"))
+            {
+                return true;
+            }
+        }
+    }
+    if path.is_empty() {
+        return false;
+    }
+    if path_suffix_matches(path, &mention.segments) {
+        return true;
+    }
+    for suffix_len in 1..mention.segments.len() {
+        let suffix = &mention.segments[mention.segments.len() - suffix_len..];
+        if path_suffix_matches(path, suffix) {
+            return true;
+        }
+    }
+    if let Some(last) = mention.segments.last() {
+        let base = path_basename(path);
+        if base == last.as_str() || strip_ext(base) == last.as_str() {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when `name` is an exact anchor for `query` after identifier
@@ -647,14 +829,23 @@ pub fn is_exact_anchor(query: &str, name: &str) -> bool {
 pub fn relevance_hits(query: &str, docs: &[LexDoc]) -> Vec<RelevanceHit> {
     let shape = classify_query(query);
     let scores = bm25_scores(query, docs);
+    let mentions = extract_query_mentions(query);
     let mut hits: Vec<RelevanceHit> = docs
         .iter()
         .zip(scores)
-        .map(|(d, bm25)| RelevanceHit {
-            id: d.id.clone(),
-            bm25,
-            exact_anchor: is_exact_anchor(query, &anchor_name(d)),
-            shape,
+        .map(|(d, bm25)| {
+            let name = anchor_name(d);
+            let path = path_field(d);
+            let named = is_exact_anchor(query, &name)
+                || mentions
+                    .iter()
+                    .any(|m| mention_matches_doc(&name, &path, m));
+            RelevanceHit {
+                id: d.id.clone(),
+                bm25,
+                exact_anchor: named,
+                shape,
+            }
         })
         .collect();
     hits.sort_by(|a, b| {
@@ -675,6 +866,15 @@ fn anchor_name(doc: &LexDoc) -> String {
     doc.fields
         .iter()
         .find(|f| f.weight == WEIGHT_NAME)
+        .map(|f| f.text.clone())
+        .unwrap_or_default()
+}
+
+// trace:exempt reason=internal-detail
+fn path_field(doc: &LexDoc) -> String {
+    doc.fields
+        .iter()
+        .find(|f| f.weight == WEIGHT_PATH)
         .map(|f| f.text.clone())
         .unwrap_or_default()
 }
@@ -809,5 +1009,49 @@ mod tests {
         for id in &ids {
             assert!(seen.insert(*id), "duplicate arm {id}");
         }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.core.query-mentions verifies=REQ-query-mentions exercises=impl.scc.core.query-mentions
+    fn query_mentions_are_precision_first() {
+        assert!(extract_query_mentions("how does login work").is_empty());
+        let path = extract_query_mentions("fix sklearn/ensemble/_iforest.py please");
+        assert_eq!(path.len(), 1);
+        assert!(path[0].is_path);
+        assert_eq!(
+            path[0].segments,
+            vec!["sklearn", "ensemble", "_iforest.py"]
+        );
+        let dotted = extract_query_mentions("see transformers.optimization");
+        assert_eq!(dotted.len(), 1);
+        assert!(!dotted[0].is_path);
+        let tick = extract_query_mentions("look at `handleList` next");
+        assert_eq!(tick.len(), 1);
+        assert!(tick[0].backticked);
+        assert_eq!(tick[0].segments, vec!["handleList"]);
+        assert!(extract_query_mentions("version 3.10 of python").is_empty());
+        assert!(extract_query_mentions("e.g. this").is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.core.query-mention-anchor verifies=REQ-query-mentions exercises=impl.scc.core.mention-matches-doc
+    fn query_mentions_mark_anchors_without_changing_bm25() {
+        let docs = vec![
+            LexDoc::from_parts("noise", "loginHelper", "src/login.ts", "handles the list", ""),
+            LexDoc::from_parts("hit", "handleList", "src/server.ts", "", ""),
+            LexDoc::from_parts("file", "iforest", "sklearn/ensemble/_iforest.py", "", ""),
+        ];
+        let hits = relevance_hits("please inspect `handleList` in the service", &docs);
+        let hit = hits.iter().find(|h| h.id == "hit").unwrap();
+        assert!(hit.exact_anchor);
+        let noise = hits.iter().find(|h| h.id == "noise").unwrap();
+        assert!(!noise.exact_anchor);
+        let prose = relevance_hits("how does login work", &docs);
+        assert!(!prose.iter().any(|h| h.exact_anchor));
+        let path_hits = relevance_hits("bug in sklearn/ensemble/_iforest.py", &docs);
+        assert!(
+            path_hits.iter().find(|h| h.id == "file").unwrap().exact_anchor,
+            "path mention must anchor the named file"
+        );
     }
 }

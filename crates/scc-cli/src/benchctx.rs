@@ -107,7 +107,7 @@ pub fn locate_fixtures_dir() -> Option<PathBuf> {
 }
 
 // trace:v1 id=impl.crates-scc-cli-src-benchctx.copy-fixture
-fn copy_fixture(src: &Path, dst: &Path) {
+pub(crate) fn copy_fixture(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();

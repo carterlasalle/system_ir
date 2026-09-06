@@ -273,6 +273,23 @@ enum BenchSub {
         #[arg(long, default_value_t = 0.6)]
         min_recall: f64,
     },
+    /// Retrieval Recall@k / MRR over fixture gold (lexical vs production arms).
+    /// Does not change the production fused ranker.
+    Retrieval {
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Comma-separated ranking arms
+        #[arg(long, default_value = "lexical-then-graph,query-routed,production-blended")]
+        arms: String,
+        /// Optional fixture repo filter (e.g. http-service-python)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Minimum mean recall@10 across printed arms (0 = measure only)
+        #[arg(long, default_value_t = 0.0)]
+        min_recall: f64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Agent-run recorder (SCC-002): run the corpus through an external
     /// agent command and record outcome metrics
     Agent {
@@ -762,6 +779,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(())
                 }
                 Err(e) => Err(scc_cli::CliError::Other(e)),
+            },
+            BenchSub::Retrieval {
+                k,
+                arms,
+                repo,
+                min_recall,
+                json,
+            } => {
+                let parsed: Vec<scc_core::RankingArm> = arms
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        scc_core::RankingArm::parse(s).ok_or_else(|| {
+                            scc_cli::CliError::Other(format!("unknown ranking arm {s}"))
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                match scc_cli::benchret::run_retrieval_benchmark(
+                    k,
+                    &parsed,
+                    min_recall,
+                    repo.as_deref(),
+                ) {
+                    Ok(summary) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&summary)?);
+                        } else {
+                            scc_cli::benchret::print_summary(&summary);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
+                }
             },
             BenchSub::Index { files, lines } => {
                 let dir = std::env::temp_dir().join(format!("scc-bench-{}", std::process::id()));

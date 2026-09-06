@@ -5,6 +5,7 @@
 //! evidence status, and warnings. STALE facts never enter trusted sections.
 
 pub mod atlas;
+pub mod budget;
 pub mod context_ledger;
 pub mod packs;
 pub mod pagerank;

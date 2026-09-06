@@ -12,6 +12,7 @@ pub mod handles;
 pub mod languages;
 pub mod lex;
 pub mod resolution;
+pub mod retrieval;
 
 pub use handles::{fnv1a64_hex, ContentHandle, HandleError, HandleKind};
 pub use languages::{
@@ -19,14 +20,16 @@ pub use languages::{
     LanguageCapability, LanguageTier, LANGUAGE_REGISTRY,
 };
 pub use lex::{
-    bm25_rank, bm25_scores, classify_query, is_exact_anchor, ranking_arm_ids, relevance_hits,
-    route_query, subtokens, LexDoc, LexField, QueryLocus, QueryShape, RankingArm, RelevanceHit,
-    RetrievalPlan, BM25_B, BM25_K1, WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
+    bm25_rank, bm25_scores, classify_query, extract_query_mentions, is_exact_anchor,
+    mention_matches_doc, ranking_arm_ids, relevance_hits, route_query, subtokens, LexDoc, LexField,
+    QueryLocus, QueryMention, QueryShape, RankingArm, RelevanceHit, RetrievalPlan, BM25_B, BM25_K1,
+    QUERY_MENTION_MAX_RAW, WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
 };
 pub use resolution::{
     choose_representation, AnalysisQuality, CallQuality, FileQuality, RecvKind,
     RepresentationChoice, RepresentationKind, ResolutionClass,
 };
+pub use retrieval::{mean_reciprocal_rank, recall_at_k};
 
 // ---------------------------------------------------------------------------
 // Provenance

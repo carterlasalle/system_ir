@@ -32,4 +32,28 @@ RankingArm enumerates production blended (A), lexical-then-graph (B), query-rout
 
 <!-- trace:v1 id=REQ-exact-anchors type=requirement work=WORK-ripwire-lessons-phase2 -->
 
-If the query text names a known entity (symbol, component, route, contract, state, …) after identifier normalization, that entity is an exact anchor. Anchors are recorded as a boolean on the hit, not mixed into the BM25 score. Mentions and co-change remain later slices; this requirement is exact-name anchors only.
+If the query text names a known entity (symbol, component, route, contract, state, …) after identifier normalization, that entity is an exact anchor. Anchors are recorded as a boolean on the hit, not mixed into the BM25 score. Whole-query exact-name matching lives here; embedded path/dotted/`backtick` mentions are REQ-query-mentions.
+
+### REQ-query-mentions — Query text mentions are anchors, not BM25 terms
+
+<!-- trace:v1 id=REQ-query-mentions type=requirement work=WORK-ripwire-lessons-phase2 -->
+
+Extract explicit mentions from the query/task text the way Ripwire `extractMentions` does in code: `/`-joined paths, dotted identifier chains, and `backticked` identifiers. Plain prose words never qualify (precision over recall). Match mentions against the indexed corpus (entity name, path suffix, basename, basename-sans-extension), never the live filesystem. A matched entity is an exact-anchor flag; mention matching must not be added into the BM25 number and must not silently change production `build_surface`.
+
+### REQ-declared-mentions — Markdown backticks are DECLARED evidence
+
+<!-- trace:v1 id=REQ-declared-mentions type=requirement work=WORK-ripwire-lessons-phase2 -->
+
+Markdown (and MDX) backtick spans outside fenced code, of identifier length ≥ 3, that match known heterogeneous entities become `DECLARED_AS` facts from the doc FILE to the matched entity, provenance DECLARED. They must never become CALLS edges and must never enter PageRank adjacency. Unmatched backticks are not facts (the claim degrades); they may increment `unmatched_doc_mentions` in store-meta `analysis_quality` only — never FILE entity attributes. EXTRACTED/RESOLVED code is authority when a doc names something the index does not contain.
+
+### REQ-cochange-retrieval-evidence — Co-change is inspectable historical evidence
+
+<!-- trace:v1 id=REQ-cochange-retrieval-evidence type=requirement work=WORK-ripwire-lessons-phase2 -->
+
+Git co-change pairs may appear on the experimental relevance lens as extra candidates (`reason=cochange` or `reason=cochange-surprise` when the pair has no static IMPORTS/CALLS coupling). The NoCochange ranking arm must omit them. Co-change must not be fused into BM25 or production PPR and must never override current EXTRACTED/RESOLVED semantic truth.
+
+### REQ-retrieval-eval — Recall@k and MRR over gold, before any production switch
+
+<!-- trace:v1 id=REQ-retrieval-eval type=requirement work=WORK-ripwire-lessons-phase2 -->
+
+A retrieval harness must compute Recall@1/5/10 and MRR against `benchmarks/tasks.json` gold (files, symbols, components, routes) for inspectable ranking arms including ProductionBlended (today's surface), LexicalThenGraph, and QueryRouted. `scc bench retrieval` prints the table. Production ranking must not change because an arm looks better on this corpus alone.

@@ -24,6 +24,7 @@ pub mod infra;
 pub mod java;
 pub mod lsp;
 pub mod lsp_ts;
+pub mod mentions;
 pub mod model;
 pub mod python;
 pub mod redact;
@@ -332,6 +333,8 @@ impl Indexer {
             }
         }
 
+        apply_doc_mentions(&self.store)?;
+
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
@@ -597,6 +600,7 @@ impl Indexer {
         }
         // tested_by edges derived from changed files must be relinked
         self.relink_tests_for(changed_paths, revision)?;
+        apply_doc_mentions(&self.store)?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
         Ok(report)
     }
@@ -742,6 +746,13 @@ fn drop_file_quality(store: &Store, path: &str) -> Result<(), IndexError> {
     Ok(())
 }
 
+fn apply_doc_mentions(store: &Store) -> Result<(), IndexError> {
+    let stats = mentions::write_mentions(store)?;
+    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+    store.meta_set("doc_mentions", &json)?;
+    Ok(())
+}
+
 /// Fold per-file gauges into one repo-wide snapshot.
 // trace:v1 id=impl.scc.index.persist-analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
 fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, IndexError> {
@@ -749,6 +760,12 @@ fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, 
     let mut q = scc_core::AnalysisQuality::default();
     for part in map.values() {
         q.merge(part);
+    }
+    if let Ok(Some(raw)) = store.meta_get("doc_mentions") {
+        if let Ok(stats) = serde_json::from_str::<mentions::MentionStats>(&raw) {
+            q.matched_doc_mentions = stats.matched;
+            q.unmatched_doc_mentions = stats.unmatched;
+        }
     }
     let json = serde_json::to_string(&q).unwrap_or_else(|_| "{}".to_string());
     store.meta_set(META_QUALITY, &json)?;

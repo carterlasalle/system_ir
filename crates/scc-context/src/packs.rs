@@ -10,8 +10,9 @@ use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
 use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
 use scc_graph::TrustedGraphView;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+// trace:exempt reason=internal-detail
 pub(crate) struct Section {
     pub(crate) title: String,
     pub(crate) body: String,
@@ -363,6 +364,7 @@ pub fn task(
 }
 
 /// `task` with optional semantic scorer + reranker (SCC-071).
+// trace:exempt reason=internal-detail
 pub fn task_with_rankers(
     ctx: &ContextCompiler,
     goal: &str,
@@ -520,44 +522,8 @@ pub fn task_with_rankers(
         }
     }
 
-    // tests exercising affected symbols, plus tests whose file imports an
-    // affected file (the test may exercise behavior through imports that
-    // token-matching misses)
-    let mut tests: BTreeSet<String> = BTreeSet::new();
-    for sid in &affected_syms {
-        for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
-            tests.insert(r.object.clone());
-        }
-    }
-    {
-        let affected_files: BTreeSet<String> = affected_syms
-            .iter()
-            .filter_map(|sid| {
-                ctx.view
-                    .entity(sid.as_str())
-                    .and_then(|e| e.attributes.get("file"))
-                    .and_then(|v| v.as_str())
-                    .map(|f| f.to_string())
-            })
-            .collect();
-        for (id, _name, file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
-            if affected_files.is_empty() {
-                break;
-            }
-            let imports = ctx.store.imports_in_file(&file).unwrap_or_default();
-            let hits_affected = imports.iter().any(|(module, _names, _line, _typ)| {
-                let target = resolve_module_ref(&file, module);
-                affected_files.iter().any(|f| {
-                    *f == target
-                        || f.starts_with(&format!("{target}."))
-                        || *f == format!("{target}/__init__.py")
-                })
-            });
-            if hits_affected {
-                tests.insert(id.clone());
-            }
-        }
-    }
+    // tests_to_run: each test carries why it was selected
+    let tests = collect_tests_to_run(ctx, &affected_syms, &affected_comps, &owned_stores);
 
     // retries/failures in affected components
     let mut retries: Vec<String> = Vec::new();
@@ -814,23 +780,10 @@ pub fn task_with_rankers(
         sections.push(Section::new("IMPLEMENTATION", impl_body, 7));
     }
 
-    // TESTS (with file locations so the agent can open them directly)
+    // TESTS TO RUN (with file locations and reasons)
     let mut test_body = String::new();
-    for tid in &tests {
-        let file = ctx
-            .view
-            .entity(tid)
-            .and_then(|e| e.attributes.get("file"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if file.is_empty() {
-            test_body.push_str(&format!("- {}\n", entity_name(&ctx.view, tid)));
-        } else {
-            test_body.push_str(&format!(
-                "- {} ({file})\n",
-                entity_name(&ctx.view, tid)
-            ));
-        }
+    for (tid, reasons) in &tests {
+        test_body.push_str(&format_test_to_run(ctx, tid, reasons));
     }
     if !test_body.is_empty() {
         sections.push(Section::new("TESTS", test_body, 7));
@@ -862,9 +815,9 @@ pub fn task_with_rankers(
         }
     }
     ids.extend(downstream.iter().cloned());
-    ids.extend(tests.iter().cloned());
+    ids.extend(tests.keys().cloned());
     // the files containing included tests (agents must find them)
-    for tid in &tests {
+    for tid in tests.keys() {
         if let Some(f) = ctx
             .view
             .entity(tid)
@@ -1574,6 +1527,113 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     pack
 }
 
+/// tests_to_run: test id → reasons (`direct`, `import`, `contract`, `state`).
+// trace:v1 id=impl.scc.context.tests-to-run work=WORK-ripwire-lessons-phase3 satisfies=REQ-tests-to-run-reasons
+fn collect_tests_to_run(
+    ctx: &crate::ContextCompiler,
+    affected_syms: &HashSet<&String>,
+    affected_comps: &BTreeSet<String>,
+    owned_stores: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<&'static str>> {
+    let mut tests: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    for sid in affected_syms {
+        for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
+            tests.entry(r.object.clone()).or_default().insert("direct");
+        }
+        for pred in [scc_core::predicates::HANDLES, scc_core::predicates::IMPLEMENTS] {
+            for r in ctx.view.out_pred(sid, pred) {
+                let Some(target) = ctx.view.entity(&r.object) else {
+                    continue;
+                };
+                if target.kind != kinds::CONTRACT && target.kind != kinds::ROUTE {
+                    continue;
+                }
+                for t in ctx.view.out_pred(&r.object, scc_core::predicates::TESTED_BY) {
+                    tests.entry(t.object.clone()).or_default().insert("contract");
+                }
+            }
+        }
+    }
+    let affected_files: BTreeSet<String> = affected_syms
+        .iter()
+        .filter_map(|sid| {
+            ctx.view
+                .entity(sid.as_str())
+                .and_then(|e| e.attributes.get("file"))
+                .and_then(|v| v.as_str())
+                .map(|f| f.to_string())
+        })
+        .collect();
+    if !affected_files.is_empty() {
+        for (id, _name, file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
+            let imports = ctx.store.imports_in_file(&file).unwrap_or_default();
+            let hits_affected = imports.iter().any(|(module, _names, _line, _typ)| {
+                let target = resolve_module_ref(&file, module);
+                affected_files.iter().any(|f| {
+                    *f == target
+                        || f.starts_with(&format!("{target}."))
+                        || *f == format!("{target}/__init__.py")
+                })
+            });
+            if hits_affected {
+                tests.entry(id).or_default().insert("import");
+            }
+        }
+    }
+    let mut state_ids: BTreeSet<String> = BTreeSet::new();
+    for sid in owned_stores {
+        if ctx.view.entity(sid).map(|e| e.kind.as_str()) == Some(kinds::STATE) {
+            state_ids.insert(sid.clone());
+        }
+    }
+    for cid in affected_comps {
+        for r in ctx.view.out_pred(cid, scc_core::predicates::OWNS) {
+            if ctx.view.entity(&r.object).map(|e| e.kind.as_str()) == Some(kinds::STATE) {
+                state_ids.insert(r.object.clone());
+            }
+        }
+    }
+    if !state_ids.is_empty() {
+        for (id, _name, _file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
+            let reads = ctx
+                .view
+                .out_pred(&id, scc_core::predicates::READS)
+                .iter()
+                .any(|r| state_ids.contains(&r.object));
+            let writes = ctx
+                .view
+                .out_pred(&id, scc_core::predicates::WRITES)
+                .iter()
+                .any(|r| state_ids.contains(&r.object));
+            if reads || writes {
+                tests.entry(id).or_default().insert("state");
+            }
+        }
+    }
+    tests
+}
+
+// trace:exempt reason=internal-detail
+fn format_test_to_run(
+    ctx: &crate::ContextCompiler,
+    tid: &str,
+    reasons: &BTreeSet<&'static str>,
+) -> String {
+    let name = entity_name(&ctx.view, tid);
+    let file = ctx
+        .view
+        .entity(tid)
+        .and_then(|e| e.attributes.get("file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let why = reasons.iter().copied().collect::<Vec<_>>().join(", ");
+    if file.is_empty() {
+        format!("- {name} — {why}\n")
+    } else {
+        format!("- {name} ({file}) — {why}\n")
+    }
+}
+
 /// Resolve a module specifier (relative or dotted) to a repo-relative path
 /// prefix, mirroring the indexer's import normalization.
 fn resolve_module_ref(from_file: &str, module: &str) -> String {
@@ -1616,5 +1676,52 @@ fn severity_str(s: Severity) -> &'static str {
         Severity::Medium => "medium",
         Severity::High => "high",
         Severity::Critical => "critical",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scc_core::{Entity, Provenance, Relationship};
+    use scc_store::Store;
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_direct_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:fn".to_string();
+        let tid = "t:test_fn".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_handle_list");
+        te.attr("file", serde_json::json!("tests/test_a.py"));
+        store.insert_entity(&te, &["tests/test_a.py".into()]).unwrap();
+        let rel = Relationship::new(
+            "rel:tb",
+            sid.clone(),
+            scc_core::predicates::TESTED_BY,
+            tid.clone(),
+            Provenance::Extracted,
+        );
+        store.insert_relationship(&rel, "src/a.py").unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found.get(&tid).expect("direct TESTED_BY must list the test");
+        assert!(reasons.contains("direct"));
+        let line = format_test_to_run(&ctx, &tid, reasons);
+        assert!(line.contains("direct"), "{line}");
+        assert!(line.contains("test_handle_list"), "{line}");
+        assert!(line.contains("tests/test_a.py"), "{line}");
     }
 }

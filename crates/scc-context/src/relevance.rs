@@ -5,10 +5,12 @@
 
 use crate::rank::ScoredEntity;
 use scc_core::{
-    kinds, relevance_hits, route_query, LexDoc, QueryShape, RankingArm, WEIGHT_BODY, WEIGHT_DOC,
-    WEIGHT_NAME, WEIGHT_PATH,
+    entity_id, kinds, predicates, relevance_hits, route_query, LexDoc, QueryShape, RankingArm,
+    WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
 };
 use scc_graph::TrustedGraphView;
+use std::collections::HashSet;
+use std::path::Path;
 
 const RELEVANCE_KINDS: &[&str] = &[
     kinds::SYMBOL,
@@ -69,13 +71,15 @@ fn entity_to_doc(e: &scc_core::Entity) -> LexDoc {
 /// Collect relevance candidates. `arm` selects which scores are emitted;
 /// BM25 and exact-anchor stay separate fields in [`scc_core::RelevanceHit`].
 /// Graph expansion, when requested, is tagged `graph-expand` and is not
-/// added into the BM25 number.
-// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors
+/// added into the BM25 number. Co-change and doc-mention extras are
+/// inspectable reasons with score 0.0 — never fused into BM25.
+// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-cochange-retrieval-evidence,REQ-declared-mentions
 pub fn collect_relevance_candidates(
     view: &TrustedGraphView,
     query: &str,
     limit: usize,
     arm: RankingArm,
+    repo_root: Option<&Path>,
 ) -> Vec<ScoredEntity> {
     if matches!(arm, RankingArm::ProductionBlended | RankingArm::NoLexical) {
         return Vec::new();
@@ -153,26 +157,182 @@ pub fn collect_relevance_candidates(
     if arm == RankingArm::LexicalThenGraph {
         let seeds: Vec<String> = out.iter().map(|c| c.id.clone()).collect();
         for sid in seeds {
-            for r in view.out_pred(&sid, scc_core::predicates::CALLS) {
-                if out.iter().any(|c| c.id == r.object) {
-                    continue;
-                }
-                if let Some(e) = view.entity(&r.object) {
-                    out.push(ScoredEntity {
-                        id: e.id.clone(),
-                        kind: e.kind.clone(),
-                        name: e.name.clone(),
-                        score: 0.0,
-                        reason: "graph-expand".into(),
-                    });
-                    if out.len() >= limit {
-                        break;
-                    }
+            for r in view.out_pred(&sid, predicates::CALLS) {
+                if push_unique(view, &mut out, &r.object, 0.0, "graph-expand") && out.len() >= limit
+                {
+                    break;
                 }
             }
         }
     }
+
+    if !matches!(
+        arm,
+        RankingArm::ProductionBlended | RankingArm::NoLexical
+    ) {
+        attach_doc_mention_evidence(view, &mut out, limit);
+        if arm != RankingArm::NoCochange {
+            if let Some(root) = repo_root {
+                attach_cochange_evidence(view, &mut out, root, limit);
+            }
+        }
+    }
     out
+}
+
+// trace:exempt reason=internal-detail
+fn push_unique(
+    view: &TrustedGraphView,
+    out: &mut Vec<ScoredEntity>,
+    id: &str,
+    score: f64,
+    reason: &str,
+) -> bool {
+    if out.iter().any(|c| c.id == id) {
+        return false;
+    }
+    let Some(e) = view.entity(id) else {
+        return false;
+    };
+    out.push(ScoredEntity {
+        id: e.id.clone(),
+        kind: e.kind.clone(),
+        name: e.name.clone(),
+        score,
+        reason: reason.to_string(),
+    });
+    true
+}
+
+/// Docs that DECLARED_AS a current hit, and symbols a hit doc names.
+/// Score stays 0.0 — never added into BM25.
+// trace:exempt reason=internal-detail
+fn attach_doc_mention_evidence(view: &TrustedGraphView, out: &mut Vec<ScoredEntity>, limit: usize) {
+    let seeds: Vec<String> = out.iter().map(|c| c.id.clone()).collect();
+    for sid in seeds {
+        if out.len() >= limit {
+            return;
+        }
+        for r in view.in_pred(&sid, predicates::DECLARED_AS) {
+            if push_unique(view, out, &r.subject, 0.0, "doc-mention") && out.len() >= limit {
+                return;
+            }
+        }
+        for r in view.out_pred(&sid, predicates::DECLARED_AS) {
+            if push_unique(view, out, &r.object, 0.0, "doc-mention") && out.len() >= limit {
+                return;
+            }
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn entity_file_path(e: &scc_core::Entity) -> Option<String> {
+    if e.kind == kinds::FILE {
+        return Some(e.name.clone());
+    }
+    let file = attr_str(e, "file");
+    if file.is_empty() {
+        None
+    } else {
+        Some(file)
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn files_statically_coupled(view: &TrustedGraphView, a: &str, b: &str) -> bool {
+    let aid = entity_id(&view.graph.repo_id, kinds::FILE, a);
+    let bid = entity_id(&view.graph.repo_id, kinds::FILE, b);
+    if view
+        .out_pred(&aid, predicates::IMPORTS)
+        .iter()
+        .any(|r| r.object == bid)
+        || view
+            .out_pred(&bid, predicates::IMPORTS)
+            .iter()
+            .any(|r| r.object == aid)
+    {
+        return true;
+    }
+    let mut a_syms: HashSet<String> = HashSet::new();
+    let mut b_syms: HashSet<String> = HashSet::new();
+    for e in view.entities() {
+        if e.kind != kinds::SYMBOL {
+            continue;
+        }
+        let f = attr_str(e, "file");
+        if f == a {
+            a_syms.insert(e.id.clone());
+        } else if f == b {
+            b_syms.insert(e.id.clone());
+        }
+    }
+    for sid in &a_syms {
+        for r in view.out_pred(sid, predicates::CALLS) {
+            if b_syms.contains(&r.object) {
+                return true;
+            }
+        }
+    }
+    for sid in &b_syms {
+        for r in view.out_pred(sid, predicates::CALLS) {
+            if a_syms.contains(&r.object) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Historical co-change partners. Never fused into BM25/PPR.
+// trace:v1 id=impl.scc.context.cochange-evidence work=WORK-ripwire-lessons-phase2 satisfies=REQ-cochange-retrieval-evidence
+fn attach_cochange_evidence(
+    view: &TrustedGraphView,
+    out: &mut Vec<ScoredEntity>,
+    repo_root: &Path,
+    limit: usize,
+) {
+    let Ok(pairs) = scc_graph::cochange::cochange_pairs(
+        repo_root,
+        scc_graph::cochange::COCHANGE_MIN_COMMITS,
+    ) else {
+        return;
+    };
+    if pairs.is_empty() {
+        return;
+    }
+    let seeds: Vec<(String, String)> = out
+        .iter()
+        .filter_map(|c| {
+            view.entity(&c.id)
+                .and_then(|e| entity_file_path(e).map(|p| (c.id.clone(), p)))
+        })
+        .collect();
+    for (_id, path) in seeds {
+        if out.len() >= limit {
+            return;
+        }
+        for pair in &pairs {
+            let partner = if pair.a == path {
+                Some(pair.b.as_str())
+            } else if pair.b == path {
+                Some(pair.a.as_str())
+            } else {
+                None
+            };
+            let Some(partner) = partner else { continue };
+            let fid = entity_id(&view.graph.repo_id, kinds::FILE, partner);
+            let reason = if files_statically_coupled(view, &path, partner) {
+                "cochange"
+            } else {
+                "cochange-surprise"
+            };
+            let _ = push_unique(view, out, &fid, 0.0, reason);
+            if out.len() >= limit {
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,9 +372,21 @@ mod tests {
     fn production_arm_emits_nothing_from_relevance_lens() {
         let (_d, store, graph) = indexed_view(vec![sym("s:a", "handleList", "src/a.ts", "")]);
         let view = scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
-        let empty = collect_relevance_candidates(&view, "handleList", 8, RankingArm::ProductionBlended);
+        let empty = collect_relevance_candidates(
+            &view,
+            "handleList",
+            8,
+            RankingArm::ProductionBlended,
+            None,
+        );
         assert!(empty.is_empty(), "production arm must not silently switch to BM25");
-        let hits = collect_relevance_candidates(&view, "handleList", 8, RankingArm::LexicalThenGraph);
+        let hits = collect_relevance_candidates(
+            &view,
+            "handleList",
+            8,
+            RankingArm::LexicalThenGraph,
+            None,
+        );
         assert_eq!(hits[0].name, "handleList");
         assert_eq!(hits[0].reason, "anchor");
     }
@@ -227,8 +399,149 @@ mod tests {
             sym("s:hit", "handleList", "src/server.ts", ""),
         ]);
         let view = scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
-        let hits = collect_relevance_candidates(&view, "handleList", 8, RankingArm::QueryRouted);
+        let hits = collect_relevance_candidates(&view, "handleList", 8, RankingArm::QueryRouted, None);
         assert_eq!(hits[0].id, "s:hit");
         assert_eq!(hits[0].reason, "anchor");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.doc-mention-evidence verifies=REQ-declared-mentions exercises=impl.scc.context.relevance-collect
+    fn doc_mention_is_inspectable_zero_score() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:hit".to_string();
+        store
+            .insert_entity(&sym(&sid, "handleList", "src/a.ts", ""), &["src/a.ts".into()])
+            .unwrap();
+        let fid = entity_id(&store.repo_id, kinds::FILE, "README.md");
+        store
+            .insert_entity(
+                &Entity::new(fid.clone(), kinds::FILE, "README.md"),
+                &["README.md".into()],
+            )
+            .unwrap();
+        let rel = scc_core::Relationship::new(
+            "rel:mention",
+            fid,
+            predicates::DECLARED_AS,
+            sid,
+            scc_core::Provenance::Declared,
+        );
+        store.insert_relationship(&rel, "README.md").unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let view =
+            scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
+        let hits = collect_relevance_candidates(
+            &view,
+            "handleList",
+            16,
+            RankingArm::LexicalThenGraph,
+            None,
+        );
+        let doc = hits
+            .iter()
+            .find(|h| h.reason == "doc-mention")
+            .expect("doc that names the hit must surface");
+        assert_eq!(doc.name, "README.md");
+        assert_eq!(doc.score, 0.0);
+        let bm25_hit = hits.iter().find(|h| h.name == "handleList").unwrap();
+        assert!(bm25_hit.score >= 0.0);
+        assert_ne!(bm25_hit.reason, "doc-mention");
+    }
+
+    // trace:exempt reason=test-helper
+    fn git_init(dir: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "SCC Test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.cochange-evidence verifies=REQ-cochange-retrieval-evidence exercises=impl.scc.context.cochange-evidence
+    fn cochange_partners_are_inspectable_and_skipped_by_nocochange() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git_init(&root);
+        std::fs::write(root.join("src/a.py"), "def handleList():\n    return 1\n").unwrap();
+        std::fs::write(root.join("src/b.py"), "def other():\n    return 2\n").unwrap();
+        for msg in ["c1", "c2"] {
+            let out = std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let out = std::process::Command::new("git")
+                .args(["commit", "-q", "-m", msg])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            std::fs::write(root.join("src/a.py"), format!("def handleList():\n    return {msg}\n"))
+                .unwrap();
+            std::fs::write(root.join("src/b.py"), format!("def other():\n    return {msg}\n"))
+                .unwrap();
+        }
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let a_id = entity_id(&store.repo_id, kinds::FILE, "src/a.py");
+        let b_id = entity_id(&store.repo_id, kinds::FILE, "src/b.py");
+        store
+            .insert_entity(&Entity::new(a_id.clone(), kinds::FILE, "src/a.py"), &["src/a.py".into()])
+            .unwrap();
+        store
+            .insert_entity(&Entity::new(b_id.clone(), kinds::FILE, "src/b.py"), &["src/b.py".into()])
+            .unwrap();
+        store
+            .insert_entity(
+                &sym("s:hit", "handleList", "src/a.py", ""),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let view =
+            scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
+        let with = collect_relevance_candidates(
+            &view,
+            "handleList",
+            16,
+            RankingArm::LexicalThenGraph,
+            Some(&root),
+        );
+        assert!(
+            with.iter()
+                .any(|h| h.id == b_id && h.reason.starts_with("cochange")),
+            "expected cochange partner, got {with:?}"
+        );
+        assert!(
+            with.iter()
+                .filter(|h| h.reason.starts_with("cochange"))
+                .all(|h| h.score == 0.0)
+        );
+        let without = collect_relevance_candidates(
+            &view,
+            "handleList",
+            16,
+            RankingArm::NoCochange,
+            Some(&root),
+        );
+        assert!(
+            without
+                .iter()
+                .all(|h| !h.reason.starts_with("cochange")),
+            "NoCochange must omit co-change evidence: {without:?}"
+        );
     }
 }

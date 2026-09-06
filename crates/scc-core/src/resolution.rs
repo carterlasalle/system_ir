@@ -103,6 +103,10 @@ pub struct AnalysisQuality {
     pub files: FileQuality,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub stale_facts_dropped: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub matched_doc_mentions: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unmatched_doc_mentions: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -132,6 +136,7 @@ pub struct FileQuality {
     pub unsupported: u32,
 }
 
+// trace:exempt reason=internal-detail
 impl AnalysisQuality {
     pub fn record_call(&mut self, class: ResolutionClass, precise: bool) {
         match class {
@@ -153,6 +158,7 @@ impl AnalysisQuality {
     }
 
     /// One-line machine-readable summary for context packs.
+    // trace:exempt reason=internal-detail
     pub fn merge(&mut self, other: &AnalysisQuality) {
         self.calls.resolved += other.calls.resolved;
         self.calls.precise += other.calls.precise;
@@ -165,10 +171,13 @@ impl AnalysisQuality {
         self.files.partial += other.files.partial;
         self.files.unsupported += other.files.unsupported;
         self.stale_facts_dropped += other.stale_facts_dropped;
+        self.matched_doc_mentions += other.matched_doc_mentions;
+        self.unmatched_doc_mentions += other.unmatched_doc_mentions;
     }
 
+    // trace:exempt reason=internal-detail
     pub fn compact_line(&self) -> String {
-        format!(
+        let mut line = format!(
             "calls: resolved={} precise={} heuristic={} ambiguous={} likely_internal_unresolved={} external={} | files: parsed={} partial={} unsupported={} | stale_facts_dropped={}",
             self.calls.resolved,
             self.calls.precise,
@@ -180,7 +189,14 @@ impl AnalysisQuality {
             self.files.partial,
             self.files.unsupported,
             self.stale_facts_dropped
-        )
+        );
+        if self.matched_doc_mentions > 0 || self.unmatched_doc_mentions > 0 {
+            line.push_str(&format!(
+                " | mentions: matched={} unmatched={}",
+                self.matched_doc_mentions, self.unmatched_doc_mentions
+            ));
+        }
+        line
     }
 }
 

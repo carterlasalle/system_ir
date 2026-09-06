@@ -6,6 +6,7 @@ pub mod benchagent;
 pub mod benchatlas;
 pub mod benchctx;
 pub mod benchres;
+pub mod benchret;
 pub mod checkpoint;
 pub mod commands;
 pub mod compress;
