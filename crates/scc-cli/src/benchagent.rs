@@ -423,6 +423,72 @@ fn run_task(
     })
 }
 
+/// Score an in-process JSONL tool stream the same way [`run_task`] scores an
+/// agent. Event index is used as `first_correct_ms` so deterministic
+/// pack-consumers have a stable ordinal (not wall-clock noise).
+// trace:v1 id=impl.scc.bench.jsonl-metrics work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
+pub fn metrics_from_jsonl(
+    jsonl: &str,
+    root: &Path,
+    id: &str,
+    gt_files: &[String],
+) -> AgentTaskResult {
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let mut first_correct_ms: Option<u64> = None;
+    let mut gt_seen = false;
+    let mut wrong_seen: BTreeSet<String> = BTreeSet::new();
+    let mut plan_buf = String::new();
+    let mut plan_done = false;
+    for (i, line) in jsonl.lines().enumerate() {
+        let elapsed_ms = i as u64;
+        if !gt_seen && gt_files.iter().any(|f| line.contains(f.as_str())) {
+            gt_seen = true;
+            if first_correct_ms.is_none() {
+                first_correct_ms = Some(elapsed_ms);
+            }
+        }
+        if !plan_done {
+            plan_buf.push_str(line);
+            plan_buf.push('\n');
+        }
+        if let Some(ev) = parse_event_line(line, root) {
+            plan_done = true;
+            if !gt_seen {
+                for p in &ev.paths {
+                    if !gt_files.iter().any(|f| f == p) {
+                        wrong_seen.insert(p.clone());
+                    }
+                }
+            }
+            events.push(ev);
+        }
+    }
+    let files_surfaced = gt_files
+        .iter()
+        .filter(|f| jsonl.contains(f.as_str()))
+        .count();
+    let mut opened: BTreeSet<String> = BTreeSet::new();
+    for ev in &events {
+        opened.extend(ev.paths.iter().cloned());
+    }
+    AgentTaskResult {
+        id: id.to_string(),
+        exit_ok: true,
+        duration_ms: jsonl.lines().count() as u64,
+        output_bytes: jsonl.len(),
+        files_surfaced,
+        files_total: gt_files.len(),
+        files_opened: opened.len(),
+        search_tool_calls: events.iter().filter(|e| e.kind == ToolKind::Search).count(),
+        read_tool_calls: events.iter().filter(|e| e.kind == ToolKind::Read).count(),
+        total_tool_calls: events.len(),
+        wrong_first_locations: wrong_seen.len(),
+        first_correct_ms,
+        first_plan_correct: gt_files.iter().any(|k| plan_buf.contains(k.as_str())),
+        graph_tool_calls: events.iter().filter(|e| e.graph).count(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 // trace:v1 id=impl.crates-scc-cli-src-benchagent.tool-kind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 enum ToolKind {
@@ -1045,6 +1111,22 @@ mod tests {
                 && r.wrong_first_locations == 0
         }));
         let _ = PathBuf::new();
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.bench.jsonl-metrics verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.bench.jsonl-metrics
+    fn metrics_from_jsonl_counts_search_read_and_first_correct() {
+        let root = PathBuf::from(".");
+        let jsonl = r#"{"type":"tool_use","name":"grep","input":{"query":"orders"}}
+{"type":"tool_use","name":"read","input":{"file_path":"wrong.py"}}
+{"type":"tool_use","name":"read","input":{"file_path":"main.py"}}"#;
+        let m = metrics_from_jsonl(jsonl, &root, "t", &["main.py".into()]);
+        assert_eq!(m.search_tool_calls, 1);
+        assert_eq!(m.read_tool_calls, 2);
+        assert_eq!(m.files_opened, 2);
+        assert_eq!(m.wrong_first_locations, 1);
+        assert_eq!(m.first_correct_ms, Some(2));
+        assert_eq!(m.files_surfaced, 1);
     }
 
 // trace:v1 id=impl.crates-scc-cli-src-benchagent.jsonl-event-stream-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching

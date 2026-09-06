@@ -428,6 +428,7 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().map(|s| s.name.clone())
@@ -442,6 +443,7 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
+    // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let mut facts = self.facts;
         // Contract subclass evidence (Contract ontology): serializer/
@@ -488,6 +490,7 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags: std::collections::BTreeMap::new(),
             facts,
+            type_binds: Vec::new(),
         }
     }
 

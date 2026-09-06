@@ -212,6 +212,7 @@ impl Indexer {
             let cfg_hits = configrefs::scan_config_refs(&content, f.language.as_str());
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(path, &ef.symbols);
+            index.set_type_binds(path, &ef.type_binds);
             extracted.insert(path.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
 
@@ -529,6 +530,7 @@ impl Indexer {
             let cfg_hits = configrefs::scan_config_refs(&content, f.language.as_str());
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(p, &ef.symbols);
+            index.set_type_binds(p, &ef.type_binds);
             extracted.insert(p.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
 
@@ -1178,5 +1180,35 @@ mod tests {
                 "secret value leaked in {s}"
             );
         }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.type-narrow verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn index_pins_named_var_call_to_constructor_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "class Order:\n    def process(self):\n        return 1\n\nclass Invoice:\n    def process(self):\n        return 2\n\ndef handle():\n    x = Order()\n    return x.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {calls:?}"
+        );
     }
 }

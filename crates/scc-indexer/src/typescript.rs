@@ -10,7 +10,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Language, Node, Parser};
@@ -315,6 +315,16 @@ impl LanguageExtractor for TypeScriptExtractor {
                         }
                     }
                 }
+                "variable_declarator" => {
+                    if let Some(b) = ts_type_bind_from_declarator(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                }
+                "required_parameter" | "optional_parameter" => {
+                    if let Some(b) = ts_type_bind_from_param(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                }
             "call_expression" => {
                 let Some(function) = node.child_by_field_name("function") else {
                     push_children(&mut frames, &node, &ctx, src);
@@ -452,6 +462,24 @@ impl LanguageExtractor for TypeScriptExtractor {
                 parent: None,
             });
         }
+
+        let known: BTreeSet<String> = out
+            .symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+                )
+            })
+            .map(|s| s.name.clone())
+            .chain(
+                out.imports
+                    .iter()
+                    .flat_map(|i| i.names.iter().map(|(local, _)| local.clone())),
+            )
+            .collect();
+        out.type_binds.retain(|b| known.contains(&b.type_name));
 
         out
         }
@@ -2145,6 +2173,85 @@ fn line_of(node: &Node) -> u32 {
     node.start_position().row as u32 + 1
 }
 
+// trace:exempt reason=internal-detail
+fn ts_simple_type_name(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cur = *node;
+    if cur.kind() == "type_annotation" {
+        if let Some(c) = cur.named_child(0) {
+            cur = c;
+        }
+    }
+    match cur.kind() {
+        "type_identifier" | "identifier" => {
+            let n = node_text(&cur, src).trim();
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.to_string())
+            }
+        }
+        _ => {
+            let n = node_text(&cur, src).trim();
+            if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !n.is_empty() {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_declarator(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let name_node = node.child_by_field_name("name")?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let line = line_of(node);
+    let mut ty = node
+        .child_by_field_name("type")
+        .and_then(|t| ts_simple_type_name(&t, src));
+    if ty.is_none() {
+        if let Some(v) = node.child_by_field_name("value") {
+            if v.kind() == "new_expression" {
+                if let Some(ctor) = v.child_by_field_name("constructor") {
+                    ty = ts_simple_type_name(&ctor, src);
+                }
+            }
+        }
+    }
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
+        name: name.to_string(),
+        type_name: ty?,
+        line,
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_param(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let pat = node.child_by_field_name("pattern")?;
+    if pat.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&pat, src).trim();
+    if name.is_empty() || name == "this" {
+        return None;
+    }
+    let ty_node = node.child_by_field_name("type")?;
+    let type_name = ts_simple_type_name(&ty_node, src)?;
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
 /// The defining source expression of a node, bounded to 200 chars
 /// (single-line, whitespace-collapsed) — enough to carry the concrete
 /// code form (`z.object({ name: z.string() })`) into the atlas without
@@ -3420,6 +3527,29 @@ mod tests {
 
     fn find_call<'a>(calls: &'a [Call], callee: &str) -> Vec<&'a Call> {
         calls.iter().filter(|c| c.callee == callee).collect()
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.type-binds verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn new_expression_and_param_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nfunction handle(x: Order) {\n  const y = new Order();\n  y.process();\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "new Order bind missing: {:?}",
+            ef.type_binds
+        );
     }
 
     #[test]

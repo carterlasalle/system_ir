@@ -6,7 +6,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -490,6 +490,54 @@ fn is_deserialize_side(name: &str) -> bool {
     matches!(name, "from_dict" | "from_json" | "deserialize" | "from_serializable")
 }
 
+// trace:exempt reason=internal-detail
+fn simple_type_ident(text: &str) -> Option<String> {
+    let t = text.trim();
+    if is_simple_ident(t) {
+        return Some(t.to_string());
+    }
+    for wrap in ["Optional[", "list[", "List[", "Sequence["] {
+        if let Some(rest) = t.strip_prefix(wrap) {
+            if let Some(inner) = rest.strip_suffix(']') {
+                let inner = inner.trim();
+                if is_simple_ident(inner) {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+// trace:exempt reason=internal-detail
+fn constructor_type_name(right: Node, src: &[u8]) -> Option<String> {
+    if right.kind() != "call" {
+        return None;
+    }
+    let fn_node = right.child_by_field_name("function")?;
+    if fn_node.kind() != "identifier" {
+        return None;
+    }
+    let n = clean(node_text(Some(fn_node), src));
+    if n.is_empty() {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -536,6 +584,8 @@ struct Ctx {
     factory_returns: BTreeMap<String, String>,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Local constructor / annotation / parameter type binds.
+    type_binds: Vec<TypeBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -555,6 +605,18 @@ impl Ctx {
     }
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
+    }
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope: self.caller().unwrap_or_default(),
+            name,
+            type_name,
+            line,
+        });
     }
 // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
@@ -727,6 +789,31 @@ impl Ctx {
         }
         facts.sort_by_key(fact_sort_key);
         facts.dedup_by(|a, b| a == b);
+        let known: BTreeSet<String> = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+                )
+            })
+            .map(|s| s.name.clone())
+            .chain(
+                self.imports
+                    .iter()
+                    .flat_map(|i| i.names.iter().map(|(local, _)| local.clone())),
+            )
+            .collect();
+        let mut type_binds = self.type_binds;
+        type_binds.retain(|b| known.contains(&b.type_name));
+        type_binds.sort_by(|a, b| {
+            (&a.scope, &a.name, a.line, &a.type_name).cmp(&(
+                &b.scope,
+                &b.name,
+                b.line,
+                &b.type_name,
+            ))
+        });
         ExtractedFile {
             symbols,
             imports: self.imports,
@@ -738,6 +825,7 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds,
         }
         }
 }
@@ -897,6 +985,9 @@ impl PythonExtractor {
             name: sym_name,
             is_class: false,
         });
+        if let Some(params) = node.child_by_field_name("parameters") {
+            self.record_param_types(params, ctx, src);
+        }
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -1307,6 +1398,7 @@ impl PythonExtractor {
 
     /// Class fields (class-level assignments, `self.x` in `__init__`) and
     /// module-level `__all__` public surface.
+    // trace:exempt reason=internal-detail
     fn record_assignment(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let left = node.child_by_field_name("left");
         let right = node.child_by_field_name("right");
@@ -1380,6 +1472,57 @@ impl PythonExtractor {
                     }
                 }
             }
+        }
+        if !ctx.top_is_class() {
+            if let Some(l) = left {
+                if l.kind() == "identifier" {
+                    let name = clean(node_text(Some(l), src));
+                    let line = node.start_position().row as u32 + 1;
+                    if let Some(ty_node) = node.child_by_field_name("type") {
+                        if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src)))
+                        {
+                            ctx.push_type_bind(name.clone(), ty, line);
+                        }
+                    }
+                    if let Some(r) = right {
+                        if let Some(ty) = constructor_type_name(r, src) {
+                            ctx.push_type_bind(name, ty, line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn record_param_types(&self, params: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            let (name_node, type_node) = match p.kind() {
+                "typed_parameter" | "typed_default_parameter" => {
+                    let ty = p.child_by_field_name("type");
+                    let name = p.named_child(0);
+                    (name, ty)
+                }
+                _ => continue,
+            };
+            let Some(n) = name_node else {
+                continue;
+            };
+            if n.kind() != "identifier" {
+                continue;
+            }
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() || name == "self" || name == "cls" {
+                continue;
+            }
+            let Some(ty_node) = type_node else {
+                continue;
+            };
+            let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src))) else {
+                continue;
+            };
+            ctx.push_type_bind(name, ty, p.start_position().row as u32 + 1);
         }
     }
 
@@ -3401,5 +3544,41 @@ class QueryBuilder:
         );
         let c = find_symbol(&ef, "QueryBuilder");
         assert_eq!(c.decl_header.as_deref(), Some("class QueryBuilder"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.type-binds verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn constructor_and_param_type_binds_are_captured() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\ndef handle(x: Order):\n    y = Order()\n    y.process()\n    x.process()\n\ndef mixed():\n    z = Order()\n    z = Invoice()\n    z.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "constructor bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(mixed.contains(&"Order") && mixed.contains(&"Invoice"));
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.type_name == "process" || b.name == "self"),
+            "must not bind methods or self: {:?}",
+            ef.type_binds
+        );
     }
 }

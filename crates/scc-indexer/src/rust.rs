@@ -584,6 +584,7 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds: Vec::new(),
         }
         }
 }

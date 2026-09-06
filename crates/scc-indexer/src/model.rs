@@ -370,6 +370,23 @@ pub struct ExtractedFile {
     /// configuration, callbacks) — additive to the classic extraction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<SemanticFact>,
+    /// Per-scope local type binds (`x = Order()`, `x: Foo`, typed params).
+    /// Extract-time only; never stamped onto FILE entity attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_binds: Vec<TypeBind>,
+}
+
+/// One local variable → type name fact used by one-hop NamedVariable narrowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeBind {
+    /// Enclosing function/method name; empty at module scope.
+    #[serde(default)]
+    pub scope: String,
+    /// Local variable or parameter name.
+    pub name: String,
+    /// Type name as written (import alias or local class).
+    pub type_name: String,
+    pub line: u32,
 }
 
 /// A language extractor. Must be deterministic and side-effect free.

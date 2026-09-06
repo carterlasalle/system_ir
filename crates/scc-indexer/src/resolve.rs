@@ -13,7 +13,7 @@
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
-use crate::model::{Call, Import, ImportType, Symbol, SymbolKind};
+use crate::model::{Call, Import, ImportType, Symbol, SymbolKind, TypeBind};
 use crate::recv::classify_callee;
 use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -44,6 +44,8 @@ pub struct FileSymbols {
     /// methods: "ClassName.method" -> entity id (for self/this resolution)
     pub methods: BTreeMap<String, (String, String)>, // key -> (class, entity id)
     pub file_entity_id: String,
+    /// Local type binds for this file (constructor / annotation / param).
+    pub type_binds: Vec<TypeBind>,
 }
 
 /// Module resolution result for an import.
@@ -101,6 +103,13 @@ impl SymbolIndex {
             }
         }
         self.files.insert(path.to_string(), fs);
+    }
+
+    /// Attach extract-time type binds used by NamedVariable narrowing.
+    pub fn set_type_binds(&mut self, path: &str, binds: &[TypeBind]) {
+        if let Some(fs) = self.files.get_mut(path) {
+            fs.type_binds = binds.to_vec();
+        }
     }
 
     pub fn file(&self, path: &str) -> Option<&FileSymbols> {
@@ -365,6 +374,12 @@ pub fn resolve_calls(
             m
         });
 
+    let type_binds: &[TypeBind] = index
+        .files
+        .get(path)
+        .map(|f| f.type_binds.as_slice())
+        .unwrap_or(&[]);
+
     let caller_ctx = |call: &Call| -> String {
         match &call.caller {
             Some(cname) => {
@@ -602,6 +617,23 @@ pub fn resolve_calls(
                 }
             }
             if recv == RecvKind::NamedVariable {
+                if let Some(ty) = unique_bound_type(type_binds, call.caller.as_deref(), root) {
+                    if let Some(id) =
+                        method_id_for_type(index, path, ty, method, &binding)
+                    {
+                        out.push(emit(
+                            caller_id,
+                            Some(id),
+                            call.callee.clone(),
+                            0.9,
+                            call.line,
+                            ResolutionClass::ResolvedInternal,
+                            recv,
+                            1,
+                        ));
+                        continue;
+                    }
+                }
                 // Unknown typed variable: do not spray to every same-name method.
                 out.push(emit(
                     caller_id,
@@ -644,6 +676,65 @@ pub fn quality_from_calls(calls: &[ResolvedCall]) -> scc_core::AnalysisQuality {
         q.record_call(c.class, false);
     }
     q
+}
+
+/// Unique type for `(scope, var)` or None when missing / tombstoned (≥2 types).
+// trace:v1 id=impl.scc.resolve.type-narrow work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
+fn unique_bound_type<'a>(
+    binds: &'a [TypeBind],
+    scope: Option<&str>,
+    var: &str,
+) -> Option<&'a str> {
+    let scope = scope.unwrap_or("");
+    let mut types: Vec<&str> = binds
+        .iter()
+        .filter(|b| b.scope == scope && b.name == var)
+        .map(|b| b.type_name.as_str())
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    if types.len() == 1 {
+        Some(types[0])
+    } else {
+        None
+    }
+}
+
+/// Real `{Type}.{method}` definition locally or on the imported type only.
+fn method_id_for_type(
+    index: &SymbolIndex,
+    local_path: &str,
+    ty: &str,
+    method: &str,
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    if method.is_empty() {
+        return None;
+    }
+    let local_key = format!("{ty}.{method}");
+    if let Some(fs) = index.files.get(local_path) {
+        if let Some((_, id)) = fs.by_name.get(&local_key) {
+            return Some(id.clone());
+        }
+        if let Some((_, id)) = fs.methods.get(&local_key) {
+            return Some(id.clone());
+        }
+    }
+    if let Some((target_file, exported)) = binding.get(ty) {
+        if target_file.starts_with("external:") {
+            return None;
+        }
+        let key = format!("{exported}.{method}");
+        if let Some(fs) = index.files.get(target_file.as_str()) {
+            if let Some((_, id)) = fs.by_name.get(&key) {
+                return Some(id.clone());
+            }
+            if let Some((_, id)) = fs.methods.get(&key) {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
 }
 
 fn default_symbol_name(index: &SymbolIndex, file: &str) -> String {
@@ -981,5 +1072,180 @@ mod tests {
         let q = quality_from_calls(&resolved);
         assert_eq!(q.calls.likely_internal_unresolved, 1);
         assert_eq!(q.calls.external, 0);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.type-narrow-local verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn unique_constructor_bind_pins_named_var_to_that_class() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            handle,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "x".into(),
+                type_name: "Order".into(),
+                line: 8,
+            }],
+        );
+        let calls = vec![Call {
+            caller: Some("handle".into()),
+            callee: "x.process".into(),
+            line: 9,
+            known_receiver: false,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+        assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.type-narrow-tombstone verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn two_types_for_same_var_do_not_narrow() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            handle,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[
+                TypeBind {
+                    scope: "handle".into(),
+                    name: "x".into(),
+                    type_name: "Order".into(),
+                    line: 8,
+                },
+                TypeBind {
+                    scope: "handle".into(),
+                    name: "x".into(),
+                    type_name: "Invoice".into(),
+                    line: 9,
+                },
+            ],
+        );
+        let calls = vec![Call {
+            caller: Some("handle".into()),
+            callee: "x.process".into(),
+            line: 10,
+            known_receiver: false,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.type-narrow-import verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn imported_type_bind_pins_without_spraying() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut save = mk_symbol("Order.save", SymbolKind::Method);
+        save.parent = Some("Order".into());
+        idx.add_file(
+            "orders.py",
+            &[mk_symbol("Order", SymbolKind::Class), save],
+        );
+        let run = mk_symbol("run", SymbolKind::Function);
+        idx.add_file("app.py", std::slice::from_ref(&run));
+        idx.set_type_binds(
+            "app.py",
+            &[TypeBind {
+                scope: "run".into(),
+                name: "o".into(),
+                type_name: "Ord".into(),
+                line: 3,
+            }],
+        );
+        let ri = ResolvedImport {
+            local_file: "app.py".into(),
+            module: "orders".into(),
+            target: ImportTarget::Internal {
+                file: "orders.py".into(),
+                name_map: HashMap::new(),
+                namespace: false,
+            },
+            names: vec![("Ord".into(), "Order".into())],
+            line: 1,
+        };
+        let calls = vec![Call {
+            caller: Some("run".into()),
+            callee: "o.save".into(),
+            line: 4,
+            known_receiver: false,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("app.py", &calls, &[run], &[ri], &idx, "repo");
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "orders.py", "Order.save"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.type-narrow-extract verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn python_extract_then_resolve_pins_constructor() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let src = "class Order:\n    def process(self):\n        pass\nclass Invoice:\n    def process(self):\n        pass\ndef handle():\n    x = Order()\n    return x.process()\n";
+        let ef = PythonExtractor::default().extract(&SourceFile::new("w.py", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.name == "x" && b.type_name == "Order"),
+            "binds: {:?}",
+            ef.type_binds
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.py", &ef.symbols);
+        idx.set_type_binds("w.py", &ef.type_binds);
+        let resolved = resolve_calls("w.py", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.process")
+            .expect("x.process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
     }
 }

@@ -310,6 +310,9 @@ enum BenchSub {
         min_delta: f64,
         #[arg(long)]
         json: bool,
+        /// JSONL pack-consumer protocol (search/read events) instead of locator
+        #[arg(long)]
+        explore: bool,
     },
     /// Agent-run recorder (SCC-002): run the corpus through an external
     /// agent command and record outcome metrics
@@ -800,6 +803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ripwire_bin,
                 min_delta,
                 json,
+                explore,
             } => {
                 let parsed: Vec<scc_cli::benchloop::LoopArm> = arms
                     .split(',')
@@ -815,6 +819,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     k,
                     repo_filter: repo,
                     ripwire_bin,
+                    explore,
+                    agent_cmd: std::env::var("SCC_EXPLORE_AGENT_CMD").ok().filter(|s| !s.is_empty()),
                 };
                 match scc_cli::benchloop::run_agent_loop(&parsed, &opts) {
                     Ok(summary) => {
