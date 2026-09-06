@@ -210,6 +210,50 @@ fn normalize_module_path(p: &str) -> String {
     parts.join("/")
 }
 
+/// Seed a field-chain's imported root without pinning the method name.
+///
+/// `db.users.findMany` through `import { db } from "./db"` yields the `db`
+/// export (UnresolvedLikelyInternal). An external import root yields
+/// ConfirmedExternal. `self.client.process` is not handled here.
+fn field_chain_root_callee(
+    root: &str,
+    binding: &HashMap<&str, (String, String)>,
+    namespaces: &HashMap<&str, String>,
+    index: &SymbolIndex,
+    repo_id: &str,
+) -> Option<(String, ResolutionClass)> {
+    if let Some((target_file, exported)) = binding.get(root) {
+        if let Some(external) = target_file.strip_prefix("external:") {
+            return Some((
+                scc_core::entity_id(repo_id, scc_core::kinds::EXTERNAL_API, external),
+                ResolutionClass::ConfirmedExternal,
+            ));
+        }
+        let id = index
+            .files
+            .get(target_file.as_str())
+            .and_then(|fs| fs.by_name.get(exported).map(|(_, id)| id.clone()))
+            .unwrap_or_else(|| scc_core::symbol_id(repo_id, target_file, exported));
+        return Some((id, ResolutionClass::UnresolvedLikelyInternal));
+    }
+    if let Some(ns_file) = namespaces.get(root) {
+        if let Some(fs) = index.files.get(ns_file.as_str()) {
+            if let Some((_, id)) = fs.by_name.get(root) {
+                return Some((id.clone(), ResolutionClass::UnresolvedLikelyInternal));
+            }
+            return Some((
+                fs.file_entity_id.clone(),
+                ResolutionClass::UnresolvedLikelyInternal,
+            ));
+        }
+        return Some((
+            scc_core::entity_id(repo_id, scc_core::kinds::FILE, ns_file),
+            ResolutionClass::UnresolvedLikelyInternal,
+        ));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit(
     caller_id: String,
@@ -348,17 +392,33 @@ pub fn resolve_calls(
         let method = fact.method.as_str();
         let root = fact.root.as_str();
 
-        // Field chains: do not pin the intermediate name as the method.
+        // Field chains: do not pin the intermediate name or the terminal
+        // method (`self.client.process`, `db.users.findMany`). If the chain
+        // is rooted at a resolved import (`import { db }`), seed that object
+        // so flows know the function touches `db` without claiming
+        // `findMany` resolved.
         if recv.is_field_chain() {
+            let seeded = if recv == RecvKind::FieldOfVariable {
+                field_chain_root_callee(root, &binding, &namespaces, index, repo_id)
+            } else {
+                None
+            };
+            let (callee_id, class, conf, cand) = match seeded {
+                Some((id, ResolutionClass::ConfirmedExternal)) => {
+                    (Some(id), ResolutionClass::ConfirmedExternal, 0.8, 0)
+                }
+                Some((id, class)) => (Some(id), class, 0.55, 1),
+                None => (None, ResolutionClass::UnresolvedLikelyInternal, 0.4, 0),
+            };
             out.push(emit(
                 caller_id,
-                None,
+                callee_id,
                 call.callee.clone(),
-                0.4,
+                conf,
                 call.line,
-                ResolutionClass::UnresolvedLikelyInternal,
+                class,
                 recv,
-                0,
+                cand,
             ));
             continue;
         }
@@ -827,6 +887,52 @@ mod tests {
         let q = quality_from_calls(&resolved);
         assert_eq!(q.calls.external, 0, "unresolved must not count as external");
         assert_eq!(q.calls.likely_internal_unresolved, 1);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-chain-import-root verifies=REQ-receiver-aware-resolution exercises=impl.scc.resolve
+    fn field_chain_through_imported_object_seeds_root_not_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let db_sym = mk_symbol("db", SymbolKind::Const);
+        idx.add_file("db.ts", &[db_sym]);
+        let handle = mk_symbol("handleList", SymbolKind::Function);
+        idx.add_file("server.ts", &[handle.clone()]);
+        let imports = vec![ResolvedImport {
+            local_file: "server.ts".into(),
+            module: "./db".into(),
+            target: ImportTarget::Internal {
+                file: "db.ts".into(),
+                name_map: HashMap::new(),
+                namespace: false,
+            },
+            names: vec![("db".into(), "db".into())],
+            line: 1,
+        }];
+        let calls = vec![Call {
+            caller: Some("handleList".into()),
+            callee: "db.users.findMany".into(),
+            line: 4,
+            known_receiver: false,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("server.ts", &calls, &[handle], &imports, &idx, "repo");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "db.ts", "db")),
+            "seed the imported object, not findMany"
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "db.ts", "findMany"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfVariable);
+        let q = quality_from_calls(&resolved);
+        assert_eq!(q.calls.resolved, 0, "must not claim findMany resolved");
+        assert_eq!(q.calls.likely_internal_unresolved, 1);
+        assert_eq!(q.calls.external, 0);
     }
 
     #[test]

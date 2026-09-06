@@ -260,6 +260,7 @@ impl Indexer {
             let content = std::fs::read_to_string(&full).unwrap_or_default();
             let hash = scan::hash_bytes(content.as_bytes());
             writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
+            record_file_quality(&self.store, path, &resolved_calls)?;
             self.store.upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(&self.store, path, f.language.as_str(), &content, cfg_hits.clone())
                 .map_err(IndexError::ConfigRefs)?;
@@ -435,6 +436,7 @@ impl Indexer {
                     if self.store.file(p)?.is_some() {
                         self.store.purge_path(p)?;
                         self.store.delete_file(p)?;
+                        drop_file_quality(&self.store, p)?;
                     }
                 }
             }
@@ -538,6 +540,7 @@ impl Indexer {
             let content = std::fs::read_to_string(&full).unwrap_or_default();
             let hash = scan::hash_bytes(content.as_bytes());
             writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
+            record_file_quality(&self.store, path, &resolved_calls)?;
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(&self.store, path, f.language.as_str(), &content, cfg_hits.clone())
@@ -695,21 +698,60 @@ fn is_readme(path: &str) -> bool {
     name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme")
 }
 
-/// Fold per-file `analysis_quality` attrs into one repo-wide snapshot.
-/// Incremental index rewrites only changed FILE entities, so a full
-/// scan is required for honest gauges after a partial refresh.
+/// Per-file gauges live in store meta, not FILE entity attributes, so
+/// System IR export stays incremental≡cold. The map is patched for
+/// changed paths and folded into `analysis_quality`.
+const META_QUALITY: &str = "analysis_quality";
+const META_QUALITY_FILES: &str = "analysis_quality_files";
+
+fn load_quality_files(store: &Store) -> BTreeMap<String, scc_core::AnalysisQuality> {
+    store
+        .meta_get(META_QUALITY_FILES)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_quality_files(
+    store: &Store,
+    map: &BTreeMap<String, scc_core::AnalysisQuality>,
+) -> Result<(), IndexError> {
+    let json = serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string());
+    store.meta_set(META_QUALITY_FILES, &json)?;
+    Ok(())
+}
+
+fn record_file_quality(
+    store: &Store,
+    path: &str,
+    calls: &[resolve::ResolvedCall],
+) -> Result<(), IndexError> {
+    let mut q = resolve::quality_from_calls(calls);
+    q.files.parsed = 1;
+    let mut map = load_quality_files(store);
+    map.insert(path.to_string(), q);
+    save_quality_files(store, &map)
+}
+
+fn drop_file_quality(store: &Store, path: &str) -> Result<(), IndexError> {
+    let mut map = load_quality_files(store);
+    if map.remove(path).is_some() {
+        save_quality_files(store, &map)?;
+    }
+    Ok(())
+}
+
+/// Fold per-file gauges into one repo-wide snapshot.
 // trace:v1 id=impl.scc.index.persist-analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
 fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, IndexError> {
+    let map = load_quality_files(store);
     let mut q = scc_core::AnalysisQuality::default();
-    for e in store.entities_by_kind(kinds::FILE)? {
-        if let Some(v) = e.attributes.get("analysis_quality") {
-            if let Ok(part) = serde_json::from_value::<scc_core::AnalysisQuality>(v.clone()) {
-                q.merge(&part);
-            }
-        }
+    for part in map.values() {
+        q.merge(part);
     }
     let json = serde_json::to_string(&q).unwrap_or_else(|_| "{}".to_string());
-    store.meta_set("analysis_quality", &json)?;
+    store.meta_set(META_QUALITY, &json)?;
     Ok(q)
 }
 
@@ -788,6 +830,19 @@ mod tests {
         assert!(report.analysis_quality.files.parsed >= 1);
         let stored = idx.store.meta_get("analysis_quality").unwrap().unwrap();
         assert!(stored.contains("resolved"), "{stored}");
+        assert!(
+            idx.store.meta_get("analysis_quality_files").unwrap().is_some(),
+            "per-file gauges live in store meta"
+        );
+        for e in idx.store.all_entities().unwrap() {
+            if e.kind == scc_core::kinds::FILE {
+                assert!(
+                    e.attributes.get("analysis_quality").is_none(),
+                    "gauges must not live on FILE entities (breaks incremental≡cold): {}",
+                    e.id
+                );
+            }
+        }
     }
 
     #[test]

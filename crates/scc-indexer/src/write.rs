@@ -87,13 +87,6 @@ impl<'a> Writer<'a> {
         // file entity
         let mut fe = scc_core::Entity::new(file_id.clone(), kinds::FILE, path.to_string());
         fe.attr("hash", serde_json::json!(hash));
-        // Per-file honesty gauges: unresolved ≠ external. Aggregated at
-        // index time so incremental refresh stays correct.
-        let mut file_quality = crate::resolve::quality_from_calls(resolved_calls);
-        file_quality.files.parsed = 1;
-        if let Ok(v) = serde_json::to_value(&file_quality) {
-            fe.attr("analysis_quality", v);
-        }
         self.store.insert_entity(&fe, &[path.to_string()])?;
 
         // imports: store rows + file imports file / imports external_api edges

@@ -22,7 +22,7 @@ Native call resolution must classify the receiver (`NONE`, `THIS`, `SELF`, `NAME
 
 <!-- trace:v1 id=REQ-resolution-honesty-gauges type=requirement work=WORK-ripwire-lessons-phase1 -->
 
-Failing to resolve a name is not evidence that the target is outside the repository. Relative import misses are `Unresolved`, not `External`. Bare unresolved names are `Unknown` or `UnresolvedLikelyInternal`, never `ConfirmedExternal` unless an import specifier was confirmed external. Each index persists a compact `analysis_quality` snapshot (resolved/precise/heuristic/ambiguous/likely_internal_unresolved/external call counts; parsed/partial/unsupported files; stale_facts_dropped) on FILE entities and as store meta. Task context exposes the compact line by default and the structured object on the pack JSON.
+Failing to resolve a name is not evidence that the target is outside the repository. Relative import misses are `Unresolved`, not `External`. Bare unresolved names are `Unknown` or `UnresolvedLikelyInternal`, never `ConfirmedExternal` unless an import specifier was confirmed external. Each index persists a compact `analysis_quality` snapshot (resolved/precise/heuristic/ambiguous/likely_internal_unresolved/external call counts; parsed/partial/unsupported files; stale_facts_dropped) in store meta as a folded repo-wide object plus a per-file map (`analysis_quality_files`). Gauges must not live on FILE entity attributes: those attributes are exported in System IR, so stamping per-file gauges there makes incremental refresh diverge from a cold rebuild of unchanged files. Task context exposes the compact line by default and the structured object on the pack JSON.
 
 ### REQ-stable-content-handles — Stable, stale-refusing content handles
 
