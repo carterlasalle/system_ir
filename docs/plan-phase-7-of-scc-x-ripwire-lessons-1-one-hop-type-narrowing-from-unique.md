@@ -9,4 +9,5 @@
 2. Resolver: for `NamedVariable` receivers, pin `x.m()` to `{Type}.m` when the bind is unique and that method exists locally or on the imported type. Never spray same-name methods; never invent a candidate.
 3. `scc bench loop --explore`: deterministic pack-consumer emits JSONL tool events (baseline grep+read, SCC `task_context`+read, Ripwire `--pack-task`+read). Score with bench-agent metrics. `SCC_EXPLORE_AGENT_CMD` is an LLM plug-in. Locator mode stays the default. Missing Ripwire is skipped.
 4. If the filesystem watcher cannot start or cannot watch, fall back to content-hash sweep (`stale_paths` → `cmd_index_paths`). Hash remains authority.
-5. Do not change production ranking, MCP tool count, context levels, or REQ-resolution-honesty-gauges.
+5. Invalidation cascade: before purging a changed/removed path, re-extract files that IMPORT or CALL into it so type-narrowed edges match a cold index. Do not disable type narrowing to restore incremental≡cold.
+6. Do not change production ranking, MCP tool count, context levels, or REQ-resolution-honesty-gauges.

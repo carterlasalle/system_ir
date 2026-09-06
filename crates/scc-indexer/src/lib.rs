@@ -44,7 +44,7 @@ use resolve::{ResolvedImport, SymbolIndex};
 use scan::{Language, ScannedFile};
 use scc_core::kinds;
 use scc_store::Store;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +161,18 @@ impl Indexer {
         );
         self.store.insert_entity(&repo_entity, &[])?;
 
+        // Hash-unchanged importers/callers still hold type-narrowed CALLS
+        // into changed files. Collect them before purge so incremental ≡ cold.
+        let scanned_by_path: HashMap<String, ScannedFile> = scanned
+            .iter()
+            .map(|f| (f.path.clone(), f.clone()))
+            .collect();
+        let mut seeds: Vec<String> = Vec::new();
+        seeds.extend(changed.iter().map(|f| f.path.clone()));
+        seeds.extend(added.iter().map(|f| f.path.clone()));
+        seeds.extend(removed.iter().cloned());
+        let cascade = self.with_dependents(&seeds)?;
+
         // ---- removal ----
         for p in &removed {
             self.store.purge_path(p)?;
@@ -168,9 +180,17 @@ impl Indexer {
             report.removed += 1;
         }
 
-        // ---- extraction of changed files ----
-        let mut to_process: Vec<ScannedFile> = changed;
-        to_process.append(&mut added);
+        // ---- extraction of changed files + dependents ----
+        let removed_set: HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
+        let mut to_process: Vec<ScannedFile> = Vec::new();
+        for p in &cascade {
+            if removed_set.contains(p.as_str()) {
+                continue;
+            }
+            if let Some(f) = scanned_by_path.get(p) {
+                to_process.push(f.clone());
+            }
+        }
 
         // Build symbol index: stored symbols for untouched files + fresh
         // extraction for changed ones.
@@ -443,6 +463,7 @@ impl Indexer {
         let started = Instant::now();
 
         let mut changed_paths: Vec<String> = Vec::new();
+        let mut deleted_paths: Vec<String> = Vec::new();
         for p in paths {
             let p = p.trim_start_matches("./");
             let p = p.trim_start_matches('/');
@@ -459,13 +480,23 @@ impl Indexer {
                     changed_paths.push(f.path.clone());
                 }
                 None => {
-                    // deleted or ignored: purge if known
+                    // deleted or ignored: collect before purge so importers
+                    // of the removed file can be re-resolved.
                     if self.store.file(p)?.is_some() {
-                        self.store.purge_path(p)?;
-                        self.store.delete_file(p)?;
-                        drop_file_quality(&self.store, p)?;
+                        deleted_paths.push(p.to_string());
                     }
                 }
+            }
+        }
+        let deleted_cascade = self.with_dependents(&deleted_paths)?;
+        for p in &deleted_paths {
+            self.store.purge_path(p)?;
+            self.store.delete_file(p)?;
+            drop_file_quality(&self.store, p)?;
+        }
+        for d in deleted_cascade {
+            if scanned.contains_key(&d) && !changed_paths.contains(&d) {
+                changed_paths.push(d);
             }
         }
         if changed_paths.is_empty() {
@@ -491,8 +522,13 @@ impl Indexer {
         revision: &str,
     ) -> Result<IndexReport, IndexError> {
         let mut report = IndexReport::default();
+        let paths = self.with_dependents(changed_paths)?;
+        let paths: Vec<String> = paths
+            .into_iter()
+            .filter(|p| scanned.contains_key(p))
+            .collect();
         let mut index = SymbolIndex::new(&self.store.repo_id);
-        let touched: HashSet<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
+        let touched: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
         for (path, _h, lang, _kind, _size) in self.store.all_files()? {
             if touched.contains(path.as_str()) {
                 continue;
@@ -518,7 +554,7 @@ impl Indexer {
                 Vec<failures::FailureHit>,
             ),
         > = BTreeMap::new();
-        for p in changed_paths {
+        for p in &paths {
             let Some(f) = scanned.get(p) else { continue };
             let full = self.store.root.join(p);
             let Ok(content) = std::fs::read_to_string(&full) else {
@@ -629,7 +665,7 @@ impl Indexer {
             }
         }
         // tested_by edges derived from changed files must be relinked
-        self.relink_tests_for(changed_paths, revision)?;
+        self.relink_tests_for(&paths, revision)?;
         apply_doc_mentions(&self.store)?;
         bridges::link_rpc_bridges(&self.store)?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
@@ -640,6 +676,20 @@ impl Indexer {
     /// True when the index exists (has a complete snapshot).
     pub fn is_indexed(&self) -> Result<bool, scc_store::StoreError> {
         Ok(self.store.snapshot_status()?.is_some())
+    }
+
+    /// `seeds` plus files that IMPORT or CALL into them. Must run before
+    /// `purge_path` so incoming edges still exist. Type-narrowed CALLS live
+    /// on the caller; refreshing only the callee would leave them stale.
+    // trace:v1 id=impl.scc.index.invalidation-cascade work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
+    fn with_dependents(&self, seeds: &[String]) -> Result<Vec<String>, IndexError> {
+        let mut out: BTreeSet<String> = seeds.iter().cloned().collect();
+        for p in seeds {
+            for d in self.store.paths_depending_on(p)? {
+                out.insert(d);
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Re-link `tested_by` edges for every test file whose imports reach one

@@ -131,6 +131,8 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 ## Phase 7 started (type narrowing, JSONL explore, hash sweep)
 
 - Unique local constructor/annotation/param type binds (Python + TypeScript) narrow NamedVariable calls to `{Type}.method` when that method exists locally or on the imported type. Two types tombstone. No same-name spray. EXTRACTED provenance. Binds are extract-time only.
+- Incremental refresh re-extracts files that IMPORT or CALL into a changed/removed path (hash-unchanged dependents). Type-narrowed CALLS live on the caller; purging only the callee is not enough for incremental≡cold.
+- `replace_components` drops derived component *entities* that vanished after a clustering topology change (merged `root+services` must not survive a later split). The `components` table was already replaced; the entities table was INSERT-OR-REPLACE only.
 - `scc bench loop --explore` emits JSONL grep/read/`task_context` events and scores them with bench-agent metrics. Default loop stays locator. Missing Ripwire is skipped. `SCC_EXPLORE_AGENT_CMD` is the LLM plug-in. Not a SWE-bench repair claim.
 - Watcher start/watch failure falls back to `refresh_stale_by_hash`. Hash remains authority.
 

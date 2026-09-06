@@ -841,6 +841,38 @@ impl Store {
         Ok(())
     }
 
+    /// Files that import this path or CALL one of its symbols. Used to
+    /// re-extract hash-unchanged dependents so incremental ≡ cold after
+    /// type-narrowed CALLS are written on the caller.
+    // trace:exempt reason=internal-detail
+    pub fn paths_depending_on(&self, path: &str) -> Result<Vec<String>> {
+        let file_id = scc_core::entity_id(&self.repo_id, scc_core::kinds::FILE, path);
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source_path FROM relationships
+             WHERE source_path != ?1 AND source_path != ''
+               AND (
+                 object = ?2
+                 OR object IN (
+                   SELECT id FROM entities
+                   WHERE kind = ?3 AND json_extract(attributes, '$.file') = ?1
+                 )
+               )
+             ORDER BY source_path",
+        )?;
+        let rows = stmt.query_map(
+            params![path, file_id, scc_core::kinds::SYMBOL],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            let p = r?;
+            if !p.is_empty() {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove all indexed facts (used by full reindex).
     // trace:exempt reason=internal-detail
     pub fn purge_all(&self) -> Result<()> {
@@ -1467,6 +1499,29 @@ impl Store {
     pub fn replace_components(&self, components: &[Entity]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM components", [])?;
+        // INSERT OR REPLACE only covers ids still present. A clustering
+        // topology change (merged `root+services` splitting back into
+        // `root` + `services`) must drop the vanished derived entities or
+        // System IR export keeps stale component nodes.
+        let keep: HashSet<&str> = components.iter().map(|c| c.id.as_str()).collect();
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM entities WHERE kind = ?1")?;
+            let rows = stmt.query_map(params![scc_core::kinds::COMPONENT], |r| {
+                r.get::<_, String>(0)
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                let id = r?;
+                if !keep.contains(id.as_str()) {
+                    v.push(id);
+                }
+            }
+            v
+        };
+        for id in &stale {
+            tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM entities_fts WHERE id = ?1", params![id])?;
+        }
         for c in components {
             tx.execute(
                 "INSERT INTO components (id, name, kind, responsibility, implementation, evidence, attributes)
@@ -2588,6 +2643,80 @@ mod tests {
         assert_eq!(s.symbols_in_file("a.py").unwrap().len(), 0);
         assert_eq!(s.all_relationships().unwrap().len(), 0);
         assert!(s.get_evidence("evidence:1").unwrap().is_none());
+    }
+
+    #[test]
+    // trace:exempt reason=internal-detail
+    fn paths_depending_on_finds_importers_and_callers() {
+        let (s, _d) = tmp_store();
+        let repo = s.repo_id.clone();
+        let file_b = scc_core::entity_id(&repo, scc_core::kinds::FILE, "b.py");
+        let file_a = scc_core::entity_id(&repo, scc_core::kinds::FILE, "a.py");
+        s.insert_entity(
+            &Entity::new(file_b.clone(), scc_core::kinds::FILE, "b.py"),
+            &["b.py".into()],
+        )
+        .unwrap();
+        s.insert_entity(
+            &Entity::new(file_a.clone(), scc_core::kinds::FILE, "a.py"),
+            &["a.py".into()],
+        )
+        .unwrap();
+        let mut meth = Entity::new(
+            scc_core::symbol_id(&repo, "b.py", "Order.process"),
+            scc_core::kinds::SYMBOL,
+            "Order.process",
+        );
+        meth.attr("file", serde_json::json!("b.py"));
+        s.insert_entity(&meth, &["b.py".into()]).unwrap();
+        s.insert_relationship(
+            &Relationship::new(
+                "rel:imp",
+                file_a.clone(),
+                scc_core::predicates::IMPORTS,
+                file_b,
+                Provenance::Extracted,
+            ),
+            "a.py",
+        )
+        .unwrap();
+        s.insert_relationship(
+            &Relationship::new(
+                "rel:call",
+                scc_core::symbol_id(&repo, "a.py", "handle"),
+                scc_core::predicates::CALLS,
+                scc_core::symbol_id(&repo, "b.py", "Order.process"),
+                Provenance::Extracted,
+            ),
+            "a.py",
+        )
+        .unwrap();
+        let deps = s.paths_depending_on("b.py").unwrap();
+        assert_eq!(deps, vec!["a.py".to_string()]);
+        assert!(s.paths_depending_on("a.py").unwrap().is_empty());
+    }
+
+    #[test]
+    // trace:exempt reason=internal-detail
+    fn replace_components_drops_vanished_component_entities() {
+        let (s, _d) = tmp_store();
+        let merged = Entity::new(
+            "repo://r/component/root-services",
+            scc_core::kinds::COMPONENT,
+            "root+services",
+        );
+        let root = Entity::new(
+            "repo://r/component/root",
+            scc_core::kinds::COMPONENT,
+            "root",
+        );
+        s.replace_components(&[merged, root.clone()]).unwrap();
+        assert_eq!(s.entities_by_kind(scc_core::kinds::COMPONENT).unwrap().len(), 2);
+        s.replace_components(&[root]).unwrap();
+        let left = s.entities_by_kind(scc_core::kinds::COMPONENT).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].name, "root");
+        assert!(s.get_entity("repo://r/component/root-services").unwrap().is_none());
     }
 
 // trace:exempt reason=internal-detail
