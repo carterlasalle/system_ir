@@ -27,6 +27,7 @@ pub mod lsp_ts;
 pub mod model;
 pub mod python;
 pub mod redact;
+pub mod recv;
 pub mod resolve;
 pub mod resolver;
 pub mod rust;
@@ -68,6 +69,7 @@ pub struct IndexReport {
     pub removed: usize,
     pub failed: usize,
     pub duration_ms: u64,
+    pub analysis_quality: scc_core::AnalysisQuality,
 }
 
 // trace:exempt reason=internal-detail
@@ -331,6 +333,7 @@ impl Indexer {
 
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
+        report.analysis_quality = persist_analysis_quality(&self.store)?;
         report.duration_ms = started.elapsed().as_millis() as u64;
         Ok(report)
     }
@@ -591,6 +594,7 @@ impl Indexer {
         }
         // tested_by edges derived from changed files must be relinked
         self.relink_tests_for(changed_paths, revision)?;
+        report.analysis_quality = persist_analysis_quality(&self.store)?;
         Ok(report)
     }
 
@@ -691,6 +695,24 @@ fn is_readme(path: &str) -> bool {
     name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme")
 }
 
+/// Fold per-file `analysis_quality` attrs into one repo-wide snapshot.
+/// Incremental index rewrites only changed FILE entities, so a full
+/// scan is required for honest gauges after a partial refresh.
+// trace:v1 id=impl.scc.index.persist-analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
+fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, IndexError> {
+    let mut q = scc_core::AnalysisQuality::default();
+    for e in store.entities_by_kind(kinds::FILE)? {
+        if let Some(v) = e.attributes.get("analysis_quality") {
+            if let Ok(part) = serde_json::from_value::<scc_core::AnalysisQuality>(v.clone()) {
+                q.merge(&part);
+            }
+        }
+    }
+    let json = serde_json::to_string(&q).unwrap_or_else(|_| "{}".to_string());
+    store.meta_set("analysis_quality", &json)?;
+    Ok(q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +751,43 @@ mod tests {
                 )),
             "expected an evidence-grade call edge"
         );
+        assert!(
+            report.analysis_quality.calls.resolved >= 1,
+            "honesty gauges must count the resolved add() call: {:?}",
+            report.analysis_quality
+        );
+        assert_eq!(
+            report.analysis_quality.calls.external, 0,
+            "bare local calls are not external"
+        );
+        let stored = idx
+            .store
+            .meta_get("analysis_quality")
+            .unwrap()
+            .expect("persisted");
+        let parsed: scc_core::AnalysisQuality = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.calls.resolved, report.analysis_quality.calls.resolved);
+        assert_eq!(parsed.files.parsed, report.analysis_quality.files.parsed);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.analysis-quality verifies=REQ-resolution-honesty-gauges exercises=impl.scc.index.persist-analysis-quality
+    fn analysis_quality_persists_and_does_not_label_local_calls_external() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/calc.py"),
+            "def add(a, b):\n    return a + b\n\ndef main():\n    return add(1, 2)\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        let report = idx.index().unwrap();
+        assert!(report.analysis_quality.calls.resolved >= 1);
+        assert_eq!(report.analysis_quality.calls.external, 0);
+        assert!(report.analysis_quality.files.parsed >= 1);
+        let stored = idx.store.meta_get("analysis_quality").unwrap().unwrap();
+        assert!(stored.contains("resolved"), "{stored}");
     }
 
     #[test]

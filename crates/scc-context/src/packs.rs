@@ -887,6 +887,16 @@ pub fn task_with_rankers(
     }
     sections.push(Section::new("EVIDENCE STATUS", ev_body, 5));
 
+    let analysis_quality = ctx
+        .store
+        .meta_get("analysis_quality")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<scc_core::AnalysisQuality>(&s).ok());
+    if let Some(ref q) = analysis_quality {
+        sections.push(Section::new("ANALYSIS QUALITY", q.compact_line() + "\n", 4));
+    }
+
     let warnings = ctx_warnings(ctx);
     let stale_note = ctx
         .stale_paths
@@ -898,6 +908,7 @@ pub fn task_with_rankers(
 
     pack.entity_ids = ids;
     pack.evidence_summary = ev_summary;
+    pack.analysis_quality = analysis_quality;
     finish(&mut pack, sections, budget, all_warnings);
     pack.compression_policy = Some(compression_policy(goal));
     pack

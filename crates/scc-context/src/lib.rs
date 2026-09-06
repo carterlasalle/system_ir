@@ -92,6 +92,10 @@ pub struct ContextPack {
     /// what to preserve when compressing shell output for the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_policy: Option<serde_json::Value>,
+    /// Compact analyzer-health summary (machine-readable). Absent when the
+    /// index has not persisted gauges yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_quality: Option<scc_core::AnalysisQuality>,
 }
 
 impl ContextPack {
@@ -111,6 +115,7 @@ impl ContextPack {
             exceeded_soft_budget: false,
             truncated: false,
             compression_policy: None,
+            analysis_quality: None,
         }
     }
 }

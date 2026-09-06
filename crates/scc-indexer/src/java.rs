@@ -1145,19 +1145,23 @@ impl JavaExtractor {
                 let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                ctx.calls.push(Call {
-                    caller,
-                    callee,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver,
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: false, // java has no syntactic await
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver,
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: false, // java has no syntactic await
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
                 self.record_store_ref(node, ctx, src);
                 // Wave 11: SPI plugin loading — `ServiceLoader.load(X.class)`
                 // registers X as a plugin extension point (import-gated on
@@ -1194,19 +1198,24 @@ impl JavaExtractor {
                 let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                ctx.calls.push(Call {
-                    caller,
-                    callee: type_name,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver: false,
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: false, // java has no syntactic await
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee: type_name,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver: false,
+                        role: scc_core::ReferenceKind::Construct,
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: false, // java has no syntactic await
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
             }
         }
         self.walk_children(node, ctx, src);

@@ -1203,19 +1203,23 @@ impl RustExtractor {
                     let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                     *seq += 1;
                     let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                    ctx.calls.push(Call {
-                        caller,
-                        callee,
-                        line: node.start_position().row as u32 + 1,
-                        known_receiver: known_receiver(fn_node, src),
-                        conditional,
-                        lexical_order: *seq - 1,
-                        control_block: control_block.map(str::to_string),
-                        inside_loop,
-                        inside_try,
-                        awaited: call_is_awaited(node),
-                        returns_value: call_returns_value(node),
-                    });
+                    ctx.calls.push(
+                        Call {
+                            caller,
+                            callee,
+                            line: node.start_position().row as u32 + 1,
+                            known_receiver: known_receiver(fn_node, src),
+                            conditional,
+                            lexical_order: *seq - 1,
+                            control_block: control_block.map(str::to_string),
+                            inside_loop,
+                            inside_try,
+                            awaited: call_is_awaited(node),
+                            returns_value: call_returns_value(node),
+                            ..Default::default()
+                        }
+                        .finish(),
+                    );
                     self.record_store_ref(node, fn_node, ctx, src);
                 }
             }

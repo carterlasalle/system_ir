@@ -87,6 +87,13 @@ impl<'a> Writer<'a> {
         // file entity
         let mut fe = scc_core::Entity::new(file_id.clone(), kinds::FILE, path.to_string());
         fe.attr("hash", serde_json::json!(hash));
+        // Per-file honesty gauges: unresolved ≠ external. Aggregated at
+        // index time so incremental refresh stays correct.
+        let mut file_quality = crate::resolve::quality_from_calls(resolved_calls);
+        file_quality.files.parsed = 1;
+        if let Ok(v) = serde_json::to_value(&file_quality) {
+            fe.attr("analysis_quality", v);
+        }
         self.store.insert_entity(&fe, &[path.to_string()])?;
 
         // imports: store rows + file imports file / imports external_api edges
@@ -111,6 +118,7 @@ impl<'a> Writer<'a> {
                 crate::resolve::ImportTarget::External { name } => {
                     (kinds::EXTERNAL_API, name.as_str())
                 }
+                crate::resolve::ImportTarget::Unresolved { .. } => continue,
             };
             let target_id = entity_id(self.repo_id, kind, key);
             // §26: native module-graph resolution is a deterministic
@@ -119,6 +127,7 @@ impl<'a> Writer<'a> {
             let provenance = match &ri.target {
                 crate::resolve::ImportTarget::Internal { .. } => Provenance::Extracted,
                 crate::resolve::ImportTarget::External { .. } => Provenance::Extracted,
+                crate::resolve::ImportTarget::Unresolved { .. } => continue,
             };
             let ev = self.ev(path, "import", &ri.module, ri.line);
             self.store.insert_evidence(&ev)?;

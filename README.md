@@ -49,7 +49,7 @@ Inferred claims are labeled with confidence and evidence and never silently prom
 
 | Area | What SCC provides |
 |---|---|
-| Extraction | Tree-sitter extractors for TypeScript and Python (symbols, imports, calls, routes, tests, store access), infrastructure parsing (Docker, Compose, Kubernetes, Terraform, GitHub Actions), config-reference and failure-pattern post-passes (retry, fallback, DLQ, circuit breakers) |
+| Extraction | Tree-sitter extractors for Python, TypeScript/JavaScript, Go, Java, and Rust (symbols, imports, calls, routes, tests, store access). Run `scc languages` for the generated support matrix — classification is not the same as extraction. Infrastructure parsing (Docker, Compose, Kubernetes, Terraform, GitHub Actions), config-reference and failure-pattern post-passes (retry, fallback, DLQ, circuit breakers) |
 | Resolution | Cross-file call resolution with conventional source-root fallbacks (`src/`/`svc`/`lib`/`app`), LSP definition resolution (pyright + typescript-language-server), SCIP import, and a resolution-conflict model — disagreements are surfaced, never merged |
 | System IR | Component compiler (workspaces, deployment units, directories, intent), responsibilities, ownership, contracts, invariants, trust boundaries, Git co-change |
 | Atlas | Machine-readable architecture, sequence, dataflow, lifecycle, and workflow views — no colors, no coordinates, semantics only |

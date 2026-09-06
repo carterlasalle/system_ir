@@ -1,16 +1,21 @@
 //! Import normalization and cross-file call resolution (SCC-025, SCC-026).
 //!
 //! Resolution rules, in priority order:
-//! 1. local symbol in the same file;
-//! 2. imported member (`import { a as b }` / `from m import a`) resolved to
+//! 1. receiver classification (this/self vs named vs field-chain vs type);
+//! 2. local symbol in the same file;
+//! 3. imported member (`import { a as b }` / `from m import a`) resolved to
 //!    the target file's exported symbol;
-//! 3. imported module namespace (`import * as ns`, `import m`) → member on
+//! 4. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 4. `self`/`this` receiver → sibling method of the enclosing class;
-//! 5. external import root → `external_api` entity;
-//! 6. otherwise: unresolved candidate (dropped from the graph, counted).
+//! 5. `self`/`this` receiver → sibling method of the enclosing class;
+//! 6. confirmed external import root → `external_api` entity;
+//! 7. otherwise: unresolved (counted; never silently treated as external).
+//!
+//! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
 use crate::model::{Call, Import, ImportType, Symbol, SymbolKind};
+use crate::recv::classify_callee;
+use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -25,6 +30,10 @@ pub struct ResolvedCall {
     pub provenance: scc_core::Provenance,
     pub confidence: f64,
     pub line: u32,
+    pub class: ResolutionClass,
+    pub recv: RecvKind,
+    /// Number of remaining in-repo candidates after narrowing (0/1/k).
+    pub candidates: u32,
 }
 
 /// Symbol index for one file.
@@ -44,6 +53,9 @@ pub enum ImportTarget {
     Internal { file: String, name_map: HashMap<String, String>, namespace: bool },
     /// Bare specifier treated as external system/api.
     External { name: String },
+    /// Relative or project-looking specifier that did not resolve to a file.
+    /// Not evidence that the target is outside the repository.
+    Unresolved { name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +124,7 @@ impl SymbolIndex {
                     name_map: HashMap::new(),
                     namespace: import.r#type == ImportType::Module,
                 },
-                None => ImportTarget::External {
+                None => ImportTarget::Unresolved {
                     name: import.module.clone(),
                 },
             }
@@ -198,9 +210,56 @@ fn normalize_module_path(p: &str) -> String {
     parts.join("/")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    caller_id: String,
+    callee_id: Option<String>,
+    callee_name: String,
+    confidence: f64,
+    line: u32,
+    class: ResolutionClass,
+    recv: RecvKind,
+    candidates: u32,
+) -> ResolvedCall {
+    ResolvedCall {
+        caller_id,
+        callee_id,
+        callee_name,
+        provenance: scc_core::Provenance::Extracted,
+        confidence,
+        line,
+        class,
+        recv,
+        candidates,
+    }
+}
+
+fn enclosing_class(call: &Call, path: &str, index: &SymbolIndex) -> Option<String> {
+    let c = call.caller.as_deref()?;
+    let base = c.split('.').next().unwrap_or(c);
+    if let Some((class, _id)) = index.files.get(path).and_then(|fs| fs.methods.get(c)) {
+        Some(class.clone())
+    } else {
+        Some(base.to_string())
+    }
+}
+
+fn sibling_method<'a>(
+    methods_by_class: &HashMap<&'a str, Vec<&'a Symbol>>,
+    class: &str,
+    method: &str,
+) -> Option<&'a Symbol> {
+    methods_by_class.get(class).and_then(|ms| {
+        ms.iter()
+            .find(|s| s.name == format!("{class}.{method}") || s.name == method)
+            .copied()
+    })
+}
+
 /// Resolve all calls in one file against the full symbol index.
-/// `self_caller` maps `self`/`this` calls to the enclosing class.
-// trace:v1 id=impl.scc.resolve work=WORK-SCC-014 satisfies=REQ-SCC-IR
+/// Receiver classification is first-class: field-chains are not pinned
+/// to the intermediate name; missing internals are not labeled external.
+// trace:v1 id=impl.scc.resolve work=WORK-ripwire-lessons-phase1 satisfies=REQ-receiver-aware-resolution
 pub fn resolve_calls(
     path: &str,
     calls: &[Call],
@@ -246,6 +305,7 @@ pub fn resolve_calls(
                     binding.insert(local.as_str(), (format!("external:{name}"), imported.clone()));
                 }
             }
+            ImportTarget::Unresolved { .. } => {}
         }
     }
 
@@ -273,101 +333,132 @@ pub fn resolve_calls(
 
     let mut out = Vec::new();
     for call in calls {
-        let caller_id = caller_ctx(call);
-        let (root, rest): (&str, &str) = match call.callee.split_once('.') {
-            Some((r, rest)) => (r, rest),
-            None => (call.callee.as_str(), ""),
+        let call = call.clone().finish();
+        if call.role != ReferenceKind::Call && call.role != ReferenceKind::Construct {
+            // Type/import/macro mentions are not execution edges.
+            continue;
+        }
+        let caller_id = caller_ctx(&call);
+        let fact = classify_callee(&call.callee);
+        let recv = if call.recv == RecvKind::Unknown {
+            fact.recv
+        } else {
+            call.recv
         };
+        let method = fact.method.as_str();
+        let root = fact.root.as_str();
 
-        // 1. self/this → sibling method
-        if root == "self" || root == "this" {
-            let target = rest.split('.').next().unwrap_or("");
-            if !target.is_empty() {
-                // caller's class
-                let class = call.caller.as_deref().map(|c| {
-                    let base = c.split('.').next().unwrap_or(c);
-                    if let Some((class, _id)) = index
-                        .files
-                        .get(path)
-                        .and_then(|fs| fs.methods.get(c))
-                    {
-                        class.clone()
-                    } else {
-                        base.to_string()
-                    }
-                });
-                if let Some(class) = class {
-                    if let Some(m) = methods_by_class.get(class.as_str()).and_then(|ms| {
-                        ms.iter().find(|s| s.name == format!("{class}.{target}"))
-                    }) {
-                        out.push(ResolvedCall {
-                            caller_id,
-                            callee_id: Some(scc_core::symbol_id(repo_id, path, &m.name)),
-                            callee_name: call.callee.clone(),
-                            provenance: scc_core::Provenance::Extracted,
-                            confidence: 0.98,
-                            line: call.line,
-                        });
-                        continue;
-                    }
-                }
-            }
-            out.push(ResolvedCall {
+        // Field chains: do not pin the intermediate name as the method.
+        if recv.is_field_chain() {
+            out.push(emit(
                 caller_id,
-                callee_id: None,
-                callee_name: call.callee.clone(),
-                provenance: scc_core::Provenance::Extracted,
-                confidence: 0.5,
-                line: call.line,
-            });
+                None,
+                call.callee.clone(),
+                0.4,
+                call.line,
+                ResolutionClass::UnresolvedLikelyInternal,
+                recv,
+                0,
+            ));
             continue;
         }
 
-        // 2. local symbol
-        if let Some(sym) = local.get(root) {
-            if sym.kind.is_callable() {
-                out.push(ResolvedCall {
-                    caller_id,
-                    callee_id: Some(scc_core::symbol_id(repo_id, path, &sym.name)),
-                    callee_name: call.callee.clone(),
-                    provenance: scc_core::Provenance::Extracted,
-                    confidence: 0.99,
-                    line: call.line,
-                });
-                continue;
+        // super(): never spray onto the caller's class.
+        if recv == RecvKind::Super {
+            out.push(emit(
+                caller_id,
+                None,
+                call.callee.clone(),
+                0.4,
+                call.line,
+                ResolutionClass::UnresolvedLikelyInternal,
+                recv,
+                0,
+            ));
+            continue;
+        }
+
+        // this/self → sibling of the enclosing class only.
+        if recv.is_instance_self() {
+            if let Some(class) = enclosing_class(&call, path, index) {
+                if let Some(m) = sibling_method(&methods_by_class, &class, method) {
+                    out.push(emit(
+                        caller_id,
+                        Some(scc_core::symbol_id(repo_id, path, &m.name)),
+                        call.callee.clone(),
+                        0.98,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
+                    continue;
+                }
+            }
+            out.push(emit(
+                caller_id,
+                None,
+                call.callee.clone(),
+                0.5,
+                call.line,
+                ResolutionClass::UnresolvedLikelyInternal,
+                recv,
+                0,
+            ));
+            continue;
+        }
+
+        // Bare local symbol.
+        if recv == RecvKind::None {
+            if let Some(sym) = local.get(root) {
+                if sym.kind.is_callable() {
+                    out.push(emit(
+                        caller_id,
+                        Some(scc_core::symbol_id(repo_id, path, &sym.name)),
+                        call.callee.clone(),
+                        0.99,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
+                    continue;
+                }
             }
         }
 
-        // 3. imported member binding
+        // Imported member binding (root of callee).
         if let Some((target_file, exported)) = binding.get(root) {
             if let Some(external) = target_file.strip_prefix("external:") {
-                out.push(ResolvedCall {
+                out.push(emit(
                     caller_id,
-                    callee_id: Some(scc_core::entity_id(
+                    Some(scc_core::entity_id(
                         repo_id,
                         scc_core::kinds::EXTERNAL_API,
                         external,
                     )),
-                    callee_name: call.callee.clone(),
-                    provenance: scc_core::Provenance::Extracted,
-                    confidence: 0.8,
-                    line: call.line,
-                });
+                    call.callee.clone(),
+                    0.8,
+                    call.line,
+                    ResolutionClass::ConfirmedExternal,
+                    recv,
+                    0,
+                ));
                 continue;
             }
-            let member = if rest.is_empty() {
+            let member = if matches!(recv, RecvKind::NamedVariable | RecvKind::StaticType) {
+                Some(method)
+            } else if recv == RecvKind::None {
                 None
             } else {
-                Some(rest.split('.').next().unwrap_or(""))
+                Some(method)
             };
-            let callee_id = match index.files.get(target_file) {
+            let callee_id = match index.files.get(target_file.as_str()) {
                 Some(fs) => {
                     if let Some(member) = member {
-                        // method on an imported class: `Exported.member`
                         if let Some((_, id)) = fs.by_name.get(&format!("{exported}.{member}")) {
                             Some(id.clone())
                         } else {
-                            // fall back to the imported symbol itself
                             fs.by_name.get(exported).map(|(_, id)| id.clone())
                         }
                     } else {
@@ -376,81 +467,123 @@ pub fn resolve_calls(
                 }
                 None => None,
             };
-            out.push(ResolvedCall {
+            let class = if callee_id.is_some() {
+                ResolutionClass::ResolvedInternal
+            } else {
+                ResolutionClass::UnresolvedLikelyInternal
+            };
+            out.push(emit(
                 caller_id,
                 callee_id,
-                callee_name: call.callee.clone(),
-                provenance: scc_core::Provenance::Extracted,
-                confidence: 0.95,
-                line: call.line,
-            });
+                call.callee.clone(),
+                0.95,
+                call.line,
+                class,
+                recv,
+                1,
+            ));
             continue;
         }
 
-        // 4. namespace import member (`import * as ns`, python `import m`)
+        // Namespace import member (`import * as ns`, python `import m`).
         if let Some(ns_file) = namespaces.get(root) {
-            if !rest.is_empty() {
-                let member = rest.split('.').next().unwrap_or("");
+            if recv != RecvKind::None {
                 if let Some((_, id)) = index
                     .files
-                    .get(ns_file)
-                    .and_then(|fs| fs.by_name.get(member))
+                    .get(ns_file.as_str())
+                    .and_then(|fs| fs.by_name.get(method))
                 {
-                    out.push(ResolvedCall {
+                    out.push(emit(
                         caller_id,
-                        callee_id: Some(id.clone()),
-                        callee_name: call.callee.clone(),
-                        provenance: scc_core::Provenance::Extracted,
-                        confidence: 0.97,
-                        line: call.line,
-                    });
+                        Some(id.clone()),
+                        call.callee.clone(),
+                        0.97,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
                     continue;
                 }
             }
-            out.push(ResolvedCall {
+            out.push(emit(
                 caller_id,
-                callee_id: None,
-                callee_name: call.callee.clone(),
-                provenance: scc_core::Provenance::Extracted,
-                confidence: 0.5,
-                line: call.line,
-            });
+                None,
+                call.callee.clone(),
+                0.5,
+                call.line,
+                ResolutionClass::UnresolvedLikelyInternal,
+                recv,
+                0,
+            ));
             continue;
         }
 
-        // 5. local class called with method (e.g. `Logger.error(...)`)
-        if !rest.is_empty() {
-            let member = rest.split('.').next().unwrap_or("");
+        // Type-qualified / static type / local class method.
+        if matches!(recv, RecvKind::StaticType | RecvKind::TypeQualified | RecvKind::NamedVariable)
+        {
             if let Some(sym) = local.get(root) {
                 if let Some((_, mid)) = index
                     .files
                     .get(path)
-                    .and_then(|fs| fs.methods.get(&format!("{}.{}", sym.name, member)))
+                    .and_then(|fs| fs.methods.get(&format!("{}.{}", sym.name, method)))
                 {
-                    out.push(ResolvedCall {
+                    out.push(emit(
                         caller_id,
-                        callee_id: Some(mid.clone()),
-                        callee_name: call.callee.clone(),
-                        provenance: scc_core::Provenance::Extracted,
-                        confidence: 0.9,
-                        line: call.line,
-                    });
+                        Some(mid.clone()),
+                        call.callee.clone(),
+                        0.9,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
                     continue;
                 }
             }
+            if recv == RecvKind::NamedVariable {
+                // Unknown typed variable: do not spray to every same-name method.
+                out.push(emit(
+                    caller_id,
+                    None,
+                    call.callee.clone(),
+                    0.4,
+                    call.line,
+                    ResolutionClass::UnresolvedLikelyInternal,
+                    recv,
+                    0,
+                ));
+                continue;
+            }
         }
 
-        // 6. unknown
-        out.push(ResolvedCall {
+        // Bare name that did not bind: unknown, not external.
+        let class = if recv == RecvKind::None {
+            ResolutionClass::Unknown
+        } else {
+            ResolutionClass::UnresolvedLikelyInternal
+        };
+        out.push(emit(
             caller_id,
-            callee_id: None,
-            callee_name: call.callee.clone(),
-            provenance: scc_core::Provenance::Extracted,
-            confidence: 0.5,
-            line: call.line,
-        });
+            None,
+            call.callee.clone(),
+            0.5,
+            call.line,
+            class,
+            recv,
+            0,
+        ));
     }
     out
+}
+
+/// Aggregate honesty gauges from native resolution (no LSP/SCIP).
+pub fn quality_from_calls(calls: &[ResolvedCall]) -> scc_core::AnalysisQuality {
+    let mut q = scc_core::AnalysisQuality::default();
+    for c in calls {
+        q.record_call(c.class, false);
+    }
+    q
 }
 
 fn default_symbol_name(index: &SymbolIndex, file: &str) -> String {
@@ -625,5 +758,122 @@ mod tests {
         assert_eq!(idx.resolve_module_path("./web"), Some("web/index.ts".into()));
         assert_eq!(idx.resolve_module_path("util"), Some("src/util.py".into()));
         assert_eq!(idx.resolve_module_path("nonexistent"), None);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.this-not-other-class verifies=REQ-receiver-aware-resolution exercises=impl.scc.resolve
+    fn this_process_does_not_bind_other_class() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_h = mk_symbol("A.handle", SymbolKind::Method);
+        a_h.parent = Some("A".into());
+        let mut a_p = mk_symbol("A.process", SymbolKind::Method);
+        a_p.parent = Some("A".into());
+        let mut b_p = mk_symbol("B.process", SymbolKind::Method);
+        b_p.parent = Some("B".into());
+        let syms = vec![
+            mk_symbol("A", SymbolKind::Class),
+            a_h,
+            a_p,
+            mk_symbol("B", SymbolKind::Class),
+            b_p,
+        ];
+        idx.add_file("w.py", &syms);
+        let calls = vec![Call {
+            caller: Some("A.handle".into()),
+            callee: "this.process".into(),
+            line: 3,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "A.process"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "B.process"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+        assert_eq!(resolved[0].recv, RecvKind::This);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-chain-not-pinned verifies=REQ-receiver-aware-resolution exercises=impl.scc.resolve
+    fn field_chain_is_not_pinned_to_intermediate_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut h = mk_symbol("A.handle", SymbolKind::Method);
+        h.parent = Some("A".into());
+        let mut client = mk_symbol("A.client", SymbolKind::Method);
+        client.parent = Some("A".into());
+        let mut process = mk_symbol("A.process", SymbolKind::Method);
+        process.parent = Some("A".into());
+        let syms = vec![mk_symbol("A", SymbolKind::Class), h, client, process];
+        idx.add_file("w.py", &syms);
+        let calls = vec![Call {
+            caller: Some("A.handle".into()),
+            callee: "self.client.process".into(),
+            line: 4,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfSelf);
+        let q = quality_from_calls(&resolved);
+        assert_eq!(q.calls.external, 0, "unresolved must not count as external");
+        assert_eq!(q.calls.likely_internal_unresolved, 1);
+    }
+
+    #[test]
+    fn relative_import_miss_is_unresolved_not_external() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &[]);
+        let import = Import {
+            module: "./missing".into(),
+            names: vec![("x".into(), "x".into())],
+            line: 1,
+            r#type: ImportType::Member,
+        };
+        match idx.resolve_import("a.py", &import) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "./missing"),
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_variable_does_not_spray_same_name_methods() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a = mk_symbol("A.process", SymbolKind::Method);
+        a.parent = Some("A".into());
+        let mut b = mk_symbol("B.process", SymbolKind::Method);
+        b.parent = Some("B".into());
+        let main = mk_symbol("run", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("A", SymbolKind::Class),
+            a,
+            mk_symbol("B", SymbolKind::Class),
+            b,
+            main,
+        ];
+        idx.add_file("w.py", &syms);
+        let calls = vec![Call {
+            caller: Some("run".into()),
+            callee: "obj.process".into(),
+            line: 9,
+            known_receiver: false,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+        let q = quality_from_calls(&resolved);
+        assert_eq!(q.calls.likely_internal_unresolved, 1);
+        assert_eq!(q.calls.external, 0);
     }
 }

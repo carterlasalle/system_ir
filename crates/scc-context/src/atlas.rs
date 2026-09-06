@@ -1888,6 +1888,13 @@ fn project_flow_graph(
                 scc_core::FlowEdgeKind::Fallback => line.push_str(" [fallback]"),
                 scc_core::FlowEdgeKind::Timeout => line.push_str(" [timeout]"),
                 scc_core::FlowEdgeKind::Compensation => line.push_str(" [compensate]"),
+                scc_core::FlowEdgeKind::Read => line.push_str(" [read]"),
+                scc_core::FlowEdgeKind::Write => line.push_str(" [write]"),
+                scc_core::FlowEdgeKind::Transform => line.push_str(" [transform]"),
+                scc_core::FlowEdgeKind::Validate => line.push_str(" [validate]"),
+                scc_core::FlowEdgeKind::Authorize => line.push_str(" [authorize]"),
+                scc_core::FlowEdgeKind::Cache => line.push_str(" [cache]"),
+                scc_core::FlowEdgeKind::Invalidate => line.push_str(" [invalidate]"),
                 _ => {}
             }
             if let Some(c) = &e.condition {
@@ -1921,6 +1928,13 @@ fn edge_rank(k: scc_core::FlowEdgeKind) -> u8 {
         scc_core::FlowEdgeKind::Return => 9,
         scc_core::FlowEdgeKind::Timeout => 10,
         scc_core::FlowEdgeKind::Compensation => 11,
+        scc_core::FlowEdgeKind::Read => 12,
+        scc_core::FlowEdgeKind::Write => 13,
+        scc_core::FlowEdgeKind::Transform => 14,
+        scc_core::FlowEdgeKind::Validate => 15,
+        scc_core::FlowEdgeKind::Authorize => 16,
+        scc_core::FlowEdgeKind::Cache => 17,
+        scc_core::FlowEdgeKind::Invalidate => 18,
     }
 }
 

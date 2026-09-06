@@ -50,6 +50,27 @@ impl Language {
             Language::Other => "other",
         }
     }
+
+    /// Every classified language. Tests bind this to LANGUAGE_REGISTRY.
+    pub const ALL: &[Language] = &[
+        Language::Python,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Go,
+        Language::Rust,
+        Language::Java,
+        Language::Json,
+        Language::Yaml,
+        Language::Toml,
+        Language::Env,
+        Language::Dockerfile,
+        Language::Compose,
+        Language::Terraform,
+        Language::Markdown,
+        Language::Shell,
+        Language::Sql,
+        Language::Other,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -324,6 +345,35 @@ pub fn relative_of(root: &Path, abs: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // trace:v1 id=test.scc.scan.registry-covers-classified verifies=REQ-language-support-matrix exercises=impl.scc.core.language-registry
+    fn classified_languages_are_in_the_support_registry() {
+        for lang in Language::ALL {
+            if *lang == Language::Other {
+                continue;
+            }
+            assert!(
+                scc_core::language_by_id(lang.as_str()).is_some(),
+                "scan Language::{} missing from LANGUAGE_REGISTRY",
+                lang.as_str()
+            );
+        }
+        for id in scc_core::extracted_language_ids() {
+            assert!(
+                Language::ALL.iter().any(|l| l.as_str() == id),
+                "extracted language {id} is not classified by scan"
+            );
+            let cap = scc_core::language_by_id(id).unwrap();
+            assert_eq!(
+                cap.tier,
+                scc_core::LanguageTier::SemanticDeep,
+                "{id} extractor is not tier A"
+            );
+        }
+        assert!(scc_core::language_by_id("c").is_some());
+        assert!(!scc_core::language_by_id("c").unwrap().extractor);
+    }
 
     #[test]
     fn classify_various() {

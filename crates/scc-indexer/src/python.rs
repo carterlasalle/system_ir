@@ -1186,19 +1186,23 @@ impl PythonExtractor {
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
                 self.record_wave11_call(node, fn_node, &callee, ctx, src);
-                ctx.calls.push(Call {
-                    caller,
-                    callee,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver,
-                    conditional,
-                    lexical_order,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: call_is_awaited(node),
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver,
+                        conditional,
+                        lexical_order,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: call_is_awaited(node),
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
                 self.record_store_ref(node, fn_node, &root, ctx, src);
                 self.record_config_call(node, fn_node, ctx, src);
                 self.record_framework_registration(node, fn_node, ctx, src);

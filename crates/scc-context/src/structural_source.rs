@@ -22,13 +22,19 @@
 //! callee, with that callee's lines nested beneath it.
 
 use crate::ContextCompiler;
-use scc_core::{kinds, predicates, Relationship, StructuralSourceUnit};
+use scc_core::{
+    choose_representation, estimate_tokens, fnv1a64_hex, kinds, predicates, ContentHandle,
+    HandleError, HandleKind, Relationship, RepresentationKind, StructuralSourceUnit,
+};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Representation label for deep structural units.
 const STRUCTURAL: &str = "STRUCTURAL";
 /// Representation label for fallback (signature-only) units.
 const SIGNATURES: &str = "SIGNATURES";
+/// Representation label when exact source is cheaper than the skeleton.
+const EXACT: &str = "EXACT";
 
 /// CFG attributes the indexer writes on symbol entities.
 const ATTR_CALL_ORDER: &str = "call_order";
@@ -359,14 +365,123 @@ fn build_unit(compiler: &ContextCompiler, path: &str) -> Option<StructuralSource
         }
     }
     let content = content.trim_end().to_string();
+    let generated_kind = if deep { STRUCTURAL } else { SIGNATURES };
+    let (content, representation, representation_reason) = apply_representation_policy(
+        &compiler.store.root,
+        path,
+        min_line,
+        max_line,
+        content,
+        generated_kind,
+    );
+    let handle = file_handle(compiler, path);
 
     Some(StructuralSourceUnit {
         path: path.to_string(),
         source: format!("source: {path}:L{min_line}-L{max_line}"),
-        representation: if deep { STRUCTURAL.to_string() } else { SIGNATURES.to_string() },
+        representation,
         revision: compiler.revision(),
         content,
+        handle,
+        representation_reason,
     })
+}
+
+/// Exact-source dominance: never spend more tokens to be clever.
+/// When the file is not on disk (synthetic fixtures), keep the generated
+/// skeleton so tests stay representation-stable.
+// trace:v1 id=impl.scc.structural.exact-dominance work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance
+fn apply_representation_policy(
+    root: &Path,
+    path: &str,
+    min_line: u32,
+    max_line: u32,
+    generated: String,
+    generated_kind: &str,
+) -> (String, String, String) {
+    let Some(exact) = read_exact_span(root, path, min_line, max_line) else {
+        return (generated, generated_kind.to_string(), String::new());
+    };
+    let choice = choose_representation(estimate_tokens(&exact), estimate_tokens(&generated));
+    match choice.kind {
+        RepresentationKind::Exact => (exact, EXACT.to_string(), choice.reason),
+        RepresentationKind::Structural | RepresentationKind::Signatures => {
+            (generated, generated_kind.to_string(), choice.reason)
+        }
+    }
+}
+
+fn read_exact_span(root: &Path, path: &str, start: u32, end: u32) -> Option<String> {
+    if start == 0 {
+        return None;
+    }
+    let text = std::fs::read_to_string(root.join(path)).ok()?;
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let n = (i + 1) as u32;
+        if n > end {
+            break;
+        }
+        if n >= start {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.trim_end().to_string())
+    }
+}
+
+fn file_handle(compiler: &ContextCompiler, path: &str) -> String {
+    let bytes = std::fs::read(compiler.store.root.join(path)).unwrap_or_default();
+    let hash = if bytes.is_empty() {
+        String::new()
+    } else {
+        fnv1a64_hex(&bytes)
+    };
+    ContentHandle::for_file(
+        &compiler.store.repo_id,
+        &compiler.revision(),
+        path,
+        &hash,
+    )
+    .to_string()
+}
+
+/// Resolve a repository-relative path or an `scc://` handle to a path.
+/// Stale handles refuse; the file is left unread. Never guesses a target.
+// trace:v1 id=impl.scc.structural.resolve-handle work=WORK-ripwire-lessons-phase1 satisfies=REQ-stable-content-handles
+pub fn resolve_handle_to_path(root: &Path, spec: &str) -> Result<String, String> {
+    if !spec.starts_with("scc://") {
+        return Ok(spec.to_string());
+    }
+    let h = ContentHandle::parse(spec).map_err(|e| e.to_string())?;
+    let path = match h.kind {
+        HandleKind::File => h.key.clone(),
+        HandleKind::Symbol => h
+            .key
+            .split_once("::")
+            .map(|(p, _)| p.to_string())
+            .ok_or_else(|| "malformed symbol handle".to_string())?,
+        HandleKind::Span => h
+            .key
+            .split_once(":L")
+            .map(|(p, _)| p.to_string())
+            .ok_or_else(|| "malformed span handle".to_string())?,
+        other => {
+            return Err(format!(
+                "handle kind {} is not a source fetch",
+                other.as_str()
+            ))
+        }
+    };
+    let full = root.join(&path);
+    let bytes = std::fs::read(&full).map_err(|_| format!("handle target missing: {path}"))?;
+    h.refuse_if_stale(&fnv1a64_hex(&bytes))
+        .map_err(|e: HandleError| e.to_string())?;
+    Ok(path)
 }
 
 /// Build structural-source units for the requested paths (deduped, order
@@ -427,6 +542,16 @@ pub fn render_structural(units: &[StructuralSourceUnit]) -> String {
         out.push_str("representation: ");
         out.push_str(&u.representation);
         out.push('\n');
+        if !u.representation_reason.is_empty() {
+            out.push_str("reason: ");
+            out.push_str(&u.representation_reason);
+            out.push('\n');
+        }
+        if !u.handle.is_empty() {
+            out.push_str("handle: ");
+            out.push_str(&u.handle);
+            out.push('\n');
+        }
         out.push_str("revision: ");
         out.push_str(&u.revision);
         out.push_str("\n\n");
@@ -733,5 +858,41 @@ mod tests {
         assert_eq!(units[0].path, "app.py");
         let units = structural_source(&c, &["app.py".to_string()], 0);
         assert!(units.is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.structural.exact-dominance verifies=REQ-exact-source-dominance exercises=impl.scc.structural.exact-dominance
+    fn exact_wins_when_on_disk_body_is_cheaper() {
+        let (_d, store, graph) = fixture();
+        let mut body = String::new();
+        for _ in 1..10 {
+            body.push('\n');
+        }
+        body.push_str("def handler(x: str) -> str:\n    return worker()\n");
+        std::fs::write(store.root.join("app.py"), body).unwrap();
+        let c = compiler(&store, &graph);
+        let units = structural_source(&c, &["app.py".to_string()], 10);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].representation, "EXACT");
+        assert_eq!(units[0].representation_reason, "exact_body_cheaper_than_structural");
+        assert!(units[0].content.contains("def handler"), "{}", units[0].content);
+        assert!(!units[0].handle.is_empty(), "handle must be stamped when file exists");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.structural.handle-stale verifies=REQ-stable-content-handles exercises=impl.scc.structural.resolve-handle
+    fn stale_handle_refuses_without_guessing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.py"), "print(1)\n").unwrap();
+        let fresh = ContentHandle::for_file("r", "e", "a.py", &fnv1a64_hex(b"print(1)\n"));
+        assert_eq!(
+            resolve_handle_to_path(root, &fresh.to_string()).unwrap(),
+            "a.py"
+        );
+        let stale = ContentHandle::for_file("r", "e", "a.py", "aaaaaaaaaaaaaaaa");
+        let err = resolve_handle_to_path(root, &stale.to_string()).unwrap_err();
+        assert!(err.contains("stale"), "{err}");
+        assert_eq!(resolve_handle_to_path(root, "a.py").unwrap(), "a.py");
     }
 }

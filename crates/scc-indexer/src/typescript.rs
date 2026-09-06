@@ -372,19 +372,23 @@ impl LanguageExtractor for TypeScriptExtractor {
                 let seq = call_seq.entry(ctx.caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = ts_call_cfg(node);
-                out.calls.push(Call {
-                    caller: ctx.caller.clone(),
-                    callee: callee.clone(),
-                    line,
-                    known_receiver: known_receiver(&function),
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: ts_call_is_awaited(node, &callee),
-                    returns_value: ts_call_returns_value(node),
-                });
+                out.calls.push(
+                    Call {
+                        caller: ctx.caller.clone(),
+                        callee: callee.clone(),
+                        line,
+                        known_receiver: known_receiver(&function),
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: ts_call_is_awaited(node, &callee),
+                        returns_value: ts_call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
             }
             _ => {}
         }

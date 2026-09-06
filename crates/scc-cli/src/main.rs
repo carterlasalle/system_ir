@@ -46,6 +46,9 @@ enum Commands {
     /// Show index status, stats, and freshness
     Status,
 
+    /// Print the generated language-support matrix (from the registry)
+    Languages,
+
     /// Watch the filesystem and re-index changed files
     Watch,
 
@@ -577,6 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Status => commands::cmd_status(&root),
+        Commands::Languages => commands::cmd_languages(),
         Commands::Watch => commands::cmd_watch(&root),
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {

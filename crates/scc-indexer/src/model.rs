@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use scc_core::{RecvKind, ReferenceKind};
 
 /// A source file handed to an extractor.
 #[derive(Debug, Clone)]
@@ -130,6 +131,20 @@ pub struct Call {
     /// Whether the callee root is a local/imported binding or something
     /// unknown (e.g. an arbitrary member on a parameter).
     pub known_receiver: bool,
+    /// Receiver shape recovered from the callee expression (or stamped by
+    /// the extractor). Default `Unknown` is filled by [`Call::finish`].
+    #[serde(default)]
+    pub recv: RecvKind,
+    /// Last identifier in a `root.field.method` chain when classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_name: Option<String>,
+    /// CALL by default. Imports/types/macros must not use this.
+    #[serde(default)]
+    pub role: ReferenceKind,
     /// Whether the call sits inside a conditional/loop/try body (if/else/
     /// for/while/try/with/match) within its enclosing function — the ONLY
     /// evidence that turns call fanout into control-flow branching.
@@ -163,6 +178,30 @@ pub struct Call {
     /// rather than discarded as a bare expression statement.
     #[serde(default)]
     pub returns_value: bool,
+}
+
+impl Call {
+    /// Fill receiver classification from the callee string when the
+    /// extractor did not stamp a more precise `recv`.
+    pub fn finish(mut self) -> Self {
+        let fact = crate::recv::classify_callee(&self.callee);
+        if self.recv == RecvKind::Unknown {
+            self.recv = fact.recv;
+        }
+        if self.qualifier.is_none() {
+            self.qualifier = fact.qualifier;
+        }
+        if self.recv_var.is_none() {
+            self.recv_var = fact.recv_var;
+        }
+        if self.field_name.is_none() {
+            self.field_name = fact.field_name;
+        }
+        if self.role == ReferenceKind::Call && fact.role != ReferenceKind::Call {
+            self.role = fact.role;
+        }
+        self
+    }
 }
 
 /// An HTTP route declaration.
