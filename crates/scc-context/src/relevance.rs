@@ -5,8 +5,9 @@
 
 use crate::rank::ScoredEntity;
 use scc_core::{
-    entity_id, kinds, predicates, relevance_hits, route_query, LexDoc, QueryShape, RankingArm,
-    WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
+    entity_id, kinds, predicates, relevance_hits, relevance_hits_with_stats, route_query,
+    Bm25CorpusStats, LexDoc, QueryShape, RankingArm, WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME,
+    WEIGHT_PATH,
 };
 use scc_graph::TrustedGraphView;
 use std::collections::HashSet;
@@ -73,13 +74,14 @@ fn entity_to_doc(e: &scc_core::Entity) -> LexDoc {
 /// Graph expansion, when requested, is tagged `graph-expand` and is not
 /// added into the BM25 number. Co-change and doc-mention extras are
 /// inspectable reasons with score 0.0 — never fused into BM25.
-// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-cochange-retrieval-evidence,REQ-declared-mentions
+// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-cochange-retrieval-evidence,REQ-declared-mentions,REQ-bm25-persist
 pub fn collect_relevance_candidates(
     view: &TrustedGraphView,
     query: &str,
     limit: usize,
     arm: RankingArm,
     repo_root: Option<&Path>,
+    corpus: Option<&Bm25CorpusStats>,
 ) -> Vec<ScoredEntity> {
     if matches!(arm, RankingArm::ProductionBlended | RankingArm::NoLexical) {
         return Vec::new();
@@ -96,7 +98,10 @@ pub fn collect_relevance_candidates(
         .filter(|e| RELEVANCE_KINDS.contains(&e.kind.as_str()))
         .collect();
     let docs: Vec<LexDoc> = entities.iter().map(|e| entity_to_doc(e)).collect();
-    let mut hits = relevance_hits(query, &docs);
+    let mut hits = match corpus {
+        Some(stats) => relevance_hits_with_stats(query, &docs, stats),
+        None => relevance_hits(query, &docs),
+    };
 
     if arm == RankingArm::QueryRouted {
         match shape {
@@ -378,6 +383,7 @@ mod tests {
             8,
             RankingArm::ProductionBlended,
             None,
+            None,
         );
         assert!(empty.is_empty(), "production arm must not silently switch to BM25");
         let hits = collect_relevance_candidates(
@@ -385,6 +391,7 @@ mod tests {
             "handleList",
             8,
             RankingArm::LexicalThenGraph,
+            None,
             None,
         );
         assert_eq!(hits[0].name, "handleList");
@@ -399,7 +406,7 @@ mod tests {
             sym("s:hit", "handleList", "src/server.ts", ""),
         ]);
         let view = scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
-        let hits = collect_relevance_candidates(&view, "handleList", 8, RankingArm::QueryRouted, None);
+        let hits = collect_relevance_candidates(&view, "handleList", 8, RankingArm::QueryRouted, None, None);
         assert_eq!(hits[0].id, "s:hit");
         assert_eq!(hits[0].reason, "anchor");
     }
@@ -438,6 +445,7 @@ mod tests {
             "handleList",
             16,
             RankingArm::LexicalThenGraph,
+            None,
             None,
         );
         let doc = hits
@@ -519,6 +527,7 @@ mod tests {
             16,
             RankingArm::LexicalThenGraph,
             Some(&root),
+            None,
         );
         assert!(
             with.iter()
@@ -536,6 +545,7 @@ mod tests {
             16,
             RankingArm::NoCochange,
             Some(&root),
+            None,
         );
         assert!(
             without
@@ -543,5 +553,55 @@ mod tests {
                 .all(|h| !h.reason.starts_with("cochange")),
             "NoCochange must omit co-change evidence: {without:?}"
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.bm25-corpus-idf verifies=REQ-bm25-persist exercises=impl.scc.core.bm25-warm-hits,impl.scc.context.relevance-collect
+    fn experimental_lens_uses_persisted_corpus_idf_not_slice() {
+        let (_d, store, graph) = indexed_view(vec![
+            sym("s:a", "handleList", "src/a.ts", "list handler"),
+            sym("s:b", "other", "src/b.ts", "unrelated"),
+            sym("s:c", "handleThing", "src/c.ts", ""),
+        ]);
+        let view =
+            scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
+        let docs: Vec<LexDoc> = view
+            .entities()
+            .filter(|e| e.kind == kinds::SYMBOL)
+            .map(entity_to_doc)
+            .collect();
+        let stats = Bm25CorpusStats::from_docs(&docs);
+        let one = vec![docs
+            .iter()
+            .find(|d| d.id == "s:a")
+            .cloned()
+            .expect("s:a")];
+        let slice_hits = relevance_hits("handleList", &one);
+        let corpus_hits = relevance_hits_with_stats("handleList", &one, &stats);
+        assert!(
+            (slice_hits[0].bm25 - corpus_hits[0].bm25).abs() > 1e-12,
+            "corpus IDF must differ from 1-doc slice IDF"
+        );
+        let prod = collect_relevance_candidates(
+            &view,
+            "handleList",
+            8,
+            RankingArm::ProductionBlended,
+            None,
+            Some(&stats),
+        );
+        assert!(
+            prod.is_empty(),
+            "production arm must ignore persisted BM25 even when stats are supplied"
+        );
+        let hits = collect_relevance_candidates(
+            &view,
+            "handleList",
+            8,
+            RankingArm::LexicalThenGraph,
+            None,
+            Some(&stats),
+        );
+        assert_eq!(hits[0].name, "handleList");
     }
 }

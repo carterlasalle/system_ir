@@ -135,6 +135,12 @@ pub fn run_retrieval_benchmark(
         let config = crate::load_config(&root).map_err(|e| e.to_string())?;
         let comp = crate::compiler(&store, &config, Vec::new()).map_err(|e| e.to_string())?;
         let ctx = comp.ctx();
+        let bm25 = ctx
+            .store
+            .meta_get("bm25_corpus")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<scc_core::Bm25CorpusStats>(&raw).ok());
 
         for task in tasks {
             let gold = gold_keys(&task.ground_truth);
@@ -142,7 +148,14 @@ pub fn run_retrieval_benchmark(
                 continue;
             }
             for arm in arms {
-                let ranked = ranked_keys_for_arm(&ctx, &root, &task.goal, *arm, k.max(10));
+                let ranked = ranked_keys_for_arm(
+                    &ctx,
+                    &root,
+                    &task.goal,
+                    *arm,
+                    k.max(10),
+                    bm25.as_ref(),
+                );
                 let r1 = recall_at_k(&ranked, &gold, 1);
                 let r5 = recall_at_k(&ranked, &gold, 5);
                 let r10 = recall_at_k(&ranked, &gold, 10);
@@ -203,6 +216,7 @@ fn ranked_keys_for_arm(
     goal: &str,
     arm: RankingArm,
     limit: usize,
+    corpus: Option<&scc_core::Bm25CorpusStats>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -247,7 +261,7 @@ fn ranked_keys_for_arm(
         return out;
     }
     let hits = scc_context::relevance::collect_relevance_candidates(
-        &ctx.view, goal, limit, arm, Some(root),
+        &ctx.view, goal, limit, arm, Some(root), corpus,
     );
     for h in hits {
         let file = ctx

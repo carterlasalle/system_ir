@@ -46,7 +46,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 | Task packs | Adaptive sections; critical never cut; dropped_sections disclosed. | Fixed quotas (rank 40 / bodies 30 / callers 15 / notes 5 / tests 10) + rollover; bodies last. | Simple robust allocation; tests_to_run. | Atlas + contracts + provenance in the pack. | Benchmark both | Budget allocator abstraction (Phase 3). Do not assume adaptive wins. | Silent cap. | Truncation disclosure tests. | P5 / P6 / Phase 3 |
 | Change-risk / git | Co-change CLI exists (`cmd_cochange`); git revision on snapshot. | gitmine, cochange, whereis, stray_content, merge_scout, dirty-tree situ. | Mature change intelligence. | Semantic impact (contracts/state/flows) possible. | Selective | Co-change as historical evidence, never override current semantics. Forgotten partners in impact_context. Skip generic git utilities. | History overriding truth. | Co-change fixtures. | P4 / P15 / Phase 2–3 |
 | tests_to_run | Tests extracted; tested_by relink on change. Pack lists tests with reasons (`direct` / `import` / `contract` / `state`). | `testmap.h` + pack `tests_to_run`. | Actionable verify list with reasons. | Can reason via contracts/state/flows. | Yes | Phase 3: tests_to_run with reasons (direct, contract, state, import). Filename-only is not a reason. | Filename-only lists. | Behavioral fixtures. | P16 / Phase 3 |
-| Tests / evals | 21-task corpus; atlas recall; `scc bench retrieval`; `scc bench loop` (baseline vs SCC vs Ripwire locator, clustered stats). | locbench, agentloop (baseline / ripwire_cli / ripwire_skills), contamination, clustered stats. | Real LLM agent-loop. | Stronger semantic corpus + Atlas GT + always-runnable locator loop. | Mandatory add | Keep 21-task. Locator loop now; LLM agent-loop still needed for product claims. | Contamination; model substitution. | Multi-seed, clustered stats, resolved primary. | P20 / Phase 5 |
+| Tests / evals | 21-task corpus; atlas recall; `scc bench retrieval` (measured arms); `scc bench loop` vs **real** Ripwire `--pack-task` (clustered). LLM/SWE-bench agent-loop still missing (no agent runtime in this env). | locbench, agentloop (baseline / ripwire_cli / ripwire_skills), contamination, clustered stats. | Real LLM agent-loop. | Semantic corpus + Atlas GT + locator vs live Ripwire. | Mandatory add | Locator measured; LLM agent-loop still needed before product claims. | Contamination; model substitution. | Multi-seed, clustered stats, resolved primary. | P20 / Phase 5 |
 | BM25 / lexical | **Now:** experimental BM25 lens + persisted `bm25_corpus` meta (n/avgdl/df/dl). Production fused ranker **unchanged**. | Custom BM25: camel/snake split, field weights, persisted stats, top-K prune. | Measured retrieval; persisted stats. | Semantic + graph + Atlas. | Yes as separate lens | Implemented tokenizer+BM25+router+persist; do not fuse into PPR without ablation evidence. | Embeddings cargo-cult; silent fusion. | Acronym pins; BM25 determinism; production arm emits nothing from BM25 lens. | P3 / Phase 2 |
 | Anchors / mentions | Goal terms / explicit files/symbols. No doc→symbol mention index. | Query anchors; doc mentions. | Name-first when the query names a symbol. | Heterogeneous anchors (component, route, contract, …). | Yes | Phase 2: resolve anchor first; mentions as DECLARED evidence, degradable. | Docs as truth. | Mention vs code contradiction tests. | P4 / Phase 2 / P33 |
 | Symbol-addressed edits | None. | replace_symbol_body / insert_before/after; stale hash refuses; file lock. | Agent can edit by symbol. | Receipt could include contracts/state/tests. | Evaluate first | Do **not** add in Phase 1. If later: refuse stale/malformed; byte-identical on refuse; reindex; semantic receipt. | Races, silent wrong target. | Byte-identity on refuse; stale handle. | P9 hold |
@@ -82,7 +82,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - Symbol-addressed edits — reliability/races not evaluated (P9).
 - C/C++/ObjC/… extractors — classification≠support; add with fixtures only.
 - Tree-sitter `.scm` rewrite of working semantic walkers — Phase 4 evaluation.
-- SWE-bench agent-loop — Phase 5 (mandatory before product claims).
+- SWE-bench / LLM agent-loop — locator vs Ripwire is measured; LLM repair success is still required before product claims.
 - Copying Ripwire quality/linter commands.
 
 <!-- trace:exempt reason=document-structure -->
@@ -96,7 +96,8 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - Markdown backticks become `DECLARED_AS` (provenance DECLARED), never CALLS, never PPR.
 - Co-change partners are inspectable relevance candidates (`cochange` / `cochange-surprise`); `NoCochange` skips them.
 - `scc bench retrieval` reports Recall@1/5/10 and MRR over `benchmarks/tasks.json` gold. Production fused ranker is unchanged.
-- BM25 corpus stats persist in store meta (`bm25_corpus`); warm scores on the full corpus match cold. Not fused into production ranking.
+- BM25 corpus stats persist in store meta (`bm25_corpus`); experimental arms score with corpus IDF when meta is present. Production `build_surface` does not read this meta.
+- Measured 21-task ablation (`benchmarks/results/ripwire-lessons-retrieval-arms.json`): lexical-then-graph MRR 0.831 / R@10 0.561; production-blended MRR 0.645 / R@10 0.594. Mixed — **do not switch production**.
 
 <!-- trace:exempt reason=document-structure -->
 ## Phase 3 started (task context)
@@ -113,7 +114,8 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 <!-- trace:exempt reason=document-structure -->
 ## Phase 5 started (agent loop)
 
-- `scc bench loop` compares baseline (lexical file overlap) vs SCC `task_context` vs black-box Ripwire `--pack-task`. Metrics are clustered by fixture repo. Missing Ripwire is `skipped`, not a win. Substitution rate is 1.0 for the SCC locator arm and 0.0 for baseline.
+- `scc bench loop` compares baseline (lexical file overlap) vs SCC `task_context` vs black-box Ripwire `--pack-task`. Metrics are clustered by fixture repo. Missing Ripwire is `skipped`, not a win. CLI also searches `/tmp/vendor/ripwire/build*` (not in unit tests).
+- Measured 21-task locator run with a real Ripwire binary (`benchmarks/results/ripwire-lessons-locator-loop.json`): clustered localization baseline 0.948, SCC 1.000, Ripwire 0.722 (status `ran`). This is pack file-name localization, **not** an LLM/SWE-bench agent-loop.
 
 <!-- trace:exempt reason=document-structure -->
 ## Phase 6 started (system moat)

@@ -446,11 +446,43 @@ fn resolve_ripwire(explicit: Option<&Path>) -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    let vendored = PathBuf::from("/tmp/vendor/ripwire/build/ripwire");
-    if vendored.is_file() {
-        return Some(vendored);
+    // Unit tests must not depend on a machine-local vendor tree. CLI and
+    // `cargo run` still search known build dirs so a present binary is
+    // measured instead of silently skipped.
+    if !cfg!(test) {
+        for cand in [
+            "/tmp/vendor/ripwire/build/ripwire",
+            "/tmp/vendor/ripwire/build-gxx/ripwire",
+        ] {
+            let p = PathBuf::from(cand);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        if let Some(p) = scan_ripwire_builds() {
+            return Some(p);
+        }
     }
     which("ripwire")
+}
+
+// trace:exempt reason=internal-detail
+fn scan_ripwire_builds() -> Option<PathBuf> {
+    let root = Path::new("/tmp/vendor/ripwire");
+    let rd = std::fs::read_dir(root).ok()?;
+    let mut bins: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("build"))
+        })
+        .map(|p| p.join("ripwire"))
+        .filter(|p| p.is_file())
+        .collect();
+    bins.sort();
+    bins.into_iter().next()
 }
 
 // trace:exempt reason=internal-detail
@@ -563,6 +595,40 @@ mod tests {
         let pooled = 4.0 / 5.0;
         assert!((c - 0.5f64).abs() < 1e-9, "clustered={c}");
         assert!((pooled - 0.8f64).abs() < 1e-9);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.bench-loop-ripwire verifies=REQ-agent-loop-three-way exercises=impl.scc.cli.bench-loop
+    fn agent_loop_ripwire_runs_when_binary_is_configured() {
+        let gxx = PathBuf::from("/tmp/vendor/ripwire/build-gxx/ripwire");
+        let cmake = PathBuf::from("/tmp/vendor/ripwire/build/ripwire");
+        let bin = if gxx.is_file() {
+            Some(gxx)
+        } else if cmake.is_file() {
+            Some(cmake)
+        } else {
+            None
+        };
+        let opts = LoopOptions {
+            k: 10,
+            repo_filter: Some("http-service-python".into()),
+            ripwire_bin: bin,
+        };
+        let summary = run_agent_loop(&[LoopArm::Ripwire], &opts).expect("loop");
+        let rw = summary
+            .arms
+            .iter()
+            .find(|a| a.arm == "ripwire")
+            .expect("ripwire arm");
+        if summary.ripwire_bin.is_some() {
+            assert_eq!(
+                rw.status, "ran",
+                "a present Ripwire binary must be scored, never skipped as an SCC win"
+            );
+            assert!(rw.tasks > 0);
+        } else {
+            assert_eq!(rw.status, "skipped");
+        }
     }
 
     #[test]

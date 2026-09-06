@@ -955,10 +955,31 @@ pub fn is_exact_anchor(query: &str, name: &str) -> bool {
 }
 
 /// Score documents with BM25 and mark exact anchors. Does not blend PPR.
+/// Uses candidate-set IDF (cold). Prefer [`relevance_hits_with_stats`] when
+/// corpus-wide stats are persisted.
 // trace:exempt reason=internal-detail
 pub fn relevance_hits(query: &str, docs: &[LexDoc]) -> Vec<RelevanceHit> {
+    relevance_hits_from_scores(query, docs, bm25_scores(query, docs))
+}
+
+/// Same as [`relevance_hits`] but BM25 uses persisted corpus IDF/`avgdl`.
+/// Experimental lens only — production `build_surface` must not call this.
+// trace:v1 id=impl.scc.core.bm25-warm-hits work=WORK-ripwire-lessons-phase2 satisfies=REQ-bm25-persist
+pub fn relevance_hits_with_stats(
+    query: &str,
+    docs: &[LexDoc],
+    stats: &Bm25CorpusStats,
+) -> Vec<RelevanceHit> {
+    relevance_hits_from_scores(query, docs, bm25_scores_with_stats(query, docs, stats))
+}
+
+// trace:exempt reason=internal-detail
+fn relevance_hits_from_scores(
+    query: &str,
+    docs: &[LexDoc],
+    scores: Vec<f64>,
+) -> Vec<RelevanceHit> {
     let shape = classify_query(query);
-    let scores = bm25_scores(query, docs);
     let mentions = extract_query_mentions(query);
     let mut hits: Vec<RelevanceHit> = docs
         .iter()
@@ -1201,6 +1222,14 @@ mod tests {
         assert_eq!(cold.len(), warm.len());
         for (c, w) in cold.iter().zip(warm.iter()) {
             assert!((c - w).abs() < 1e-9, "cold={c} warm={w}");
+        }
+        let cold_hits = relevance_hits("handleList", &docs);
+        let warm_hits = relevance_hits_with_stats("handleList", &docs, &stats);
+        assert_eq!(cold_hits.len(), warm_hits.len());
+        for (c, w) in cold_hits.iter().zip(warm_hits.iter()) {
+            assert_eq!(c.id, w.id);
+            assert_eq!(c.exact_anchor, w.exact_anchor);
+            assert!((c.bm25 - w.bm25).abs() < 1e-9);
         }
         let subset = vec![docs[0].clone()];
         let subset_cold = bm25_scores("handleList", &subset);
