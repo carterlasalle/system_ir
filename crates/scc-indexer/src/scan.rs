@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// trace:exempt reason=internal-detail
 pub enum Language {
     Python,
     TypeScript,
@@ -74,6 +75,7 @@ impl Language {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// trace:exempt reason=internal-detail
 pub enum FileKind {
     Source,
     Test,
@@ -354,7 +356,9 @@ mod tests {
                 continue;
             }
             assert!(
-                scc_core::language_by_id(lang.as_str()).is_some(),
+                scc_core::language_registry()
+                    .iter()
+                    .any(|c| c.id == lang.as_str()),
                 "scan Language::{} missing from LANGUAGE_REGISTRY",
                 lang.as_str()
             );

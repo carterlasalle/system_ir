@@ -837,7 +837,7 @@ mod tests {
         for e in idx.store.all_entities().unwrap() {
             if e.kind == scc_core::kinds::FILE {
                 assert!(
-                    e.attributes.get("analysis_quality").is_none(),
+                    !e.attributes.contains_key("analysis_quality"),
                     "gauges must not live on FILE entities (breaks incremental≡cold): {}",
                     e.id
                 );

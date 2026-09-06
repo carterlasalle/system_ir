@@ -14,8 +14,8 @@ pub mod resolution;
 
 pub use handles::{fnv1a64_hex, ContentHandle, HandleError, HandleKind};
 pub use languages::{
-    extracted_language_ids, language_by_id, support_matrix_markdown, LanguageCapability,
-    LanguageTier, LANGUAGE_REGISTRY,
+    extracted_language_ids, language_by_id, language_registry, support_matrix_markdown,
+    LanguageCapability, LanguageTier, LANGUAGE_REGISTRY,
 };
 pub use resolution::{
     choose_representation, AnalysisQuality, CallQuality, FileQuality, RecvKind,
@@ -1277,6 +1277,13 @@ pub mod predicates {
     ];
 }
 
+/// Authoritative kind and predicate ids. Rankers, exporters, and tests
+/// must derive from these slices rather than a second hand-maintained list.
+// trace:v1 id=impl.scc.core.ontology-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-ontology-single-source
+pub fn ontology_registries() -> (&'static [&'static str], &'static [&'static str]) {
+    (kinds::ALL, predicates::ALL)
+}
+
 // ---------------------------------------------------------------------------
 // Token budgeting
 // ---------------------------------------------------------------------------
@@ -2232,10 +2239,11 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.core.predicate-registry-complete verifies=REQ-ontology-single-source exercises=impl.scc.core.language-registry
+    // trace:v1 id=test.scc.core.predicate-registry-complete verifies=REQ-ontology-single-source exercises=impl.scc.core.ontology-registry
     fn predicate_and_kind_registries_are_complete() {
         // Mutation gate: dropping DEFINES/COMPOSES/EXPORTS from ALL used to
         // compile while ranking/export silently omitted those edges.
+        let (kind_ids, predicate_ids) = ontology_registries();
         for required in [
             predicates::DEFINES,
             predicates::COMPOSES,
@@ -2248,16 +2256,16 @@ mod tests {
             predicates::OCCURS,
         ] {
             assert!(
-                predicates::ALL.contains(&required),
+                predicate_ids.contains(&required),
                 "predicates::ALL missing {required}"
             );
         }
         for required in [kinds::FIELD, kinds::SCHEMA, kinds::TRUST_BOUNDARY, kinds::OCCURRENCE]
         {
-            assert!(kinds::ALL.contains(&required), "kinds::ALL missing {required}");
+            assert!(kind_ids.contains(&required), "kinds::ALL missing {required}");
         }
         let mut seen = std::collections::BTreeSet::new();
-        for p in predicates::ALL {
+        for p in predicate_ids {
             assert!(seen.insert(*p), "duplicate predicate in ALL: {p}");
         }
     }

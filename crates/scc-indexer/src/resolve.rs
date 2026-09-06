@@ -896,7 +896,7 @@ mod tests {
         let db_sym = mk_symbol("db", SymbolKind::Const);
         idx.add_file("db.ts", &[db_sym]);
         let handle = mk_symbol("handleList", SymbolKind::Function);
-        idx.add_file("server.ts", &[handle.clone()]);
+        idx.add_file("server.ts", std::slice::from_ref(&handle));
         let imports = vec![ResolvedImport {
             local_file: "server.ts".into(),
             module: "./db".into(),

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Honest support tier. Parsing syntax is not "supported".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// trace:exempt reason=internal-detail
 pub enum LanguageTier {
     /// Semantic/deep: symbols, refs, routes/state/contracts when present.
     SemanticDeep,
@@ -33,6 +34,7 @@ impl LanguageTier {
 
 /// Capability flags for one language. Generated surfaces must read these
 /// rather than assuming "we have a parser, therefore we extract X".
+// trace:exempt reason=internal-detail
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LanguageCapability {
     pub id: &'static str,
@@ -63,7 +65,6 @@ pub struct LanguageCapability {
 /// Keep `id` identical to [`crate` scan `Language::as_str`] for languages
 /// the indexer classifies. Languages listed here but not classified are
 /// honest "not indexed" rows.
-// trace:v1 id=impl.scc.core.language-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-language-support-matrix
 pub const LANGUAGE_REGISTRY: &[LanguageCapability] = &[
     cap("python", "Python", LanguageTier::SemanticDeep, &["py", "pyi"], &[], true, true, true, true, true, true, true, true, false, false, false, true, true, true, true, "procedural tree-sitter; store R/W not SSA"),
     cap("typescript", "TypeScript", LanguageTier::SemanticDeep, &["ts", "tsx", "mts", "cts"], &[], true, true, true, true, true, true, true, true, false, true, false, true, true, true, true, "TS/TSX; implements→REGISTERS not INHERITS"),
@@ -92,7 +93,15 @@ pub const LANGUAGE_REGISTRY: &[LanguageCapability] = &[
     cap("kotlin", "Kotlin", LanguageTier::IndexSearch, &["kt", "kts"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "not classified by scan yet"),
 ];
 
+/// Authoritative language-support rows. Scan, CLI `scc languages`, and
+/// tests must read this rather than a second hand-maintained list.
+// trace:v1 id=impl.scc.core.language-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-language-support-matrix
+pub fn language_registry() -> &'static [LanguageCapability] {
+    LANGUAGE_REGISTRY
+}
+
 #[allow(clippy::too_many_arguments)]
+// trace:exempt reason=internal-detail
 const fn cap(
     id: &'static str,
     display: &'static str,
@@ -141,12 +150,14 @@ const fn cap(
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn language_by_id(id: &str) -> Option<&'static LanguageCapability> {
-    LANGUAGE_REGISTRY.iter().find(|c| c.id == id)
+    language_registry().iter().find(|c| c.id == id)
 }
 
+// trace:exempt reason=internal-detail
 pub fn extracted_language_ids() -> Vec<&'static str> {
-    LANGUAGE_REGISTRY
+    language_registry()
         .iter()
         .filter(|c| c.extractor)
         .map(|c| c.id)
@@ -154,11 +165,12 @@ pub fn extracted_language_ids() -> Vec<&'static str> {
 }
 
 /// Markdown table generated from the registry (docs/CLI must not duplicate).
+// trace:exempt reason=internal-detail
 pub fn support_matrix_markdown() -> String {
     let mut out = String::from(
         "| Language | Tier | Extractor | Defs | Calls | Fields | Imports | Routes | Tests | Notes |\n|---|---|---|---|---|---|---|---|---|---|\n",
     );
-    for c in LANGUAGE_REGISTRY {
+    for c in language_registry() {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             c.display,
@@ -193,7 +205,7 @@ mod tests {
     // trace:v1 id=test.scc.core.language-registry-unique verifies=REQ-language-support-matrix exercises=impl.scc.core.language-registry
     fn registry_ids_are_unique_and_extracted_are_tier_a() {
         let mut ids = BTreeSet::new();
-        for c in LANGUAGE_REGISTRY {
+        for c in language_registry() {
             assert!(ids.insert(c.id), "duplicate language id {}", c.id);
             if c.extractor {
                 assert_eq!(
