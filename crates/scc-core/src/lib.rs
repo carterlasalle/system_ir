@@ -10,12 +10,18 @@ pub const SCHEMA_VERSION: &str = "0.1.0";
 
 pub mod handles;
 pub mod languages;
+pub mod lex;
 pub mod resolution;
 
 pub use handles::{fnv1a64_hex, ContentHandle, HandleError, HandleKind};
 pub use languages::{
     extracted_language_ids, language_by_id, language_registry, support_matrix_markdown,
     LanguageCapability, LanguageTier, LANGUAGE_REGISTRY,
+};
+pub use lex::{
+    bm25_rank, bm25_scores, classify_query, is_exact_anchor, ranking_arm_ids, relevance_hits,
+    route_query, subtokens, LexDoc, LexField, QueryLocus, QueryShape, RankingArm, RelevanceHit,
+    RetrievalPlan, BM25_B, BM25_K1, WEIGHT_BODY, WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
 };
 pub use resolution::{
     choose_representation, AnalysisQuality, CallQuality, FileQuality, RecvKind,

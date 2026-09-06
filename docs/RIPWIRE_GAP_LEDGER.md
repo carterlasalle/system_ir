@@ -47,7 +47,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 | Change-risk / git | Co-change CLI exists (`cmd_cochange`); git revision on snapshot. | gitmine, cochange, whereis, stray_content, merge_scout, dirty-tree situ. | Mature change intelligence. | Semantic impact (contracts/state/flows) possible. | Selective | Co-change as historical evidence, never override current semantics. Forgotten partners in impact_context. Skip generic git utilities. | History overriding truth. | Co-change fixtures. | P4 / P15 / Phase 2–3 |
 | tests_to_run | Tests extracted; tested_by relink on change. Pack lists tests weakly. | `testmap.h` + pack `tests_to_run`. | Actionable verify list with reasons. | Can reason via contracts/state/flows. | Yes | Phase 3: tests_to_run with reasons (direct, contract, state, co-change, e2e). | Filename-only lists. | Behavioral fixtures. | P16 / Phase 3 |
 | Tests / evals | Deterministic 21-task behavioral corpus; atlas recall; resolution bench; golden incremental. | locbench, agentloop (baseline / ripwire_cli / ripwire_skills), contamination, clustered stats. | Real agent-loop outcomes. | Stronger semantic corpus + Atlas GT. | Mandatory add | Keep 21-task. Add SWE-bench-style agent-loop vs baseline + Ripwire (Phase 5). | Contamination; model substitution. | Multi-seed, clustered stats, resolved primary. | P20 / Phase 5 |
-| BM25 / lexical | Lexical candidates exist in ranker; not a persisted BM25 index with field weights. | Custom BM25: camel/snake split, field weights, persisted stats, top-K prune. | Measured retrieval. | Semantic + graph. | Yes as separate lens | Implement/study in Phase 2; don't import a library blindly; don't fuse into PPR without evidence. | Embeddings cargo-cult. | Ablations E (no lexical) vs B. | P3 / Phase 2 |
+| BM25 / lexical | **Now:** experimental `scc-core` subtoken BM25 lens (name/path/doc/body weights, k1=1.5, b=0.75) + query-shape router + RankingArm A–I. Production fused ranker **unchanged**. | Custom BM25: camel/snake split, field weights, persisted stats, top-K prune. | Measured retrieval; persisted stats. | Semantic + graph + Atlas. | Yes as separate lens | Implemented tokenizer+BM25+router; do not fuse into PPR without ablation evidence. Persist stats later. | Embeddings cargo-cult; silent fusion. | Acronym pins; BM25 determinism; production arm emits nothing from BM25 lens. | P3 / Phase 2 |
 | Anchors / mentions | Goal terms / explicit files/symbols. No doc→symbol mention index. | Query anchors; doc mentions. | Name-first when the query names a symbol. | Heterogeneous anchors (component, route, contract, …). | Yes | Phase 2: resolve anchor first; mentions as DECLARED evidence, degradable. | Docs as truth. | Mention vs code contradiction tests. | P4 / Phase 2 / P33 |
 | Symbol-addressed edits | None. | replace_symbol_body / insert_before/after; stale hash refuses; file lock. | Agent can edit by symbol. | Receipt could include contracts/state/tests. | Evaluate first | Do **not** add in Phase 1. If later: refuse stale/malformed; byte-identical on refuse; reindex; semantic receipt. | Races, silent wrong target. | Byte-identity on refuse; stale handle. | P9 hold |
 | Agent reflex / skills | Startup context injection; Claude/Codex/OMP plugins. | skills/hooks/wrap; pilot showed overhead can **increase** tokens. | Aggressive default tool use. | Automatic startup Task Context. | Measure | Prefer SCC before grep; measure substitution rate. Don't assume more instructions win. | Token bloat. | SCC_calls / (SCC + native reads). | P19 / Phase 5 |
@@ -85,7 +85,17 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - SWE-bench agent-loop — Phase 5 (mandatory before product claims).
 - Copying Ripwire quality/linter commands.
 
-## Working order (unchanged)
+<!-- trace:exempt reason=document-structure -->
+## Phase 2 started (retrieval lenses; production ranker unchanged)
+
+- Subtoken tokenizer (ACRONYMWord, min length 2) + BM25 field weights as named constants.
+- Query-shape router (conservative: one `path:line` is not a stack trace).
+- RankingArm A–I; `collect_relevance_candidates` returns empty for ProductionBlended.
+- Exact-name anchors are a boolean, not mixed into the BM25 number.
+- Not yet: persisted lexical stats, mentions/co-change ranking, production switch, retrieval Recall@k harness over holdout gold.
+
+<!-- trace:exempt reason=document-structure -->
+## Working order
 
 1. Truth foundation (this PR)
 2. Retrieval (BM25, routing, anchors, mentions, co-change, ablations)
