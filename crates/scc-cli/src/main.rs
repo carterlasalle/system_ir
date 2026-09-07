@@ -829,7 +829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             scc_cli::benchloop::print_loop_summary(&summary);
                         }
-                        let gate_fail = if min_delta != 0.0 {
+                        let gate_fail = {
                             let base = summary.arms.iter().find(|a| a.arm == "baseline");
                             let scc = summary.arms.iter().find(|a| a.arm == "scc");
                             match (base, scc) {
@@ -844,8 +844,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 _ => None,
                             }
-                        } else {
-                            None
                         };
                         match gate_fail {
                             Some(msg) => Err(scc_cli::CliError::Other(msg)),

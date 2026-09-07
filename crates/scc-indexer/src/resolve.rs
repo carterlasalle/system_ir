@@ -912,10 +912,11 @@ fn has_fn_bind(binds: &[FnBind], scope: Option<&str>, var: &str) -> bool {
     binds.iter().any(|b| b.scope == scope && b.name == var)
 }
 
-/// Unique in-repo Function named `name`. Local Function wins; a local
-/// non-function symbol or import binding vetoes the rest of the repo.
-/// Two same-named Functions across files stay unresolved. Classes are
-/// never pins (constructor aliases are out of scope).
+/// Unique in-repo Function named `name`, or Const with a signature
+/// (TypeScript function-valued `const helper = () => {}`). Local hit
+/// wins; a local non-callable symbol or import binding vetoes the rest
+/// of the repo. Two same-named callables across files stay unresolved.
+/// Classes and signature-less consts (`LIMIT = 10`) are never pins.
 fn unique_function_id(
     index: &SymbolIndex,
     local_path: &str,
@@ -927,7 +928,7 @@ fn unique_function_id(
     }
     if let Some(fs) = index.files.get(local_path) {
         if let Some((sym, id)) = fs.by_name.get(name) {
-            return (sym.kind == SymbolKind::Function).then(|| id.clone());
+            return is_fn_alias_target(sym).then(|| id.clone());
         }
     }
     if let Some((target_file, exported)) = binding.get(name) {
@@ -936,14 +937,14 @@ fn unique_function_id(
         }
         let fs = index.files.get(target_file.as_str())?;
         let (sym, id) = fs.by_name.get(exported.as_str())?;
-        return (sym.kind == SymbolKind::Function).then(|| id.clone());
+        return is_fn_alias_target(sym).then(|| id.clone());
     }
     let mut found: Option<String> = None;
     for fs in index.files.values() {
         let Some((sym, id)) = fs.by_name.get(name) else {
             continue;
         };
-        if sym.kind != SymbolKind::Function {
+        if !is_fn_alias_target(sym) {
             continue;
         }
         if found.as_ref().is_some_and(|existing| existing != id) {
@@ -952,6 +953,10 @@ fn unique_function_id(
         found = Some(id.clone());
     }
     found
+}
+
+fn is_fn_alias_target(sym: &Symbol) -> bool {
+    sym.kind == SymbolKind::Function || (sym.kind == SymbolKind::Const && sym.signature.is_some())
 }
 
 /// Unique type for `(scope, var)` or None when missing / tombstoned (≥2 types).
@@ -3649,5 +3654,49 @@ class Svc {
             .find(|c| c.callee_name == "f")
             .expect("f()");
         assert_eq!(hit.callee_id, None, "two helpers must not spray");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.fn-alias-const verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.resolve.fn-alias
+    fn ts_function_valued_const_pins_and_limit_does_not() {
+        use crate::model::{LanguageExtractor, SourceFile, SymbolKind};
+        use crate::typescript::TypeScriptExtractor;
+        let src = "const helper = () => 1;\nconst LIMIT = 10;\nfunction f() { return 2; }\nfunction run() {\n  const g = helper;\n  g();\n}\nfunction bad() {\n  const h = LIMIT;\n  h();\n}\n";
+        let ef = TypeScriptExtractor::default().extract(&SourceFile::new("w.ts", src));
+        let helper = ef
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!(helper.kind, SymbolKind::Const);
+        assert!(helper.signature.is_some(), "function-valued const needs a signature");
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.ts", &ef.symbols);
+        idx.set_fn_binds("w.ts", &ef.fn_binds);
+        let resolved = resolve_calls("w.ts", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let run_id = scc_core::symbol_id("repo", "w.ts", "run");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "g" && c.caller_id == run_id)
+            .expect("run g()");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.ts", "helper"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.ts", "f")),
+            "must not spray to a same-named global function"
+        );
+        assert_eq!(hit.class, ResolutionClass::ResolvedInternal);
+        let bad_id = scc_core::symbol_id("repo", "w.ts", "bad");
+        let h = resolved
+            .iter()
+            .find(|c| c.callee_name == "h" && c.caller_id == bad_id)
+            .expect("bad h()");
+        assert_eq!(
+            h.callee_id, None,
+            "signature-less const LIMIT must not pin"
+        );
     }
 }

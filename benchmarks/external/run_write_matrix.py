@@ -177,6 +177,8 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
     except Exception as exc:
         task_success, eval_err = False, f"evaluator-crash: {type(exc).__name__}: {exc}"[:300]
     run_completion = (row.get("run_completion_rate") or 0) >= 1.0
+    infra = not run_completion
+    err = eval_err or ("agent-run-incomplete" if infra else None)
     return {
         "task_success": task_success,
         "run_completion": run_completion,
@@ -184,9 +186,9 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
         "patch_produced": (row.get("patch_rate") or 0) > 0,
         "modified_files": 0,
         "wall_sec": float(row.get("mean_wall_sec") or 0.0),
-        "error": eval_err,
+        "error": err,
         "error_type": ("evaluator-infrastructure" if eval_err else
-                       ("agent-infrastructure" if not run_completion else None)),
+                       ("agent-infrastructure" if infra else None)),
         "evaluator_structural": task.get("structural", False),
     }
 

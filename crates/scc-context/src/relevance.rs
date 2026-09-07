@@ -74,7 +74,7 @@ fn entity_to_doc(e: &scc_core::Entity) -> LexDoc {
 /// Graph expansion, when requested, is tagged `graph-expand` and is not
 /// added into the BM25 number. Co-change and doc-mention extras are
 /// inspectable reasons with score 0.0 — never fused into BM25.
-// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-cochange-retrieval-evidence,REQ-declared-mentions,REQ-bm25-persist
+// trace:v1 id=impl.scc.context.relevance-collect work=WORK-ripwire-lessons-phase2 satisfies=REQ-ranking-arms-inspectable,REQ-exact-anchors,REQ-query-mentions,REQ-cochange-retrieval-evidence,REQ-declared-mentions,REQ-bm25-persist,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn collect_relevance_candidates(
     view: &TrustedGraphView,
     query: &str,
@@ -83,7 +83,14 @@ pub fn collect_relevance_candidates(
     repo_root: Option<&Path>,
     corpus: Option<&Bm25CorpusStats>,
 ) -> Vec<ScoredEntity> {
-    if matches!(arm, RankingArm::ProductionBlended | RankingArm::NoLexical) {
+    if matches!(
+        arm,
+        RankingArm::ProductionBlended
+            | RankingArm::NoLexical
+            | RankingArm::NoTaskPpr
+            | RankingArm::NoGlobalPpr
+    ) {
+        // PPR ablations run through `build_surface_staged`, not this BM25 lens.
         return Vec::new();
     }
     let plan = route_query(query);
@@ -115,7 +122,10 @@ pub fn collect_relevance_candidates(
             QueryShape::StackTrace | QueryShape::ErrorMessage => {
                 if plan.prefer_locus && !plan.loci.is_empty() {
                     let paths: Vec<&str> = plan.loci.iter().map(|l| l.path.as_str()).collect();
-                    for (e, hit) in entities.iter().zip(hits.iter_mut()) {
+                    for hit in hits.iter_mut() {
+                        let Some(e) = view.entity(&hit.id) else {
+                            continue;
+                        };
                         let file = attr_str(e, "file");
                         if paths.iter().any(|p| file.ends_with(p) || file == *p) {
                             hit.exact_anchor = true;
@@ -175,7 +185,9 @@ pub fn collect_relevance_candidates(
         arm,
         RankingArm::ProductionBlended | RankingArm::NoLexical
     ) {
-        attach_doc_mention_evidence(view, &mut out, limit);
+        if arm != RankingArm::NoSemantic {
+            attach_doc_mention_evidence(view, &mut out, limit);
+        }
         if arm != RankingArm::NoCochange {
             if let Some(root) = repo_root {
                 attach_cochange_evidence(view, &mut out, root, limit);
@@ -396,6 +408,44 @@ mod tests {
         );
         assert_eq!(hits[0].name, "handleList");
         assert_eq!(hits[0].reason, "anchor");
+        for arm in [RankingArm::NoTaskPpr, RankingArm::NoGlobalPpr] {
+            let empty = collect_relevance_candidates(&view, "handleList", 8, arm, None, None);
+            assert!(
+                empty.is_empty(),
+                "{arm:?} is a surface-pipeline ablation, not this BM25 lens"
+            );
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.relevance-locus-by-id verifies=REQ-exact-anchors,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.context.relevance-collect
+    fn stack_locus_matches_hits_by_entity_id() {
+        let (_d, store, graph) = indexed_view(vec![
+            sym("s:noise", "alpha", "src/other.py", ""),
+            sym("s:hit", "beta", "src/app.py", ""),
+        ]);
+        let view =
+            scc_graph::TrustedGraphView::new(&graph, &store, &[], scc_graph::TrustPolicy::default());
+        let query = "Traceback (most recent call last):\n  File \"src/app.py\", line 11, in inner\nValueError: boom\n";
+        let hits = collect_relevance_candidates(
+            &view,
+            query,
+            8,
+            RankingArm::QueryRouted,
+            None,
+            None,
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.id == "s:hit")
+            .expect("locus file must remain a hit");
+        assert_eq!(hit.reason, "anchor");
+        assert!(
+            hits.iter()
+                .filter(|h| h.id == "s:noise")
+                .all(|h| h.reason != "anchor"),
+            "unrelated file must not inherit locus from a positional zip: {hits:?}"
+        );
     }
 
     #[test]
@@ -457,6 +507,19 @@ mod tests {
         let bm25_hit = hits.iter().find(|h| h.name == "handleList").unwrap();
         assert!(bm25_hit.score >= 0.0);
         assert_ne!(bm25_hit.reason, "doc-mention");
+        let nosem = collect_relevance_candidates(
+            &view,
+            "handleList",
+            16,
+            RankingArm::NoSemantic,
+            None,
+            None,
+        );
+        assert!(
+            nosem.iter().all(|h| h.reason != "doc-mention"),
+            "NoSemantic must skip doc-mention extras: {nosem:?}"
+        );
+        assert!(nosem.iter().any(|h| h.name == "handleList"));
     }
 
     // trace:exempt reason=test-helper

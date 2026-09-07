@@ -1015,6 +1015,9 @@ fn collect_task_paths(
         }
     };
     for f in files {
+        if !crate::repo_path::is_repo_relative(f) {
+            continue;
+        }
         push(f);
     }
     for c in candidates {
@@ -1036,7 +1039,7 @@ fn collect_task_paths(
 
 /// Level-3 exact excerpts for Task Context. Truncation is disclosed
 /// (`shown=`/`total=`/`capped=`). Priority 1 so semantic sections win.
-// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance
+// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 fn exact_source_tail(
     ctx: &ContextCompiler,
     files: &[String],
@@ -1046,7 +1049,7 @@ fn exact_source_tail(
     let mut body = String::new();
     let root = &ctx.store.root;
     for path in &paths {
-        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+        let Some(text) = crate::repo_path::read_repo_text(root, path) else {
             continue;
         };
         let total = text.lines().count();
@@ -1890,7 +1893,7 @@ fn innermost_enclosing_symbol(
 }
 
 /// tests_to_run: test id → reasons (`direct`, `import`, `contract`, `state`).
-// trace:v1 id=impl.scc.context.tests-to-run work=WORK-ripwire-lessons-phase3 satisfies=REQ-tests-to-run-reasons
+// trace:v1 id=impl.scc.context.tests-to-run work=WORK-ripwire-lessons-phase3 satisfies=REQ-tests-to-run-reasons,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 fn collect_tests_to_run(
     ctx: &crate::ContextCompiler,
     affected_syms: &HashSet<&String>,
@@ -1953,13 +1956,13 @@ fn collect_tests_to_run(
     }
     let mut state_ids: BTreeSet<String> = BTreeSet::new();
     for sid in owned_stores {
-        if ctx.view.entity(sid).map(|e| e.kind.as_str()) == Some(kinds::STATE) {
+        if is_state_like(ctx.view.entity(sid).map(|e| e.kind.as_str())) {
             state_ids.insert(sid.clone());
         }
     }
     for cid in affected_comps {
         for r in ctx.view.out_pred(cid, scc_core::predicates::OWNS) {
-            if ctx.view.entity(&r.object).map(|e| e.kind.as_str()) == Some(kinds::STATE) {
+            if is_state_like(ctx.view.entity(&r.object).map(|e| e.kind.as_str())) {
                 state_ids.insert(r.object.clone());
             }
         }
@@ -1982,6 +1985,19 @@ fn collect_tests_to_run(
         }
     }
     tests
+}
+
+// trace:exempt reason=internal-detail
+fn is_state_like(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some(kinds::STATE)
+            | Some(kinds::DATA_STORE)
+            | Some(kinds::DATA_ENTITY)
+            | Some(kinds::TABLE)
+            | Some(kinds::COLLECTION)
+            | Some(kinds::CACHE)
+    )
 }
 
 // trace:exempt reason=internal-detail
@@ -2055,6 +2071,37 @@ mod tests {
     use super::*;
     use scc_core::{Entity, Provenance, Relationship};
     use scc_store::Store;
+
+    #[test]
+    // trace:v1 id=test.scc.context.task-files-sandbox verifies=REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.context.repo-sandbox,impl.scc.context.exact-source-last
+    fn task_context_files_stay_inside_the_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.py"), "IN_REPO = 1\n").unwrap();
+        std::fs::write(dir.path().join("secret.py"), "OUTSIDE_SECRET = 1\n").unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let body = exact_source_tail(
+            &ctx,
+            &[
+                "ok.py".into(),
+                "../secret.py".into(),
+                "/etc/passwd".into(),
+            ],
+            &[],
+        );
+        assert!(body.contains("IN_REPO"), "{body}");
+        assert!(!body.contains("OUTSIDE_SECRET"), "{body}");
+        assert!(!body.contains("/etc/passwd"), "{body}");
+        assert!(!body.contains("secret.py"), "{body}");
+    }
 
     #[test]
     // trace:v1 id=test.scc.context.tests-to-run verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
@@ -2276,6 +2323,79 @@ mod tests {
         let comps: BTreeSet<String> = [comp].into_iter().collect();
         let found = collect_tests_to_run(&ctx, &HashSet::new(), &comps, &BTreeSet::new());
         let reasons = found.get(&tid).expect("state READS must list the test");
+        assert!(reasons.contains("state"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-store verifies=REQ-tests-to-run-reasons,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_state_reason_for_data_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let comp = "comp:orders".to_string();
+        let st = "store:orders_db".to_string();
+        let tid = "t:store".to_string();
+        store
+            .insert_entity(
+                &Entity::new(&comp, kinds::COMPONENT, "orders"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_entity(
+                &Entity::new(&st, kinds::DATA_STORE, "orders_db"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_orders_store");
+        te.attr("file", serde_json::json!("tests/test_store.py"));
+        store
+            .insert_entity(&te, &["tests/test_store.py".into()])
+            .unwrap();
+        store
+            .insert_test(
+                &tid,
+                "test_orders_store",
+                "tests/test_store.py",
+                "unit",
+                None,
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:owns-store",
+                    comp.clone(),
+                    scc_core::predicates::OWNS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:rd-store",
+                    tid.clone(),
+                    scc_core::predicates::READS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_store.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let comps: BTreeSet<String> = [comp].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &HashSet::new(), &comps, &BTreeSet::new());
+        let reasons = found.get(&tid).expect("store READS must list the test");
         assert!(reasons.contains("state"));
     }
 

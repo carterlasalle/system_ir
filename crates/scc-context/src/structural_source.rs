@@ -415,7 +415,7 @@ fn read_exact_span(root: &Path, path: &str, start: u32, end: u32) -> Option<Stri
     if start == 0 {
         return None;
     }
-    let text = std::fs::read_to_string(root.join(path)).ok()?;
+    let text = crate::repo_path::read_repo_text(root, path)?;
     let mut out = String::new();
     for (i, line) in text.lines().enumerate() {
         let n = (i + 1) as u32;
@@ -436,11 +436,9 @@ fn read_exact_span(root: &Path, path: &str, start: u32, end: u32) -> Option<Stri
 
 // trace:exempt reason=internal-detail
 pub(crate) fn file_handle(compiler: &ContextCompiler, path: &str) -> String {
-    let bytes = std::fs::read(compiler.store.root.join(path)).unwrap_or_default();
-    let hash = if bytes.is_empty() {
-        String::new()
-    } else {
-        fnv1a64_hex(&bytes)
+    let hash = match crate::repo_path::read_repo_file(&compiler.store.root, path) {
+        Some(bytes) => fnv1a64_hex(&bytes),
+        None => String::new(),
     };
     ContentHandle::for_file(
         &compiler.store.repo_id,
@@ -478,8 +476,8 @@ pub fn resolve_handle_to_path(root: &Path, spec: &str) -> Result<String, String>
             ))
         }
     };
-    let full = root.join(&path);
-    let bytes = std::fs::read(&full).map_err(|_| format!("handle target missing: {path}"))?;
+    let bytes = crate::repo_path::read_repo_file(root, &path)
+        .ok_or_else(|| format!("handle target missing: {path}"))?;
     h.refuse_if_stale(&fnv1a64_hex(&bytes))
         .map_err(|e: HandleError| e.to_string())?;
     Ok(path)
@@ -895,5 +893,20 @@ mod tests {
         let err = resolve_handle_to_path(root, &stale.to_string()).unwrap_err();
         assert!(err.contains("stale"), "{err}");
         assert_eq!(resolve_handle_to_path(root, "a.py").unwrap(), "a.py");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.structural.empty-handle-hash verifies=REQ-stable-content-handles,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.structural.resolve-handle
+    fn empty_file_handle_is_not_a_wildcard() {
+        let (_d, store, graph) = fixture();
+        std::fs::write(store.root.join("empty.py"), b"").unwrap();
+        let c = compiler(&store, &graph);
+        let rendered = file_handle(&c, "empty.py");
+        let parsed = ContentHandle::parse(&rendered).expect("handle");
+        let empty_hash = fnv1a64_hex(b"");
+        assert_eq!(parsed.content_hash, empty_hash);
+        assert!(!parsed.content_hash.is_empty());
+        assert!(parsed.matches_content(&empty_hash));
+        assert!(!parsed.matches_content(&fnv1a64_hex(b"later\n")));
     }
 }

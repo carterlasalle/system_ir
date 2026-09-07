@@ -5,4 +5,4 @@
 <!-- trace:exempt reason=document-structure -->
 ## Steps
 
-- Implement: Phase 25 of SCC x Ripwire lessons: absorb extract-time function-alias binds for bare f(). Ripwire fnPtrBindingTarget is C/C++/ObjC only and fires before Rule 1: unique var=function ident pins f() to t…
+- Implement: Phase 25 of SCC x Ripwire lessons: absorb extract-time function-alias binds for bare f(). Unique `f = helper` pins bare `f()` to the unique in-repo Function or Const that has a signature (TypeScript function-valued const; `const LIMIT = 10` is not a pin). Do not retag arrows as Function.

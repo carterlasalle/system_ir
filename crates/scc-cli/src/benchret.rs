@@ -89,7 +89,7 @@ fn keys_for_hit(kind: &str, name: &str, file: &str) -> Vec<String> {
 }
 
 /// Run retrieval eval. `repo_filter` limits to one fixture repo id.
-// trace:v1 id=impl.scc.cli.bench-retrieval work=WORK-ripwire-lessons-phase2 satisfies=REQ-retrieval-eval
+// trace:v1 id=impl.scc.cli.bench-retrieval work=WORK-ripwire-lessons-phase2 satisfies=REQ-retrieval-eval,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn run_retrieval_benchmark(
     k: usize,
     arms: &[RankingArm],
@@ -155,6 +155,7 @@ pub fn run_retrieval_benchmark(
                     *arm,
                     k.max(10),
                     bm25.as_ref(),
+                    &gold,
                 );
                 let r1 = recall_at_k(&ranked, &gold, 1);
                 let r5 = recall_at_k(&ranked, &gold, 5);
@@ -210,6 +211,71 @@ pub fn run_retrieval_benchmark(
 }
 
 // trace:exempt reason=internal-detail
+fn push_entity_rank(
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    keys: Vec<String>,
+    gold: &HashSet<String>,
+) {
+    if let Some(k) = keys.iter().find(|k| gold.contains(*k)) {
+        push_key(out, seen, k.clone());
+    } else if let Some(k) = keys.into_iter().next() {
+        push_key(out, seen, k);
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn ranked_keys_from_surface(
+    ctx: &scc_context::ContextCompiler<'_>,
+    goal: &str,
+    stages: &scc_context::SurfacePipelineStages,
+    gold: &HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let budget = 8000usize;
+    let request = scc_context::surface::SurfaceRequest {
+        mode: scc_context::surface::SurfaceMode::Task {
+            goal,
+            visible: None,
+        },
+        budget,
+        explain: false,
+        policy: scc_context::surface::SurfacePolicy::defaults(budget),
+        semantic: None,
+    };
+    let result = scc_context::build_surface_staged(ctx, request, stages);
+    let map = scc_context::surface::compile_surface_map(ctx);
+    for id in &result.rendered_ids {
+        if let Some(e) = map.entries.iter().find(|ent| &ent.id == id) {
+            let qn = e
+                .qualified_name
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(&e.qualified_name);
+            let mut keys = keys_for_hit("symbol", qn, &e.path);
+            if let Some(c) = &e.component {
+                keys.push(format!("component:{c}"));
+            }
+            push_entity_rank(&mut out, &mut seen, keys, gold);
+        } else if let Some(ent) = ctx.view.entity(id) {
+            let file = ent
+                .attributes
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            push_entity_rank(
+                &mut out,
+                &mut seen,
+                keys_for_hit(&ent.kind, &ent.name, file),
+                gold,
+            );
+        }
+    }
+    out
+}
+
+// trace:exempt reason=internal-detail
 fn ranked_keys_for_arm(
     ctx: &scc_context::ContextCompiler<'_>,
     root: &Path,
@@ -217,49 +283,35 @@ fn ranked_keys_for_arm(
     arm: RankingArm,
     limit: usize,
     corpus: Option<&scc_core::Bm25CorpusStats>,
+    gold: &HashSet<String>,
 ) -> Vec<String> {
+    match arm {
+        RankingArm::ProductionBlended => {
+            return ranked_keys_from_surface(
+                ctx,
+                goal,
+                &scc_context::SurfacePipelineStages::default(),
+                gold,
+            );
+        }
+        RankingArm::NoTaskPpr => {
+            let stages = scc_context::SurfacePipelineStages {
+                task_ppr: false,
+                ..scc_context::SurfacePipelineStages::default()
+            };
+            return ranked_keys_from_surface(ctx, goal, &stages, gold);
+        }
+        RankingArm::NoGlobalPpr => {
+            let stages = scc_context::SurfacePipelineStages {
+                global_ppr: false,
+                ..scc_context::SurfacePipelineStages::default()
+            };
+            return ranked_keys_from_surface(ctx, goal, &stages, gold);
+        }
+        _ => {}
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    if arm == RankingArm::ProductionBlended {
-        let budget = 8000usize;
-        let request = scc_context::surface::SurfaceRequest {
-            mode: scc_context::surface::SurfaceMode::Task {
-                goal,
-                visible: None,
-            },
-            budget,
-            explain: false,
-            policy: scc_context::surface::SurfacePolicy::defaults(budget),
-            semantic: None,
-        };
-        let result = scc_context::build_surface(ctx, request);
-        let map = scc_context::surface::compile_surface_map(ctx);
-        for id in &result.rendered_ids {
-            if let Some(e) = map.entries.iter().find(|ent| &ent.id == id) {
-                let qn = e
-                    .qualified_name
-                    .rsplit(['.', ':'])
-                    .next()
-                    .unwrap_or(&e.qualified_name);
-                for k in keys_for_hit("symbol", qn, &e.path) {
-                    push_key(&mut out, &mut seen, k);
-                }
-                if let Some(c) = &e.component {
-                    push_key(&mut out, &mut seen, format!("component:{c}"));
-                }
-            } else if let Some(ent) = ctx.view.entity(id) {
-                let file = ent
-                    .attributes
-                    .get("file")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                for k in keys_for_hit(&ent.kind, &ent.name, file) {
-                    push_key(&mut out, &mut seen, k);
-                }
-            }
-        }
-        return out;
-    }
     let hits = scc_context::relevance::collect_relevance_candidates(
         &ctx.view, goal, limit, arm, Some(root), corpus,
     );
@@ -270,9 +322,12 @@ fn ranked_keys_for_arm(
             .and_then(|e| e.attributes.get("file"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        for k in keys_for_hit(&h.kind, &h.name, file) {
-            push_key(&mut out, &mut seen, k);
-        }
+        push_entity_rank(
+            &mut out,
+            &mut seen,
+            keys_for_hit(&h.kind, &h.name, file),
+            gold,
+        );
     }
     out
 }
@@ -317,5 +372,25 @@ mod tests {
             "lexical lens must retrieve some gold on the fixture: {lex:?}"
         );
         assert!(lex.mrr >= 0.0);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.retrieval-entity-rank verifies=REQ-retrieval-eval,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.cli.bench-retrieval
+    fn entity_aliases_occupy_one_rank_slot() {
+        let gold: HashSet<String> = ["file:src/a.py".into()].into_iter().collect();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        push_entity_rank(
+            &mut out,
+            &mut seen,
+            vec![
+                "symbol:handleList".into(),
+                "file:src/a.py".into(),
+                "file:a.py".into(),
+            ],
+            &gold,
+        );
+        assert_eq!(out, vec!["file:src/a.py".to_string()]);
+        assert_eq!(recall_at_k(&out, &gold, 1), 1.0);
     }
 }

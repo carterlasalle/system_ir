@@ -632,7 +632,7 @@ fn persist_reconcile_findings(
 
 /// Confirm matching static CALLS with OBSERVED_AS. Never rewrites CALLS
 /// provenance and never invents CALLS for observed-only traffic.
-// trace:v1 id=impl.scc.runtime.observed-upgrade work=WORK-ripwire-lessons-phase6 satisfies=REQ-observed-call-upgrade
+// trace:v1 id=impl.scc.runtime.observed-upgrade work=WORK-ripwire-lessons-phase6 satisfies=REQ-observed-call-upgrade,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn upgrade_observed_calls(store: &Store) -> Result<usize, String> {
     let observed = runtime_edges(store)?;
     if observed.is_empty() {
@@ -668,7 +668,6 @@ pub fn upgrade_observed_calls(store: &Store) -> Result<usize, String> {
                 .iter()
                 .any(|e| e.provenance == Provenance::Observed)
             {
-                upgrades += 1;
                 continue;
             }
             let src_path = store
@@ -1111,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.runtime.observed-upgrade verifies=REQ-observed-call-upgrade exercises=impl.scc.runtime.observed-upgrade
+    // trace:v1 id=test.scc.runtime.observed-upgrade verifies=REQ-observed-call-upgrade,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.runtime.observed-upgrade
     fn observed_upgrades_calls_without_rewriting_extracted() {
         let (store, _dir) = tmp_store();
         store
@@ -1174,6 +1173,11 @@ mod tests {
             !rels.iter().any(|r| r.predicate == predicates::CALLS
                 && (r.subject.contains("web") || r.object.contains("web"))),
             "observed-only traffic must not become CALLS"
+        );
+        let again = reconcile(&store).unwrap();
+        assert_eq!(
+            again.observed_upgrades, 0,
+            "idempotent reconcile must not recount existing OBSERVED_AS: {again:?}"
         );
     }
 

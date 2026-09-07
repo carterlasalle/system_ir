@@ -232,7 +232,7 @@ fn extract_env(_path: &str, content: &str, repo_id: &str, out: &mut ConfigExtrac
 
 /// Parse `service Name { rpc Foo (...) returns (...); }` into CONTRACT
 /// entities. Not an AST extractor — identifier syntax only.
-// trace:v1 id=impl.scc.index.proto-contracts work=WORK-ripwire-lessons-phase6 satisfies=REQ-cross-lang-semantic-bridges
+// trace:v1 id=impl.scc.index.proto-contracts work=WORK-ripwire-lessons-phase6 satisfies=REQ-cross-lang-semantic-bridges,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn extract_proto(path: &str, content: &str, repo_id: &str, out: &mut ConfigExtraction) {
     let mut service: Option<String> = None;
     let mut depth: i32 = 0;
@@ -264,7 +264,7 @@ pub fn extract_proto(path: &str, content: &str, repo_id: &str, out: &mut ConfigE
             );
             out.relationships.push((rel, path.to_string()));
         }
-        if depth <= 0 {
+        if depth <= 0 && parse_proto_service(&line).is_none() {
             service = None;
             depth = 0;
         }
@@ -509,7 +509,7 @@ flows:
     }
 
     #[test]
-    // trace:v1 id=test.scc.index.proto-contracts verifies=REQ-cross-lang-semantic-bridges exercises=impl.scc.index.proto-contracts
+    // trace:v1 id=test.scc.index.proto-contracts verifies=REQ-cross-lang-semantic-bridges,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.index.proto-contracts
     fn proto_rpc_becomes_contract_not_a_call() {
         let content = r#"
 syntax = "proto3";
@@ -532,5 +532,18 @@ service Orders {
             .relationships
             .iter()
             .all(|(r, _)| r.predicate == scc_core::predicates::CONTAINS));
+        let split = extract_config_file(
+            "contracts/orders.proto",
+            "syntax = \"proto3\";\nservice Orders\n{\n  rpc GetOrder (GetOrderRequest) returns (GetOrderResponse);\n}\n",
+            "repo",
+        );
+        assert!(
+            split
+                .entities
+                .iter()
+                .any(|e| e.name == "Orders.GetOrder"),
+            "newline before brace must keep the service: {:?}",
+            split.entities.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        );
     }
 }

@@ -79,7 +79,7 @@ pub fn split_recv_path(callee: &str) -> Vec<String> {
         out.push(cur);
     }
     out.into_iter()
-        .map(|p| p.trim().to_string())
+        .map(|p| p.trim().trim_end_matches('!').trim().to_string())
         .filter(|p| !p.is_empty() && p != "()")
         .collect()
 }
@@ -103,11 +103,33 @@ fn super_recv_root(seg: &str) -> &str {
     }
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Rust/C `ident!` / `ident!(` / `ident![`. TypeScript non-null `expr!.m`
+/// is `!.` and stays a Call.
+// trace:exempt reason=internal-detail
+fn looks_like_macro(callee: &str) -> bool {
+    let b = callee.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'!' && i > 0 && is_ident_byte(b[i - 1]) {
+            let next = b.get(i + 1).copied();
+            if next != Some(b'.') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Classify a callee expression captured by an extractor.
-// trace:v1 id=impl.scc.recv.classify work=WORK-ripwire-lessons-phase1 satisfies=REQ-receiver-aware-resolution
+// trace:v1 id=impl.scc.recv.classify work=WORK-ripwire-lessons-phase1 satisfies=REQ-receiver-aware-resolution,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn classify_callee(callee: &str) -> RecvFact {
     let trimmed = callee.trim();
-    let role = if trimmed.contains('!') {
+    let role = if looks_like_macro(trimmed) {
         ReferenceKind::Macro
     } else {
         ReferenceKind::Call
@@ -238,7 +260,7 @@ mod tests {
     use super::*;
 
     #[test]
-    // trace:v1 id=test.scc.recv.classify-shapes verifies=REQ-receiver-aware-resolution exercises=impl.scc.recv.classify
+    // trace:v1 id=test.scc.recv.classify-shapes verifies=REQ-receiver-aware-resolution,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.recv.classify
     fn classifies_receiver_shapes() {
         let bare = classify_callee("normalize");
         assert_eq!(bare.recv, RecvKind::None);
@@ -284,6 +306,12 @@ mod tests {
         let mac = classify_callee("println!");
         assert_eq!(mac.role, ReferenceKind::Macro);
         assert_eq!(mac.recv, RecvKind::None);
+
+        let ts_nn = classify_callee("client!.load");
+        assert_eq!(ts_nn.role, ReferenceKind::Call);
+        assert_eq!(ts_nn.recv, RecvKind::NamedVariable);
+        assert_eq!(ts_nn.recv_var.as_deref(), Some("client"));
+        assert_eq!(ts_nn.method, "load");
     }
 
     #[test]

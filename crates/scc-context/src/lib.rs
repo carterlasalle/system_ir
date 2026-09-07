@@ -11,6 +11,7 @@ pub mod packs;
 pub mod pagerank;
 pub mod rank;
 pub mod relevance;
+mod repo_path;
 pub mod selector;
 pub mod startup;
 pub mod structural_source;

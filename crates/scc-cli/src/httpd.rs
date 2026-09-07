@@ -296,11 +296,26 @@ pub fn watch_loop(root: &Path) -> crate::Result<()> {
 
 /// Refresh files whose content hash no longer matches the snapshot.
 /// Hash remains authority; used when the OS watcher cannot start.
-// trace:v1 id=impl.scc.cli.hash-sweep work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
+// trace:v1 id=impl.scc.cli.hash-sweep work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn refresh_stale_by_hash(root: &Path) -> crate::Result<Vec<String>> {
     let store = crate::open_store(root)?;
-    let paths = crate::stale_paths(&store)?;
+    let config = crate::load_config(root)?;
+    let mut paths = crate::stale_paths(&store)?;
+    let indexed: std::collections::HashSet<String> = store
+        .all_files()?
+        .into_iter()
+        .map(|(p, _, _, _, _)| p)
+        .collect();
     drop(store);
+    let scanned = scc_indexer::scan::scan_repo(root, &config.index)
+        .map_err(scc_indexer::IndexError::from)?;
+    for f in scanned {
+        if !indexed.contains(&f.path) {
+            paths.push(f.path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
     if !paths.is_empty() {
         crate::commands::cmd_index_paths(root, &paths, true)?;
     }
@@ -385,7 +400,7 @@ mod tests {
     use crate::benchctx::{copy_fixture, locate_fixtures_dir};
 
     #[test]
-    // trace:v1 id=test.scc.cli.hash-sweep verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.cli.hash-sweep
+    // trace:v1 id=test.scc.cli.hash-sweep verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.cli.hash-sweep
     fn hash_sweep_refreshes_edited_file() {
         let fixtures = locate_fixtures_dir().expect("fixtures");
         let src = fixtures.join("behavior-native");
@@ -409,6 +424,34 @@ mod tests {
         assert!(
             crate::stale_paths(&store).unwrap().is_empty(),
             "after sweep the snapshot must match disk"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.hash-sweep-new-file verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.cli.hash-sweep
+    fn hash_sweep_indexes_newly_created_file() {
+        let fixtures = locate_fixtures_dir().expect("fixtures");
+        let src = fixtures.join("behavior-native");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        copy_fixture(&src, &root);
+        crate::commands::cmd_index(&root, true).unwrap();
+        std::fs::write(root.join("fresh.py"), "def fresh():\n    return 1\n").unwrap();
+        let stale = refresh_stale_by_hash(&root).unwrap();
+        assert!(
+            stale.iter().any(|p| p == "fresh.py" || p.ends_with("/fresh.py")),
+            "new file must be in the hash sweep: {stale:?}"
+        );
+        let store = crate::open_store(&root).unwrap();
+        let files: Vec<_> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|(p, _, _, _, _)| p)
+            .collect();
+        assert!(
+            files.iter().any(|p| p == "fresh.py" || p.ends_with("/fresh.py")),
+            "new file must be indexed: {files:?}"
         );
     }
 }

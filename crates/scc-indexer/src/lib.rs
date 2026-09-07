@@ -296,7 +296,7 @@ impl Indexer {
             let content = std::fs::read_to_string(&full).unwrap_or_default();
             let hash = scan::hash_bytes(content.as_bytes());
             writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
-            record_file_quality(&self.store, path, &resolved_calls)?;
+            record_file_quality(&self.store, path, f.language, &resolved_calls)?;
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(
@@ -660,7 +660,7 @@ impl Indexer {
             let content = std::fs::read_to_string(&full).unwrap_or_default();
             let hash = scan::hash_bytes(content.as_bytes());
             writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
-            record_file_quality(&self.store, path, &resolved_calls)?;
+            record_file_quality(&self.store, path, f.language, &resolved_calls)?;
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(
@@ -868,10 +868,18 @@ fn save_quality_files(
 fn record_file_quality(
     store: &Store,
     path: &str,
+    lang: Language,
     calls: &[resolve::ResolvedCall],
 ) -> Result<(), IndexError> {
     let mut q = resolve::quality_from_calls(calls);
-    q.files.parsed = 1;
+    match scc_core::language_by_id(lang.as_str()).map(|c| c.tier) {
+        Some(scc_core::LanguageTier::IndexSearch) | None => {
+            q.files.unsupported = 1;
+        }
+        Some(_) => {
+            q.files.parsed = 1;
+        }
+    }
     let mut map = load_quality_files(store);
     map.insert(path.to_string(), q);
     save_quality_files(store, &map)
@@ -893,7 +901,7 @@ fn apply_doc_mentions(store: &Store) -> Result<(), IndexError> {
 }
 
 /// Fold per-file gauges into one repo-wide snapshot.
-// trace:v1 id=impl.scc.index.persist-analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
+// trace:v1 id=impl.scc.index.persist-analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 fn persist_analysis_quality(store: &Store) -> Result<scc_core::AnalysisQuality, IndexError> {
     let map = load_quality_files(store);
     let mut q = scc_core::AnalysisQuality::default();
@@ -1034,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.index.analysis-quality verifies=REQ-resolution-honesty-gauges exercises=impl.scc.index.persist-analysis-quality
+    // trace:v1 id=test.scc.index.analysis-quality verifies=REQ-resolution-honesty-gauges,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.index.persist-analysis-quality
     fn analysis_quality_persists_and_does_not_label_local_calls_external() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
@@ -1067,6 +1075,14 @@ mod tests {
                 );
             }
         }
+        std::fs::write(root.join("src/util.c"), "int add(int a, int b) { return a + b; }\n")
+            .unwrap();
+        let report = idx.index().unwrap();
+        assert!(
+            report.analysis_quality.files.unsupported >= 1,
+            "IndexSearch C must not count as parsed: {:?}",
+            report.analysis_quality
+        );
     }
 
     #[test]
@@ -2676,5 +2692,44 @@ class Svc {
                 && r.object == cold_helper
         });
         assert!(cold_hit, "cold index must also CALL imported helper");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.fn-alias-const verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.resolve.fn-alias
+    fn index_pins_ts_function_valued_const_alias() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.ts"),
+            "const helper = () => 1;\nconst LIMIT = 10;\nfunction f() { return 2; }\nfunction run() {\n  const g = helper;\n  return g();\n}\nfunction bad() {\n  const h = LIMIT;\n  return h();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let helper = scc_core::symbol_id(&idx.store.repo_id, "w.ts", "helper");
+        let global_f = scc_core::symbol_id(&idx.store.repo_id, "w.ts", "f");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.ts", "run");
+        let bad = scc_core::symbol_id(&idx.store.repo_id, "w.ts", "bad");
+        let rels = idx.store.all_relationships().unwrap();
+        let run_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            run_calls.iter().any(|r| r.object == helper),
+            "run must CALL function-valued const helper: {run_calls:?}"
+        );
+        assert!(
+            !run_calls.iter().any(|r| r.object == global_f),
+            "must not spray to global f: {run_calls:?}"
+        );
+        let bad_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == bad)
+            .collect();
+        assert!(
+            !bad_calls.iter().any(|r| r.object == helper),
+            "LIMIT alias must not pin helper: {bad_calls:?}"
+        );
     }
 }

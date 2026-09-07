@@ -389,14 +389,17 @@ const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 
 /// Refuse a non-empty existing file that is not a SQLite database. Empty
 /// files are a fresh index. Truncation after the header is caught by
-/// `quick_check_existing_db` after open.
-// trace:v1 id=impl.scc.store.refuse-corrupt work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
+/// `probe_existing_schema` after open (not a full `PRAGMA quick_check`).
+// trace:v1 id=impl.scc.store.refuse-corrupt work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
 fn refuse_corrupt_existing_db(path: &Path) -> Result<()> {
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
     if !meta.is_file() || meta.len() == 0 {
         return Ok(());
+    }
+    if meta.len() < 100 {
+        return Err(StoreError::Corrupt("truncated sqlite header".into()));
     }
     let mut f = std::fs::File::open(path).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     let mut magic = [0u8; 16];
@@ -409,15 +412,22 @@ fn refuse_corrupt_existing_db(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Cheap existing-DB probe: the SCC `entities` table must already exist.
+/// Missing schema on a nonempty file is corrupt — do not migrate it into
+/// an empty index. Not a full integrity walk.
 // trace:exempt reason=internal-detail
-fn quick_check_existing_db(conn: &Connection) -> Result<()> {
-    let check: String = conn
-        .query_row("PRAGMA quick_check", [], |r| r.get(0))
-        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    if !check.eq_ignore_ascii_case("ok") {
-        return Err(StoreError::Corrupt(check));
+fn probe_existing_schema(conn: &Connection) -> Result<()> {
+    match conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entities' LIMIT 1",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::Corrupt(
+            "existing database is missing SCC schema".into(),
+        )),
+        Err(e) => Err(StoreError::Corrupt(e.to_string())),
     }
-    Ok(())
 }
 
 // trace:exempt reason=internal-detail
@@ -438,7 +448,7 @@ impl Store {
             Err(e) => return Err(e.into()),
         };
         if existed_nonempty {
-            quick_check_existing_db(&conn)?;
+            probe_existing_schema(&conn)?;
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -901,6 +911,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT source_path FROM relationships
              WHERE source_path != ?1 AND source_path != ''
+               AND predicate IN (?4, ?5)
                AND (
                  object = ?2
                  OR object IN (
@@ -911,7 +922,13 @@ impl Store {
              ORDER BY source_path",
         )?;
         let rows = stmt.query_map(
-            params![path, file_id, scc_core::kinds::SYMBOL],
+            params![
+                path,
+                file_id,
+                scc_core::kinds::SYMBOL,
+                scc_core::predicates::IMPORTS,
+                scc_core::predicates::CALLS
+            ],
             |r| r.get::<_, String>(0),
         )?;
         let mut out = Vec::new();
@@ -2471,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.store.refuse-corrupt verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.store.refuse-corrupt
+    // trace:v1 id=test.scc.store.refuse-corrupt verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.store.refuse-corrupt
     fn truncated_or_garbage_db_refuses_to_open() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2740,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    // trace:exempt reason=internal-detail
+    // trace:v1 id=test.scc.store.paths-depending verifies=REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
     fn paths_depending_on_finds_importers_and_callers() {
         let (s, _d) = tmp_store();
         let repo = s.repo_id.clone();
@@ -2788,6 +2805,23 @@ mod tests {
         let deps = s.paths_depending_on("b.py").unwrap();
         assert_eq!(deps, vec!["a.py".to_string()]);
         assert!(s.paths_depending_on("a.py").unwrap().is_empty());
+        s.insert_relationship(
+            &Relationship::new(
+                "rel:tested",
+                scc_core::symbol_id(&repo, "c.py", "test_it"),
+                scc_core::predicates::TESTED_BY,
+                scc_core::symbol_id(&repo, "b.py", "Order.process"),
+                Provenance::Extracted,
+            ),
+            "c.py",
+        )
+        .unwrap();
+        let deps = s.paths_depending_on("b.py").unwrap();
+        assert_eq!(
+            deps,
+            vec!["a.py".to_string()],
+            "TESTED_BY must not cascade: {deps:?}"
+        );
     }
 
     #[test]

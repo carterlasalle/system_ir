@@ -3860,7 +3860,7 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.extract.typescript.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.typescript.fn-alias
+    // trace:v1 id=test.scc.extract.typescript.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.extract.typescript.fn-alias
     fn function_alias_binds_from_ident_arrow_and_clobber() {
         let ef = extract(
             "app.ts",
@@ -3890,6 +3890,32 @@ mod tests {
             "arrow must tombstone: {:?}",
             ef.fn_binds
         );
+        let const_src = extract(
+            "app.ts",
+            "const helper = () => 1;\nconst LIMIT = 10;\nfunction run() {\n  const f = helper;\n  f();\n}\n",
+        );
+        let helper = const_src
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!(helper.kind, SymbolKind::Const);
+        assert!(helper.signature.is_some());
+        assert!(
+            const_src
+                .fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "const helper alias missing: {:?}",
+            const_src.fn_binds
+        );
+        let limit = const_src
+            .symbols
+            .iter()
+            .find(|s| s.name == "LIMIT")
+            .expect("LIMIT");
+        assert_eq!(limit.kind, SymbolKind::Const);
+        assert_eq!(limit.signature, None);
     }
 
     #[test]

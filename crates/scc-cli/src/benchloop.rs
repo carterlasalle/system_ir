@@ -121,7 +121,7 @@ pub struct LoopOptions {
 
 /// Run the three-way locator loop. `min_delta` is unused here (measure-only
 /// in tests); the CLI applies it after printing.
-// trace:v1 id=impl.scc.cli.bench-loop work=WORK-ripwire-lessons-phase5 satisfies=REQ-agent-loop-three-way
+// trace:v1 id=impl.scc.cli.bench-loop work=WORK-ripwire-lessons-phase5 satisfies=REQ-agent-loop-three-way,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn run_agent_loop(arms: &[LoopArm], opts: &LoopOptions) -> Result<LoopSummary, String> {
     let k = opts.k.max(1);
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
@@ -831,6 +831,14 @@ fn run_ripwire(bin: &Path, root: &Path, goal: &str) -> Result<String, String> {
         Err(e) => return Err(format!("ripwire spawn: {e}")),
     };
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if !out.status.success() {
+        return Err(format!(
+            "ripwire status {} stderr={} stdout={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+            stdout
+        ));
+    }
     if stdout.trim().is_empty() {
         return Err(format!(
             "ripwire empty stdout (status {}): {}",
