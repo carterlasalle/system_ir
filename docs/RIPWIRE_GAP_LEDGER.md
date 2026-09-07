@@ -188,6 +188,11 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 - Unique Go `x := v.(*Order)` / `y := Order(v)` (simple type only; generic `fs[i](3)` is not a bind), unique Rust `let y = v as Order`, and unique TypeScript `const y = v as Order` / `const z = <Order>v` pin `x.Process()` / `x.process()` when that method exists. Two types tombstone. Longer chains stay unresolved. Opaque factory calls still do not mint a bind. EXTRACTED provenance. Binds extract-time only.
 
 <!-- trace:exempt reason=document-structure -->
+## Phase 17 started (Python identifier RHS copy)
+
+- Unique Python `y = x` when `x` is a uniquely typed local or parameter pins `y.m()` to that type when the method exists. Two types tombstone. A later conflicting constructor assignment is tombstone fuel. Longer chains stay unresolved. EXTRACTED provenance. Binds extract-time only.
+
+<!-- trace:exempt reason=document-structure -->
 ## Working order
 
 1. Truth foundation (this PR)
@@ -206,3 +211,4 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 14. Rust self-field assignment tombstone
 15. Go/Rust local and param type narrowing
 16. Type assertion / conversion / cast as Rule 2 fuel (Go, Rust, TypeScript)
+17. Python identifier RHS copy bind (`x = y` when `y` is uniquely typed)

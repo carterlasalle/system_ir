@@ -1274,6 +1274,49 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.index.python.ident-copy verifies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident exercises=impl.scc.extract.python.ident-copy
+    fn index_pins_python_ident_copy_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "class Order:\n    def process(self):\n        return 1\n\nclass Invoice:\n    def process(self):\n        return 2\n\ndef handle(x: Order):\n    y = x\n    return y.process()\n\ndef mixed():\n    z = Order()\n    w = z\n    w = Invoice()\n    return w.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let mixed = scc_core::symbol_id(&idx.store.repo_id, "w.py", "mixed");
+        let rels = idx.store.all_relationships().unwrap();
+        let handle_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            handle_calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.process: {handle_calls:?}"
+        );
+        assert!(
+            !handle_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {handle_calls:?}"
+        );
+        let mixed_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == mixed)
+            .collect();
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == order),
+            "conflicting copy/ctor must not pin Order.process: {mixed_calls:?}"
+        );
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process from mixed: {mixed_calls:?}"
+        );
+    }
+
+    #[test]
     // trace:v1 id=test.scc.index.field-type-narrow verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
     fn index_pins_self_field_call_to_field_type() {
         let dir = tempfile::TempDir::new().unwrap();

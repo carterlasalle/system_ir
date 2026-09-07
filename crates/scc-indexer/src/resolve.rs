@@ -1396,6 +1396,38 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.python.ident-copy verifies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident exercises=impl.scc.extract.python.ident-copy
+    fn python_ident_copy_pin_and_tombstone() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let src = "class Order:\n    def process(self):\n        pass\nclass Invoice:\n    def process(self):\n        pass\ndef handle(x: Order):\n    y = x\n    y.process()\n    y.inner.process()\ndef mixed():\n    z = Order()\n    w = z\n    w = Invoice()\n    w.process()\n";
+        let ef = PythonExtractor::default().extract(&SourceFile::new("w.py", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.py", &ef.symbols);
+        idx.set_type_binds("w.py", &ef.type_binds);
+        let resolved = resolve_calls("w.py", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let handle_id = scc_core::symbol_id("repo", "w.py", "handle");
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.process" && c.caller_id == handle_id)
+            .expect("y.process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let w = resolved
+            .iter()
+            .find(|c| c.callee_name == "w.process")
+            .expect("w.process");
+        assert_eq!(w.callee_id, None, "conflicting copy/ctor must not pin");
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.field-type-narrow verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
     fn unique_field_type_pins_self_field_method() {
         let mut idx = SymbolIndex::new("repo");

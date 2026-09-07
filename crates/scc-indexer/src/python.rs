@@ -538,6 +538,18 @@ fn constructor_type_name(right: Node, src: &[u8]) -> Option<String> {
     }
 }
 
+/// `Order()` / uniquely typed ident (`x = y`).
+// trace:v1 id=impl.scc.extract.python.ident-copy work=WORK-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co satisfies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident implements=PLAN-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co
+fn python_rhs_type_name(n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    if let Some(ty) = constructor_type_name(n, src) {
+        return Some(ty);
+    }
+    if n.kind() == "identifier" {
+        return ctx.unique_local_type(&clean(node_text(Some(n), src)));
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -1579,7 +1591,7 @@ impl PythonExtractor {
                         }
                     }
                     if let Some(r) = right {
-                        if let Some(ty) = constructor_type_name(r, src) {
+                        if let Some(ty) = python_rhs_type_name(r, src, ctx) {
                             ctx.push_type_bind(name, ty, line);
                         }
                     }
@@ -3673,6 +3685,31 @@ class QueryBuilder:
                 .any(|b| b.type_name == "process" || b.name == "self"),
             "must not bind methods or self: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.ident-copy verifies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident exercises=impl.scc.extract.python.ident-copy
+    fn identifier_rhs_copy_binds_from_unique_source() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\ndef handle(x: Order):\n    y = x\n    y.process()\n\ndef mixed():\n    z = Order()\n    w = z\n    w = Invoice()\n    w.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "ident copy bind missing: {:?}",
+            ef.type_binds
+        );
+        let w: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "w")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            w.contains(&"Order") && w.contains(&"Invoice"),
+            "conflicting copy/ctor must tombstone fuel: {w:?}"
         );
     }
 
