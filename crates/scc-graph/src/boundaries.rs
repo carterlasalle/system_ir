@@ -315,9 +315,13 @@ mod tests {
         // compiles them, so an un-recompiled store renders empty
         assert!(lines.is_empty(), "{lines:?}");
 
-        // after the pipeline compiles, the display renders them without
-        // touching the database again
-        crate::recompile(&store).unwrap();
+        // Compile crossings without reclustering: a full `recompile()` would
+        // replace components from an empty file set and drop the hand-built
+        // units under vanished-entity cleanup (needed for incremental≡cold).
+        let compiled = compile_boundaries(&graph, &store).unwrap();
+        for (rel, src) in compiled {
+            store.insert_relationship(&rel, &src).unwrap();
+        }
         let after_compile = store.all_relationships().unwrap().len();
         assert!(after_compile > before, "compile inserts crossings");
         let before2 = store.all_relationships().unwrap().len();
