@@ -471,18 +471,24 @@ pub fn task_with_rankers(
             symbol_files.insert(e.id.clone(), f.to_string());
         }
     }
-    // component containing each file
-    let mut file_component: HashMap<String, String> = HashMap::new();
+    // Every component that CONTAINS a file: merged clusters *and* member
+    // regions. Last-write-wins hid `root`/`services` after type narrowing
+    // merged them into `root+services`.
+    let mut file_components: HashMap<String, BTreeSet<String>> = HashMap::new();
     for c in ctx.store.components().unwrap_or_default() {
         for r in ctx.view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
-            file_component.insert(r.object.clone(), c.id.clone());
+            file_components
+                .entry(r.object.clone())
+                .or_default()
+                .insert(c.id.clone());
         }
     }
-    // symbol -> component
-    let mut symbol_component: HashMap<String, String> = HashMap::new();
+    let mut symbol_components: HashMap<String, BTreeSet<String>> = HashMap::new();
     for (sid, f) in &symbol_files {
-        if let Some(cid) = file_component.get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f)) {
-            symbol_component.insert(sid.clone(), cid.clone());
+        if let Some(cids) =
+            file_components.get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f))
+        {
+            symbol_components.insert(sid.clone(), cids.clone());
         }
     }
 
@@ -490,14 +496,14 @@ pub fn task_with_rankers(
     let mut affected_comps: BTreeSet<String> = BTreeSet::new();
     for c in &candidates {
         if c.kind == kinds::SYMBOL {
-            if let Some(cid) = symbol_component.get(&c.id) {
-                affected_comps.insert(cid.clone());
+            if let Some(cids) = symbol_components.get(&c.id) {
+                affected_comps.extend(cids.iter().cloned());
             }
         } else if c.kind == kinds::COMPONENT {
             affected_comps.insert(c.id.clone());
         } else if c.kind == kinds::FILE {
-            if let Some(cid) = file_component.get(&c.id) {
-                affected_comps.insert(cid.clone());
+            if let Some(cids) = file_components.get(&c.id) {
+                affected_comps.extend(cids.iter().cloned());
             }
         } else if c.kind == kinds::ROUTE {
             if let Some(h) = ctx
@@ -506,16 +512,16 @@ pub fn task_with_rankers(
                 .and_then(|e| e.attributes.get("handler"))
                 .and_then(|v| v.as_str())
             {
-                if let Some(cid) = symbol_component.get(h) {
-                    affected_comps.insert(cid.clone());
+                if let Some(cids) = symbol_components.get(h) {
+                    affected_comps.extend(cids.iter().cloned());
                 }
             }
         }
     }
     for f in files {
         let fid = entity_id(&ctx.view.graph.repo_id, kinds::FILE, f);
-        if let Some(cid) = file_component.get(&fid) {
-            affected_comps.insert(cid.clone());
+        if let Some(cids) = file_components.get(&fid) {
+            affected_comps.extend(cids.iter().cloned());
         }
     }
 
@@ -559,9 +565,9 @@ pub fn task_with_rankers(
 
     // contracts: routes handled by symbols in affected comps
     let mut contracts: BTreeSet<String> = BTreeSet::new();
-    let affected_syms: HashSet<&String> = symbol_component
+    let affected_syms: HashSet<&String> = symbol_components
         .iter()
-        .filter(|(_, c)| affected_comps.contains(*c))
+        .filter(|(_, cids)| cids.iter().any(|c| affected_comps.contains(c)))
         .map(|(s, _)| s)
         .collect();
     for sid in &affected_syms {
@@ -756,8 +762,18 @@ pub fn task_with_rankers(
             .in_pred(store_id, scc_core::predicates::WRITES)
             .into_iter()
             .map(|r| {
-                let comp = symbol_component.get(&r.subject).cloned();
-                comp.map(|c| component_short(&ctx.view, &c))
+                symbol_components
+                    .get(&r.subject)
+                    .map(|cids| {
+                        let mut names: Vec<String> = cids
+                            .iter()
+                            .map(|c| component_short(&ctx.view, c))
+                            .collect();
+                        names.sort();
+                        names.dedup();
+                        names.join(", ")
+                    })
+                    .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| entity_name(&ctx.view, &r.subject))
             })
             .collect();

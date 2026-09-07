@@ -180,14 +180,18 @@ impl Indexer {
             report.removed += 1;
         }
 
-        // ---- extraction of changed files + dependents ----
+        // changed + added keep scan order (shared-entity last-write is
+        // order-sensitive). Hash-unchanged importers/callers append after.
         let removed_set: HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
-        let mut to_process: Vec<ScannedFile> = Vec::new();
+        let mut to_process: Vec<ScannedFile> = changed;
+        to_process.append(&mut added);
+        let mut seen: HashSet<String> = to_process.iter().map(|f| f.path.clone()).collect();
         for p in &cascade {
-            if removed_set.contains(p.as_str()) {
+            if seen.contains(p) || removed_set.contains(p.as_str()) {
                 continue;
             }
             if let Some(f) = scanned_by_path.get(p) {
+                seen.insert(p.clone());
                 to_process.push(f.clone());
             }
         }
@@ -522,11 +526,18 @@ impl Indexer {
         revision: &str,
     ) -> Result<IndexReport, IndexError> {
         let mut report = IndexReport::default();
-        let paths = self.with_dependents(changed_paths)?;
-        let paths: Vec<String> = paths
-            .into_iter()
-            .filter(|p| scanned.contains_key(p))
-            .collect();
+        let mut paths: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for p in changed_paths {
+            if scanned.contains_key(p) && seen.insert(p.clone()) {
+                paths.push(p.clone());
+            }
+        }
+        for d in self.with_dependents(changed_paths)? {
+            if scanned.contains_key(&d) && seen.insert(d.clone()) {
+                paths.push(d);
+            }
+        }
         let mut index = SymbolIndex::new(&self.store.repo_id);
         let touched: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
         for (path, _h, lang, _kind, _size) in self.store.all_files()? {

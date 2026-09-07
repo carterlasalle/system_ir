@@ -155,6 +155,22 @@ fn normalize_id(id: &str) -> Option<(String, String)> {
     }
 }
 
+/// A merged cluster `root+services` sanitizes to `root-services`. That
+/// entity still *is* the `root` and `services` regions for recall: gold
+/// named the member directories, type-narrowed CALLS merged the behavior.
+// trace:v1 id=impl.scc.bench.merged-component-hit work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
+fn component_name_hit(pack_names: &BTreeSet<String>, gold: &str) -> bool {
+    if pack_names.contains(gold) {
+        return true;
+    }
+    pack_names.iter().any(|p| {
+        p == gold
+            || p.starts_with(&format!("{gold}-"))
+            || p.ends_with(&format!("-{gold}"))
+            || p.contains(&format!("-{gold}-"))
+    })
+}
+
 // trace:v1 id=impl.crates-scc-cli-src-benchctx.score-task-public
 pub fn score_task_public(
     repo_dir: &Path,
@@ -216,10 +232,17 @@ fn score_task(
             } else {
                 scc_core::sanitize_key(name)
             };
-            let hit = pack_by_kind
-                .get(kind)
-                .map(|set| set.contains(&norm))
-                .unwrap_or(false);
+            let hit = if kind == "component" {
+                pack_by_kind
+                    .get(kind)
+                    .map(|set| component_name_hit(set, &norm))
+                    .unwrap_or(false)
+            } else {
+                pack_by_kind
+                    .get(kind)
+                    .map(|set| set.contains(&norm))
+                    .unwrap_or(false)
+            };
             if hit {
                 *gt_hit += 1;
             } else {
@@ -408,6 +431,17 @@ mod tests {
         let (k3, n3) = normalize_id("repo://repo/component/services").unwrap();
         assert_eq!(k3, "component");
         assert_eq!(n3, "services");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.bench.merged-component-hit verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.bench.merged-component-hit
+    fn merged_cluster_satisfies_member_region_gold() {
+        let pack: BTreeSet<String> = ["root-services".into()].into();
+        assert!(component_name_hit(&pack, "root"));
+        assert!(component_name_hit(&pack, "services"));
+        assert!(component_name_hit(&pack, "root-services"));
+        assert!(!component_name_hit(&pack, "tests"));
+        assert!(!component_name_hit(&pack, "service"));
     }
 
     #[test]

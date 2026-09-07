@@ -9,6 +9,7 @@
 use scc_core::{RecvKind, ReferenceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// trace:exempt reason=internal-detail
 pub struct RecvFact {
     pub recv: RecvKind,
     pub root: String,

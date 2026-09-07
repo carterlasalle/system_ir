@@ -13,6 +13,7 @@ use thiserror::Error;
 /// are not only symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// trace:exempt reason=internal-detail
 pub enum HandleKind {
     Symbol,
     Component,
@@ -84,6 +85,7 @@ pub enum HandleError {
     UnknownKind,
 }
 
+// trace:exempt reason=internal-detail
 impl ContentHandle {
     pub fn new(
         repo: impl Into<String>,

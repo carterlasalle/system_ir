@@ -10,4 +10,5 @@
 3. `scc bench loop --explore`: deterministic pack-consumer emits JSONL tool events (baseline grep+read, SCC `task_context`+read, Ripwire `--pack-task`+read). Score with bench-agent metrics. `SCC_EXPLORE_AGENT_CMD` is an LLM plug-in. Locator mode stays the default. Missing Ripwire is skipped.
 4. If the filesystem watcher cannot start or cannot watch, fall back to content-hash sweep (`stale_paths` → `cmd_index_paths`). Hash remains authority.
 5. Invalidation cascade: before purging a changed/removed path, re-extract files that IMPORT or CALL into it so type-narrowed edges match a cold index. Do not disable type narrowing to restore incremental≡cold.
-6. Do not change production ranking, MCP tool count, context levels, or REQ-resolution-honesty-gauges.
+6. Task Context unions every component that CONTAINS a selected file. Context-benchmark recall treats merged cluster ids as covering gold member-region names. Clustering still does not emit member shells after a merge.
+7. Do not change production ranking, MCP tool count, context levels, or REQ-resolution-honesty-gauges.

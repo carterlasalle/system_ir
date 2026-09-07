@@ -20,4 +20,6 @@ Explore protocol: `scc bench loop --explore` runs a three-way pack-consumer that
 
 Watcher: if notify cannot start or cannot watch the root, fall back to content-hash sweep via `stale_paths` then incremental refresh. Watcher never becomes correctness authority.
 
+Task Context and context-benchmark scoring treat merged cluster ids (`root-services`) as covering gold member-region names (`root`, `services`). Packs include every component that CONTAINS a selected file, not last-write-wins. Clustering still does not emit member-region shell entities after a merge.
+
 Do not change production ranking, do not add a fifth context level, do not add MCP tools, do not rewrite REQ-resolution-honesty-gauges.
