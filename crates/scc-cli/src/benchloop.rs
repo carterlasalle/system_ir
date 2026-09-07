@@ -432,21 +432,23 @@ fn xml_test_path(t: &str) -> Option<String> {
 /// Gold kebab-case `it()` ids match SCC titles; file paths do not match function names.
 // trace:v1 id=impl.scc.cli.loop-test-match work=WORK-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall-for-type-scr satisfies=REQ-implement-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall implements=PLAN-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall-for-type-scr
 fn test_name_matches(proposed: &str, gold: &str) -> bool {
-    if proposed == gold {
+    if proposed.eq_ignore_ascii_case(gold) {
         return true;
     }
     if gold.contains('/') && (proposed.ends_with(gold) || gold.ends_with(proposed)) {
         return true;
     }
-    let p: Vec<&str> = ident_tokens(proposed).collect();
-    let g: Vec<&str> = ident_tokens(gold).collect();
-    p.contains(&gold) || (!g.is_empty() && p == g)
+    let p: Vec<String> = ident_tokens(proposed).collect();
+    let g: Vec<String> = ident_tokens(gold).collect();
+    let gold_l = gold.to_ascii_lowercase();
+    p.contains(&gold_l) || (!g.is_empty() && p == g)
 }
 
 // trace:exempt reason=internal-detail
-fn ident_tokens(s: &str) -> impl Iterator<Item = &str> {
+fn ident_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
 }
 
 /// `None` when the task has no gold tests — omit from clustered mean.
@@ -1432,6 +1434,10 @@ mod tests {
             score_tests(r#"<test p="tests/orders.test.ts"/>"#, &gold),
             (Some(0.0), 0, 1)
         );
+        let gold_api = vec!["joins-user-names-from-the-api-response".into()];
+        let pack_api =
+            "- joins user names from the API response (web/view.test.ts) — import\n";
+        assert_eq!(score_tests(pack_api, &gold_api), (Some(1.0), 1, 1));
     }
 
     #[test]
@@ -1474,6 +1480,26 @@ mod tests {
             qw_hits.contains(&"queue-worker.street-vocabulary"),
             "fixed relative imports must let import-reason tests_to_run fire: {qw_hits:?} rows={:?}",
             qw_summary.per_task
+        );
+        let api = LoopOptions {
+            k: 10,
+            repo_filter: Some("ts-api-web".into()),
+            ripwire_bin: None,
+            explore: false,
+            agent_cmd: None,
+        };
+        let api_summary = run_agent_loop(&[LoopArm::Scc], &api).expect("ts-api-web");
+        let api_hits: Vec<_> = api_summary
+            .per_task
+            .iter()
+            .filter(|r| r.arm == "scc" && r.tests_localization == Some(1.0))
+            .map(|r| r.task.as_str())
+            .collect();
+        assert!(
+            api_hits.contains(&"ts-api-web.contract-field")
+                && api_hits.contains(&"ts-api-web.creation-test"),
+            "kebab gold must match it() titles that contain acronyms: {api_hits:?} rows={:?}",
+            api_summary.per_task
         );
     }
 }

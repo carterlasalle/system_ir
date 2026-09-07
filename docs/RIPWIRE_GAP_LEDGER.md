@@ -207,7 +207,7 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 ## Phase 20 started (tests_to_run recall for TypeScript it() titles)
 
 - Gold kebab-case names match SCC TESTS titles by ident-token sequence (`expands-department-street-names` ≡ `expands department street names`). Ripwire file-only `<test p>` rows still do not match function/title gold. `queue-worker-ts` test imports resolve (`./text`, `../geo/resolver`) so import-reason tests_to_run can fire. Production ranking, MCP tool count, context levels, and packer quotas unchanged.
-- Measured after this change: clustered_tests SCC 0.833 vs baseline/Ripwire 0.000 (7 gold-test tasks). ts-api-web.contract-field and creation-test still miss.
+- Measured after this change: clustered_tests SCC 0.833 vs baseline/Ripwire 0.000 (7 gold-test tasks). ts-api-web.contract-field and creation-test still miss **until ident-token matching is ASCII-case-insensitive** (`API` vs `api`). Packs already list `joins user names from the API response`; the matcher was the gap.
 
 <!-- trace:exempt reason=document-structure -->
 ## Phase 21 started (Rule 2c class-name receiver)
@@ -239,5 +239,5 @@ Ripwire clone inspected: `/tmp/vendor/ripwire` (redhat-et/ripwire).
 17. Python identifier RHS copy bind (`x = y` when `y` is uniquely typed)
 18. Score tests_to_run vs gold tests in locator/explore agent loop
 19. Java `(Order)v` extract-time cast as Rule 2 fuel
-20. tests_to_run recall: kebab gold vs `it()` titles; fix queue-worker-ts test imports
+20. tests_to_run recall: kebab gold vs `it()` titles; fix queue-worker-ts test imports; ASCII case-fold so `API` matches `api`
 21. Rule 2c class-name receiver (`Cls.m()`) + local/untyped-param shadow veto
