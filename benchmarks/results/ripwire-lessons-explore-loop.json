@@ -6,7 +6,7 @@
   "protocol": "explore",
   "ripwire_status": "ran",
   "ripwire_bin": "/tmp/vendor/ripwire/build-gxx/ripwire",
-  "notes": "Deterministic JSONL pack-consumer (baseline grep+read, SCC task_context+FETCH handles+read, Ripwire --pack-task+read). Clustered means by fixture repo. tests_localization is recall of tasks.json ground_truth.tests against pack tests_to_run (SCC TESTS rows / Ripwire <test p=>). Empty gold tests omitted from the clustered mean, not scored as 1.0. Baseline has no tests_to_run list and scores 0 when gold tests exist. Ripwire file-only test paths do not match gold function names. Kebab-case gold matches SCC it() titles by ident-token sequence. SCC hits 5/7 gold-test tasks (both Python fixtures plus large-ts, monorepo, queue-worker-ts). ts-api-web.contract-field and creation-test still miss. Not an LLM/SWE-bench repair loop. Missing Ripwire must never be scored as an SCC win; this run had a binary. SCC mean_search=0 (no grep after task_context); substitution 1.0.",
+  "notes": "Deterministic JSONL pack-consumer (baseline grep+read, SCC task_context+FETCH handles+read, Ripwire --pack-task+read). Clustered means by fixture repo. tests_localization is recall of tasks.json ground_truth.tests against pack tests_to_run (SCC TESTS rows / Ripwire <test p=>). Empty gold tests omitted from the clustered mean, not scored as 1.0. Baseline has no tests_to_run list and scores 0 when gold tests exist. Ripwire file-only test paths do not match gold function names. Kebab-case gold matches SCC it() titles by ident-token sequence with ASCII case-fold. Remeasured after the matcher: SCC clustered_tests 1.000 (7/7, including ts-api-web.contract-field and creation-test). Not an LLM/SWE-bench repair loop. Missing Ripwire must never be scored as an SCC win; this run had a binary. SCC mean_search=0 (no grep after task_context); substitution 1.0.",
   "arms": [
     {
       "arm": "baseline",
@@ -30,8 +30,8 @@
       "mean_search": 0.0,
       "mean_read": 5.095,
       "first_correct_tasks": 21,
-      "clustered_tests": 0.833,
-      "pooled_tests": 0.714,
+      "clustered_tests": 1.0,
+      "pooled_tests": 1.0,
       "tests_tasks": 7
     },
     {

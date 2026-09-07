@@ -4,7 +4,7 @@
   "tasks": 21,
   "k": 10,
   "ripwire_status": "ran",
-  "notes": "Black-box ripwire --pack-task vs SCC task_context vs lexical baseline. Clustered means by fixture repo. tests_localization is recall of tasks.json ground_truth.tests against pack tests_to_run; kebab gold matches it() titles. Empty gold tests omitted from the clustered mean. File-name localization from packs plus tests_to_run scoring, not an LLM repair loop. Missing Ripwire must never be scored as an SCC win; this run had a binary.",
+  "notes": "Black-box ripwire --pack-task vs SCC task_context vs lexical baseline. Clustered means by fixture repo. tests_localization is recall of tasks.json ground_truth.tests against pack tests_to_run; kebab gold matches it() titles with ASCII case-fold. Empty gold tests omitted from the clustered mean. File-name localization from packs plus tests_to_run scoring, not an LLM repair loop. Remeasured after the ident-token case-fold matcher: SCC clustered_tests 1.000 (7/7 gold-test tasks). Missing Ripwire must never be scored as an SCC win; this run had a binary.",
   "arms": [
     {
       "arm": "baseline",
@@ -22,8 +22,8 @@
       "clustered_localization": 1.0,
       "pooled_localization": 1.0,
       "mean_substitution": 1.0,
-      "clustered_tests": 0.833,
-      "pooled_tests": 0.714,
+      "clustered_tests": 1.0,
+      "pooled_tests": 1.0,
       "tests_tasks": 7
     },
     {
