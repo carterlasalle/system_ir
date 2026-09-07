@@ -5,9 +5,9 @@
 //! perform syntax-level extraction only. Cross-file resolution happens later
 //! in `resolve.rs`.
 
+use scc_core::{RecvKind, ReferenceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use scc_core::{RecvKind, ReferenceKind};
 
 /// A source file handed to an extractor.
 #[derive(Debug, Clone)]
@@ -294,9 +294,6 @@ pub struct Entrypoint {
     pub line: u32,
 }
 
-
-
-
 /// One semantic fact (Wave 9): a first-class representation beyond
 /// symbols/calls/routes. Every fact carries its owning symbol so the
 /// writer can attach store evidence.
@@ -309,10 +306,18 @@ pub enum SemanticFact {
     /// @Controller, #[derive(...)]).
     Annotation { name: String, target: String },
     /// A class/struct field (state surface).
-    Field { owner: String, name: String, mutable: bool },
+    Field {
+        owner: String,
+        name: String,
+        mutable: bool,
+    },
     /// A framework registration: route/middleware/plugin/DI/event
     /// registration performed by `owner` naming `target` with a `kind`.
-    Registration { owner: String, kind: String, target: String },
+    Registration {
+        owner: String,
+        kind: String,
+        target: String,
+    },
     /// Configuration ownership: `owner` reads/writes config `key`.
     Configuration { owner: String, key: String },
     /// A callback/hook handled by `owner` (framework invokes it).
@@ -322,7 +327,11 @@ pub enum SemanticFact {
     /// validation annotations): `owner` defines schema `name`.
     /// `expr` is the defining source expression when available
     /// (e.g. `z.object({ name: z.string() })`), else empty.
-    SchemaDefinition { owner: String, name: String, expr: String },
+    SchemaDefinition {
+        owner: String,
+        name: String,
+        expr: String,
+    },
     /// Schema composition: `owner` composes schema `name` from `parent`
     /// (zod .extend/.merge, pydantic inheritance, serde flatten).
     SchemaComposition {
@@ -375,6 +384,11 @@ pub struct ExtractedFile {
     /// never stamped onto FILE entity attributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_binds: Vec<TypeBind>,
+    /// Simple-ident bases for class-like symbols in this file
+    /// (`IERS_B` → `["IERS"]`). Persisted on CLASS entity attributes, never
+    /// on FILE entities (incremental≡cold).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_bases: Vec<(String, Vec<String>)>,
 }
 
 /// One local / field → type name fact used by one-hop NamedVariable and
@@ -390,6 +404,47 @@ pub struct TypeBind {
     /// Type name as written (import alias or local class).
     pub type_name: String,
     pub line: u32,
+}
+
+/// Last simple ident of a heritage clause (`pkg.IERS[T]` → `IERS`).
+pub fn simple_heritage_ident(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let t = t.split(['<', '[']).next().unwrap_or(t).trim();
+    let t = t.rsplit('.').next().unwrap_or(t).trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Sort, dedup, and keep only simple-ident bases for CHA persistence.
+pub fn normalize_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = raw
+        .iter()
+        .filter_map(|(class, bases)| {
+            let mut b: Vec<String> = bases
+                .iter()
+                .filter_map(|s| simple_heritage_ident(s))
+                .collect();
+            b.sort();
+            b.dedup();
+            (!class.is_empty() && !b.is_empty()).then(|| (class.clone(), b))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// A language extractor. Must be deterministic and side-effect free.

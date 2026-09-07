@@ -598,6 +598,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds: self.type_binds,
+            class_bases: Vec::new(),
         }
     }
 

@@ -213,6 +213,7 @@ impl Indexer {
             {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
+                index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
             }
         }
 
@@ -237,6 +238,7 @@ impl Indexer {
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(path, &ef.symbols);
             index.set_type_binds(path, &ef.type_binds);
+            index.set_class_bases(path, &ef.class_bases);
             extracted.insert(path.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
 
@@ -443,6 +445,39 @@ impl Indexer {
             .collect())
     }
 
+    fn load_class_bases(
+        &self,
+        path: &str,
+        symbols: &[model::Symbol],
+    ) -> Result<Vec<(String, Vec<String>)>, scc_store::StoreError> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for s in symbols {
+            if !matches!(
+                s.kind,
+                model::SymbolKind::Class | model::SymbolKind::Interface | model::SymbolKind::Type
+            ) {
+                continue;
+            }
+            let id = scc_core::symbol_id(&self.store.repo_id, path, &s.name);
+            let Some(e) = self.store.get_entity(&id)? else {
+                continue;
+            };
+            let Some(arr) = e.attributes.get("class_bases").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            let mut bases: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            bases.sort();
+            bases.dedup();
+            if !bases.is_empty() {
+                out.push((s.name.clone(), bases));
+            }
+        }
+        Ok(out)
+    }
+
     /// Refresh specific paths (watch events / post-edit). Unknown paths are
     /// ignored. Returns the number of files re-indexed.
     pub fn refresh_paths(&self, paths: &[String]) -> Result<IndexReport, IndexError> {
@@ -553,6 +588,7 @@ impl Indexer {
             {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
+                index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
             }
         }
 
@@ -578,6 +614,7 @@ impl Indexer {
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(p, &ef.symbols);
             index.set_type_binds(p, &ef.type_binds);
+            index.set_class_bases(p, &ef.class_bases);
             extracted.insert(p.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
 
@@ -722,6 +759,7 @@ impl Indexer {
             {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
+                index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
             }
         }
         let test_files: Vec<String> = self
@@ -2060,5 +2098,116 @@ class Svc {
             calls.iter().any(|r| r.object == order),
             "unique class in another file must pin Order.process: {calls:?}"
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.cha-base-pin verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn index_pins_class_name_receiver_through_unique_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("iers_b.py"), "class IERS_B(IERS):\n    pass\n").unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "def handle():\n    return IERS_B.open()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.py", "IERS.open");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "IERS_B.open must CALL IERS.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.cha-base-split verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn index_class_name_receiver_two_bases_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.py"),
+            "class A:\n    def m(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.py"),
+            "class B:\n    def m(self):\n        return 2\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("c.py"), "class C(A, B):\n    pass\n").unwrap();
+        std::fs::write(root.join("w.py"), "def handle():\n    return C.m()\n").unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "a.py", "A.m");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "b.py", "B.m");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a || r.object == b),
+            "two hitting bases must not spray: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.cha-base-incremental verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.write.class-bases
+    fn index_cha_base_walk_survives_incremental_caller_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("iers_b.py"), "class IERS_B(IERS):\n    pass\n").unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "def handle():\n    return IERS_B.open()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "def handle():\n    return IERS_B.open()\n# touch\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.py", "IERS.open");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "incremental caller edit must still CALL IERS.open via persisted heritage: {calls:?}"
+        );
+        let (cold, _t2) = indexer_for(root);
+        cold.index().unwrap();
+        let cold_base = scc_core::symbol_id(&cold.store.repo_id, "iers.py", "IERS.open");
+        let cold_handle = scc_core::symbol_id(&cold.store.repo_id, "w.py", "handle");
+        let cold_hit = cold.store.all_relationships().unwrap().iter().any(|r| {
+            r.predicate == scc_core::predicates::CALLS
+                && r.subject == cold_handle
+                && r.object == cold_base
+        });
+        assert!(cold_hit, "cold index must also CALL IERS.open");
     }
 }

@@ -428,6 +428,8 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
     /// Local parameter and class-field type binds. Extract-time only.
     type_binds: Vec<TypeBind>,
+    /// Superclass + interfaces for CHA (`IERS_B` → `["IERS"]`).
+    class_bases: Vec<(String, Vec<String>)>,
 }
 
 // trace:exempt reason=internal-detail
@@ -493,6 +495,7 @@ impl Ctx {
             cli_flags: std::collections::BTreeMap::new(),
             facts,
             type_binds: self.type_binds,
+            class_bases: java_class_bases(&self.class_bases),
         }
     }
 
@@ -971,6 +974,16 @@ impl JavaExtractor {
                     kind: "extension".to_string(),
                     target: iface,
                 });
+            }
+        }
+        {
+            let mut bases: Vec<String> = Vec::new();
+            if let Some(parent) = superclass_name(node, src) {
+                bases.push(parent);
+            }
+            bases.extend(implemented_interfaces(&node, src));
+            if !bases.is_empty() {
+                ctx.class_bases.push((name.clone(), bases));
             }
         }
         ctx.scopes.push(Scope {
@@ -1963,6 +1976,12 @@ fn superclass_name(node: Node, src: &[u8]) -> Option<String> {
     } else {
         Some(simple.to_string())
     }
+}
+
+/// Simple-ident superclass + interfaces for Rule 2c CHA.
+// trace:v1 id=impl.scc.extract.java.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn java_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    crate::model::normalize_class_bases(raw)
 }
 
 /// First string literal argument of the annotation named `want`
@@ -3047,6 +3066,21 @@ class Svc {
                 .any(|b| b.scope == "Svc.not_a_bind" && b.name == "b" && b.type_name == "Order"),
             "generic cast must not mint a bind: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.java.class-bases
+    fn class_bases_include_superclass_and_interfaces() {
+        let ef = extract(
+            "package com.example;\nclass IERS { void open() {} }\nclass IERS_B extends IERS implements Closeable {}\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.contains(&"IERS".to_string()) && b.contains(&"Closeable".to_string())
+            }),
+            "IERS_B heritage missing: {:?}",
+            ef.class_bases
         );
     }
 }

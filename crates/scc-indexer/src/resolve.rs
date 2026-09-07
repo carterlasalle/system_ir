@@ -3,7 +3,8 @@
 //! Resolution rules, in priority order:
 //! 1. receiver classification (this/self vs named vs field-chain vs type);
 //! 2. unique typed local/param (Rule 2) then class-name receiver `Cls.m()`
-//!    (Rule 2c: unique class-like def, local/param names veto, no spray);
+//!    (Rule 2c: unique class-like def, local/param names veto, no spray;
+//!    CHA/base walk when `Cls` itself does not define `m`);
 //! 3. local symbol in the same file;
 //! 4. imported member (`import { a as b }` / `from m import a`) resolved to
 //!    the target file's exported symbol;
@@ -48,13 +49,19 @@ pub struct FileSymbols {
     pub file_entity_id: String,
     /// Local type binds for this file (constructor / annotation / param).
     pub type_binds: Vec<TypeBind>,
+    /// Simple-ident bases for class-like symbols in this file.
+    pub class_bases: BTreeMap<String, Vec<String>>,
 }
 
 /// Module resolution result for an import.
 #[derive(Debug, Clone)]
 pub enum ImportTarget {
     /// Resolved to a file in the repo. `name_map`: local name -> exported name.
-    Internal { file: String, name_map: HashMap<String, String>, namespace: bool },
+    Internal {
+        file: String,
+        name_map: HashMap<String, String>,
+        namespace: bool,
+    },
     /// Bare specifier treated as external system/api.
     External { name: String },
     /// Relative or project-looking specifier that did not resolve to a file.
@@ -114,6 +121,13 @@ impl SymbolIndex {
         }
     }
 
+    /// Attach extract-time class heritage used by Rule 2c CHA.
+    pub fn set_class_bases(&mut self, path: &str, bases: &[(String, Vec<String>)]) {
+        if let Some(fs) = self.files.get_mut(path) {
+            fs.class_bases = bases.iter().cloned().collect();
+        }
+    }
+
     pub fn file(&self, path: &str) -> Option<&FileSymbols> {
         self.files.get(path)
     }
@@ -168,7 +182,9 @@ impl SymbolIndex {
         // source root (src, svc, lib, app, services, packages) — common for
         // python and typescript repos. Deterministic order; first match wins.
         if !module.starts_with('.') && !module.starts_with('/') {
-            for root in ["src", "svc", "lib", "app", "services", "service", "packages"] {
+            for root in [
+                "src", "svc", "lib", "app", "services", "service", "packages",
+            ] {
                 for c in self.candidate_paths(&format!("{root}/{module}")) {
                     if self.all_files.contains(&c) {
                         return Some(c);
@@ -329,7 +345,9 @@ pub fn resolve_calls(
     let mut namespaces: HashMap<&str, String> = HashMap::new();
     for ri in resolved_imports {
         match &ri.target {
-            ImportTarget::Internal { file, namespace, .. } => {
+            ImportTarget::Internal {
+                file, namespace, ..
+            } => {
                 if *namespace {
                     // `import * as ns from 'm'`, python `import a.b [as c]`:
                     // local name binds the module
@@ -357,7 +375,10 @@ pub fn resolve_calls(
             }
             ImportTarget::External { name } => {
                 for (local, imported) in &ri.names {
-                    binding.insert(local.as_str(), (format!("external:{name}"), imported.clone()));
+                    binding.insert(
+                        local.as_str(),
+                        (format!("external:{name}"), imported.clone()),
+                    );
                 }
             }
             ImportTarget::Unresolved { .. } => {}
@@ -409,7 +430,9 @@ pub fn resolve_calls(
         let method = fact.method.as_str();
         let root = fact.root.as_str();
 
-        if let Some(id) = field_type_callee_id(recv, &fact, &call, path, index, type_binds, &binding) {
+        if let Some(id) =
+            field_type_callee_id(recv, &fact, &call, path, index, type_binds, &binding)
+        {
             out.push(emit(
                 caller_id,
                 Some(id),
@@ -667,9 +690,7 @@ pub fn resolve_calls(
             }
             if recv == RecvKind::NamedVariable {
                 if let Some(ty) = unique_bound_type(type_binds, call.caller.as_deref(), root) {
-                    if let Some(id) =
-                        method_id_for_type(index, path, ty, method, &binding)
-                    {
+                    if let Some(id) = pin_type_method(index, path, ty, method, &binding) {
                         out.push(emit(
                             caller_id,
                             Some(id),
@@ -684,13 +705,7 @@ pub fn resolve_calls(
                     }
                 }
                 if let Some(id) = unprefixed_field_type_callee_id(
-                    recv,
-                    &fact,
-                    &call,
-                    path,
-                    index,
-                    type_binds,
-                    &binding,
+                    recv, &fact, &call, path, index, type_binds, &binding,
                 ) {
                     out.push(emit(
                         caller_id,
@@ -750,11 +765,7 @@ pub fn quality_from_calls(calls: &[ResolvedCall]) -> scc_core::AnalysisQuality {
 
 /// Unique type for `(scope, var)` or None when missing / tombstoned (≥2 types).
 // trace:v1 id=impl.scc.resolve.type-narrow work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
-fn unique_bound_type<'a>(
-    binds: &'a [TypeBind],
-    scope: Option<&str>,
-    var: &str,
-) -> Option<&'a str> {
+fn unique_bound_type<'a>(binds: &'a [TypeBind], scope: Option<&str>, var: &str) -> Option<&'a str> {
     let scope = scope.unwrap_or("");
     let mut types: Vec<&str> = binds
         .iter()
@@ -798,7 +809,7 @@ fn field_type_callee_id(
     let field = fact.field_name.as_deref()?;
     let class = enclosing_class(call, path, index)?;
     let ty = unique_bound_type(type_binds, Some(&class), field)?;
-    method_id_for_type(index, path, ty, &fact.method, binding)
+    pin_type_method(index, path, ty, &fact.method, binding)
 }
 
 /// Pin `s.field.m()` (exactly one field hop) when `s` is uniquely typed as
@@ -827,7 +838,7 @@ fn receiver_field_type_callee_id(
     }
     let field = fact.field_name.as_deref()?;
     let ty = unique_bound_type(type_binds, Some(&class), field)?;
-    method_id_for_type(index, path, ty, &fact.method, binding)
+    pin_type_method(index, path, ty, &fact.method, binding)
 }
 
 /// Pin Java `repo.save()` (exactly one named hop, no `this.`) to `{Type}.save`
@@ -863,7 +874,7 @@ fn unprefixed_field_type_callee_id(
     if ty.is_empty() {
         return None;
     }
-    method_id_for_type(index, path, ty, &fact.method, binding)
+    pin_type_method(index, path, ty, &fact.method, binding)
 }
 
 fn is_class_like(kind: SymbolKind) -> bool {
@@ -873,14 +884,25 @@ fn is_class_like(kind: SymbolKind) -> bool {
     )
 }
 
-/// Unique in-repo `{Type}.{method}` on a Class/Interface/Type named `type_name`.
+/// Unique in-repo `{Type}.{method}` on a Class/Interface/Type named `type_name`,
+/// else the unique base at the shallowest CHA level that uniquely defines it.
 /// Two class-like defs that both expose the method stay unresolved (no spray).
-/// Modules and non-defining same-named types do not count.
+/// Two same-named class-likes refuse heritage merge. Modules do not count.
 // trace:v1 id=impl.scc.resolve.class-name work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
 fn unique_class_like_method(index: &SymbolIndex, type_name: &str, method: &str) -> Option<String> {
     if type_name.is_empty() || method.is_empty() {
         return None;
     }
+    unique_defining_class_like_method(index, type_name, method)
+        .or_else(|| method_on_bases(index, type_name, method))
+}
+
+/// Own-type pin only: unique `{Type}.{method}` on a class-like named `type_name`.
+fn unique_defining_class_like_method(
+    index: &SymbolIndex,
+    type_name: &str,
+    method: &str,
+) -> Option<String> {
     let key = format!("{type_name}.{method}");
     let mut found: Option<String> = None;
     for fs in index.files.values() {
@@ -906,6 +928,78 @@ fn unique_class_like_method(index: &SymbolIndex, type_name: &str, method: &str) 
     found
 }
 
+/// Direct bases of the unique class-like named `type_name`. Two same-named
+/// class-likes → `None` (do not merge heritage). Missing map → empty vec.
+fn class_bases_of_unique(index: &SymbolIndex, type_name: &str) -> Option<Vec<String>> {
+    let mut found: Option<Vec<String>> = None;
+    for fs in index.files.values() {
+        let Some((sym, _)) = fs.by_name.get(type_name) else {
+            continue;
+        };
+        if !is_class_like(sym.kind) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(fs.class_bases.get(type_name).cloned().unwrap_or_default());
+    }
+    found
+}
+
+/// Ripwire `methodOnTypeOrBases` BFS: shallowest level with exactly one
+/// hitting base wins; two at one level refuse. Cap 16 visited names.
+// trace:v1 id=impl.scc.resolve.cha-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn method_on_bases(index: &SymbolIndex, type_name: &str, method: &str) -> Option<String> {
+    const CHA_WALK_CAP: usize = 16;
+    let mut visited: Vec<String> = Vec::with_capacity(CHA_WALK_CAP);
+    visited.push(type_name.to_string());
+    let mut begin = 0;
+    while begin < visited.len() {
+        let end = visited.len();
+        for i in begin..end {
+            let Some(bases) = class_bases_of_unique(index, &visited[i]) else {
+                continue;
+            };
+            for base in bases {
+                if visited.len() >= CHA_WALK_CAP {
+                    break;
+                }
+                if !visited.iter().any(|v| v == &base) {
+                    visited.push(base);
+                }
+            }
+        }
+        let mut found: Option<String> = None;
+        for name in &visited[end..] {
+            let Some(id) = unique_defining_class_like_method(index, name, method) else {
+                continue;
+            };
+            if found.as_ref().is_some_and(|existing| existing != &id) {
+                return None;
+            }
+            found = Some(id);
+        }
+        if found.is_some() {
+            return found;
+        }
+        begin = end;
+    }
+    None
+}
+
+/// Local/import `{Type}.{method}`, else unique class-like / CHA.
+fn pin_type_method(
+    index: &SymbolIndex,
+    local_path: &str,
+    ty: &str,
+    method: &str,
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    method_id_for_type(index, local_path, ty, method, binding)
+        .or_else(|| unique_class_like_method(index, ty, method))
+}
+
 /// Pin `Cls.m()` (StaticType). A unique typed bind for `Cls` is Rule 2 and
 /// wins; any bind including an untyped shadow vetoes the class-name pin.
 fn static_type_callee_id(
@@ -923,8 +1017,7 @@ fn static_type_callee_id(
         if ty.is_empty() {
             return None;
         }
-        return method_id_for_type(index, path, ty, method, binding)
-            .or_else(|| unique_class_like_method(index, ty, method));
+        return pin_type_method(index, path, ty, method, binding);
     }
     unique_class_like_method(index, root, method)
 }
@@ -985,7 +1078,7 @@ mod tests {
     use super::*;
     use crate::model::{Import, ImportType};
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
     fn mk_symbol(name: &str, kind: SymbolKind) -> Symbol {
         Symbol {
             name: name.into(),
@@ -1015,8 +1108,15 @@ mod tests {
         }];
         let resolved = resolve_calls("a.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "a.py", "normalize")));
-        assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted, "native resolution is evidence-grade (candidate), never RESOLVED (section 26)");
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "normalize"))
+        );
+        assert_eq!(
+            resolved[0].provenance,
+            scc_core::Provenance::Extracted,
+            "native resolution is evidence-grade (candidate), never RESOLVED (section 26)"
+        );
     }
 
     #[test]
@@ -1033,7 +1133,11 @@ mod tests {
         let resolved_imports = vec![ResolvedImport {
             local_file: "a.py".into(),
             module: "b".into(),
-            target: ImportTarget::Internal { file: "b.py".into(), name_map: HashMap::new(), namespace: false },
+            target: ImportTarget::Internal {
+                file: "b.py".into(),
+                name_map: HashMap::new(),
+                namespace: false,
+            },
             names: vec![("r".into(), "resolve".into())],
             line: 1,
         }];
@@ -1045,8 +1149,18 @@ mod tests {
             conditional: false,
             ..Default::default()
         }];
-        let resolved = resolve_calls("a.py", &calls, &[mk_symbol("main", SymbolKind::Function)], &resolved_imports, &idx, "repo");
-        assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "b.py", "resolve")));
+        let resolved = resolve_calls(
+            "a.py",
+            &calls,
+            &[mk_symbol("main", SymbolKind::Function)],
+            &resolved_imports,
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "b.py", "resolve"))
+        );
         // unused import var
         let _ = &import;
     }
@@ -1054,12 +1168,19 @@ mod tests {
     #[test]
     fn resolves_namespace_member() {
         let mut idx = SymbolIndex::new("repo");
-        idx.add_file("svc/asr.py", &[mk_symbol("transcribe", SymbolKind::Function)]);
+        idx.add_file(
+            "svc/asr.py",
+            &[mk_symbol("transcribe", SymbolKind::Function)],
+        );
         idx.add_file("main.py", &[mk_symbol("run", SymbolKind::Function)]);
         let ri = ResolvedImport {
             local_file: "main.py".into(),
             module: "svc.asr".into(),
-            target: ImportTarget::Internal { file: "svc/asr.py".into(), name_map: HashMap::new(), namespace: true },
+            target: ImportTarget::Internal {
+                file: "svc/asr.py".into(),
+                name_map: HashMap::new(),
+                namespace: true,
+            },
             names: vec![("asr".into(), "*".into())],
             line: 1,
         };
@@ -1071,8 +1192,18 @@ mod tests {
             conditional: false,
             ..Default::default()
         }];
-        let resolved = resolve_calls("main.py", &calls, &[mk_symbol("run", SymbolKind::Function)], &[ri], &idx, "repo");
-        assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "svc/asr.py", "transcribe")));
+        let resolved = resolve_calls(
+            "main.py",
+            &calls,
+            &[mk_symbol("run", SymbolKind::Function)],
+            &[ri],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "svc/asr.py", "transcribe"))
+        );
     }
 
     #[test]
@@ -1082,11 +1213,7 @@ mod tests {
         m.parent = Some("Worker".into());
         let mut m2 = mk_symbol("Worker.helper", SymbolKind::Method);
         m2.parent = Some("Worker".into());
-        let syms = vec![
-            mk_symbol("Worker", SymbolKind::Class),
-            m,
-            m2,
-        ];
+        let syms = vec![mk_symbol("Worker", SymbolKind::Class), m, m2];
         idx.add_file("w.py", &syms);
         let calls = vec![Call {
             caller: Some("Worker.handle".into()),
@@ -1097,7 +1224,10 @@ mod tests {
             ..Default::default()
         }];
         let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
-        assert_eq!(resolved[0].callee_id, Some(scc_core::symbol_id("repo", "w.py", "Worker.helper")));
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Worker.helper"))
+        );
     }
 
     #[test]
@@ -1107,7 +1237,9 @@ mod tests {
         let ri = ResolvedImport {
             local_file: "a.ts".into(),
             module: "express".into(),
-            target: ImportTarget::External { name: "express".into() },
+            target: ImportTarget::External {
+                name: "express".into(),
+            },
             names: vec![("express".into(), "default".into())],
             line: 1,
         };
@@ -1119,10 +1251,21 @@ mod tests {
             conditional: false,
             ..Default::default()
         }];
-        let resolved = resolve_calls("a.ts", &calls, &[mk_symbol("main", SymbolKind::Function)], &[ri], &idx, "repo");
+        let resolved = resolve_calls(
+            "a.ts",
+            &calls,
+            &[mk_symbol("main", SymbolKind::Function)],
+            &[ri],
+            &idx,
+            "repo",
+        );
         assert_eq!(
             resolved[0].callee_id,
-            Some(scc_core::entity_id("repo", scc_core::kinds::EXTERNAL_API, "express"))
+            Some(scc_core::entity_id(
+                "repo",
+                scc_core::kinds::EXTERNAL_API,
+                "express"
+            ))
         );
     }
 
@@ -1133,9 +1276,18 @@ mod tests {
         idx.add_file("pkg/__init__.py", &[]);
         idx.add_file("src/util.py", &[]);
         idx.add_file("web/index.ts", &[]);
-        assert_eq!(idx.resolve_module_path("pkg.sub"), Some("pkg/sub.py".into()));
-        assert_eq!(idx.resolve_module_path("pkg"), Some("pkg/__init__.py".into()));
-        assert_eq!(idx.resolve_module_path("./web"), Some("web/index.ts".into()));
+        assert_eq!(
+            idx.resolve_module_path("pkg.sub"),
+            Some("pkg/sub.py".into())
+        );
+        assert_eq!(
+            idx.resolve_module_path("pkg"),
+            Some("pkg/__init__.py".into())
+        );
+        assert_eq!(
+            idx.resolve_module_path("./web"),
+            Some("web/index.ts".into())
+        );
         assert_eq!(idx.resolve_module_path("util"), Some("src/util.py".into()));
         assert_eq!(idx.resolve_module_path("nonexistent"), None);
     }
@@ -1574,6 +1726,156 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.cha-base-pin verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn class_name_receiver_pins_unique_base_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        idx.add_file("iers.py", &[mk_symbol("IERS", SymbolKind::Class), open]);
+        let iers_b = mk_symbol("IERS_B", SymbolKind::Class);
+        idx.add_file("iers_b.py", std::slice::from_ref(&iers_b));
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&handle));
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "IERS_B.open".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&handle),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "iers.py", "IERS.open"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+        assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.cha-base-split verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn two_bases_defining_same_method_stay_unresolved() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_m = mk_symbol("A.m", SymbolKind::Method);
+        a_m.parent = Some("A".into());
+        idx.add_file("a.py", &[mk_symbol("A", SymbolKind::Class), a_m]);
+        let mut b_m = mk_symbol("B.m", SymbolKind::Method);
+        b_m.parent = Some("B".into());
+        idx.add_file("b.py", &[mk_symbol("B", SymbolKind::Class), b_m]);
+        let c = mk_symbol("C", SymbolKind::Class);
+        idx.add_file("c.py", std::slice::from_ref(&c));
+        idx.set_class_bases("c.py", &[("C".into(), vec!["A".into(), "B".into()])]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&handle));
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "C.m".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&handle),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.cha-grandparent verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn class_name_receiver_pins_grandparent_when_parent_has_no_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        idx.add_file("iers.py", &[mk_symbol("IERS", SymbolKind::Class), open]);
+        let iers_a = mk_symbol("IERS_A", SymbolKind::Class);
+        idx.add_file("mid.py", std::slice::from_ref(&iers_a));
+        idx.set_class_bases("mid.py", &[("IERS_A".into(), vec!["IERS".into()])]);
+        let iers_b = mk_symbol("IERS_B", SymbolKind::Class);
+        idx.add_file("leaf.py", std::slice::from_ref(&iers_b));
+        idx.set_class_bases("leaf.py", &[("IERS_B".into(), vec!["IERS_A".into()])]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&handle));
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "IERS_B.open".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&handle),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "iers.py", "IERS.open"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.cha-typed-local verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.resolve.cha-bases
+    fn typed_local_of_derived_class_pins_base_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("IERS", SymbolKind::Class),
+            open,
+            mk_symbol("IERS_B", SymbolKind::Class),
+            handle.clone(),
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_class_bases("w.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "x".into(),
+                type_name: "IERS_B".into(),
+                line: 8,
+            }],
+        );
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "x.open".into(),
+                line: 9,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "IERS.open"))
+        );
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.type-narrow-tombstone verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
     fn two_types_for_same_var_do_not_narrow() {
         let mut idx = SymbolIndex::new("repo");
@@ -1626,10 +1928,7 @@ mod tests {
         let mut idx = SymbolIndex::new("repo");
         let mut save = mk_symbol("Order.save", SymbolKind::Method);
         save.parent = Some("Order".into());
-        idx.add_file(
-            "orders.py",
-            &[mk_symbol("Order", SymbolKind::Class), save],
-        );
+        idx.add_file("orders.py", &[mk_symbol("Order", SymbolKind::Class), save]);
         let run = mk_symbol("run", SymbolKind::Function);
         idx.add_file("app.py", std::slice::from_ref(&run));
         idx.set_type_binds(
@@ -2317,7 +2616,10 @@ func factory() {
             .iter()
             .find(|c| c.callee_name == "z.Process")
             .expect("z.Process");
-        assert_eq!(z.callee_id, None, "conflicting local assignment must not pin");
+        assert_eq!(
+            z.callee_id, None,
+            "conflicting local assignment must not pin"
+        );
         assert_eq!(z.recv, RecvKind::NamedVariable);
         let chain = resolved
             .iter()
@@ -2329,10 +2631,7 @@ func factory() {
             .iter()
             .find(|c| c.callee_name == "x.Process" && c.caller_id == factory_id)
             .expect("factory x.Process");
-        assert_eq!(
-            factory.callee_id, None,
-            "opaque factory call must not pin"
-        );
+        assert_eq!(factory.callee_id, None, "opaque factory call must not pin");
     }
 
     #[test]
@@ -2387,7 +2686,10 @@ fn factory() {
             .iter()
             .find(|c| c.callee_name == "z.process")
             .expect("z.process");
-        assert_eq!(z.callee_id, None, "conflicting local assignment must not pin");
+        assert_eq!(
+            z.callee_id, None,
+            "conflicting local assignment must not pin"
+        );
         assert_eq!(z.recv, RecvKind::NamedVariable);
         let chain = resolved
             .iter()
@@ -2399,10 +2701,7 @@ fn factory() {
             .iter()
             .find(|c| c.callee_name == "x.process" && c.caller_id == factory_id)
             .expect("factory x.process");
-        assert_eq!(
-            factory.callee_id, None,
-            "opaque factory call must not pin"
-        );
+        assert_eq!(factory.callee_id, None, "opaque factory call must not pin");
     }
 
     #[test]
@@ -2664,8 +2963,7 @@ class Svc {
         .finish()];
         let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
         assert_eq!(
-            resolved[0].callee_id,
-            None,
+            resolved[0].callee_id, None,
             "Python owned.process must not pin via Java field-as-receiver"
         );
         assert_eq!(resolved[0].recv, RecvKind::NamedVariable);

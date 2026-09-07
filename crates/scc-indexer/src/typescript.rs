@@ -153,6 +153,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     docstring: leading_jsdoc(&node, src),
                                     parent: None,
                                 });
+                                let bases = collect_heritage_idents(&node, src);
+                                if !bases.is_empty() {
+                                    out.class_bases.push((name.clone(), bases));
+                                }
                                 for (policy, pline) in collect_retries(&node, src) {
                                     out.retries.push(Retry {
                                         symbol: name.clone(),
@@ -199,7 +203,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                             let name = node_text(&name_node, src).to_string();
                             if !name.is_empty() {
                                 out.symbols.push(Symbol {
-                                    name,
+                                    name: name.clone(),
                                     kind: SymbolKind::Interface,
                                     signature: None,
                                     decl_header: decl_header_of(&node, src),
@@ -209,6 +213,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     docstring: leading_jsdoc(&node, src),
                                     parent: None,
                                 });
+                                let bases = collect_heritage_idents(&node, src);
+                                if !bases.is_empty() {
+                                    out.class_bases.push((name, bases));
+                                }
                             }
                         }
                     }
@@ -756,7 +764,57 @@ fn implemented_interfaces(node: &Node, src: &[u8]) -> Vec<String> {
     out
 }
 
-/// Deterministic total order over facts: (family, owner/symbol, secondary,
+/// Simple-ident `extends` / `implements` types on a class or interface.
+// trace:v1 id=impl.scc.extract.typescript.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn collect_heritage_idents(node: &Node, src: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = node.walk();
+    for child in node.named_children(&mut cur) {
+        match child.kind() {
+            "class_heritage"
+            | "extends_clause"
+            | "implements_clause"
+            | "extends_type_clause"
+            | "heritage_clause"
+            | "extends_class_clause" => {
+                collect_heritage_idents_in(&child, src, &mut out);
+            }
+            _ => {}
+        }
+    }
+    let mut b = out;
+    b.sort();
+    b.dedup();
+    b.retain(|s| crate::model::simple_heritage_ident(s).is_some());
+    b
+}
+
+// trace:exempt reason=internal-detail
+fn collect_heritage_idents_in(node: &Node, src: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            if let Some(s) = crate::model::simple_heritage_ident(node_text(node, src)) {
+                out.push(s);
+            }
+        }
+        "nested_type_identifier" | "member_expression" | "qualified_type" => {
+            if let Some(s) = crate::model::simple_heritage_ident(node_text(node, src)) {
+                out.push(s);
+            }
+        }
+        "generic_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_heritage_idents_in(&t, src, out);
+            }
+        }
+        _ => {
+            let mut c = node.walk();
+            for ch in node.named_children(&mut c) {
+                collect_heritage_idents_in(&ch, src, out);
+            }
+        }
+    }
+}
 /// tertiary). Identical facts sort adjacent so `dedup` collapses them.
 fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
     match f {
@@ -3740,6 +3798,22 @@ mod tests {
                 .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
             "typed param must still bind: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.typescript.class-bases
+    fn class_bases_include_extends_and_implements() {
+        let ef = extract(
+            "app.ts",
+            "class IERS { open() {} }\nclass IERS_B extends IERS implements Closeable { }\ninterface Closeable { close(): void }\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.contains(&"IERS".to_string()) && b.contains(&"Closeable".to_string())
+            }),
+            "IERS_B heritage missing: {:?}",
+            ef.class_bases
         );
     }
 

@@ -521,6 +521,12 @@ fn is_simple_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Simple-ident bases for Rule 2c CHA (`IERS_B(IERS)` → `["IERS"]`).
+// trace:v1 id=impl.scc.extract.python.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn python_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    crate::model::normalize_class_bases(raw)
+}
+
 // trace:exempt reason=internal-detail
 fn constructor_type_name(right: Node, src: &[u8]) -> Option<String> {
     if right.kind() != "call" {
@@ -912,6 +918,7 @@ impl Ctx {
                 &b.type_name,
             ))
         });
+        let class_bases = python_class_bases(&self.class_bases);
         ExtractedFile {
             symbols,
             imports: self.imports,
@@ -924,6 +931,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds,
+            class_bases,
         }
         }
 }
@@ -3819,6 +3827,33 @@ class QueryBuilder:
         assert!(
             types.contains(&"Order") && types.contains(&"Invoice"),
             "tombstone fuel missing: {types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.python.class-bases
+    fn class_bases_are_simple_idents() {
+        let ef = extract(
+            "class IERS:\n    def open(self):\n        pass\nclass IERS_B(IERS):\n    pass\nclass Mix(pkg.Base, Generic[T]):\n    pass\n",
+        );
+        assert!(
+            ef.class_bases
+                .iter()
+                .any(|(c, b)| c == "IERS_B" && b == &["IERS"]),
+            "IERS_B bases missing: {:?}",
+            ef.class_bases
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "Mix" && b.contains(&"Base".to_string()) && b.contains(&"Generic".to_string())
+            }),
+            "dotted/generic bases must keep last ident: {:?}",
+            ef.class_bases
+        );
+        assert!(
+            !ef.class_bases.iter().any(|(c, _)| c == "IERS"),
+            "class with no bases must be omitted: {:?}",
+            ef.class_bases
         );
     }
 }
