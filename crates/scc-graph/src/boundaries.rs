@@ -300,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.graph.boundary-display-pure work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
     fn display_does_not_mutate_the_store() {
         // P0 regression: boundary_crossings() is a pure read. Calling it
         // (atlas/verify) must not delete or add relationships.
