@@ -7,14 +7,14 @@
 //!    the target file's exported symbol;
 //! 4. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 5. `self`/`this` receiver → sibling method of the enclosing class;
+//! 5. `self`/`this` sibling methods, plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
 //! 6. confirmed external import root → `external_api` entity;
 //! 7. otherwise: unresolved (counted; never silently treated as external).
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
 use crate::model::{Call, Import, ImportType, Symbol, SymbolKind, TypeBind};
-use crate::recv::classify_callee;
+use crate::recv::{classify_callee, split_recv_path, RecvFact};
 use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -407,6 +407,20 @@ pub fn resolve_calls(
         let method = fact.method.as_str();
         let root = fact.root.as_str();
 
+        if let Some(id) = field_type_callee_id(recv, &fact, &call, path, index, type_binds, &binding) {
+            out.push(emit(
+                caller_id,
+                Some(id),
+                call.callee.clone(),
+                0.9,
+                call.line,
+                ResolutionClass::ResolvedInternal,
+                recv,
+                1,
+            ));
+            continue;
+        }
+
         // Field chains: do not pin the intermediate name or the terminal
         // method (`self.client.process`, `db.users.findMany`). If the chain
         // is rooted at a resolved import (`import { db }`), seed that object
@@ -698,6 +712,30 @@ fn unique_bound_type<'a>(
     } else {
         None
     }
+}
+
+/// Pin `self.x.m()` / `this.x.m()` (exactly one field hop) to `{Type}.m`
+/// when the enclosing class has a unique field type and that method exists.
+// trace:v1 id=impl.scc.resolve.field-type-narrow work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
+fn field_type_callee_id(
+    recv: RecvKind,
+    fact: &RecvFact,
+    call: &Call,
+    path: &str,
+    index: &SymbolIndex,
+    type_binds: &[TypeBind],
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    if !matches!(recv, RecvKind::FieldOfSelf | RecvKind::FieldOfThis) {
+        return None;
+    }
+    if split_recv_path(&call.callee).len() != 3 {
+        return None;
+    }
+    let field = fact.field_name.as_deref()?;
+    let class = enclosing_class(call, path, index)?;
+    let ty = unique_bound_type(type_binds, Some(&class), field)?;
+    method_id_for_type(index, path, ty, &fact.method, binding)
 }
 
 /// Real `{Type}.{method}` definition locally or on the imported type only.
@@ -1238,6 +1276,180 @@ mod tests {
             .iter()
             .find(|c| c.callee_name == "x.process")
             .expect("x.process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-type-narrow verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
+    fn unique_field_type_pins_self_field_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut run = mk_symbol("Svc.run", SymbolKind::Method);
+        run.parent = Some("Svc".into());
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let mut init = mk_symbol("Svc.__init__", SymbolKind::Method);
+        init.parent = Some("Svc".into());
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            mk_symbol("Svc", SymbolKind::Class),
+            init,
+            run,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "Svc".into(),
+                name: "owned".into(),
+                type_name: "Order".into(),
+                line: 8,
+            }],
+        );
+        let calls = vec![Call {
+            caller: Some("Svc.run".into()),
+            callee: "self.owned.process".into(),
+            line: 12,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfSelf);
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+        assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-type-tombstone verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
+    fn two_field_types_do_not_pin() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut run = mk_symbol("Svc.run", SymbolKind::Method);
+        run.parent = Some("Svc".into());
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            mk_symbol("Svc", SymbolKind::Class),
+            run,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[
+                TypeBind {
+                    scope: "Svc".into(),
+                    name: "x".into(),
+                    type_name: "Order".into(),
+                    line: 8,
+                },
+                TypeBind {
+                    scope: "Svc".into(),
+                    name: "x".into(),
+                    type_name: "Invoice".into(),
+                    line: 9,
+                },
+            ],
+        );
+        let calls = vec![Call {
+            caller: Some("Svc.run".into()),
+            callee: "self.x.process".into(),
+            line: 10,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfSelf);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-type-chain-honest verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
+    fn longer_field_chain_stays_unresolved_even_with_field_type() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut run = mk_symbol("Svc.run", SymbolKind::Method);
+        run.parent = Some("Svc".into());
+        let mut order_exec = mk_symbol("Order.execute", SymbolKind::Method);
+        order_exec.parent = Some("Order".into());
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_exec,
+            mk_symbol("Svc", SymbolKind::Class),
+            run,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "Svc".into(),
+                name: "owned".into(),
+                type_name: "Order".into(),
+                line: 8,
+            }],
+        );
+        let calls = vec![Call {
+            caller: Some("Svc.run".into()),
+            callee: "self.owned.db.execute".into(),
+            line: 12,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None, "must not pin Order.execute");
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfSelf);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.field-type-extract verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.resolve.field-type-narrow
+    fn python_extract_then_resolve_pins_self_field() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let src = "class Order:\n    def process(self):\n        pass\nclass Invoice:\n    def process(self):\n        pass\nclass Svc:\n    def __init__(self):\n        self.owned = Order()\n    def run(self):\n        return self.owned.process()\n";
+        let ef = PythonExtractor::default().extract(&SourceFile::new("w.py", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "binds: {:?}",
+            ef.type_binds
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.py", &ef.symbols);
+        idx.set_type_binds("w.py", &ef.type_binds);
+        let resolved = resolve_calls("w.py", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "self.owned.process")
+            .expect("self.owned.process call");
         assert_eq!(
             hit.callee_id,
             Some(scc_core::symbol_id("repo", "w.py", "Order.process"))

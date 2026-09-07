@@ -33,6 +33,7 @@ pub enum RecvKind {
     Unknown,
 }
 
+// trace:exempt reason=internal-detail
 impl RecvKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -55,8 +56,10 @@ impl RecvKind {
         matches!(self, RecvKind::This | RecvKind::SelfRecv)
     }
 
-    /// Receivers that walk through an intermediate field. Resolution must
-    /// not pretend the intermediate name is the method.
+    /// Receivers that walk through an intermediate field. One-hop
+    /// `self.x.m()` / `this.x.m()` may pin via a unique field type; longer
+    /// chains stay unresolved and must not pretend the intermediate name
+    /// is the method.
     pub fn is_field_chain(self) -> bool {
         matches!(
             self,

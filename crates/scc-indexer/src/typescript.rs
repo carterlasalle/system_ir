@@ -325,6 +325,18 @@ impl LanguageExtractor for TypeScriptExtractor {
                         out.type_binds.push(b);
                     }
                 }
+                "public_field_definition" => {
+                    if let Some(b) = ts_type_bind_from_class_field(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                }
+                "assignment_expression" => {
+                    if let Some(b) =
+                        ts_type_bind_from_this_assign(&node, &ctx, &out.type_binds, src)
+                    {
+                        out.type_binds.push(b);
+                    }
+                }
             "call_expression" => {
                 let Some(function) = node.child_by_field_name("function") else {
                     push_children(&mut frames, &node, &ctx, src);
@@ -2202,6 +2214,108 @@ fn ts_simple_type_name(node: &Node, src: &[u8]) -> Option<String> {
 }
 
 // trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
+fn ts_new_ctor_name(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = node.child_by_field_name("constructor")?;
+    ts_simple_type_name(&ctor, src)
+}
+
+/// Class name from `ctx.class` or `Class.method` caller (methods clear `class`).
+// trace:exempt reason=internal-detail
+fn ts_enclosing_class(ctx: &Ctx) -> Option<String> {
+    if let Some(c) = &ctx.class {
+        return (!c.is_empty()).then(|| c.clone());
+    }
+    let caller = ctx.caller.as_deref()?;
+    let (class, rest) = caller.split_once('.')?;
+    if class.is_empty() || rest.is_empty() {
+        None
+    } else {
+        Some(class.to_string())
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn ts_unique_bind_type(binds: &[TypeBind], scope: &str, name: &str) -> Option<String> {
+    let mut types: Vec<&str> = binds
+        .iter()
+        .filter(|b| b.scope == scope && b.name == name)
+        .map(|b| b.type_name.as_str())
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    (types.len() == 1).then(|| types[0].to_string())
+}
+
+/// Class field `repo: Order` / `repo = new Order()`.
+// trace:v1 id=impl.scc.extract.typescript.field-type work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
+fn ts_type_bind_from_class_field(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let class = ts_enclosing_class(ctx)?;
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut ty = node
+        .child_by_field_name("type")
+        .and_then(|t| ts_simple_type_name(&t, src));
+    if ty.is_none() {
+        if let Some(v) = node.child_by_field_name("value") {
+            ty = ts_new_ctor_name(&v, src);
+        }
+    }
+    Some(TypeBind {
+        scope: class,
+        name: name.to_string(),
+        type_name: ty?,
+        line: line_of(node),
+    })
+}
+
+/// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique type in this method.
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_this_assign(
+    node: &Node,
+    ctx: &Ctx,
+    binds: &[TypeBind],
+    src: &[u8],
+) -> Option<TypeBind> {
+    let class = ts_enclosing_class(ctx)?;
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let obj = left.child_by_field_name("object")?;
+    if node_text(&obj, src).trim() != "this" {
+        return None;
+    }
+    let prop = left.child_by_field_name("property")?;
+    let name = node_text(&prop, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let right = node.child_by_field_name("right")?;
+    let type_name = if let Some(ty) = ts_new_ctor_name(&right, src) {
+        ty
+    } else if right.kind() == "identifier" {
+        let rhs = node_text(&right, src).trim();
+        let scope = ctx.caller.clone().unwrap_or_default();
+        ts_unique_bind_type(binds, &scope, rhs)?
+    } else {
+        return None;
+    };
+    Some(TypeBind {
+        scope: class,
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
+// trace:exempt reason=internal-detail
 fn ts_type_bind_from_declarator(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
     let name_node = node.child_by_field_name("name")?;
     if name_node.kind() != "identifier" {
@@ -3548,6 +3662,36 @@ mod tests {
                 .iter()
                 .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
             "new Order bind missing: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.field-type verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.extract.typescript.field-type
+    fn class_field_and_this_assign_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nclass Svc {\n  repo: Order;\n  constructor(other: Invoice) {\n    this.owned = new Order();\n    this.other = other;\n  }\n  run() { return this.owned.process(); }\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "class field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = new Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "this.other = param bind missing: {:?}",
             ef.type_binds
         );
     }

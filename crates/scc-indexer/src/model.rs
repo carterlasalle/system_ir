@@ -370,19 +370,22 @@ pub struct ExtractedFile {
     /// configuration, callbacks) — additive to the classic extraction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<SemanticFact>,
-    /// Per-scope local type binds (`x = Order()`, `x: Foo`, typed params).
-    /// Extract-time only; never stamped onto FILE entity attributes.
+    /// Per-scope local and class-field type binds (`x = Order()`, `x: Foo`,
+    /// typed params, `self.x = Order()`, class `x: Foo`). Extract-time only;
+    /// never stamped onto FILE entity attributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_binds: Vec<TypeBind>,
 }
 
-/// One local variable → type name fact used by one-hop NamedVariable narrowing.
+/// One local / field → type name fact used by one-hop NamedVariable and
+/// one-hop `self`/`this` field-type narrowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeBind {
-    /// Enclosing function/method name; empty at module scope.
+    /// Enclosing function/method name, or class name for field binds;
+    /// empty at module scope.
     #[serde(default)]
     pub scope: String,
-    /// Local variable or parameter name.
+    /// Local variable, parameter, or class field name.
     pub name: String,
     /// Type name as written (import alias or local class).
     pub type_name: String,

@@ -608,15 +608,79 @@ impl Ctx {
     }
     // trace:exempt reason=internal-detail
     fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
-        if name.is_empty() || type_name.is_empty() {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() || name == "self" || name == "cls" {
             return;
         }
         self.type_binds.push(TypeBind {
-            scope: self.caller().unwrap_or_default(),
+            scope,
             name,
             type_name,
             line,
         });
+    }
+
+    /// Class name for `Class.method` scopes; `None` at module level.
+    // trace:exempt reason=internal-detail
+    fn enclosing_class_name(&self) -> Option<String> {
+        if self.top_is_class() {
+            let n = self.top_name();
+            return (!n.is_empty()).then_some(n);
+        }
+        let top = self.top_name();
+        let (class, rest) = top.split_once('.')?;
+        if rest.is_empty() || class.is_empty() {
+            None
+        } else {
+            Some(class.to_string())
+        }
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
+
+    /// Class-scoped field type from annotation, constructor call, or unique RHS ident.
+    // trace:v1 id=impl.scc.extract.python.field-type work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
+    fn bind_field_type(
+        &mut self,
+        class: String,
+        field: String,
+        right: Option<Node>,
+        type_node: Option<Node>,
+        line: u32,
+        src: &[u8],
+    ) {
+        if let Some(ty_node) = type_node {
+            if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src))) {
+                self.push_type_bind_in(class.clone(), field.clone(), ty, line);
+            }
+        }
+        if let Some(r) = right {
+            if let Some(ty) = constructor_type_name(r, src) {
+                self.push_type_bind_in(class, field, ty, line);
+            } else if r.kind() == "identifier" {
+                let rhs = clean(node_text(Some(r), src));
+                if let Some(ty) = self.unique_local_type(&rhs) {
+                    self.push_type_bind_in(class, field, ty, line);
+                }
+            }
+        }
     }
 // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
@@ -1410,9 +1474,18 @@ impl PythonExtractor {
                     if !name.is_empty() {
                         let mutable = value_is_mutable(right);
                         ctx.fields
-                            .entry((owner, name))
+                            .entry((owner.clone(), name.clone()))
                             .and_modify(|m| *m = *m || mutable)
                             .or_insert(mutable);
+                        let line = node.start_position().row as u32 + 1;
+                        ctx.bind_field_type(
+                            owner,
+                            name,
+                            right,
+                            node.child_by_field_name("type"),
+                            line,
+                            src,
+                        );
                     }
                 }
             }
@@ -1428,6 +1501,27 @@ impl PythonExtractor {
                             .entry((owner, segs[1].clone()))
                             .and_modify(|m| *m = *m || mutable)
                             .or_insert(mutable);
+                    }
+                }
+            }
+        }
+        if !ctx.top_is_class() {
+            if let Some(l) = left {
+                if l.kind() == "attribute" {
+                    let mut segs: Vec<String> = Vec::new();
+                    attribute_segments(l, &mut segs, src);
+                    if segs.len() == 2 && segs[0] == "self" {
+                        if let Some(class) = ctx.enclosing_class_name() {
+                            let line = node.start_position().row as u32 + 1;
+                            ctx.bind_field_type(
+                                class,
+                                segs[1].clone(),
+                                right,
+                                node.child_by_field_name("type"),
+                                line,
+                                src,
+                            );
+                        }
                     }
                 }
             }
@@ -3579,6 +3673,48 @@ class QueryBuilder:
                 .any(|b| b.type_name == "process" || b.name == "self"),
             "must not bind methods or self: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.field-type verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.extract.python.field-type
+    fn field_type_binds_from_init_annotation_and_param() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\nclass Svc:\n    repo: Order\n    def __init__(self, other: Invoice):\n        self.owned = Order()\n        self.other = other\n    def run(self):\n        return self.owned.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "class annotation bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "self.owned = Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "self.other = param bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            "class Order:\n    def process(self):\n        pass\nclass Invoice:\n    def process(self):\n        pass\nclass Svc:\n    def __init__(self):\n        self.x = Order()\n        self.x = Invoice()\n",
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "tombstone fuel missing: {types:?}"
         );
     }
 }
