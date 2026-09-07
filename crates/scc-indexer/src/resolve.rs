@@ -1849,6 +1849,84 @@ impl Svc {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.rust.field-assign-tombstone verifies=REQ-implement-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-fi exercises=impl.scc.extract.rust.field-assign
+    fn rust_conflicting_field_assignment_does_not_pin() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::rust::RustExtractor;
+        let src = r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Invoice {};
+        self.owned.process();
+    }
+}
+"#;
+        let ef = RustExtractor::default().extract(&SourceFile::new("w.rs", src));
+        let types: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment must tombstone fuel: {types:?}"
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.rs", &ef.symbols);
+        idx.set_type_binds("w.rs", &ef.type_binds);
+        let resolved = resolve_calls("w.rs", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "self.owned.process")
+            .expect("self.owned.process call");
+        assert_eq!(hit.callee_id, None, "conflicting assignment must not pin");
+        assert_eq!(hit.recv, RecvKind::FieldOfSelf);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust.field-assign-same verifies=REQ-implement-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-fi exercises=impl.scc.extract.rust.field-assign
+    fn rust_same_type_field_assignment_still_pins() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::rust::RustExtractor;
+        let src = r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Order {};
+        self.owned.process();
+    }
+}
+"#;
+        let ef = RustExtractor::default().extract(&SourceFile::new("w.rs", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.rs", &ef.symbols);
+        idx.set_type_binds("w.rs", &ef.type_binds);
+        let resolved = resolve_calls("w.rs", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "self.owned.process")
+            .expect("self.owned.process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Invoice.process"))
+        );
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.java.unprefixed-field-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
     fn java_unprefixed_field_pins_and_local_shadows() {
         use crate::java::JavaExtractor;

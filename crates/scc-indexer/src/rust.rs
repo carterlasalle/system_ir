@@ -518,7 +518,18 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
-// trace:exempt reason=internal-detail
+
+    /// Innermost `impl Type` scope, used to attribute `self.field = …` binds.
+    // trace:exempt reason=internal-detail
+    fn enclosing_impl(&self) -> Option<String> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|s| s.is_impl)
+            .map(|s| s.name.clone())
+    }
+
+    // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
@@ -618,6 +629,7 @@ impl Ctx {
 
 // trace:exempt reason=internal-detail
 impl RustExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             // trait method declarations have no body (function_signature_item)
@@ -631,6 +643,7 @@ impl RustExtractor {
             "use_declaration" => self.record_use(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
             "macro_invocation" => self.record_macro_invocation(node, ctx, src),
+            "assignment_expression" => self.record_field_assign(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -1493,6 +1506,26 @@ impl RustExtractor {
         }
     }
 
+    /// `self.owned = Invoice {}` — class-scoped field bind from a one-hop
+    /// self-field assignment. A different type than the struct declaration
+    /// tombstones at resolve time.
+    // trace:v1 id=impl.scc.extract.rust.field-assign work=WORK-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme satisfies=REQ-implement-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-fi implements=PLAN-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme
+    fn record_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(class) = ctx.enclosing_impl() {
+            if let Some(left) = node.child_by_field_name("left") {
+                if let Some(field) = one_hop_self_field(left, src) {
+                    if let Some(right) = node.child_by_field_name("right") {
+                        if let Some(ty) = rust_rhs_type_name(right, src) {
+                            let line = node.start_position().row as u32 + 1;
+                            ctx.push_type_bind_in(class, field, ty, line);
+                        }
+                    }
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
     /// `env!("KEY")` / `option_env!("KEY")` configuration reads (macro
     /// invocation form; the `std::env::var` function form is handled in
     /// `record_call`). Body children are walked like before so calls
@@ -1872,6 +1905,59 @@ fn rust_simple_type_name(text: &str) -> Option<String> {
         return None;
     }
     Some(t.to_string())
+}
+
+/// One-hop `self.field`; longer chains and non-self roots are skipped.
+// trace:exempt reason=internal-detail
+fn one_hop_self_field(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "field_expression" {
+        return None;
+    }
+    let val = node.child_by_field_name("value")?;
+    if val.kind() != "self" {
+        return None;
+    }
+    let field = clean(node_text(node.child_by_field_name("field"), src));
+    if field.is_empty() {
+        None
+    } else {
+        Some(field)
+    }
+}
+
+/// Type name from `Invoice {}` / `&Invoice {}` / `Invoice::new()`.
+// trace:exempt reason=internal-detail
+fn rust_rhs_type_name(mut n: Node, src: &[u8]) -> Option<String> {
+    while matches!(
+        n.kind(),
+        "reference_expression"
+            | "parenthesized_expression"
+            | "try_expression"
+            | "await_expression"
+    ) {
+        n = n
+            .child_by_field_name("value")
+            .or_else(|| n.named_child(0))?;
+    }
+    match n.kind() {
+        "struct_expression" => {
+            rust_simple_type_name(&clean(node_text(n.child_by_field_name("name"), src)))
+        }
+        "call_expression" => rust_ctor_type_name(n, src),
+        _ => None,
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn rust_ctor_type_name(n: Node, src: &[u8]) -> Option<String> {
+    let fn_n = n.child_by_field_name("function")?;
+    let text = clean(node_text(Some(fn_n), src));
+    let (ty, method) = text.rsplit_once("::")?;
+    if !matches!(method, "new" | "default" | "from") {
+        return None;
+    }
+    let ty = ty.rsplit("::").next().unwrap_or(ty);
+    rust_simple_type_name(ty)
 }
 
 /// Derive names of a `#[derive(...)]` attribute run, last path segment
@@ -2962,6 +3048,54 @@ impl Svc {
                 .any(|b| b.scope == "Svc" && b.name == "borrowed" && b.type_name == "Order"),
             "&Order bind missing: {:?}",
             ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Invoice {};
+        self.owned.process();
+    }
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment tombstone fuel missing: {types:?}"
+        );
+        let same = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Order {};
+        self.owned.process();
+    }
+}
+"#,
+        );
+        let same_types: Vec<_> = same
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
+            "same-type assignment must stay unique Order: {same_types:?}"
         );
     }
 }
