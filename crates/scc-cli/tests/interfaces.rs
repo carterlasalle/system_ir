@@ -287,8 +287,7 @@ fn context_parity_across_cli_http_mcp() {
     // endpoint that fails closed to lexical ranking — parity must hold
     // through the same ranker decision on every transport). The config is
     // written FIRST so every transport sees hindsight enabled.
-    let port = 20000 + (std::process::id() % 20000) as u16;
-    let addr = format!("127.0.0.1:{port}");
+    let addr = test_listen_addr();
     std::fs::create_dir_all(dir.join(".scc")).unwrap();
     std::fs::create_dir_all(dir.join(".beads")).unwrap();
     std::fs::write(
@@ -502,10 +501,9 @@ fn corrupt_index_cache_refuses_instead_of_empty_atlas() {
 fn http_daemon_endpoints() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
-    // override the listen address via config for this repo; the port is
-    // derived from the process id so parallel/leaked daemons cannot collide
-    let port = 20000 + (std::process::id() % 20000) as u16;
-    let addr = format!("127.0.0.1:{port}");
+    // override the listen address via config for this repo; ephemeral so
+    // this test cannot collide with context_parity in the same binary
+    let addr = test_listen_addr();
     std::fs::write(
         workdir(repo.path()).join(".scc/config.yaml"),
         format!("schema: 1\nindex:\n  watch: false\nsecurity:\n  listen: {addr}\n"),
@@ -589,4 +587,14 @@ fn http_daemon_endpoints() {
 
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// Bind an ephemeral port so two HTTP tests in this binary cannot share a
+/// listen address. `20000 + pid` collided when cargo ran
+/// `context_parity_across_cli_http_mcp` and `http_daemon_endpoints` in
+/// parallel: the parity POST hit the other daemon (no beads/hindsight).
+// trace:exempt reason=internal-helper
+fn test_listen_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    listener.local_addr().expect("local_addr").to_string()
 }
