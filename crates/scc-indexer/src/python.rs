@@ -636,6 +636,28 @@ impl Ctx {
         });
     }
 
+    /// Untyped local/param of `name` — veto fuel for class-name receivers.
+    // trace:v1 id=impl.scc.extract.python.param-shadow work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
+    fn push_local_shadow(&mut self, name: String, line: u32) {
+        let scope = self.caller().unwrap_or_default();
+        if name.is_empty() || name == "self" || name == "cls" {
+            return;
+        }
+        if self
+            .type_binds
+            .iter()
+            .any(|b| b.scope == scope && b.name == name)
+        {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name: String::new(),
+            line,
+        });
+    }
+
     /// Class name for `Class.method` scopes; `None` at module level.
     // trace:exempt reason=internal-detail
     fn enclosing_class_name(&self) -> Option<String> {
@@ -881,7 +903,7 @@ impl Ctx {
             )
             .collect();
         let mut type_binds = self.type_binds;
-        type_binds.retain(|b| known.contains(&b.type_name));
+        type_binds.retain(|b| b.type_name.is_empty() || known.contains(&b.type_name));
         type_binds.sort_by(|a, b| {
             (&a.scope, &a.name, a.line, &a.type_name).cmp(&(
                 &b.scope,
@@ -1604,31 +1626,42 @@ impl PythonExtractor {
     fn record_param_types(&self, params: Node, ctx: &mut Ctx, src: &[u8]) {
         let mut cursor = params.walk();
         for p in params.named_children(&mut cursor) {
-            let (name_node, type_node) = match p.kind() {
+            let line = p.start_position().row as u32 + 1;
+            match p.kind() {
                 "typed_parameter" | "typed_default_parameter" => {
-                    let ty = p.child_by_field_name("type");
-                    let name = p.named_child(0);
-                    (name, ty)
+                    let Some(n) = p.named_child(0) else {
+                        continue;
+                    };
+                    if n.kind() != "identifier" {
+                        continue;
+                    }
+                    let name = clean(node_text(Some(n), src));
+                    if name.is_empty() || name == "self" || name == "cls" {
+                        continue;
+                    }
+                    if let Some(ty_node) = p.child_by_field_name("type") {
+                        if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src)))
+                        {
+                            ctx.push_type_bind(name, ty, line);
+                            continue;
+                        }
+                    }
+                    ctx.push_local_shadow(name, line);
                 }
-                _ => continue,
-            };
-            let Some(n) = name_node else {
-                continue;
-            };
-            if n.kind() != "identifier" {
-                continue;
+                "identifier" => {
+                    ctx.push_local_shadow(clean(node_text(Some(p), src)), line);
+                }
+                "default_parameter" => {
+                    let Some(n) = p.named_child(0) else {
+                        continue;
+                    };
+                    if n.kind() != "identifier" {
+                        continue;
+                    }
+                    ctx.push_local_shadow(clean(node_text(Some(n), src)), line);
+                }
+                _ => {}
             }
-            let name = clean(node_text(Some(n), src));
-            if name.is_empty() || name == "self" || name == "cls" {
-                continue;
-            }
-            let Some(ty_node) = type_node else {
-                continue;
-            };
-            let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src))) else {
-                continue;
-            };
-            ctx.push_type_bind(name, ty, p.start_position().row as u32 + 1);
         }
     }
 
@@ -3684,6 +3717,40 @@ class QueryBuilder:
                 .iter()
                 .any(|b| b.type_name == "process" || b.name == "self"),
             "must not bind methods or self: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.param-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.extract.python.param-shadow
+    fn untyped_params_are_empty_shadow_binds() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\ndef handle(Order, x: Order, y=1):\n    Order.process()\n    x.process()\n",
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "Order"
+                && b.type_name.is_empty()),
+            "untyped param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "typed param must still bind: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "y"
+                && b.type_name.is_empty()),
+            "default param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds.iter().any(|b| b.name == "self"),
+            "must not shadow self: {:?}",
             ef.type_binds
         );
     }

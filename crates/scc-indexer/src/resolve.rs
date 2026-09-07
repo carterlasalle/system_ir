@@ -2,14 +2,16 @@
 //!
 //! Resolution rules, in priority order:
 //! 1. receiver classification (this/self vs named vs field-chain vs type);
-//! 2. local symbol in the same file;
-//! 3. imported member (`import { a as b }` / `from m import a`) resolved to
+//! 2. unique typed local/param (Rule 2) then class-name receiver `Cls.m()`
+//!    (Rule 2c: unique class-like def, local/param names veto, no spray);
+//! 3. local symbol in the same file;
+//! 4. imported member (`import { a as b }` / `from m import a`) resolved to
 //!    the target file's exported symbol;
-//! 4. imported module namespace (`import * as ns`, `import m`) → member on
+//! 5. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 5. `self`/`this` sibling methods, plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
-//! 6. confirmed external import root → `external_api` entity;
-//! 7. otherwise: unresolved (counted; never silently treated as external).
+//! 6. `self`/`this` sibling methods, plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
+//! 7. confirmed external import root → `external_api` entity;
+//! 8. otherwise: unresolved (counted; never silently treated as external).
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
@@ -623,9 +625,27 @@ pub fn resolve_calls(
             continue;
         }
 
-        // Type-qualified / static type / local class method.
-        if matches!(recv, RecvKind::StaticType | RecvKind::TypeQualified | RecvKind::NamedVariable)
-        {
+        // Rule 2c: `Cls.m()` — the receiver token is the type. Typed locals
+        // win (Rule 2); any local/param of that name vetoes the class pin.
+        if recv == RecvKind::StaticType {
+            if let Some(id) = static_type_callee_id(&call, &fact, path, index, type_binds, &binding)
+            {
+                out.push(emit(
+                    caller_id,
+                    Some(id),
+                    call.callee.clone(),
+                    0.9,
+                    call.line,
+                    ResolutionClass::ResolvedInternal,
+                    recv,
+                    1,
+                ));
+                continue;
+            }
+        }
+
+        // Type-qualified / local class method.
+        if matches!(recv, RecvKind::TypeQualified | RecvKind::NamedVariable) {
             if let Some(sym) = local.get(root) {
                 if let Some((_, mid)) = index
                     .files
@@ -846,6 +866,69 @@ fn unprefixed_field_type_callee_id(
     method_id_for_type(index, path, ty, &fact.method, binding)
 }
 
+fn is_class_like(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+    )
+}
+
+/// Unique in-repo `{Type}.{method}` on a Class/Interface/Type named `type_name`.
+/// Two class-like defs that both expose the method stay unresolved (no spray).
+/// Modules and non-defining same-named types do not count.
+// trace:v1 id=impl.scc.resolve.class-name work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
+fn unique_class_like_method(index: &SymbolIndex, type_name: &str, method: &str) -> Option<String> {
+    if type_name.is_empty() || method.is_empty() {
+        return None;
+    }
+    let key = format!("{type_name}.{method}");
+    let mut found: Option<String> = None;
+    for fs in index.files.values() {
+        let Some((sym, _)) = fs.by_name.get(type_name) else {
+            continue;
+        };
+        if !is_class_like(sym.kind) {
+            continue;
+        }
+        let Some(id) = fs
+            .methods
+            .get(&key)
+            .map(|(_, id)| id)
+            .or_else(|| fs.by_name.get(&key).map(|(_, id)| id))
+        else {
+            continue;
+        };
+        if found.as_ref().is_some_and(|existing| existing != id) {
+            return None;
+        }
+        found = Some(id.clone());
+    }
+    found
+}
+
+/// Pin `Cls.m()` (StaticType). A unique typed bind for `Cls` is Rule 2 and
+/// wins; any bind including an untyped shadow vetoes the class-name pin.
+fn static_type_callee_id(
+    call: &Call,
+    fact: &RecvFact,
+    path: &str,
+    index: &SymbolIndex,
+    type_binds: &[TypeBind],
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    let root = fact.root.as_str();
+    let method = fact.method.as_str();
+    if has_bind(type_binds, call.caller.as_deref(), root) {
+        let ty = unique_bound_type(type_binds, call.caller.as_deref(), root)?;
+        if ty.is_empty() {
+            return None;
+        }
+        return method_id_for_type(index, path, ty, method, binding)
+            .or_else(|| unique_class_like_method(index, ty, method));
+    }
+    unique_class_like_method(index, root, method)
+}
+
 /// Real `{Type}.{method}` definition locally or on the imported type only.
 fn method_id_for_type(
     index: &SymbolIndex,
@@ -854,7 +937,7 @@ fn method_id_for_type(
     method: &str,
     binding: &HashMap<&str, (String, String)>,
 ) -> Option<String> {
-    if method.is_empty() {
+    if ty.is_empty() || method.is_empty() {
         return None;
     }
     let local_key = format!("{ty}.{method}");
@@ -1265,6 +1348,229 @@ mod tests {
         );
         assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
         assert_eq!(resolved[0].provenance, scc_core::Provenance::Extracted);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-pin verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn unique_class_name_receiver_pins_that_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            handle,
+        ];
+        idx.add_file("w.py", &syms);
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Order.process".into(),
+                line: 9,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-typed-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn typed_param_named_like_class_pins_bound_type() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            handle,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "Order".into(),
+                type_name: "Invoice".into(),
+                line: 8,
+            }],
+        );
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Order.process".into(),
+                line: 9,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Invoice.process"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "Order.process"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-untyped-veto verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn untyped_param_named_like_class_vetoes_class_pin() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![mk_symbol("Order", SymbolKind::Class), order_p, handle];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "Order".into(),
+                type_name: String::new(),
+                line: 8,
+            }],
+        );
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Order.process".into(),
+                line: 9,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-split verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn two_defining_classes_do_not_pin_class_name_receiver() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_p = mk_symbol("Order.process", SymbolKind::Method);
+        a_p.parent = Some("Order".into());
+        idx.add_file("a.py", &[mk_symbol("Order", SymbolKind::Class), a_p]);
+        let mut b_p = mk_symbol("Order.process", SymbolKind::Method);
+        b_p.parent = Some("Order".into());
+        idx.add_file("b.py", &[mk_symbol("Order", SymbolKind::Class), b_p]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&handle));
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Order.process".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &[handle],
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-cross-file verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn unique_class_in_other_file_pins_class_name_receiver() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        idx.add_file(
+            "order.py",
+            &[mk_symbol("Order", SymbolKind::Class), order_p],
+        );
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&handle));
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Order.process".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &[handle],
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "order.py", "Order.process"))
+        );
+        assert_eq!(resolved[0].class, ResolutionClass::ResolvedInternal);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.class-name-module verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn module_name_is_not_a_class_name_receiver() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut join = mk_symbol("Os.join", SymbolKind::Function);
+        join.parent = Some("Os".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![mk_symbol("Os", SymbolKind::Module), join, handle];
+        idx.add_file("w.py", &syms);
+        let resolved = resolve_calls(
+            "w.py",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "Os.join".into(),
+                line: 2,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
     }
 
     #[test]

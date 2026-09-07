@@ -1910,4 +1910,155 @@ class Svc {
             "opaque factory must not mint a bind: {factory_calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.class-name-pin verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn index_pins_class_name_receiver_to_unique_class_method() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "class Order:\n    def process(self):\n        return 1\n\nclass Invoice:\n    def process(self):\n        return 2\n\ndef handle():\n    return Order.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.class-name-typed-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn index_class_name_receiver_typed_param_beats_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "class Order:\n    def process(self):\n        return 1\n\nclass Invoice:\n    def process(self):\n        return 2\n\ndef handle(Order: Invoice):\n    return Order.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == invoice),
+            "typed param Order: Invoice must CALL Invoice.process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == order),
+            "must not pin class Order.process through a typed param: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.class-name-untyped-veto verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.extract.python.param-shadow
+    fn index_class_name_receiver_untyped_param_vetoes_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "class Order:\n    def process(self):\n        return 1\n\ndef handle(Order):\n    return Order.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.py", "Order.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == order),
+            "untyped param must veto class Order.process: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.class-name-split verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn index_class_name_receiver_two_defining_classes_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.py"),
+            "class Order:\n    def process(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.py"),
+            "class Order:\n    def process(self):\n        return 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "def handle():\n    return Order.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "a.py", "Order.process");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "b.py", "Order.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a || r.object == b),
+            "two defining classes must not spray: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.class-name-cross-file verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.resolve.class-name
+    fn index_class_name_receiver_cross_file_unique_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("order.py"),
+            "class Order:\n    def process(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "def handle():\n    return Order.process()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "order.py", "Order.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.py", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "unique class in another file must pin Order.process: {calls:?}"
+        );
+    }
 }

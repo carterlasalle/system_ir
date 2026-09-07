@@ -494,7 +494,8 @@ impl LanguageExtractor for TypeScriptExtractor {
                     .flat_map(|i| i.names.iter().map(|(local, _)| local.clone())),
             )
             .collect();
-        out.type_binds.retain(|b| known.contains(&b.type_name));
+        out.type_binds
+            .retain(|b| b.type_name.is_empty() || known.contains(&b.type_name));
 
         out
         }
@@ -2395,7 +2396,9 @@ fn ts_type_bind_from_declarator(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<Ty
     })
 }
 
-// trace:exempt reason=internal-detail
+// Untyped identifier params are empty-type shadows so `Order.process()`
+// cannot pin the class when a parameter is named `Order`.
+// trace:v1 id=impl.scc.extract.typescript.param-shadow work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
 fn ts_type_bind_from_param(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
     let pat = node.child_by_field_name("pattern")?;
     if pat.kind() != "identifier" {
@@ -2405,8 +2408,10 @@ fn ts_type_bind_from_param(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBin
     if name.is_empty() || name == "this" {
         return None;
     }
-    let ty_node = node.child_by_field_name("type")?;
-    let type_name = ts_simple_type_name(&ty_node, src)?;
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|ty_node| ts_simple_type_name(&ty_node, src))
+        .unwrap_or_default();
     Some(TypeBind {
         scope: ctx.caller.clone().unwrap_or_default(),
         name: name.to_string(),
@@ -3711,6 +3716,29 @@ mod tests {
                 .iter()
                 .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
             "new Order bind missing: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.param-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.extract.typescript.param-shadow
+    fn untyped_params_are_empty_shadow_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nfunction handle(Order, x: Order) {\n  Order.process();\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "Order"
+                && b.type_name.is_empty()),
+            "untyped param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "typed param must still bind: {:?}",
             ef.type_binds
         );
     }
