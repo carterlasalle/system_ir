@@ -21,6 +21,12 @@
 //! 9. confirmed external import root → `external_api` entity;
 //! 10. otherwise: unresolved (counted; never silently treated as external).
 //!
+//! Step-A import files are language-gated unique-or-degrade (Ripwire analog):
+//! `.rs` → `crate::` / `super::` / `self::` / `mod:x`; `.py` → `mod.py` or
+//! `mod/__init__.py` (relative: includer dir; absolute: file + repo-root +
+//! unique source-root fallback); `.ts`/`.js` → relative `./`/`../` only
+//! (bare specifiers stay External). Two distinct hits contribute nothing.
+//!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
 use crate::model::{Call, FnBind, Import, ImportType, Symbol, SymbolKind, TypeBind};
@@ -76,6 +82,13 @@ pub enum ImportTarget {
     /// Relative or project-looking specifier that did not resolve to a file.
     /// Not evidence that the target is outside the repository.
     Unresolved { name: String },
+}
+
+/// Unique-or-degrade probe: 0 hits, exactly one distinct file, or ≥2 files.
+enum UniqueHit {
+    None,
+    One(String),
+    Ambiguous,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +166,12 @@ impl SymbolIndex {
         if from_file.ends_with(".rs") {
             return self.resolve_rust_import_target(from_file, import);
         }
+        if from_file.ends_with(".py") {
+            return self.resolve_python_import_target(from_file, import);
+        }
+        if is_typescript_file(from_file) {
+            return self.resolve_ts_import_target(from_file, import);
+        }
         if import.module.starts_with('.') {
             // relative: join with dir of from_file, then normalize ./ and ..
             let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -201,9 +220,7 @@ impl SymbolIndex {
         // source root (src, svc, lib, app, services, packages) — common for
         // python and typescript repos. Deterministic order; first match wins.
         if !module.starts_with('.') && !module.starts_with('/') {
-            for root in [
-                "src", "svc", "lib", "app", "services", "service", "packages",
-            ] {
+            for root in SOURCE_ROOTS {
                 for c in self.candidate_paths(&format!("{root}/{module}")) {
                     if self.all_files.contains(&c) {
                         return Some(c);
@@ -319,6 +336,13 @@ impl SymbolIndex {
     }
 
     fn rust_unique_file(&self, candidates: impl IntoIterator<Item = String>) -> Option<String> {
+        match self.unique_existing(candidates) {
+            UniqueHit::One(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn unique_existing(&self, candidates: impl IntoIterator<Item = String>) -> UniqueHit {
         let mut hit: Option<String> = None;
         for raw in candidates {
             let c = normalize_module_path(&raw);
@@ -327,11 +351,93 @@ impl SymbolIndex {
             }
             match &hit {
                 None => hit = Some(c),
-                Some(prev) if prev != &c => return None,
+                Some(prev) if prev != &c => return UniqueHit::Ambiguous,
                 Some(_) => {}
             }
         }
-        hit
+        match hit {
+            Some(f) => UniqueHit::One(f),
+            None => UniqueHit::None,
+        }
+    }
+
+    fn resolve_python_import_target(&self, from_file: &str, import: &Import) -> ImportTarget {
+        import_hit_to_target(
+            self.resolve_python_import(from_file, &import.module),
+            &import.module,
+            import.r#type == ImportType::Module,
+            !import.module.starts_with('.'),
+        )
+    }
+
+    /// Ripwire `resolvePythonImport`: unique-or-degrade path-precise Step-A.
+    /// Dots→slashes; probe `mod.py` then `mod/__init__.py`. Relative: includer
+    /// dir only. Absolute: file-relative, repo-root, and unique SCC source-root
+    /// fallbacks as one set. Two hits (e.g. `pkg.py` and `pkg/__init__.py`)
+    /// degrade. Never steal `.ts`/`.js` files.
+    // trace:v1 id=impl.scc.resolve.python-import work=WORK-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-script-step-a-p satisfies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr implements=PLAN-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-script-step-a-p
+    fn resolve_python_import(&self, from_file: &str, target: &str) -> UniqueHit {
+        if target.is_empty() {
+            return UniqueHit::None;
+        }
+        let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if target.starts_with("./") || target.starts_with("../") {
+            let joined = normalize_module_path(&rust_join(dir, target));
+            if joined.ends_with(".py") {
+                return self.unique_existing(std::iter::once(joined));
+            }
+            return self.unique_existing(python_probe_pair("", "", &joined));
+        }
+        let n_dots = target.bytes().take_while(|&b| b == b'.').count();
+        let tail = &target[n_dots..];
+        let mod_path = tail.replace('.', "/");
+        let is_relative = n_dots > 0;
+        let rel_prefix = "../".repeat(n_dots.saturating_sub(1));
+        let mut cands = Vec::new();
+        cands.extend(python_probe_pair(dir, &rel_prefix, &mod_path));
+        if !is_relative {
+            cands.extend(python_probe_pair("", "", &mod_path));
+            for root in SOURCE_ROOTS {
+                cands.extend(python_probe_pair(root, "", &mod_path));
+            }
+        }
+        self.unique_existing(cands)
+    }
+
+    fn resolve_ts_import_target(&self, from_file: &str, import: &Import) -> ImportTarget {
+        if !import.module.starts_with('.') {
+            return ImportTarget::External {
+                name: import.module.clone(),
+            };
+        }
+        import_hit_to_target(
+            self.resolve_ts_import(from_file, &import.module),
+            &import.module,
+            import.r#type == ImportType::Module,
+            false,
+        )
+    }
+
+    /// Ripwire `resolveTsImport`: unique-or-degrade path-precise Step-A.
+    /// Relative `./x` / `../a/b` probe exact, then a fixed extension list,
+    /// then index files, relative-to-includer. Bare specifiers are External
+    /// (no tsconfig aliases). Two hits (e.g. `x.ts` and `x/index.ts`) degrade.
+    /// Never steal `.py` files.
+    // trace:v1 id=impl.scc.resolve.ts-import work=WORK-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-script-step-a-p satisfies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr implements=PLAN-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-script-step-a-p
+    fn resolve_ts_import(&self, from_file: &str, target: &str) -> UniqueHit {
+        if target.is_empty() || !target.starts_with('.') {
+            return UniqueHit::None;
+        }
+        let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut cands = Vec::with_capacity(1 + TS_FILE_EXTS.len() + TS_INDEX_RELS.len());
+        cands.push(rust_join(dir, target));
+        for ext in TS_FILE_EXTS {
+            cands.push(rust_join(dir, &format!("{target}{ext}")));
+        }
+        for rel in TS_INDEX_RELS {
+            cands.push(rust_join(dir, &format!("{target}{rel}")));
+        }
+        self.unique_existing(cands)
     }
 }
 
@@ -350,6 +456,56 @@ fn rust_join(base: &str, rel: &str) -> String {
         rel.to_string()
     } else {
         format!("{base}/{rel}")
+    }
+}
+
+const SOURCE_ROOTS: [&str; 7] = [
+    "src", "svc", "lib", "app", "services", "service", "packages",
+];
+
+const TS_FILE_EXTS: [&str; 7] = [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mjs", ".cjs"];
+const TS_INDEX_RELS: [&str; 4] = ["/index.ts", "/index.tsx", "/index.js", "/index.jsx"];
+
+fn is_typescript_file(path: &str) -> bool {
+    path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".js")
+        || path.ends_with(".jsx")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
+}
+
+fn python_probe_pair(base: &str, rel_prefix: &str, mod_path: &str) -> [String; 2] {
+    let py = rust_join(base, &format!("{rel_prefix}{mod_path}.py"));
+    let init = if mod_path.is_empty() {
+        rust_join(base, &format!("{rel_prefix}__init__.py"))
+    } else {
+        rust_join(base, &format!("{rel_prefix}{mod_path}/__init__.py"))
+    };
+    [py, init]
+}
+
+fn import_hit_to_target(
+    hit: UniqueHit,
+    module: &str,
+    namespace: bool,
+    miss_is_external: bool,
+) -> ImportTarget {
+    match hit {
+        UniqueHit::One(file) => ImportTarget::Internal {
+            file,
+            name_map: HashMap::new(),
+            namespace,
+        },
+        UniqueHit::Ambiguous => ImportTarget::Unresolved {
+            name: module.to_string(),
+        },
+        UniqueHit::None if miss_is_external => ImportTarget::External {
+            name: module.to_string(),
+        },
+        UniqueHit::None => ImportTarget::Unresolved {
+            name: module.to_string(),
+        },
     }
 }
 
@@ -1799,6 +1955,186 @@ mod tests {
         match idx.resolve_import("src/foo/bar.rs", &rust_imp("super::cfg")) {
             ImportTarget::Internal { file, .. } => assert_eq!(file, "src/cfg.rs"),
             other => panic!("super::cfg expected src/cfg.rs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.python-import verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.python-import
+    fn python_step_a_unique_or_degrade_and_never_basename() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &[]);
+        idx.add_file("other/a.py", &[]);
+        idx.add_file("other/mod.py", &[]);
+        idx.add_file("pkg/mod.py", &[]);
+        idx.add_file("pkg/__init__.py", &[]);
+        idx.add_file("rel/sibling.py", &[]);
+        idx.add_file("rel/relcaller.py", &[]);
+        idx.add_file("other/caller2.py", &[]);
+        idx.add_file("caller.py", &[]);
+        idx.add_file("web/index.ts", &[]);
+        idx.add_file("src/util.py", &[]);
+
+        match idx.resolve_import("caller.py", &rust_imp("a")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "a.py"),
+            other => panic!("import a expected a.py, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("a")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/a.py", "must not basename-guess other/a.py")
+            }
+            other => panic!("import a expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("pkg.mod")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "pkg/mod.py"),
+            other => panic!("pkg.mod expected pkg/mod.py, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("pkg.mod")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/mod.py", "must not basename-guess other/mod.py")
+            }
+            other => panic!("pkg.mod expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("pkg")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "pkg/__init__.py"),
+            other => panic!("import pkg expected pkg/__init__.py, got {other:?}"),
+        }
+        match idx.resolve_import("other/caller2.py", &rust_imp("other.a")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "other/a.py"),
+            other => panic!("other.a expected other/a.py, got {other:?}"),
+        }
+        match idx.resolve_import("rel/relcaller.py", &rust_imp(".sibling")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "rel/sibling.py"),
+            other => panic!("from .sibling expected rel/sibling.py, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("os")) {
+            ImportTarget::External { name } => assert_eq!(name, "os"),
+            other => panic!("stdlib os must stay External, got {other:?}"),
+        }
+        match idx.resolve_import("w.py", &rust_imp("util")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/util.py"),
+            other => panic!("unique src/util.py must still pin, got {other:?}"),
+        }
+        match idx.resolve_import("caller.py", &rust_imp("web")) {
+            ImportTarget::External { name } => assert_eq!(name, "web"),
+            other => panic!("Python must not steal web/index.ts, got {other:?}"),
+        }
+
+        let mut amb = SymbolIndex::new("repo");
+        amb.add_file("pkg.py", &[]);
+        amb.add_file("pkg/__init__.py", &[]);
+        amb.add_file("w.py", &[]);
+        match amb.resolve_import("w.py", &rust_imp("pkg")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "pkg"),
+            other => panic!("pkg.py + pkg/__init__.py must degrade, got {other:?}"),
+        }
+
+        let mut roots = SymbolIndex::new("repo");
+        roots.add_file("util.py", &[]);
+        roots.add_file("src/util.py", &[]);
+        roots.add_file("w.py", &[]);
+        match roots.resolve_import("w.py", &rust_imp("util")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "util"),
+            other => panic!("util.py + src/util.py must degrade, got {other:?}"),
+        }
+
+        let mut nested = SymbolIndex::new("repo");
+        nested.add_file("pkg/sub/w.py", &[]);
+        nested.add_file("pkg/models.py", &[]);
+        nested.add_file("pkg/sub/models.py", &[]);
+        match nested.resolve_import("pkg/sub/w.py", &rust_imp("..models")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "pkg/models.py"),
+            other => panic!("from ..models expected pkg/models.py, got {other:?}"),
+        }
+        match nested.resolve_import("pkg/sub/w.py", &rust_imp("..models")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "pkg/sub/models.py", "must not stay in the child dir")
+            }
+            other => panic!("from ..models expected Internal, got {other:?}"),
+        }
+        match nested.resolve_import("pkg/sub/w.py", &rust_imp(".")) {
+            ImportTarget::Internal { file, .. } => {
+                panic!("from . without __init__.py must not guess, got {file}")
+            }
+            ImportTarget::Unresolved { name } => assert_eq!(name, "."),
+            other => panic!("from . miss must be Unresolved, got {other:?}"),
+        }
+        nested.add_file("pkg/sub/__init__.py", &[]);
+        match nested.resolve_import("pkg/sub/w.py", &rust_imp(".")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "pkg/sub/__init__.py"),
+            other => panic!("from . expected pkg/sub/__init__.py, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.ts-import verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.ts-import
+    fn ts_step_a_unique_or_degrade_and_never_basename() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("x.ts", &[]);
+        idx.add_file("other/x.ts", &[]);
+        idx.add_file("a/b.ts", &[]);
+        idx.add_file("other/b.ts", &[]);
+        idx.add_file("idx/index.ts", &[]);
+        idx.add_file("caller.ts", &[]);
+        idx.add_file("other/caller2.ts", &[]);
+        idx.add_file("react.ts", &[]);
+        idx.add_file("util.py", &[]);
+
+        match idx.resolve_import("caller.ts", &rust_imp("./x")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "x.ts"),
+            other => panic!("./x expected x.ts, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./x")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/x.ts", "must not basename-guess other/x.ts")
+            }
+            other => panic!("./x expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./a/b")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "a/b.ts"),
+            other => panic!("./a/b expected a/b.ts, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./a/b")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/b.ts", "must not basename-guess other/b.ts")
+            }
+            other => panic!("./a/b expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./idx")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "idx/index.ts"),
+            other => panic!("./idx expected idx/index.ts, got {other:?}"),
+        }
+        match idx.resolve_import("other/caller2.ts", &rust_imp("./x")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "other/x.ts"),
+            other => panic!("other/ ./x expected other/x.ts, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("react")) {
+            ImportTarget::External { name } => assert_eq!(name, "react"),
+            other => panic!("bare react must stay External even if react.ts exists, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./util")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "./util"),
+            other => panic!("TS must not steal util.py, got {other:?}"),
+        }
+        match idx.resolve_import("caller.ts", &rust_imp("./missing")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "./missing"),
+            other => panic!("relative miss must be Unresolved, got {other:?}"),
+        }
+
+        let mut amb = SymbolIndex::new("repo");
+        amb.add_file("x.ts", &[]);
+        amb.add_file("x/index.ts", &[]);
+        amb.add_file("caller.ts", &[]);
+        match amb.resolve_import("caller.ts", &rust_imp("./x")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "./x"),
+            other => panic!("x.ts + x/index.ts must degrade, got {other:?}"),
+        }
+
+        let mut py = SymbolIndex::new("repo");
+        py.add_file("w.py", &[]);
+        py.add_file("x.ts", &[]);
+        match py.resolve_import("w.py", &rust_imp("./x")) {
+            ImportTarget::Unresolved { .. } => {}
+            other => panic!("Python path-style ./x must not steal x.ts, got {other:?}"),
         }
     }
 

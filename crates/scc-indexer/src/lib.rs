@@ -2967,4 +2967,249 @@ class Svc {
             "amb.rs + amb/mod.rs must not guess a CALL: {calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.python-import verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.python-import
+    fn index_python_import_pins_named_not_decoy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::create_dir_all(root.join("rel")).unwrap();
+        std::fs::create_dir_all(root.join("pkg/sub")).unwrap();
+        std::fs::write(root.join("a.py"), "def widget():\n    return 1\n").unwrap();
+        std::fs::write(root.join("other/a.py"), "def widget():\n    return 9\n").unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "def gadget():\n    return 2\n").unwrap();
+        std::fs::write(root.join("other/mod.py"), "def gadget():\n    return 8\n").unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "def pkginit():\n    return 3\n").unwrap();
+        std::fs::write(root.join("rel/sibling.py"), "def sib():\n    return 4\n").unwrap();
+        std::fs::write(root.join("pkg/models.py"), "def sib():\n    return 5\n").unwrap();
+        std::fs::write(root.join("pkg/sub/models.py"), "def sib():\n    return 6\n").unwrap();
+        std::fs::write(
+            root.join("caller.py"),
+            "import a\nfrom pkg.mod import gadget\nimport pkg\ndef use_a():\n    return widget()\ndef use_pkgmod():\n    return gadget()\ndef use_pkginit():\n    return pkginit()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rel/relcaller.py"),
+            "from .sibling import sib\ndef use_rel():\n    return sib()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pkg/sub/w.py"),
+            "from ..models import sib\ndef use_parent():\n    return sib()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let calls_of = |file: &str, func: &str| {
+            let sub = scc_core::symbol_id(&rid, file, func);
+            rels.iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == sub)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let a_widget = scc_core::symbol_id(&rid, "a.py", "widget");
+        let decoy_a = scc_core::symbol_id(&rid, "other/a.py", "widget");
+        let use_a = calls_of("caller.py", "use_a");
+        assert!(
+            use_a.iter().any(|r| r.object == a_widget),
+            "import a must CALL a.py widget: {use_a:?}"
+        );
+        assert!(
+            !use_a.iter().any(|r| r.object == decoy_a),
+            "must not basename-guess other/a.py: {use_a:?}"
+        );
+        let gadget = scc_core::symbol_id(&rid, "pkg/mod.py", "gadget");
+        let decoy_g = scc_core::symbol_id(&rid, "other/mod.py", "gadget");
+        let use_pkgmod = calls_of("caller.py", "use_pkgmod");
+        assert!(
+            use_pkgmod.iter().any(|r| r.object == gadget),
+            "from pkg.mod import gadget must CALL pkg/mod.py: {use_pkgmod:?}"
+        );
+        assert!(
+            !use_pkgmod.iter().any(|r| r.object == decoy_g),
+            "must not basename-guess other/mod.py: {use_pkgmod:?}"
+        );
+        let pkginit = scc_core::symbol_id(&rid, "pkg/__init__.py", "pkginit");
+        let use_pkginit = calls_of("caller.py", "use_pkginit");
+        assert!(
+            use_pkginit.iter().any(|r| r.object == pkginit),
+            "import pkg must CALL pkg/__init__.py pkginit: {use_pkginit:?}"
+        );
+        let sib = scc_core::symbol_id(&rid, "rel/sibling.py", "sib");
+        let use_rel = calls_of("rel/relcaller.py", "use_rel");
+        assert!(
+            use_rel.iter().any(|r| r.object == sib),
+            "from .sibling must CALL rel/sibling.py: {use_rel:?}"
+        );
+        let parent = scc_core::symbol_id(&rid, "pkg/models.py", "sib");
+        let child = scc_core::symbol_id(&rid, "pkg/sub/models.py", "sib");
+        let use_parent = calls_of("pkg/sub/w.py", "use_parent");
+        assert!(
+            use_parent.iter().any(|r| r.object == parent),
+            "from ..models must CALL pkg/models.py: {use_parent:?}"
+        );
+        assert!(
+            !use_parent.iter().any(|r| r.object == child),
+            "from ..models must not stay in pkg/sub/models.py: {use_parent:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.python-import-degrade verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.python-import
+    fn index_python_import_degrades_when_py_and_init_both_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg.py"), "def pkginit():\n    return 1\n").unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "def pkginit():\n    return 2\n").unwrap();
+        std::fs::write(
+            root.join("caller.py"),
+            "import pkg\ndef run():\n    return pkginit()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "pkg.py", "pkginit");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "pkg/__init__.py", "pkginit");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "caller.py", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
+            "pkg.py + pkg/__init__.py must not guess a CALL: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.ts-import verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.ts-import
+    fn index_ts_relative_pins_named_not_decoy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::create_dir_all(root.join("idx")).unwrap();
+        std::fs::write(root.join("x.ts"), "export function helper() { return 1; }\n").unwrap();
+        std::fs::write(
+            root.join("other/x.ts"),
+            "export function helper() { return 9; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a/b.ts"), "export function widget() { return 2; }\n").unwrap();
+        std::fs::write(
+            root.join("other/b.ts"),
+            "export function widget() { return 8; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("idx/index.ts"),
+            "export function idxfn() { return 3; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("react.ts"),
+            "export function createElement() { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("caller.ts"),
+            "import { helper } from \"./x\";\nimport { widget } from \"./a/b\";\nimport { idxfn } from \"./idx\";\nimport React from \"react\";\nexport function useHelper() { return helper(); }\nexport function useWidget() { return widget(); }\nexport function useIdx() { return idxfn(); }\nexport function useReact() { return createElement(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/caller2.ts"),
+            "import { helper } from \"./x\";\nexport function useOther() { return helper(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let calls_of = |file: &str, func: &str| {
+            let sub = scc_core::symbol_id(&rid, file, func);
+            rels.iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == sub)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let helper = scc_core::symbol_id(&rid, "x.ts", "helper");
+        let decoy = scc_core::symbol_id(&rid, "other/x.ts", "helper");
+        let use_helper = calls_of("caller.ts", "useHelper");
+        assert!(
+            use_helper.iter().any(|r| r.object == helper),
+            "from './x' must CALL x.ts helper: {use_helper:?}"
+        );
+        assert!(
+            !use_helper.iter().any(|r| r.object == decoy),
+            "must not basename-guess other/x.ts: {use_helper:?}"
+        );
+        let widget = scc_core::symbol_id(&rid, "a/b.ts", "widget");
+        let decoy_w = scc_core::symbol_id(&rid, "other/b.ts", "widget");
+        let use_widget = calls_of("caller.ts", "useWidget");
+        assert!(
+            use_widget.iter().any(|r| r.object == widget),
+            "from './a/b' must CALL a/b.ts: {use_widget:?}"
+        );
+        assert!(
+            !use_widget.iter().any(|r| r.object == decoy_w),
+            "must not basename-guess other/b.ts: {use_widget:?}"
+        );
+        let idxfn = scc_core::symbol_id(&rid, "idx/index.ts", "idxfn");
+        let use_idx = calls_of("caller.ts", "useIdx");
+        assert!(
+            use_idx.iter().any(|r| r.object == idxfn),
+            "from './idx' must CALL idx/index.ts: {use_idx:?}"
+        );
+        let other_h = scc_core::symbol_id(&rid, "other/x.ts", "helper");
+        let use_other = calls_of("other/caller2.ts", "useOther");
+        assert!(
+            use_other.iter().any(|r| r.object == other_h),
+            "other/ from './x' must CALL other/x.ts: {use_other:?}"
+        );
+        let react = scc_core::symbol_id(&rid, "react.ts", "createElement");
+        let use_react = calls_of("caller.ts", "useReact");
+        assert!(
+            !use_react.iter().any(|r| r.object == react),
+            "bare react must not CALL in-repo react.ts: {use_react:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.ts-import-degrade verifies=REQ-implement-phase-28-of-scc-x-ripwire-lessons-absorb-python-and-type-scr exercises=impl.scc.resolve.ts-import
+    fn index_ts_relative_degrades_when_file_and_index_both_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("x")).unwrap();
+        std::fs::write(root.join("x.ts"), "export function helper() { return 1; }\n").unwrap();
+        std::fs::write(
+            root.join("x/index.ts"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("caller.ts"),
+            "import { helper } from \"./x\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "x.ts", "helper");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "x/index.ts", "helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "caller.ts", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
+            "x.ts + x/index.ts must not guess a CALL: {calls:?}"
+        );
+    }
 }
