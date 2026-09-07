@@ -429,16 +429,18 @@ fn xml_test_path(t: &str) -> Option<String> {
     }
 }
 
-// trace:exempt reason=internal-detail
+/// Gold kebab-case `it()` ids match SCC titles; file paths do not match function names.
+// trace:v1 id=impl.scc.cli.loop-test-match work=WORK-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall-for-type-scr satisfies=REQ-implement-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall implements=PLAN-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall-for-type-scr
 fn test_name_matches(proposed: &str, gold: &str) -> bool {
     if proposed == gold {
         return true;
     }
-    if gold.contains('/') && (proposed.ends_with(gold) || gold.ends_with(proposed) || proposed == gold)
-    {
+    if gold.contains('/') && (proposed.ends_with(gold) || gold.ends_with(proposed)) {
         return true;
     }
-    ident_tokens(proposed).any(|tok| tok == gold)
+    let p: Vec<&str> = ident_tokens(proposed).collect();
+    let g: Vec<&str> = ident_tokens(gold).collect();
+    p.contains(&gold) || (!g.is_empty() && p == g)
 }
 
 // trace:exempt reason=internal-detail
@@ -1418,5 +1420,60 @@ mod tests {
         assert_eq!(score_tests(pack, &gold), (Some(1.0), 1, 1));
         let ascii = "- test_foo (tests/t.py) -- import\n";
         assert_eq!(score_tests(ascii, &gold), (Some(1.0), 1, 1));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.loop-test-match verifies=REQ-implement-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall exercises=impl.scc.cli.loop-test-match
+    fn score_tests_matches_kebab_it_titles_not_ripwire_files() {
+        let gold = vec!["computes-order-totals-from-line-items".into()];
+        let pack = "- computes order totals from line items (tests/orders.test.ts) — import\n";
+        assert_eq!(score_tests(pack, &gold), (Some(1.0), 1, 1));
+        assert_eq!(
+            score_tests(r#"<test p="tests/orders.test.ts"/>"#, &gold),
+            (Some(0.0), 0, 1)
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.loop-test-ts verifies=REQ-implement-phase-20-of-scc-x-ripwire-lessons-raise-tests-to-run-recall exercises=impl.scc.cli.loop-test-match
+    fn tests_to_run_hits_typescript_it_titles() {
+        let opts = LoopOptions {
+            k: 10,
+            repo_filter: Some("large-ts".into()),
+            ripwire_bin: None,
+            explore: false,
+            agent_cmd: None,
+        };
+        let summary = run_agent_loop(&[LoopArm::Scc], &opts).expect("loop");
+        let hits: Vec<_> = summary
+            .per_task
+            .iter()
+            .filter(|r| r.arm == "scc" && r.tests_localization == Some(1.0))
+            .map(|r| r.task.as_str())
+            .collect();
+        assert!(
+            hits.contains(&"large-ts.order-total-invariant"),
+            "SCC TESTS must list the it() title that gold kebab-case names: {hits:?} rows={:?}",
+            summary.per_task
+        );
+        let qw = LoopOptions {
+            k: 10,
+            repo_filter: Some("queue-worker-ts".into()),
+            ripwire_bin: None,
+            explore: false,
+            agent_cmd: None,
+        };
+        let qw_summary = run_agent_loop(&[LoopArm::Scc], &qw).expect("queue-worker");
+        let qw_hits: Vec<_> = qw_summary
+            .per_task
+            .iter()
+            .filter(|r| r.arm == "scc" && r.tests_localization == Some(1.0))
+            .map(|r| r.task.as_str())
+            .collect();
+        assert!(
+            qw_hits.contains(&"queue-worker.street-vocabulary"),
+            "fixed relative imports must let import-reason tests_to_run fire: {qw_hits:?} rows={:?}",
+            qw_summary.per_task
+        );
     }
 }
