@@ -565,13 +565,8 @@ impl Ctx {
             self.push_type_bind_in(class.clone(), field.clone(), ty, line);
         }
         if let Some(r) = right {
-            if let Some(ty) = java_ctor_type(r, src) {
+            if let Some(ty) = java_rhs_type_name(r, src, self) {
                 self.push_type_bind_in(class, field, ty, line);
-            } else if r.kind() == "identifier" {
-                let rhs = clean(node_text(Some(r), src));
-                if let Some(ty) = self.unique_local_type(&rhs) {
-                    self.push_type_bind_in(class, field, ty, line);
-                }
             }
         }
     }
@@ -597,15 +592,9 @@ impl Ctx {
             bound = true;
         }
         if let Some(r) = right {
-            if let Some(ty) = java_ctor_type(r, src) {
+            if let Some(ty) = java_rhs_type_name(r, src, self) {
                 self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
                 bound = true;
-            } else if r.kind() == "identifier" {
-                let rhs = clean(node_text(Some(r), src));
-                if let Some(ty) = self.unique_local_type(&rhs) {
-                    self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
-                    bound = true;
-                }
             }
         }
         if !bound {
@@ -847,6 +836,29 @@ fn java_ctor_type(node: Node, src: &[u8]) -> Option<String> {
         return None;
     }
     java_simple_type_name(node.child_by_field_name("type"), src)
+}
+
+/// `(Order)v` — simple types only. Arrays and generics stay unbound.
+// trace:v1 id=impl.scc.extract.java.type-cast work=WORK-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as-rule-2-fuel satisfies=REQ-implement-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as implements=PLAN-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as-rule-2-fuel
+fn java_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    if n.kind() != "cast_expression" {
+        return None;
+    }
+    java_simple_type_name(n.child_by_field_name("type"), src)
+}
+
+/// `new Order()`, `(Order)v`, or a uniquely typed identifier.
+// trace:exempt reason=internal-detail
+fn java_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    while n.kind() == "parenthesized_expression" {
+        n = n.named_child(0)?;
+    }
+    match n.kind() {
+        "object_creation_expression" => java_ctor_type(n, src),
+        "cast_expression" => java_cast_type_name(n, src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        _ => None,
+    }
 }
 
 // trace:exempt reason=internal-detail
@@ -1249,22 +1261,21 @@ impl JavaExtractor {
     /// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique param type.
     // trace:exempt reason=internal-detail
     fn record_this_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
-        if let Some(class) = ctx.enclosing_class_name() {
-            if let Some(left) = node.child_by_field_name("left") {
-                if left.kind() == "field_access" {
+        if let Some(left) = node.child_by_field_name("left") {
+            let line = node.start_position().row as u32 + 1;
+            let right = node.child_by_field_name("right");
+            if left.kind() == "identifier" {
+                let name = clean(node_text(Some(left), src));
+                if !name.is_empty() && name != "this" {
+                    ctx.bind_local_type(name, None, right, line, src);
+                }
+            } else if left.kind() == "field_access" {
+                if let Some(class) = ctx.enclosing_class_name() {
                     let obj = left.child_by_field_name("object");
                     if clean(node_text(obj, src)) == "this" {
                         let fname = clean(node_text(left.child_by_field_name("field"), src));
                         if !fname.is_empty() {
-                            let line = node.start_position().row as u32 + 1;
-                            ctx.bind_field_type(
-                                class,
-                                fname,
-                                node.child_by_field_name("right"),
-                                None,
-                                line,
-                                src,
-                            );
+                            ctx.bind_field_type(class, fname, right, None, line, src);
                         }
                     }
                 }
@@ -2959,6 +2970,82 @@ class Svc {
                 && b.name == "owned"
                 && b.type_name == "Invoice"),
             "local bind missing: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.type-cast verifies=REQ-implement-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as exercises=impl.scc.extract.java.type-cast
+    fn cast_type_binds_from_var_assignment_and_field() {
+        let ef = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    private Object owned;
+    void handle(Object v) {
+        var x = (Order) v;
+        x.process();
+        z = (Order) v;
+        this.owned = (Order) v;
+    }
+    void mixed(Object v) {
+        var y = (Order) v;
+        y = (Invoice) v;
+        y.process();
+    }
+    void not_a_bind(Object v) {
+        var a = (Order[]) v;
+        var b = (List<Order>) v;
+        a.process();
+        b.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.handle"
+                && b.name == "x"
+                && b.type_name == "Order"),
+            "var x = (Order)v bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.handle"
+                && b.name == "z"
+                && b.type_name == "Order"),
+            "z = (Order)v assignment bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = (Order)v bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc.mixed" && b.name == "y")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            mixed.contains(&"Order") && mixed.contains(&"Invoice"),
+            "conflicting cast assignment must tombstone fuel: {mixed:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.not_a_bind" && b.name == "a" && b.type_name == "Order"),
+            "array cast must not mint a bind: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.not_a_bind" && b.name == "b" && b.type_name == "Order"),
+            "generic cast must not mint a bind: {:?}",
             ef.type_binds
         );
     }

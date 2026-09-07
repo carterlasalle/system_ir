@@ -1837,4 +1837,77 @@ func mixed(v any) {
             "must not spray Invoice.Process from mixed: {mixed_calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.java.type-cast verifies=REQ-implement-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as exercises=impl.scc.extract.java.type-cast
+    fn index_pins_java_cast_local_and_assignment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("W.java"),
+            r#"
+class Order { void process() { } }
+class Invoice { void process() { } }
+class Svc {
+    void handle(Object v) {
+        var x = (Order) v;
+        x.process();
+        z = (Order) v;
+        z.process();
+        x.y.process();
+    }
+    void mixed(Object v) {
+        var y = (Order) v;
+        y = (Invoice) v;
+        y.process();
+    }
+    void factory(Object v) {
+        var f = MakeOrder();
+        f.process();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Svc.handle");
+        let mixed = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Svc.mixed");
+        let factory = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Svc.factory");
+        let rels = idx.store.all_relationships().unwrap();
+        let handle_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            handle_calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.process: {handle_calls:?}"
+        );
+        assert!(
+            !handle_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {handle_calls:?}"
+        );
+        let mixed_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == mixed)
+            .collect();
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == order),
+            "conflicting cast must not pin Order.process: {mixed_calls:?}"
+        );
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process from mixed: {mixed_calls:?}"
+        );
+        let factory_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == factory)
+            .collect();
+        assert!(
+            !factory_calls.iter().any(|r| r.object == order),
+            "opaque factory must not mint a bind: {factory_calls:?}"
+        );
+    }
 }
