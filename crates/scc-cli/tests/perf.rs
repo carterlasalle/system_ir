@@ -7,11 +7,11 @@
 //!
 //! The TEST_PLAN §16 figure is 50k cold < 30s. Current main (post-mission
 //! graph/surface work) indexes this fixture in ~40s release locally and
-//! 80–110s debug on a busy GHA VM, so a 30s hard fail is not a product
-//! regression detector — it is a runner lottery. CI runs this test with
-//! `--release` and a 90s envelope (headroom above measured release) and
-//! retries once. The test still requires a successful index with
-//! relationships. Do **not** treat a 90s pass as a 30s claim.
+//! 80–120s debug, so a 30s hard fail is not a product regression detector
+//! — it is a runner lottery. CI runs this test `--release` in the
+//! `bench-250k` job (same release compile as the 250k index) with a 90s
+//! envelope and one retry. Do **not** treat a 90s pass as a 30s claim.
+//! The test still requires a successful index with relationships.
 
 use std::io::Write;
 use std::path::Path;
