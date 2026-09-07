@@ -2417,4 +2417,148 @@ class Svc {
         });
         assert!(cold_hit, "cold index must also CALL IERS.open");
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-trait-cha verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
+    fn index_rust_trait_default_pins_typed_receiver() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("open.rs"),
+            "pub trait Open {\n    fn open(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.rs"),
+            "struct IERS_B;\nimpl Open for IERS_B {}\nfn handle(x: IERS_B) {\n    x.open();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "open.rs", "Open.open");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "x.open on IERS_B must CALL Open.open via trait CHA: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-trait-inherent verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.class-bases
+    fn index_rust_inherent_impl_wins_over_trait() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("open.rs"),
+            "pub trait Open {\n    fn open(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.rs"),
+            "struct IERS_B;\nimpl Open for IERS_B {}\nimpl IERS_B {\n    fn open(&self) {}\n}\nfn handle(x: IERS_B) {\n    x.open();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let own = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "IERS_B.open");
+        let tr = scc_core::symbol_id(&idx.store.repo_id, "open.rs", "Open.open");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == own),
+            "inherent IERS_B.open must win: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == tr),
+            "must not spray to Open.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-trait-split verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.resolve.cha-bases
+    fn index_rust_two_traits_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub trait A {\n    fn m(&self) {}\n}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub trait B {\n    fn m(&self) {}\n}\n").unwrap();
+        std::fs::write(
+            root.join("c.rs"),
+            "struct C;\nimpl A for C {}\nimpl B for C {}\nfn handle(x: C) {\n    x.m();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "a.rs", "A.m");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "b.rs", "B.m");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "c.rs", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a || r.object == b),
+            "two hitting traits must not spray: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-trait-incremental verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.write.class-bases
+    fn index_rust_trait_cha_survives_incremental_caller_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("open.rs"),
+            "pub trait Open {\n    fn open(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iers_b.rs"),
+            "struct IERS_B;\nimpl Open for IERS_B {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.rs"),
+            "fn handle(x: IERS_B) {\n    x.open();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        std::fs::write(
+            root.join("w.rs"),
+            "fn handle(x: IERS_B) {\n    x.open();\n    // touch\n}\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "open.rs", "Open.open");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "handle");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "incremental caller edit must still CALL Open.open via persisted heritage: {calls:?}"
+        );
+        let (cold, _t2) = indexer_for(root);
+        cold.index().unwrap();
+        let cold_base = scc_core::symbol_id(&cold.store.repo_id, "open.rs", "Open.open");
+        let cold_handle = scc_core::symbol_id(&cold.store.repo_id, "w.rs", "handle");
+        let cold_hit = cold.store.all_relationships().unwrap().iter().any(|r| {
+            r.predicate == scc_core::predicates::CALLS
+                && r.subject == cold_handle
+                && r.object == cold_base
+        });
+        assert!(cold_hit, "cold index must also CALL Open.open");
+    }
 }

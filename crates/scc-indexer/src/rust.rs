@@ -10,6 +10,8 @@
 //! their methods are emitted as Method symbols named `Type.method` so the
 //! native resolver's `self`/`this` rule can resolve `self.method()` calls
 //! (resolve.rs splits on '.' — `Type::method` names would never resolve).
+//! Trait methods are `Trait.method`. `impl Trait for T` records Trait as a
+//! simple-ident base of T for CHA.
 
 use crate::facts;
 use crate::model::{
@@ -505,6 +507,8 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
     /// Struct-field type binds. Extract-time only.
     type_binds: Vec<TypeBind>,
+    /// `impl Trait for T` → (T, [Trait, ...]) for CHA.
+    class_bases: Vec<(String, Vec<String>)>,
 }
 
 // trace:exempt reason=internal-detail
@@ -598,7 +602,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds: self.type_binds,
-            class_bases: Vec::new(),
+            class_bases: rust_class_bases(&self.class_bases),
         }
     }
 
@@ -942,10 +946,21 @@ impl RustExtractor {
             }
         }
         // Trait bodies contain function declarations (contracts, default
-        // impls); struct/enum bodies have none. Walk everything uniformly.
-        self.walk_children(node, ctx, src);
+        // impls); struct/enum bodies have none. Walk trait methods under a
+        // Type.method scope so CHA can pin Trait.m.
+        if kind == SymbolKind::Interface {
+            ctx.scopes.push(Scope {
+                name: name.clone(),
+                is_impl: true,
+            });
+            self.walk_children(node, ctx, src);
+            ctx.scopes.pop();
+        } else {
+            self.walk_children(node, ctx, src);
+        }
     }
 
+    // trace:exempt reason=internal-detail
     fn walk_impl(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         // Receiver type of the impl (`impl Trait for Type` -> Type). Generic
         // parameters are dropped from the name.
@@ -954,6 +969,7 @@ impl RustExtractor {
             .map(|t| clean(node_text(Some(t), src)))
             .unwrap_or_default();
         let type_name = type_name.split('<').next().unwrap_or("").trim().to_string();
+        let type_name = rust_heritage_ident(&type_name).unwrap_or(type_name);
         if type_name.is_empty() {
             self.walk_children(node, ctx, src);
             return;
@@ -962,7 +978,8 @@ impl RustExtractor {
         // `impl Deserialize for T` (last path segment, so `serde::Serialize`
         // counts) are Serialization-pair sides around the type.
         if let Some(trait_node) = node.child_by_field_name("trait") {
-            let trait_name = clean(node_text(Some(trait_node), src))
+            let trait_text = clean(node_text(Some(trait_node), src));
+            let trait_name = trait_text
                 .rsplit("::")
                 .next()
                 .unwrap_or("")
@@ -973,6 +990,7 @@ impl RustExtractor {
                     .or_default()
                     .insert(trait_name);
             }
+            record_trait_impl(ctx, &type_name, &trait_text);
         }
         ctx.scopes.push(Scope {
             name: type_name,
@@ -1918,6 +1936,38 @@ fn turbofish_type(fn_node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
+/// Last simple ident of a Rust type/trait path (`std::io::Write` → `Write`).
+// trace:exempt reason=internal-detail
+fn rust_heritage_ident(text: &str) -> Option<String> {
+    crate::model::simple_heritage_ident(&text.replace("::", "."))
+}
+
+/// Merge `impl Trait for T` rows then keep simple-ident bases.
+// trace:v1 id=impl.scc.extract.rust.class-bases work=WORK-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h satisfies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo implements=PLAN-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h
+fn rust_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    let mut merged: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (class, bases) in raw {
+        merged
+            .entry(class.clone())
+            .or_default()
+            .extend(bases.iter().cloned());
+    }
+    let pairs: Vec<(String, Vec<String>)> = merged.into_iter().collect();
+    crate::model::normalize_class_bases(&pairs)
+}
+
+/// Record `impl Trait for T` as CHA fuel on T.
+// trace:v1 id=impl.scc.extract.rust.trait-impl work=WORK-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h satisfies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo implements=PLAN-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h
+fn record_trait_impl(ctx: &mut Ctx, type_name: &str, trait_text: &str) {
+    let Some(tr) = rust_heritage_ident(trait_text) else {
+        return;
+    };
+    if type_name.is_empty() {
+        return;
+    }
+    ctx.class_bases.push((type_name.to_string(), vec![tr]));
+}
+
 /// Field type of a `#[serde(flatten)]` field as the composed parent schema
 /// name: strips an outer `Option<...>`, rejects qualified/generic types
 /// (only plain local type names are resolvable).
@@ -2179,6 +2229,7 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.extract.rust.symbols verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
     fn symbols_methods_signatures() {
         let ef = extract(
             r#"use std::collections::HashMap;
@@ -2249,9 +2300,10 @@ impl Service {
 
         // trait method declarations (no body) are recorded too; the
         // receiver is dropped from the signature like method symbols
-        let save = find_symbol(&ef, "save");
-        assert_eq!(save.kind, SymbolKind::Function);
+        let save = find_symbol(&ef, "Store.save");
+        assert_eq!(save.kind, SymbolKind::Method);
         assert!(!save.exported);
+        assert_eq!(save.parent.as_deref(), Some("Store"));
         assert_eq!(save.signature.as_deref(), Some("fn save(job: &str)"));
 
         let m = find_symbol(&ef, "internal");
@@ -3282,5 +3334,37 @@ fn mixed(v: Order, w: Invoice) {
             z.contains(&"Order") && z.contains(&"Invoice"),
             "conflicting as-cast must tombstone fuel: {z:?}"
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.class-bases verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
+    fn class_bases_from_impl_trait_for_type() {
+        let ef = extract(
+            "trait Open { fn open(&self); }\nstruct IERS_B;\nimpl Open for IERS_B {}\nimpl std::fmt::Display for IERS_B { fn fmt(&self) {} }\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.iter().any(|x| x == "Open") && b.iter().any(|x| x == "Display")
+            }),
+            "impl Trait for T must record simple-ident bases: {:?}",
+            ef.class_bases
+        );
+        let open = find_symbol(&ef, "Open.open");
+        assert_eq!(open.kind, SymbolKind::Method);
+        assert_eq!(open.parent.as_deref(), Some("Open"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.trait-method verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.class-bases
+    fn two_trait_impls_merge_and_generic_paths_strip() {
+        let ef = extract(
+            "trait A<T> { fn m(&self); }\ntrait B { fn m(&self); }\nstruct C;\nimpl A<u8> for C {}\nimpl B for C {}\n",
+        );
+        let row = ef
+            .class_bases
+            .iter()
+            .find(|(c, _)| c == "C")
+            .unwrap_or_else(|| panic!("C bases: {:?}", ef.class_bases));
+        assert_eq!(row.1, vec!["A".to_string(), "B".to_string()]);
     }
 }

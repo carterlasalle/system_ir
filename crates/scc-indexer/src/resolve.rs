@@ -2183,6 +2183,137 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.rust-trait-cha verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
+    fn rust_trait_impl_pins_unique_trait_method() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("Open.open", SymbolKind::Method);
+        open.parent = Some("Open".into());
+        idx.add_file("open.rs", &[mk_symbol("Open", SymbolKind::Interface), open]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let iers_b = mk_symbol("IERS_B", SymbolKind::Class);
+        idx.add_file("w.rs", &[iers_b, handle.clone()]);
+        idx.set_class_bases("w.rs", &[("IERS_B".into(), vec!["Open".into()])]);
+        idx.set_type_binds(
+            "w.rs",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "x".into(),
+                type_name: "IERS_B".into(),
+                line: 4,
+            }],
+        );
+        let resolved = resolve_calls(
+            "w.rs",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "x.open".into(),
+                line: 5,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&handle),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "open.rs", "Open.open"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust-trait-inherent-wins verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.resolve.cha-bases
+    fn rust_inherent_impl_wins_over_trait_cha() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut trait_open = mk_symbol("Open.open", SymbolKind::Method);
+        trait_open.parent = Some("Open".into());
+        idx.add_file(
+            "open.rs",
+            &[mk_symbol("Open", SymbolKind::Interface), trait_open],
+        );
+        let mut own = mk_symbol("IERS_B.open", SymbolKind::Method);
+        own.parent = Some("IERS_B".into());
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        let syms = vec![
+            mk_symbol("IERS_B", SymbolKind::Class),
+            own,
+            handle.clone(),
+        ];
+        idx.add_file("w.rs", &syms);
+        idx.set_class_bases("w.rs", &[("IERS_B".into(), vec!["Open".into()])]);
+        idx.set_type_binds(
+            "w.rs",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "x".into(),
+                type_name: "IERS_B".into(),
+                line: 6,
+            }],
+        );
+        let resolved = resolve_calls(
+            "w.rs",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "x.open".into(),
+                line: 7,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "IERS_B.open"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust-trait-split verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.resolve.cha-bases
+    fn rust_two_traits_defining_method_unresolved() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_m = mk_symbol("A.m", SymbolKind::Method);
+        a_m.parent = Some("A".into());
+        idx.add_file("a.rs", &[mk_symbol("A", SymbolKind::Interface), a_m]);
+        let mut b_m = mk_symbol("B.m", SymbolKind::Method);
+        b_m.parent = Some("B".into());
+        idx.add_file("b.rs", &[mk_symbol("B", SymbolKind::Interface), b_m]);
+        let handle = mk_symbol("handle", SymbolKind::Function);
+        idx.add_file("c.rs", &[mk_symbol("C", SymbolKind::Class), handle.clone()]);
+        idx.set_class_bases("c.rs", &[("C".into(), vec!["A".into(), "B".into()])]);
+        idx.set_type_binds(
+            "c.rs",
+            &[TypeBind {
+                scope: "handle".into(),
+                name: "x".into(),
+                type_name: "C".into(),
+                line: 3,
+            }],
+        );
+        let resolved = resolve_calls(
+            "c.rs",
+            &[Call {
+                caller: Some("handle".into()),
+                callee: "x.m".into(),
+                line: 4,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&handle),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.type-narrow-tombstone verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
     fn two_types_for_same_var_do_not_narrow() {
         let mut idx = SymbolIndex::new("repo");
