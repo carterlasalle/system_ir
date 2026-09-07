@@ -65,6 +65,14 @@ pub struct LoopTaskRow {
     pub wrong_first: usize,
     #[serde(default)]
     pub jsonl_events: usize,
+    /// Recall of gold test names/paths against pack tests_to_run. `None`
+    /// when the task has no gold tests (omitted from clustered mean).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_localization: Option<f64>,
+    #[serde(default)]
+    pub tests_hit: usize,
+    #[serde(default)]
+    pub tests_gold: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -83,6 +91,12 @@ pub struct LoopArmSummary {
     pub mean_read: f64,
     #[serde(default)]
     pub mean_files_opened: f64,
+    #[serde(default)]
+    pub clustered_tests: f64,
+    #[serde(default)]
+    pub pooled_tests: f64,
+    #[serde(default)]
+    pub tests_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -160,6 +174,7 @@ pub fn run_agent_loop(arms: &[LoopArm], opts: &LoopOptions) -> Result<LoopSummar
             if gold.is_empty() {
                 continue;
             }
+            let gold_tests = &task.ground_truth.tests;
             let contaminated = std::env::var("SCC_GOLD").is_ok();
             for arm in arms {
                 let row = if opts.explore {
@@ -170,6 +185,7 @@ pub fn run_agent_loop(arms: &[LoopArm], opts: &LoopOptions) -> Result<LoopSummar
                         &task.repo,
                         &task.goal,
                         gold,
+                        gold_tests,
                         &indexed,
                         k,
                         ripwire.as_deref(),
@@ -184,6 +200,7 @@ pub fn run_agent_loop(arms: &[LoopArm], opts: &LoopOptions) -> Result<LoopSummar
                         &task.repo,
                         &task.goal,
                         gold,
+                        gold_tests,
                         &indexed,
                         k,
                         ripwire.as_deref(),
@@ -208,6 +225,7 @@ fn run_arm(
     repo: &str,
     goal: &str,
     gold: &[String],
+    gold_tests: &[String],
     indexed: &[String],
     k: usize,
     ripwire: Option<&Path>,
@@ -216,36 +234,58 @@ fn run_arm(
     match arm {
         LoopArm::Baseline => {
             let opened = baseline_open(root, goal, k);
-            Ok(score_row(task_id, repo, arm, "ran", &opened, gold, 1, 0, 0.0, contaminated))
+            Ok(score_row(
+                task_id,
+                repo,
+                arm,
+                "ran",
+                &opened,
+                gold,
+                gold_tests,
+                "",
+                1,
+                0,
+                0.0,
+                contaminated,
+            ))
         }
         LoopArm::Scc => {
             let pack = scc_pack(root, goal)?;
             let opened = files_from_text(&pack, indexed, k);
-            Ok(score_row(task_id, repo, arm, "ran", &opened, gold, 0, 1, 1.0, contaminated))
+            Ok(score_row(
+                task_id,
+                repo,
+                arm,
+                "ran",
+                &opened,
+                gold,
+                gold_tests,
+                &pack,
+                0,
+                1,
+                1.0,
+                contaminated,
+            ))
         }
         LoopArm::Ripwire => match ripwire {
-            None => Ok(LoopTaskRow {
-                task: task_id.to_string(),
-                repo: repo.to_string(),
-                arm: arm.as_str().to_string(),
-                status: "skipped".into(),
-                localization: 0.0,
-                first_correct_rank: None,
-                files_opened: 0,
-                search_calls: 0,
-                scc_calls: 0,
-                substitution_rate: 0.0,
-                contaminated,
-                protocol: "locator".into(),
-                read_calls: 0,
-                first_correct_ms: None,
-                wrong_first: 0,
-                jsonl_events: 0,
-            }),
+            None => Ok(skipped_row(task_id, repo, "locator", contaminated)),
             Some(bin) => {
                 let out = run_ripwire(bin, root, goal)?;
                 let opened = files_from_ripwire(&out, indexed, k);
-                Ok(score_row(task_id, repo, arm, "ran", &opened, gold, 0, 0, 0.0, contaminated))
+                Ok(score_row(
+                    task_id,
+                    repo,
+                    arm,
+                    "ran",
+                    &opened,
+                    gold,
+                    gold_tests,
+                    &out,
+                    0,
+                    0,
+                    0.0,
+                    contaminated,
+                ))
             }
         },
     }
@@ -260,6 +300,8 @@ fn score_row(
     status: &str,
     opened: &[String],
     gold: &[String],
+    gold_tests: &[String],
+    pack: &str,
     search_calls: usize,
     scc_calls: usize,
     substitution_rate: f64,
@@ -276,6 +318,7 @@ fn score_row(
         hits as f64 / gold.len() as f64
     };
     let first_correct_rank = opened.iter().position(|f| gold_matches(f, &gold_set)).map(|i| i + 1);
+    let (tests_localization, tests_hit, tests_gold) = score_tests(pack, gold_tests);
     LoopTaskRow {
         task: task.to_string(),
         repo: repo.to_string(),
@@ -293,12 +336,129 @@ fn score_row(
         first_correct_ms: None,
         wrong_first: 0,
         jsonl_events: 0,
+        tests_localization,
+        tests_hit,
+        tests_gold,
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn skipped_row(task_id: &str, repo: &str, protocol: &str, contaminated: bool) -> LoopTaskRow {
+    LoopTaskRow {
+        task: task_id.to_string(),
+        repo: repo.to_string(),
+        arm: LoopArm::Ripwire.as_str().to_string(),
+        status: "skipped".into(),
+        localization: 0.0,
+        first_correct_rank: None,
+        files_opened: 0,
+        search_calls: 0,
+        scc_calls: 0,
+        substitution_rate: 0.0,
+        contaminated,
+        protocol: protocol.into(),
+        read_calls: 0,
+        first_correct_ms: None,
+        wrong_first: 0,
+        jsonl_events: 0,
+        tests_localization: None,
+        tests_hit: 0,
+        tests_gold: 0,
     }
 }
 
 // trace:exempt reason=internal-detail
 fn gold_matches(opened: &str, gold: &BTreeSet<String>) -> bool {
     gold.iter().any(|g| opened == g || opened.ends_with(&format!("/{g}")) || g.ends_with(&format!("/{opened}")))
+}
+
+/// Names and paths from SCC TESTS rows and Ripwire `<test p="...">` pack rows.
+// trace:v1 id=impl.scc.cli.loop-tests work=WORK-phase-18-of-scc-x-ripwire-lessons-score-tests-to-run-in-the-agent-loop satisfies=REQ-implement-phase-18-of-scc-x-ripwire-lessons-score-tests-to-run-in-the implements=PLAN-phase-18-of-scc-x-ripwire-lessons-score-tests-to-run-in-the-agent-loop
+fn tests_from_pack(pack: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in pack.lines() {
+        let t = line.trim();
+        if let Some(p) = xml_test_path(t) {
+            out.push(p);
+            continue;
+        }
+        if !(t.starts_with("- ") && (t.contains(" — ") || t.contains(" -- "))) {
+            continue;
+        }
+        let rest = t.trim_start_matches("- ");
+        let left = rest
+            .split(" — ")
+            .next()
+            .unwrap_or(rest)
+            .split(" -- ")
+            .next()
+            .unwrap_or(rest)
+            .trim();
+        if let Some((name, after)) = left.split_once(" (") {
+            let name = name.trim();
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+            if let Some(file) = after.strip_suffix(')') {
+                let file = file.trim();
+                if !file.is_empty() {
+                    out.push(file.to_string());
+                }
+            }
+        } else if !left.is_empty() {
+            out.push(left.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// trace:exempt reason=internal-detail
+fn xml_test_path(t: &str) -> Option<String> {
+    let idx = t.find("<test ")?;
+    let rest = &t[idx..];
+    let p = rest.find("p=\"")?;
+    let start = p + 3;
+    let end = rest[start..].find('"')?;
+    let path = rest[start..start + end].trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn test_name_matches(proposed: &str, gold: &str) -> bool {
+    if proposed == gold {
+        return true;
+    }
+    if gold.contains('/') && (proposed.ends_with(gold) || gold.ends_with(proposed) || proposed == gold)
+    {
+        return true;
+    }
+    ident_tokens(proposed).any(|tok| tok == gold)
+}
+
+// trace:exempt reason=internal-detail
+fn ident_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+}
+
+/// `None` when the task has no gold tests — omit from clustered mean.
+// trace:exempt reason=internal-detail
+fn score_tests(pack: &str, gold: &[String]) -> (Option<f64>, usize, usize) {
+    if gold.is_empty() {
+        return (None, 0, 0);
+    }
+    let proposed = tests_from_pack(pack);
+    let hits = gold
+        .iter()
+        .filter(|g| proposed.iter().any(|p| test_name_matches(p, g)))
+        .count();
+    (Some(hits as f64 / gold.len() as f64), hits, gold.len())
 }
 
 // trace:exempt reason=internal-detail
@@ -309,11 +469,14 @@ fn aggregate(rows: &[LoopTaskRow], arms: &[LoopArm]) -> Vec<LoopArmSummary> {
         let skipped = mine.iter().filter(|r| r.status == "skipped").count();
         let ran: Vec<&LoopTaskRow> = mine.iter().copied().filter(|r| r.status == "ran").collect();
         let mut by_repo: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let mut by_repo_tests: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut pooled = 0.0;
         let mut subst = 0.0;
         let mut search = 0.0;
         let mut read = 0.0;
         let mut files = 0.0;
+        let mut pooled_tests = 0.0;
+        let mut tests_n = 0usize;
         for r in &ran {
             by_repo.entry(r.repo.clone()).or_default().push(r.localization);
             pooled += r.localization;
@@ -321,6 +484,11 @@ fn aggregate(rows: &[LoopTaskRow], arms: &[LoopArm]) -> Vec<LoopArmSummary> {
             search += r.search_calls as f64;
             read += r.read_calls as f64;
             files += r.files_opened as f64;
+            if let Some(t) = r.tests_localization {
+                by_repo_tests.entry(r.repo.clone()).or_default().push(t);
+                pooled_tests += t;
+                tests_n += 1;
+            }
         }
         let clustered = clustered_mean(&by_repo);
         let n = ran.len();
@@ -339,6 +507,9 @@ fn aggregate(rows: &[LoopTaskRow], arms: &[LoopArm]) -> Vec<LoopArmSummary> {
             mean_search: if n == 0 { 0.0 } else { search / n as f64 },
             mean_read: if n == 0 { 0.0 } else { read / n as f64 },
             mean_files_opened: if n == 0 { 0.0 } else { files / n as f64 },
+            clustered_tests: clustered_mean(&by_repo_tests),
+            pooled_tests: if tests_n == 0 { 0.0 } else { pooled_tests / tests_n as f64 },
+            tests_tasks: tests_n,
         });
     }
     out
@@ -675,6 +846,7 @@ fn run_explore_arm(
     repo: &str,
     goal: &str,
     gold: &[String],
+    gold_tests: &[String],
     indexed: &[String],
     k: usize,
     ripwire: Option<&Path>,
@@ -682,26 +854,78 @@ fn run_explore_arm(
     agent_cmd: Option<&str>,
 ) -> Result<LoopTaskRow, String> {
     if let Some(cmd) = agent_cmd {
-        return run_explore_agent_cmd(arm, root, task_id, repo, goal, gold, indexed, k, ripwire, contaminated, cmd);
+        return run_explore_agent_cmd(
+            arm,
+            root,
+            task_id,
+            repo,
+            goal,
+            gold,
+            gold_tests,
+            indexed,
+            k,
+            ripwire,
+            contaminated,
+            cmd,
+        );
     }
     match arm {
         LoopArm::Baseline => {
             let jsonl = explore_baseline_jsonl(root, goal, k);
-            Ok(score_explore(task_id, repo, arm, "ran", &jsonl, root, gold, 0, 0.0, contaminated))
+            Ok(score_explore(
+                task_id,
+                repo,
+                arm,
+                "ran",
+                &jsonl,
+                root,
+                gold,
+                gold_tests,
+                "",
+                0,
+                0.0,
+                contaminated,
+            ))
         }
         LoopArm::Scc => {
             let pack = scc_pack(root, goal)?;
             let opened = files_from_pack(&pack, root, indexed, k);
             let jsonl = explore_pack_jsonl("task_context", goal, &opened);
-            Ok(score_explore(task_id, repo, arm, "ran", &jsonl, root, gold, 1, 1.0, contaminated))
+            Ok(score_explore(
+                task_id,
+                repo,
+                arm,
+                "ran",
+                &jsonl,
+                root,
+                gold,
+                gold_tests,
+                &pack,
+                1,
+                1.0,
+                contaminated,
+            ))
         }
         LoopArm::Ripwire => match ripwire {
-            None => Ok(explore_skipped(task_id, repo, contaminated)),
+            None => Ok(skipped_row(task_id, repo, "explore", contaminated)),
             Some(bin) => {
                 let out = run_ripwire(bin, root, goal)?;
                 let opened = files_from_ripwire(&out, indexed, k);
                 let jsonl = explore_ripwire_jsonl(goal, &opened);
-                Ok(score_explore(task_id, repo, arm, "ran", &jsonl, root, gold, 0, 0.0, contaminated))
+                Ok(score_explore(
+                    task_id,
+                    repo,
+                    arm,
+                    "ran",
+                    &jsonl,
+                    root,
+                    gold,
+                    gold_tests,
+                    &out,
+                    0,
+                    0.0,
+                    contaminated,
+                ))
             }
         },
     }
@@ -716,6 +940,7 @@ fn run_explore_agent_cmd(
     repo: &str,
     goal: &str,
     gold: &[String],
+    gold_tests: &[String],
     indexed: &[String],
     k: usize,
     ripwire: Option<&Path>,
@@ -723,7 +948,7 @@ fn run_explore_agent_cmd(
     cmd: &str,
 ) -> Result<LoopTaskRow, String> {
     if arm == LoopArm::Ripwire && ripwire.is_none() {
-        return Ok(explore_skipped(task_id, repo, contaminated));
+        return Ok(skipped_row(task_id, repo, "explore", contaminated));
     }
     let pack = match arm {
         LoopArm::Scc => scc_pack(root, goal)?,
@@ -754,32 +979,12 @@ fn run_explore_agent_cmd(
         &jsonl,
         root,
         gold,
+        gold_tests,
+        &pack,
         scc_calls,
         subst,
         contaminated,
     ))
-}
-
-// trace:exempt reason=internal-detail
-fn explore_skipped(task_id: &str, repo: &str, contaminated: bool) -> LoopTaskRow {
-    LoopTaskRow {
-        task: task_id.to_string(),
-        repo: repo.to_string(),
-        arm: LoopArm::Ripwire.as_str().to_string(),
-        status: "skipped".into(),
-        localization: 0.0,
-        first_correct_rank: None,
-        files_opened: 0,
-        search_calls: 0,
-        scc_calls: 0,
-        substitution_rate: 0.0,
-        contaminated,
-        protocol: "explore".into(),
-        read_calls: 0,
-        first_correct_ms: None,
-        wrong_first: 0,
-        jsonl_events: 0,
-    }
 }
 
 // trace:exempt reason=internal-detail
@@ -869,6 +1074,8 @@ fn score_explore(
     jsonl: &str,
     root: &Path,
     gold: &[String],
+    gold_tests: &[String],
+    pack: &str,
     scc_calls: usize,
     substitution_rate: f64,
     contaminated: bool,
@@ -902,6 +1109,7 @@ fn score_explore(
     } else {
         scc_calls as f64 / (scc_calls + search_calls) as f64
     };
+    let (tests_localization, tests_hit, tests_gold) = score_tests(pack, gold_tests);
     LoopTaskRow {
         task: task.to_string(),
         repo: repo.to_string(),
@@ -919,6 +1127,9 @@ fn score_explore(
         first_correct_ms: m.first_correct_ms,
         wrong_first: m.wrong_first_locations,
         jsonl_events: m.total_tool_calls,
+        tests_localization,
+        tests_hit,
+        tests_gold,
     }
 }
 
@@ -936,12 +1147,12 @@ pub fn print_loop_summary(s: &LoopSummary) {
         println!("  ripwire: skipped (no binary; set RIPWIRE_BIN or --ripwire-bin)");
     }
     println!(
-        "  {:<12} {:>8} {:>12} {:>10} {:>10} {:>8} {:>8} {:>8}",
-        "arm", "status", "clustered", "pooled", "subst", "search", "read", "tasks"
+        "  {:<12} {:>8} {:>12} {:>10} {:>10} {:>8} {:>8} {:>8} {:>10} {:>8}",
+        "arm", "status", "clustered", "pooled", "subst", "search", "read", "tasks", "tests_cl", "tests_n"
     );
     for a in &s.arms {
         println!(
-            "  {:<12} {:>8} {:>12.3} {:>10.3} {:>10.3} {:>8.2} {:>8.2} {:>8}",
+            "  {:<12} {:>8} {:>12.3} {:>10.3} {:>10.3} {:>8.2} {:>8.2} {:>8} {:>10.3} {:>8}",
             a.arm,
             a.status,
             a.clustered_localization,
@@ -949,7 +1160,9 @@ pub fn print_loop_summary(s: &LoopSummary) {
             a.mean_substitution,
             a.mean_search,
             a.mean_read,
-            a.tasks
+            a.tasks,
+            a.clustered_tests,
+            a.tests_tasks
         );
     }
 }
@@ -1140,5 +1353,70 @@ mod tests {
             assert_eq!(rw.status, "skipped");
         }
         assert!(summary.per_task.iter().all(|r| !r.contaminated));
+        let scc_tests: Vec<_> = summary
+            .per_task
+            .iter()
+            .filter(|r| r.arm == "scc" && r.tests_localization.is_some())
+            .collect();
+        assert!(
+            !scc_tests.is_empty(),
+            "http-service-python has gold tests; SCC must report tests_localization"
+        );
+        assert!(
+            summary
+                .per_task
+                .iter()
+                .filter(|r| r.arm == "baseline" && r.tests_localization.is_some())
+                .all(|r| r.tests_localization == Some(0.0)),
+            "baseline has no tests_to_run list and must score 0 when gold tests exist"
+        );
+        assert!(
+            summary
+                .per_task
+                .iter()
+                .filter(|r| r.arm == "scc" && r.tests_gold == 0)
+                .all(|r| r.tests_localization.is_none()),
+            "empty gold tests must be omitted, not scored as 1.0"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.loop-tests verifies=REQ-implement-phase-18-of-scc-x-ripwire-lessons-score-tests-to-run-in-the exercises=impl.scc.cli.loop-tests
+    fn tests_from_pack_parses_scc_rows_and_ripwire_xml() {
+        let scc = "TESTS\n- test_normalization_preserves_raw (tests/test_transcripts.py) — direct\nFETCH\n- src/server.py handle=scc://abc\n";
+        let got = tests_from_pack(scc);
+        assert!(
+            got.iter()
+                .any(|s| s == "test_normalization_preserves_raw"),
+            "SCC name: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s == "tests/test_transcripts.py"),
+            "SCC file: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|s| s.contains("handle=")),
+            "FETCH rows are not tests: {got:?}"
+        );
+
+        let rw = r#"<ctx><test p="tests/test_transcripts.py">test_transcripts</test></ctx>"#;
+        let rw_got = tests_from_pack(rw);
+        assert_eq!(rw_got, vec!["tests/test_transcripts.py"]);
+        assert!(
+            !test_name_matches("tests/test_transcripts.py", "test_normalization_preserves_raw"),
+            "Ripwire file-only rows must not match a gold function name"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.score-tests verifies=REQ-implement-phase-18-of-scc-x-ripwire-lessons-score-tests-to-run-in-the exercises=impl.scc.cli.loop-tests
+    fn score_tests_omits_empty_gold_and_zeros_baseline() {
+        assert_eq!(score_tests("whatever", &[]).0, None);
+        let gold = vec!["test_foo".into()];
+        assert_eq!(score_tests("", &gold), (Some(0.0), 0, 1));
+        let pack = "- test_foo (tests/t.py) — direct\n";
+        assert_eq!(score_tests(pack, &gold), (Some(1.0), 1, 1));
+        let ascii = "- test_foo (tests/t.py) -- import\n";
+        assert_eq!(score_tests(ascii, &gold), (Some(1.0), 1, 1));
     }
 }

@@ -4,28 +4,37 @@
   "tasks": 21,
   "k": 10,
   "ripwire_status": "ran",
-  "notes": "Black-box ripwire --pack-task vs SCC task_context vs lexical baseline. Clustered means by fixture repo. This is file-name localization from packs, not an LLM repair loop. Missing Ripwire must never be scored as an SCC win; this run had a binary.",
+  "notes": "Black-box ripwire --pack-task vs SCC task_context vs lexical baseline. Clustered means by fixture repo. tests_localization is recall of tasks.json ground_truth.tests against pack tests_to_run. Empty gold tests omitted from the clustered mean. File-name localization from packs plus tests_to_run scoring, not an LLM repair loop. Missing Ripwire must never be scored as an SCC win; this run had a binary.",
   "arms": [
     {
       "arm": "baseline",
       "status": "ran",
       "clustered_localization": 0.948,
       "pooled_localization": 0.952,
-      "mean_substitution": 0.0
+      "mean_substitution": 0.0,
+      "clustered_tests": 0.0,
+      "pooled_tests": 0.0,
+      "tests_tasks": 7
     },
     {
       "arm": "scc",
       "status": "ran",
       "clustered_localization": 1.0,
       "pooled_localization": 1.0,
-      "mean_substitution": 1.0
+      "mean_substitution": 1.0,
+      "clustered_tests": 0.333,
+      "pooled_tests": 0.286,
+      "tests_tasks": 7
     },
     {
       "arm": "ripwire",
       "status": "ran",
       "clustered_localization": 0.722,
       "pooled_localization": 0.73,
-      "mean_substitution": 0.0
+      "mean_substitution": 0.0,
+      "clustered_tests": 0.0,
+      "pooled_tests": 0.0,
+      "tests_tasks": 7
     }
   ]
 }
