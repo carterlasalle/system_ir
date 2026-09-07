@@ -2888,4 +2888,83 @@ class Svc {
         });
         assert!(cold_hit, "cold index must also CALL pkg/a.py helper");
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-import verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.resolve.rust-import
+    fn index_rust_crate_use_pins_named_helper_not_decoy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/geo")).unwrap();
+        std::fs::create_dir_all(root.join("src/other")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "mod geo;\nmod util;\n").unwrap();
+        std::fs::write(
+            root.join("src/geo/mod.rs"),
+            "pub fn helper() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/other/mod.rs"),
+            "pub fn helper() -> i32 { 9 }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/util.rs"), "pub fn utilfn() -> i32 { 2 }\n").unwrap();
+        std::fs::write(
+            root.join("src/consumer.rs"),
+            "use crate::geo::helper;\nuse crate::util::utilfn;\nfn run() {\n    helper();\n    utilfn();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let geo = scc_core::symbol_id(&idx.store.repo_id, "src/geo/mod.rs", "helper");
+        let decoy = scc_core::symbol_id(&idx.store.repo_id, "src/other/mod.rs", "helper");
+        let util = scc_core::symbol_id(&idx.store.repo_id, "src/util.rs", "utilfn");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "src/consumer.rs", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == geo),
+            "crate::geo::helper must CALL geo/mod.rs helper: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == decoy),
+            "must not basename-guess other/mod.rs: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|r| r.object == util),
+            "crate::util::utilfn must CALL util.rs: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust-import-degrade verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.resolve.rust-import
+    fn index_rust_crate_use_degrades_when_rs_and_mod_rs_both_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/amb")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "mod amb;\n").unwrap();
+        std::fs::write(root.join("src/amb.rs"), "pub fn dupfn() -> i32 { 1 }\n").unwrap();
+        std::fs::write(root.join("src/amb/mod.rs"), "pub fn dupfn() -> i32 { 2 }\n").unwrap();
+        std::fs::write(
+            root.join("src/caller.rs"),
+            "use crate::amb::dupfn;\nfn run() { dupfn(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "src/amb.rs", "dupfn");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "src/amb/mod.rs", "dupfn");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "src/caller.rs", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
+            "amb.rs + amb/mod.rs must not guess a CALL: {calls:?}"
+        );
+    }
 }

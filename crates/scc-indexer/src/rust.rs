@@ -1004,6 +1004,9 @@ impl RustExtractor {
     }
 
 // trace:exempt reason=internal-detail
+    /// `mod x;` (no body) is a file-module declaration. Inline
+    /// `mod x { ... }` keeps a Module symbol and must not mint `mod:x`.
+    // trace:v1 id=impl.scc.extract.rust.mod-file work=WORK-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor satisfies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p implements=PLAN-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor
     fn walk_mod(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -1029,6 +1032,15 @@ impl RustExtractor {
             ctx.facts.push(SemanticFact::PublicExport {
                 symbol: name.clone(),
                 kind: "module".to_string(),
+            });
+        }
+        let text = node_text(Some(node), src);
+        if !text.contains('{') {
+            ctx.imports.push(Import {
+                module: format!("mod:{name}"),
+                names: vec![(name.clone(), name.clone())],
+                line: start_line,
+                r#type: ImportType::Module,
             });
         }
         // Module bodies are walked WITHOUT a scope push: nested items keep
@@ -2411,6 +2423,24 @@ impl Service {
         assert_eq!(imps[6].names, vec![("domain".into(), "domain".into())]);
         assert_eq!(imps[7].module, "crate::domain::Service");
         assert_eq!(imps[7].names, vec![("Service".into(), "Service".into())]);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.mod-file verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.extract.rust.mod-file
+    fn bodyless_mod_emits_mod_target_inline_does_not() {
+        let ef = extract("mod geo;\nmod inner {\n    fn f() {}\n}\n");
+        assert!(
+            ef.imports.iter().any(|i| i.module == "mod:geo"),
+            "body-less mod geo; must emit mod:geo: {:?}",
+            ef.imports
+        );
+        assert!(
+            !ef.imports.iter().any(|i| i.module == "mod:inner"),
+            "inline mod inner {{ }} must not emit mod:inner: {:?}",
+            ef.imports
+        );
+        assert!(ef.symbols.iter().any(|s| s.name == "geo" && s.kind == SymbolKind::Module));
+        assert!(ef.symbols.iter().any(|s| s.name == "inner" && s.kind == SymbolKind::Module));
     }
 
     #[test]

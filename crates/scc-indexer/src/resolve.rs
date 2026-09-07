@@ -150,6 +150,9 @@ impl SymbolIndex {
 
     /// Resolve an import statement to a file in the repo.
     pub fn resolve_import(&self, from_file: &str, import: &Import) -> ImportTarget {
+        if from_file.ends_with(".rs") {
+            return self.resolve_rust_import_target(from_file, import);
+        }
         if import.module.starts_with('.') {
             // relative: join with dir of from_file, then normalize ./ and ..
             let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -235,6 +238,118 @@ impl SymbolIndex {
         out.push(format!("{module}/index.js"));
         out.push(format!("{module}/index.jsx"));
         out
+    }
+
+    fn resolve_rust_import_target(&self, from_file: &str, import: &Import) -> ImportTarget {
+        match self.resolve_rust_import(from_file, &import.module) {
+            Some(file) => ImportTarget::Internal {
+                file,
+                name_map: HashMap::new(),
+                namespace: import.r#type == ImportType::Module,
+            },
+            None if rust_is_project_import(&import.module) => ImportTarget::Unresolved {
+                name: import.module.clone(),
+            },
+            None => ImportTarget::External {
+                name: import.module.clone(),
+            },
+        }
+    }
+
+    /// Ripwire `resolveRustImport`: unique-or-degrade path-precise Step-A.
+    /// `crate::` / `super::` / `self::` / `mod:x` map to exactly one `.rs` or
+    /// `/mod.rs`. Two hits (e.g. `a.rs` and `a/mod.rs`) degrade. Bare/`std::`
+    /// paths are not project imports.
+    // trace:v1 id=impl.scc.resolve.rust-import work=WORK-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor satisfies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p implements=PLAN-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor
+    fn resolve_rust_import(&self, from_file: &str, target: &str) -> Option<String> {
+        if target.is_empty() || target.contains(['{', '}', ',', ' ']) {
+            return None;
+        }
+        let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if let Some(mod_name) = target.strip_prefix("mod:") {
+            if mod_name.is_empty() || mod_name.contains(':') {
+                return None;
+            }
+            return self.rust_unique_file([
+                rust_join(dir, &format!("{mod_name}.rs")),
+                rust_join(dir, &format!("{mod_name}/mod.rs")),
+            ]);
+        }
+        let segs: Vec<&str> = target.split("::").collect();
+        if segs.is_empty() || segs.iter().any(|s| s.is_empty()) {
+            return None;
+        }
+        let (base, path): (String, &[&str]) = match segs[0] {
+            "crate" => (self.rust_crate_root_dir()?, &segs[1..]),
+            "self" => (dir.to_string(), &segs[1..]),
+            "super" => (rust_join(dir, ".."), &segs[1..]),
+            _ => return None,
+        };
+        if path.is_empty() {
+            return None;
+        }
+        let full = path.join("/");
+        let mut cands = vec![
+            rust_join(&base, &format!("{full}.rs")),
+            rust_join(&base, &format!("{full}/mod.rs")),
+        ];
+        if path.len() >= 2 {
+            let parent = path[..path.len() - 1].join("/");
+            cands.push(rust_join(&base, &format!("{parent}.rs")));
+            cands.push(rust_join(&base, &format!("{parent}/mod.rs")));
+        }
+        self.rust_unique_file(cands)
+    }
+
+    fn rust_crate_root_dir(&self) -> Option<String> {
+        let mut files: Vec<&str> = self.all_files.iter().map(String::as_str).collect();
+        files.sort_unstable();
+        for p in files {
+            let is_lib = p == "lib.rs" || p.ends_with("/lib.rs");
+            let is_main = p == "main.rs" || p.ends_with("/main.rs");
+            if is_lib || is_main {
+                return Some(
+                    p.rsplit_once('/')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        None
+    }
+
+    fn rust_unique_file(&self, candidates: impl IntoIterator<Item = String>) -> Option<String> {
+        let mut hit: Option<String> = None;
+        for raw in candidates {
+            let c = normalize_module_path(&raw);
+            if c.is_empty() || !self.all_files.contains(&c) {
+                continue;
+            }
+            match &hit {
+                None => hit = Some(c),
+                Some(prev) if prev != &c => return None,
+                Some(_) => {}
+            }
+        }
+        hit
+    }
+}
+
+fn rust_is_project_import(module: &str) -> bool {
+    module.starts_with("mod:")
+        || module == "crate"
+        || module.starts_with("crate::")
+        || module == "self"
+        || module.starts_with("self::")
+        || module == "super"
+        || module.starts_with("super::")
+}
+
+fn rust_join(base: &str, rel: &str) -> String {
+    if base.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{base}/{rel}")
     }
 }
 
@@ -1593,6 +1708,98 @@ mod tests {
         );
         assert_eq!(idx.resolve_module_path("util"), Some("src/util.py".into()));
         assert_eq!(idx.resolve_module_path("nonexistent"), None);
+    }
+
+    fn rust_imp(module: &str) -> Import {
+        Import {
+            module: module.into(),
+            names: vec![],
+            line: 1,
+            r#type: ImportType::Member,
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust-import verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.resolve.rust-import
+    fn rust_step_a_unique_or_degrade_and_never_basename() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("src/lib.rs", &[]);
+        idx.add_file("src/geo/mod.rs", &[]);
+        idx.add_file("src/other/mod.rs", &[]);
+        idx.add_file("src/util.rs", &[]);
+        idx.add_file("src/amb.rs", &[]);
+        idx.add_file("src/amb/mod.rs", &[]);
+        idx.add_file("src/consumer.rs", &[]);
+
+        match idx.resolve_import("src/lib.rs", &rust_imp("mod:geo")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/geo/mod.rs"),
+            other => panic!("mod:geo expected geo/mod.rs, got {other:?}"),
+        }
+        match idx.resolve_import("src/lib.rs", &rust_imp("mod:geo")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "src/other/mod.rs", "must not basename-guess other/mod.rs")
+            }
+            other => panic!("mod:geo expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("src/lib.rs", &rust_imp("mod:util")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/util.rs"),
+            other => panic!("mod:util expected util.rs, got {other:?}"),
+        }
+        match idx.resolve_import("src/consumer.rs", &rust_imp("crate::geo::helper")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/geo/mod.rs"),
+            other => panic!("crate::geo::helper expected geo/mod.rs, got {other:?}"),
+        }
+        match idx.resolve_import("src/consumer.rs", &rust_imp("crate::util::utilfn")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/util.rs"),
+            other => panic!("crate::util::utilfn expected util.rs, got {other:?}"),
+        }
+        match idx.resolve_import("src/consumer.rs", &rust_imp("crate::amb::dupfn")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "crate::amb::dupfn"),
+            other => panic!("amb.rs + amb/mod.rs must degrade, got {other:?}"),
+        }
+        match idx.resolve_import("src/consumer.rs", &rust_imp("std::collections::HashMap")) {
+            ImportTarget::External { name } => assert_eq!(name, "std::collections::HashMap"),
+            other => panic!("std:: must stay External, got {other:?}"),
+        }
+        match idx.resolve_import("src/consumer.rs", &rust_imp("crate::{geo, util}")) {
+            ImportTarget::Unresolved { .. } => {}
+            other => panic!("brace group must degrade, got {other:?}"),
+        }
+
+        let mut no_root = SymbolIndex::new("repo");
+        no_root.add_file("src/consumer.rs", &[]);
+        no_root.add_file("src/geo/mod.rs", &[]);
+        match no_root.resolve_import("src/consumer.rs", &rust_imp("crate::geo::helper")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "crate::geo::helper"),
+            other => panic!("no crate root must degrade, got {other:?}"),
+        }
+
+        let mut py = SymbolIndex::new("repo");
+        py.add_file("w.py", &[]);
+        py.add_file("crate.rs", &[]);
+        py.add_file("src/lib.rs", &[]);
+        match py.resolve_import("w.py", &rust_imp("crate::geo::helper")) {
+            ImportTarget::External { name } => assert_eq!(name, "crate::geo::helper"),
+            other => panic!("Python caller must not use Rust Step-A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust-import-super verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.resolve.rust-import
+    fn rust_super_and_self_resolve_relative_to_includer() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("src/lib.rs", &[]);
+        idx.add_file("src/foo/bar.rs", &[]);
+        idx.add_file("src/foo/cfg.rs", &[]);
+        idx.add_file("src/cfg.rs", &[]);
+        match idx.resolve_import("src/foo/bar.rs", &rust_imp("self::cfg")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/foo/cfg.rs"),
+            other => panic!("self::cfg expected src/foo/cfg.rs, got {other:?}"),
+        }
+        match idx.resolve_import("src/foo/bar.rs", &rust_imp("super::cfg")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/cfg.rs"),
+            other => panic!("super::cfg expected src/cfg.rs, got {other:?}"),
+        }
     }
 
     #[test]
