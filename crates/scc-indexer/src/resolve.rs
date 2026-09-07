@@ -1927,6 +1927,147 @@ impl Svc {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.go.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.go.local-type
+    fn go_local_and_param_pin_and_assignment_tombstones() {
+        use crate::go::GoExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(x *Order) {
+	y := &Order{}
+	y.Process()
+	x.Process()
+	y.inner.Process()
+}
+func mixed() {
+	z := &Order{}
+	z = &Invoice{}
+	z.Process()
+}
+func factory() {
+	x := MakeOrder()
+	x.Process()
+}
+"#;
+        let ef = GoExtractor::default().extract(&SourceFile::new("w.go", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.go", &ef.symbols);
+        idx.set_type_binds("w.go", &ef.type_binds);
+        let resolved = resolve_calls("w.go", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let handle_id = scc_core::symbol_id("repo", "w.go", "handle");
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.Process")
+            .expect("y.Process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        let x = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.Process" && c.caller_id == handle_id)
+            .expect("x.Process");
+        assert_eq!(
+            x.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        let z = resolved
+            .iter()
+            .find(|c| c.callee_name == "z.Process")
+            .expect("z.Process");
+        assert_eq!(z.callee_id, None, "conflicting local assignment must not pin");
+        assert_eq!(z.recv, RecvKind::NamedVariable);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.inner.Process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let factory_id = scc_core::symbol_id("repo", "w.go", "factory");
+        let factory = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.Process" && c.caller_id == factory_id)
+            .expect("factory x.Process");
+        assert_eq!(
+            factory.callee_id, None,
+            "opaque factory call must not pin"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.rust.local-type
+    fn rust_local_and_param_pin_and_assignment_tombstones() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::rust::RustExtractor;
+        let src = r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(x: Order) {
+    let y = Order {};
+    y.process();
+    x.process();
+    y.inner.process();
+}
+fn mixed() {
+    let mut z = Order {};
+    z = Invoice {};
+    z.process();
+}
+fn factory() {
+    let x = make_order();
+    x.process();
+}
+"#;
+        let ef = RustExtractor::default().extract(&SourceFile::new("w.rs", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.rs", &ef.symbols);
+        idx.set_type_binds("w.rs", &ef.type_binds);
+        let resolved = resolve_calls("w.rs", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let handle_id = scc_core::symbol_id("repo", "w.rs", "handle");
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.process")
+            .expect("y.process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Order.process"))
+        );
+        let x = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.process" && c.caller_id == handle_id)
+            .expect("x.process");
+        assert_eq!(
+            x.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Order.process"))
+        );
+        let z = resolved
+            .iter()
+            .find(|c| c.callee_name == "z.process")
+            .expect("z.process");
+        assert_eq!(z.callee_id, None, "conflicting local assignment must not pin");
+        assert_eq!(z.recv, RecvKind::NamedVariable);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let factory_id = scc_core::symbol_id("repo", "w.rs", "factory");
+        let factory = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.process" && c.caller_id == factory_id)
+            .expect("factory x.process");
+        assert_eq!(
+            factory.callee_id, None,
+            "opaque factory call must not pin"
+        );
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.java.unprefixed-field-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
     fn java_unprefixed_field_pins_and_local_shadows() {
         use crate::java::JavaExtractor;

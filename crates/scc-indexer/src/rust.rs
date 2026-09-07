@@ -603,7 +603,7 @@ impl Ctx {
 
     // trace:exempt reason=internal-detail
     fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
-        if name.is_empty() || type_name.is_empty() {
+        if name.is_empty() || type_name.is_empty() || name == "_" || name == "self" {
             return;
         }
         self.type_binds.push(TypeBind {
@@ -612,6 +612,26 @@ impl Ctx {
             type_name,
             line,
         });
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
     }
 
     /// Struct-scoped field type from the declared type (`Order`, `&Order`, `Box<Order>`).
@@ -644,6 +664,7 @@ impl RustExtractor {
             "call_expression" => self.record_call(node, ctx, src),
             "macro_invocation" => self.record_macro_invocation(node, ctx, src),
             "assignment_expression" => self.record_field_assign(node, ctx, src),
+            "let_declaration" => self.record_let(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -799,6 +820,7 @@ impl RustExtractor {
             name: sym_name,
             is_impl: false,
         });
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -1511,19 +1533,75 @@ impl RustExtractor {
     /// tombstones at resolve time.
     // trace:v1 id=impl.scc.extract.rust.field-assign work=WORK-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme satisfies=REQ-implement-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-fi implements=PLAN-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme
     fn record_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
-        if let Some(class) = ctx.enclosing_impl() {
-            if let Some(left) = node.child_by_field_name("left") {
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        let line = node.start_position().row as u32 + 1;
+        if let (Some(left), Some(right)) = (left, right) {
+            if let Some(class) = ctx.enclosing_impl() {
                 if let Some(field) = one_hop_self_field(left, src) {
-                    if let Some(right) = node.child_by_field_name("right") {
-                        if let Some(ty) = rust_rhs_type_name(right, src) {
-                            let line = node.start_position().row as u32 + 1;
-                            ctx.push_type_bind_in(class, field, ty, line);
-                        }
+                    if let Some(ty) = rust_rhs_type_name(right, src, ctx) {
+                        ctx.push_type_bind_in(class, field, ty, line);
+                    }
+                }
+            }
+            if left.kind() == "identifier" {
+                let name = clean(node_text(Some(left), src));
+                if let Some(ty) = rust_rhs_type_name(right, src, ctx) {
+                    ctx.push_type_bind(name, ty, line);
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `let x = Order {}` / `let x: Order = ...` — caller-scoped local bind.
+    // trace:v1 id=impl.scc.extract.rust.local-type work=WORK-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa satisfies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time implements=PLAN-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa
+    fn record_let(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(pat) = node.child_by_field_name("pattern") {
+            if pat.kind() == "identifier" {
+                let name = clean(node_text(Some(pat), src));
+                let line = node.start_position().row as u32 + 1;
+                if let Some(ty) = node
+                    .child_by_field_name("type")
+                    .and_then(|t| rust_simple_type_name(&clean(node_text(Some(t), src))))
+                {
+                    ctx.push_type_bind(name.clone(), ty, line);
+                }
+                if let Some(val) = node.child_by_field_name("value") {
+                    if let Some(ty) = rust_rhs_type_name(val, src, ctx) {
+                        ctx.push_type_bind(name, ty, line);
                     }
                 }
             }
         }
         self.walk_children(node, ctx, src);
+    }
+
+    /// Typed parameters (`fn handle(x: Order)`) bind in the current callable.
+    // trace:exempt reason=internal-detail
+    fn bind_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let Some(pat) = p.child_by_field_name("pattern") else {
+                continue;
+            };
+            if pat.kind() != "identifier" {
+                continue;
+            }
+            let name = clean(node_text(Some(pat), src));
+            let Some(ty) =
+                rust_simple_type_name(&clean(node_text(p.child_by_field_name("type"), src)))
+            else {
+                continue;
+            };
+            ctx.push_type_bind(name, ty, p.start_position().row as u32 + 1);
+        }
     }
 
     /// `env!("KEY")` / `option_env!("KEY")` configuration reads (macro
@@ -1927,7 +2005,7 @@ fn one_hop_self_field(node: Node, src: &[u8]) -> Option<String> {
 
 /// Type name from `Invoice {}` / `&Invoice {}` / `Invoice::new()`.
 // trace:exempt reason=internal-detail
-fn rust_rhs_type_name(mut n: Node, src: &[u8]) -> Option<String> {
+fn rust_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
     while matches!(
         n.kind(),
         "reference_expression"
@@ -1944,6 +2022,7 @@ fn rust_rhs_type_name(mut n: Node, src: &[u8]) -> Option<String> {
             rust_simple_type_name(&clean(node_text(n.child_by_field_name("name"), src)))
         }
         "call_expression" => rust_ctor_type_name(n, src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
         _ => None,
     }
 }
@@ -3096,6 +3175,65 @@ impl Svc {
         assert!(
             same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
             "same-type assignment must stay unique Order: {same_types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.rust.local-type
+    fn local_type_binds_from_let_and_params() {
+        let ef = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(x: Order) {
+    let y = Order {};
+    y.process();
+    x.process();
+    y.inner.process();
+}
+fn mixed() {
+    let mut z = Order {};
+    z = Invoice {};
+    z.process();
+}
+fn factory() {
+    let x = make_order();
+    x.process();
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "let bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting local assignment must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "factory" && b.name == "x"),
+            "opaque factory call must not mint a type bind: {:?}",
+            ef.type_binds
         );
     }
 }

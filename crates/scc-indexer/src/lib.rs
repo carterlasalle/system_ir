@@ -1617,4 +1617,121 @@ func (s *Svc) Run() {
             "must not spray Invoice.Process: {calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.go.local-type
+    fn index_pins_go_local_and_param_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.go"),
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(x *Order) {
+	y := &Order{}
+	y.Process()
+	x.Process()
+}
+func mixed() {
+	z := &Order{}
+	z = &Invoice{}
+	z.Process()
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Order.Process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Invoice.Process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.go", "handle");
+        let mixed = scc_core::symbol_id(&idx.store.repo_id, "w.go", "mixed");
+        let rels = idx.store.all_relationships().unwrap();
+        let handle_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            handle_calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.Process: {handle_calls:?}"
+        );
+        assert!(
+            !handle_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process: {handle_calls:?}"
+        );
+        let mixed_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == mixed)
+            .collect();
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == order),
+            "conflicting local assignment must not pin Order.Process: {mixed_calls:?}"
+        );
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process from mixed: {mixed_calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.rust.local-type
+    fn index_pins_rust_local_and_param_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.rs"),
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(x: Order) {
+    let y = Order {};
+    y.process();
+    x.process();
+}
+fn mixed() {
+    let mut z = Order {};
+    z = Invoice {};
+    z.process();
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "Invoice.process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "handle");
+        let mixed = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "mixed");
+        let rels = idx.store.all_relationships().unwrap();
+        let handle_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            handle_calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.process: {handle_calls:?}"
+        );
+        assert!(
+            !handle_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {handle_calls:?}"
+        );
+        let mixed_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == mixed)
+            .collect();
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == order),
+            "conflicting local assignment must not pin Order.process: {mixed_calls:?}"
+        );
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process from mixed: {mixed_calls:?}"
+        );
+    }
 }

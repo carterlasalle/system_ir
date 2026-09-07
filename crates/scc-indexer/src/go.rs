@@ -590,6 +590,9 @@ impl Ctx {
         if name.is_empty() || type_name.is_empty() {
             return;
         }
+        if name == "_" {
+            return;
+        }
         self.type_binds.push(TypeBind {
             scope,
             name,
@@ -637,6 +640,8 @@ impl GoExtractor {
                 self.walk_value_decl(node, ctx, src, SymbolKind::Const);
                 self.walk_children(node, ctx, src);
             }
+            "var_spec" => self.record_var_spec(node, ctx, src),
+            "short_var_declaration" => self.record_short_var(node, ctx, src),
             "import_declaration" => self.record_import(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
             "assignment_statement" => self.record_field_assign(node, ctx, src),
@@ -696,6 +701,7 @@ impl GoExtractor {
             });
         }
         ctx.scopes.push(name);
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -754,6 +760,7 @@ impl GoExtractor {
         {
             ctx.push_type_bind(rname, rty, start_line);
         }
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -915,17 +922,86 @@ impl GoExtractor {
         let rights = expr_nodes(node.child_by_field_name("right"));
         let line = node.start_position().row as u32 + 1;
         for (i, left) in lefts.iter().enumerate() {
-            let Some((root, field)) = one_hop_selector(*left, src) else {
-                continue;
-            };
-            let Some(owner) = ctx.unique_local_type(&root) else {
-                continue;
-            };
-            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
-                ctx.push_type_bind_in(owner, field, ty, line);
+            let rhs = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx));
+            if let Some((root, field)) = one_hop_selector(*left, src) {
+                if let Some(owner) = ctx.unique_local_type(&root) {
+                    if let Some(ty) = rhs {
+                        ctx.push_type_bind_in(owner, field, ty, line);
+                    }
+                }
+            } else if left.kind() == "identifier" {
+                let name = clean(node_text(Some(*left), src));
+                if let Some(ty) = rhs {
+                    ctx.push_type_bind(name, ty, line);
+                }
             }
         }
         self.walk_children(node, ctx, src);
+    }
+
+    /// `x := &Order{}` — caller-scoped local type bind (Ripwire Rule 2).
+    // trace:v1 id=impl.scc.extract.go.local-type work=WORK-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa satisfies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time implements=PLAN-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa
+    fn record_short_var(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let lefts = expr_nodes(node.child_by_field_name("left"));
+        let rights = expr_nodes(node.child_by_field_name("right"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, left) in lefts.iter().enumerate() {
+            if left.kind() != "identifier" {
+                continue;
+            }
+            let name = clean(node_text(Some(*left), src));
+            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
+                ctx.push_type_bind(name, ty, line);
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `var x *Order` / `var x = &Order{}` — declared type and RHS both bind.
+    // trace:exempt reason=internal-detail
+    fn record_var_spec(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut names: Vec<String> = Vec::new();
+        let mut nc = node.walk();
+        for n in node.children_by_field_name("name", &mut nc) {
+            let name = clean(node_text(Some(n), src));
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        let declared = go_simple_type_name(node.child_by_field_name("type"), src);
+        let rights = expr_nodes(node.child_by_field_name("value"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, name) in names.into_iter().enumerate() {
+            if let Some(ty) = declared.clone() {
+                ctx.push_type_bind(name.clone(), ty, line);
+            }
+            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
+                ctx.push_type_bind(name, ty, line);
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// Typed parameters (`func handle(x *Order)`) bind in the current callable.
+    // trace:exempt reason=internal-detail
+    fn bind_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "parameter_declaration" {
+                continue;
+            }
+            let Some(ty) = go_simple_type_name(p.child_by_field_name("type"), src) else {
+                continue;
+            };
+            let line = p.start_position().row as u32 + 1;
+            let mut nc = p.walk();
+            for n in p.children_by_field_name("name", &mut nc) {
+                ctx.push_type_bind(clean(node_text(Some(n), src)), ty.clone(), line);
+            }
+        }
     }
 
     /// `const_declaration` / `var_declaration` → one symbol per spec.
@@ -3094,6 +3170,66 @@ func (s *Svc) Run() {
         assert!(
             same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
             "same-type assignment must stay unique Order: {same_types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.go.local-type
+    fn local_type_binds_from_short_var_and_params() {
+        let ef = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(x *Order) {
+	y := &Order{}
+	y.Process()
+	x.Process()
+	y.inner.Process()
+}
+func mixed() {
+	z := &Order{}
+	z = &Invoice{}
+	z.Process()
+}
+func factory() {
+	x := MakeOrder()
+	x.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "short-var bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting local assignment must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "factory" && b.name == "x"),
+            "opaque factory call must not mint a type bind: {:?}",
+            ef.type_binds
         );
     }
 }
