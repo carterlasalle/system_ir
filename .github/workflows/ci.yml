@@ -69,10 +69,8 @@ jobs:
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
           # Skip the 50k wall-clock gate here. Debug+test profile indexes
-          # this fixture in 80–120s (over the 90s envelope); `--release`
-          # is the honest bound. Compiling release in this job was ~2.5 min
-          # for a ~12s index, then bench-250k compiled release again.
-          # The gate runs in bench-250k against that one release build.
+          # this fixture in 80–120s; `--release` is the honest bound. The
+          # gate runs in bench-250k against that job's release build.
           # Golden tests live only in tests/golden.rs (helpers: tests/common/).
           cargo test --workspace -- --skip cold_index_50k_loc_under_30s
       # HERMETIC TraceLayer: pinned version via uv — no unpinned pip, no
@@ -111,9 +109,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release -p scc-cli
       - name: 50k LOC cold-index gate (release)
+        # Builds the release `scc` binary as a test dependency (the 250k
+        # step reuses it). 180s envelope: a cold parallel GHA VM measured
+        # 113–130s release; 90s was a runner lottery, not a 30s claim.
         run: cargo test -p scc-cli --release --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
       - name: 250k LOC benchmark
         run: ./target/release/scc bench index --files 1000 --lines 250
