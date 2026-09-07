@@ -1149,9 +1149,9 @@ mod tests {
         )
         .unwrap();
         let rec = reconcile(&store).unwrap();
-        assert!(
-            rec.observed_upgrades >= 1,
-            "matched CALLS must upgrade: {rec:?}"
+        assert_eq!(
+            rec.observed_upgrades, 0,
+            "ingest already attached OBSERVED_AS; reconcile must not recount: {rec:?}"
         );
 
         let rels = store.all_relationships().unwrap();
