@@ -149,9 +149,10 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
                 agent_label=None, model_label=None, budget=None):
     """One (variant, task) cell via the shared writable runner.
 
-    Native SCC and aider/repomix both go through `h.run_writable_variant`
-    (copy → artifact against THAT copy → `run_write_task`). The registry
-    evaluator is the acceptance SoT after the agent returns.
+    Native SCC (NATIVE_SCC_VARIANTS) and EXTERNAL_VARIANTS both go through
+    `h.run_writable_variant` (copy → artifact against THAT copy →
+    `run_write_task`). Raw keeps artifact = None. The registry evaluator
+    is the acceptance SoT after the agent returns.
     """
     mode = "equal-token" if budget is not None else "native-default"
     grouped = {task["repo"]: [task]}
