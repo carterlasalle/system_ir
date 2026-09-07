@@ -19,6 +19,7 @@ require_semantic_audit = true
 
 [exclusions]
 paths = [
+  "Cargo.lock",
   "crates/scc-indexer/src/adapters.rs",
   "vendor/**",
   "generated/**",

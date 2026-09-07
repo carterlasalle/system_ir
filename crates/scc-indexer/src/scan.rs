@@ -242,7 +242,7 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
             "sh" | "bash" | "zsh" => Language::Shell,
             "sql" => Language::Sql,
             "c" | "h" => Language::C,
-            "cc" | "cpp" | "cxx" | "hpp" | "hh" => Language::Cpp,
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
             "m" | "mm" => Language::Objc,
             "cs" => Language::Csharp,
             "rb" => Language::Ruby,
@@ -458,13 +458,14 @@ mod tests {
             );
         }
         assert!(scc_core::language_by_id("c").is_some());
-        assert!(!scc_core::language_by_id("c").unwrap().extractor);
+        assert!(scc_core::language_by_id("c").unwrap().extractor);
         assert_eq!(classify(Path::new("src/foo.c")).unwrap().0, Language::C);
         assert_eq!(classify(Path::new("src/foo.cpp")).unwrap().0, Language::Cpp);
+        assert_eq!(classify(Path::new("src/foo.hxx")).unwrap().0, Language::Cpp);
         assert_eq!(classify(Path::new("src/foo.rb")).unwrap().0, Language::Ruby);
-        assert!(!scc_core::language_by_id("c").unwrap().extractor);
+        assert!(!scc_core::language_by_id("objc").unwrap().extractor);
         assert_eq!(
-            scc_core::language_by_id("c").unwrap().tier,
+            scc_core::language_by_id("objc").unwrap().tier,
             scc_core::LanguageTier::IndexSearch
         );
     }

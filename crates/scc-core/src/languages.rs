@@ -82,8 +82,8 @@ pub const LANGUAGE_REGISTRY: &[LanguageCapability] = &[
     cap("markdown", "Markdown", LanguageTier::DataConfig, &["md", "mdx", "rst"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "docs; DECLARED_AS mention index"),
     cap("shell", "Shell", LanguageTier::IndexSearch, &["sh", "bash", "zsh"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
     cap("sql", "SQL", LanguageTier::IndexSearch, &["sql"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
-    cap("c", "C", LanguageTier::IndexSearch, &["c", "h"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
-    cap("cpp", "C++", LanguageTier::IndexSearch, &["cc", "cpp", "cxx", "hpp", "hh"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
+    cap("c", "C", LanguageTier::SemanticDeep, &["c", "h"], &[], true, true, false, false, false, true, false, true, false, false, false, false, false, false, false, "procedural tree-sitter; quote-include Step-A; no CHA/fn-ptr/ObjC"),
+    cap("cpp", "C++", LanguageTier::SemanticDeep, &["cc", "cpp", "cxx", "hpp", "hh", "hxx"], &[], true, true, true, true, false, true, false, true, false, false, false, false, false, false, false, "procedural tree-sitter; quote-include Step-A; class methods; no CHA/fn-ptr"),
     cap("objc", "Objective-C", LanguageTier::IndexSearch, &["m", "mm"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
     cap("csharp", "C#", LanguageTier::IndexSearch, &["cs"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
     cap("ruby", "Ruby", LanguageTier::IndexSearch, &["rb"], &[], false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, "classified; no AST extractor"),
@@ -220,13 +220,17 @@ mod tests {
         }
         assert!(extracted_language_ids().contains(&"python"));
         assert!(extracted_language_ids().contains(&"rust"));
-        assert!(!extracted_language_ids().contains(&"c"));
+        assert!(extracted_language_ids().contains(&"c"));
+        assert!(extracted_language_ids().contains(&"cpp"));
+        assert!(!extracted_language_ids().contains(&"objc"));
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn matrix_is_generated_not_empty() {
         let md = support_matrix_markdown();
         assert!(md.contains("| Python |"));
-        assert!(md.contains("| C | C | no |"));
+        assert!(md.contains("| C | A | yes |"));
+        assert!(md.contains("| Objective-C | C | no |"));
     }
 }

@@ -27,7 +27,9 @@
 //! unique source-root fallback); `.ts`/`.js` → relative `./`/`../` only
 //! (bare specifiers stay External); `.go` → unique `{path}.go` or production
 //! files in `{path}/` (multi-file packages expand); `.java` → unique
-//! `dots/to/Type.java` (star imports contribute nothing). Two distinct
+//! `dots/to/Type.java` (star imports contribute nothing); C/C++ quote
+//! `#include "foo.h"` joins the includer directory (exact hit, never
+//! basename-guess); angle `#include <stdio.h>` stays External. Two distinct
 //! package identities or type files contribute nothing. Go/Java never steal
 //! `.py`/`.ts`.
 //!
@@ -187,6 +189,9 @@ impl SymbolIndex {
         }
         if from_file.ends_with(".java") {
             return self.resolve_java_import_target(from_file, import);
+        }
+        if is_cfamily_file(from_file) {
+            return self.resolve_c_include_target(from_file, import);
         }
         if import.module.starts_with('.') {
             // relative: join with dir of from_file, then normalize ./ and ..
@@ -595,6 +600,46 @@ impl SymbolIndex {
             _ => UniqueHit::None,
         }
     }
+
+    /// C-family `#include` Step-A (Ripwire `includeLangOf` CFamily +
+    /// `joinNormalizeLookup`). Quote `"foo.h"` is an exact lexical join with
+    /// the includer directory — a hit pins, a miss is Unresolved, never a
+    /// basename guess. Angle `<stdio.h>` is External even when a same-named
+    /// header exists in-repo. Direct includes only (no `-I`, no
+    /// `compile_commands.json`, no transitive closure).
+    // trace:v1 id=impl.scc.resolve.c-include work=WORK-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extractors-with-path satisfies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto implements=PLAN-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extractors-with-path
+    fn resolve_c_include_target(&self, from_file: &str, import: &Import) -> ImportTarget {
+        let module = import.module.trim();
+        if module.len() >= 2 && module.starts_with('<') && module.ends_with('>') {
+            return ImportTarget::External {
+                name: import.module.clone(),
+            };
+        }
+        let relative = module.trim_matches('"');
+        if relative.is_empty() {
+            return ImportTarget::Unresolved {
+                name: import.module.clone(),
+            };
+        }
+        let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let joined = normalize_module_path(&rust_join(dir, relative));
+        if joined.is_empty() {
+            return ImportTarget::Unresolved {
+                name: import.module.clone(),
+            };
+        }
+        if self.all_files.contains(&joined) {
+            ImportTarget::Internal {
+                file: joined,
+                name_map: HashMap::new(),
+                namespace: import.r#type == ImportType::Module,
+            }
+        } else {
+            ImportTarget::Unresolved {
+                name: import.module.clone(),
+            }
+        }
+    }
 }
 
 fn rust_is_project_import(module: &str) -> bool {
@@ -629,6 +674,17 @@ fn is_typescript_file(path: &str) -> bool {
         || path.ends_with(".jsx")
         || path.ends_with(".mjs")
         || path.ends_with(".cjs")
+}
+
+fn is_cfamily_file(path: &str) -> bool {
+    path.ends_with(".c")
+        || path.ends_with(".h")
+        || path.ends_with(".cc")
+        || path.ends_with(".cpp")
+        || path.ends_with(".cxx")
+        || path.ends_with(".hpp")
+        || path.ends_with(".hh")
+        || path.ends_with(".hxx")
 }
 
 fn python_probe_pair(base: &str, rel_prefix: &str, mod_path: &str) -> [String; 2] {
@@ -2584,6 +2640,53 @@ mod tests {
         match amb.resolve_import("Main.java", &rust_imp("com.foo.Bar")) {
             ImportTarget::Unresolved { name } => assert_eq!(name, "com.foo.Bar"),
             other => panic!("two Bar.java files must degrade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.c-include verifies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto exercises=impl.scc.resolve.c-include
+    fn c_quote_include_is_exact_join_angle_is_external_never_steals() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("src/foo.h", &[mk_symbol("helper", SymbolKind::Function)]);
+        idx.add_file("other/foo.h", &[mk_symbol("helper", SymbolKind::Function)]);
+        idx.add_file("stdio.h", &[mk_symbol("helper", SymbolKind::Function)]);
+        idx.add_file("fmt.py", &[mk_symbol("helper", SymbolKind::Function)]);
+        idx.add_file("src/main.c", &[mk_symbol("main", SymbolKind::Function)]);
+
+        match idx.resolve_import("src/main.c", &rust_imp("foo.h")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/foo.h"),
+            other => panic!("quote foo.h expected src/foo.h, got {other:?}"),
+        }
+        match idx.resolve_import("src/main.c", &rust_imp("foo.h")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/foo.h", "must not basename-guess other/foo.h")
+            }
+            other => panic!("quote foo.h expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("src/main.c", &rust_imp("missing.h")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "missing.h"),
+            other => panic!("missing quote include must be Unresolved, got {other:?}"),
+        }
+        match idx.resolve_import("src/main.c", &rust_imp("<stdio.h>")) {
+            ImportTarget::External { name } => assert_eq!(name, "<stdio.h>"),
+            other => panic!("angle include must stay External even if stdio.h exists, got {other:?}"),
+        }
+        match idx.resolve_import("src/main.c", &rust_imp("fmt")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "fmt"),
+            other => panic!("C must not steal fmt.py, got {other:?}"),
+        }
+
+        let mut cpp = SymbolIndex::new("repo");
+        cpp.add_file("src/foo.hpp", &[mk_symbol("helper", SymbolKind::Function)]);
+        cpp.add_file("src/main.cpp", &[mk_symbol("main", SymbolKind::Function)]);
+        match cpp.resolve_import("src/main.cpp", &rust_imp("foo.hpp")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/foo.hpp"),
+            other => panic!("C++ quote include expected src/foo.hpp, got {other:?}"),
+        }
+        cpp.add_file("main.py", &[]);
+        match cpp.resolve_import("main.py", &rust_imp("foo.hpp")) {
+            ImportTarget::External { name } => assert_eq!(name, "foo.hpp"),
+            other => panic!("Python must not take the C-family join path, got {other:?}"),
         }
     }
 

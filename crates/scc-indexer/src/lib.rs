@@ -12,6 +12,7 @@
 // trace:exempt reason=module-facade  # pub mod re-exports only; behavior traced per module
 pub mod adapters;
 pub mod bridges;
+pub mod cfamily;
 pub mod config;
 pub mod configrefs;
 pub mod configs;
@@ -83,6 +84,8 @@ pub struct Indexer {
     pub typescript: Box<dyn LanguageExtractor>,
     pub java: Box<dyn LanguageExtractor>,
     pub rust: Box<dyn LanguageExtractor>,
+    pub c: Box<dyn LanguageExtractor>,
+    pub cpp: Box<dyn LanguageExtractor>,
 }
 
 // trace:exempt reason=internal-detail
@@ -96,6 +99,8 @@ impl Indexer {
             typescript: Box::new(crate::typescript::TypeScriptExtractor::default()),
             java: Box::new(crate::java::JavaExtractor::default()),
             rust: Box::new(crate::rust::RustExtractor::default()),
+            c: Box::new(crate::cfamily::CFamilyExtractor::c()),
+            cpp: Box::new(crate::cfamily::CFamilyExtractor::cpp()),
         }
     }
 
@@ -204,13 +209,7 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python"
-                || lang == "typescript"
-                || lang == "javascript"
-                || lang == "go"
-                || lang == "java"
-                || lang == "rust"
-            {
+            if extracts_code_id(&lang) {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
                 index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
@@ -258,15 +257,7 @@ impl Indexer {
             let lang = f.language;
             let mut resolved_imports: Vec<ResolvedImport> = Vec::new();
             let mut resolved_calls = Vec::new();
-            if matches!(
-                lang,
-                Language::Python
-                    | Language::TypeScript
-                    | Language::JavaScript
-                    | Language::Go
-                    | Language::Java
-                    | Language::Rust
-            ) {
+            if extracts_code(lang) {
                 resolved_imports = index.resolved_imports(path, &ef.imports);
                 resolved_calls = resolve::resolve_calls(
                     path,
@@ -399,6 +390,8 @@ impl Indexer {
             Language::Rust if self.config.language_enabled(Language::Rust) => {
                 self.rust.extract(&file)
             }
+            Language::C if self.config.language_enabled(Language::C) => self.c.extract(&file),
+            Language::Cpp if self.config.language_enabled(Language::Cpp) => self.cpp.extract(&file),
             _ => ExtractedFile::default(),
         }
     }
@@ -567,13 +560,7 @@ impl Indexer {
             if touched.contains(path.as_str()) {
                 continue;
             }
-            if lang == "python"
-                || lang == "typescript"
-                || lang == "javascript"
-                || lang == "go"
-                || lang == "java"
-                || lang == "rust"
-            {
+            if extracts_code_id(&lang) {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
                 index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
@@ -610,15 +597,7 @@ impl Indexer {
         for (path, (f, ef, cfg_hits, fail_hits)) in &extracted {
             let mut resolved_imports: Vec<ResolvedImport> = Vec::new();
             let mut resolved_calls = Vec::new();
-            if matches!(
-                f.language,
-                Language::Python
-                    | Language::TypeScript
-                    | Language::JavaScript
-                    | Language::Go
-                    | Language::Java
-                    | Language::Rust
-            ) {
+            if extracts_code(f.language) {
                 resolved_imports = index.resolved_imports(path, &ef.imports);
                 resolved_calls = resolve::resolve_calls(
                     path,
@@ -726,13 +705,7 @@ impl Indexer {
         let changed: HashSet<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
         let mut index = SymbolIndex::new(&self.store.repo_id);
         for (path, _h, lang, _kind, _size) in self.store.all_files()? {
-            if lang == "python"
-                || lang == "typescript"
-                || lang == "javascript"
-                || lang == "go"
-                || lang == "java"
-                || lang == "rust"
-            {
+            if extracts_code_id(&lang) {
                 let syms = self.load_symbols(&path)?;
                 index.add_file(&path, &syms);
                 index.set_class_bases(&path, &self.load_class_bases(&path, &syms)?);
@@ -806,6 +779,16 @@ impl Indexer {
 fn is_readme(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme")
+}
+
+fn extracts_code(lang: Language) -> bool {
+    extracts_code_id(lang.as_str())
+}
+
+fn extracts_code_id(lang: &str) -> bool {
+    scc_core::language_by_id(lang)
+        .map(|c| c.extractor)
+        .unwrap_or(false)
 }
 
 /// Per-file gauges live in store meta, not FILE entity attributes, so
@@ -1042,12 +1025,12 @@ mod tests {
                 );
             }
         }
-        std::fs::write(root.join("src/util.c"), "int add(int a, int b) { return a + b; }\n")
+        std::fs::write(root.join("src/util.rb"), "def add(a, b); a + b; end\n")
             .unwrap();
         let report = idx.index().unwrap();
         assert!(
             report.analysis_quality.files.unsupported >= 1,
-            "IndexSearch C must not count as parsed: {:?}",
+            "IndexSearch Ruby must not count as parsed: {:?}",
             report.analysis_quality
         );
     }
@@ -3462,6 +3445,117 @@ class Svc {
         assert!(
             calls.iter().any(|r| r.object == save),
             "unique src/main/java Service must pin: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.c-include verifies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto exercises=impl.scc.resolve.c-include,impl.scc.extract.cfamily
+    fn index_c_quote_include_rule3_pins_unique_header_not_decoy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("src/foo.h"),
+            "int helper(void) { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/foo.h"),
+            "int helper(void) { return 9; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("fmt.py"), "def helper():\n    return 0\n").unwrap();
+        std::fs::write(
+            root.join("src/main.c"),
+            "#include \"foo.h\"\nint main(void) { return helper(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        let report = idx.index().unwrap();
+        assert!(
+            report.analysis_quality.files.parsed >= 1,
+            "C must count as parsed, not unsupported: {:?}",
+            report.analysis_quality
+        );
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let main = scc_core::symbol_id(&rid, "src/main.c", "main");
+        let helper = scc_core::symbol_id(&rid, "src/foo.h", "helper");
+        let decoy = scc_core::symbol_id(&rid, "other/foo.h", "helper");
+        let py = scc_core::symbol_id(&rid, "fmt.py", "helper");
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == main)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == helper),
+            "quote include must Rule-3 pin unique src/foo.h helper: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == decoy),
+            "must not basename-guess other/foo.h: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == py),
+            "C must not steal fmt.py: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.c-angle-include verifies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto exercises=impl.scc.resolve.c-include
+    fn index_c_angle_include_does_not_pin_in_repo_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/stdio.h"),
+            "int helper(void) { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.c"),
+            "#include <stdio.h>\nint main(void) { return helper(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let helper = scc_core::symbol_id(&idx.store.repo_id, "src/stdio.h", "helper");
+        let main = scc_core::symbol_id(&idx.store.repo_id, "src/main.c", "main");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == main)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == helper),
+            "angle include must not pin in-repo stdio.h: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.cpp-method verifies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto exercises=impl.scc.extract.cfamily
+    fn index_cpp_class_method_this_call_pins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/foo.cpp"),
+            "class Foo {\n public:\n  void bar() {}\n  void run() { this->bar(); }\n};\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let bar = scc_core::symbol_id(&idx.store.repo_id, "src/foo.cpp", "Foo.bar");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "src/foo.cpp", "Foo.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == bar),
+            "this->bar() must CALL Foo.bar: {calls:?}"
         );
     }
 }

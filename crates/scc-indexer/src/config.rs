@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct Config {
     pub schema: u32,
     pub index: IndexConfig,
@@ -19,6 +20,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct IndexConfig {
     pub ignore: Vec<String>,
     pub watch: bool,
@@ -29,16 +31,20 @@ pub struct IndexConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct LanguagesConfig {
     pub typescript: bool,
     pub python: bool,
     pub go: bool,
     pub rust: bool,
     pub java: bool,
+    pub c: bool,
+    pub cpp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct ContextConfig {
     pub startup_tokens: usize,
     pub task_tokens: usize,
@@ -55,6 +61,7 @@ pub struct ContextConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct InferenceConfig {
     pub enabled: bool,
     /// ollama | openai | endpoint (any OpenAI-compatible API)
@@ -73,6 +80,7 @@ pub struct InferenceConfig {
     pub api_key_env: String,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for InferenceConfig {
     fn default() -> Self {
         InferenceConfig {
@@ -88,6 +96,7 @@ impl Default for InferenceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct RuntimeConfig {
     pub opentelemetry: OtelConfig,
 }
@@ -95,6 +104,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
+// trace:exempt reason=internal-detail
 pub struct OtelConfig {
     pub enabled: bool,
 }
@@ -102,6 +112,7 @@ pub struct OtelConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct IntegrationsConfig {
     pub serena: bool,
     pub beads: bool,
@@ -114,12 +125,14 @@ pub struct IntegrationsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// trace:exempt reason=internal-detail
 pub struct SecurityConfig {
     pub redact_secrets: bool,
     pub allow_remote_models: bool,
     pub listen: String,
 }
 
+// trace:exempt reason=internal-detail
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -135,6 +148,7 @@ impl Default for Config {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for IndexConfig {
     fn default() -> Self {
         IndexConfig {
@@ -161,7 +175,9 @@ impl Default for IndexConfig {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for LanguagesConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         LanguagesConfig {
             typescript: true,
@@ -169,10 +185,13 @@ impl Default for LanguagesConfig {
             go: true,
             rust: true,
             java: true,
+            c: true,
+            cpp: true,
         }
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for ContextConfig {
     fn default() -> Self {
         ContextConfig {
@@ -185,12 +204,14 @@ impl Default for ContextConfig {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig { opentelemetry: OtelConfig { enabled: false } }
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for IntegrationsConfig {
     fn default() -> Self {
         IntegrationsConfig {
@@ -204,6 +225,7 @@ impl Default for IntegrationsConfig {
     }
 }
 
+// trace:exempt reason=internal-detail
 impl Default for SecurityConfig {
     fn default() -> Self {
         SecurityConfig {
@@ -215,6 +237,7 @@ impl Default for SecurityConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
+// trace:exempt reason=internal-detail
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
     Io {
@@ -225,6 +248,7 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
 }
 
+// trace:exempt reason=internal-detail
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -239,6 +263,7 @@ impl Config {
         serde_yaml::to_string(&Config::default()).unwrap()
     }
 
+    // trace:v1 id=impl.scc-config-cfamily-languages work=WORK-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extractors-with-path satisfies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto implements=PLAN-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extractors-with-path
     pub fn language_enabled(&self, lang: crate::scan::Language) -> bool {
         match lang {
             crate::scan::Language::Python => self.languages.python,
@@ -248,11 +273,14 @@ impl Config {
             crate::scan::Language::Go => self.languages.go,
             crate::scan::Language::Rust => self.languages.rust,
             crate::scan::Language::Java => self.languages.java,
+            crate::scan::Language::C => self.languages.c,
+            crate::scan::Language::Cpp => self.languages.cpp,
             _ => true, // config/infra/docs always processed
         }
     }
 }
 
+// trace:exempt reason=internal-detail
 impl IndexConfig {
     pub fn compile_ignore(&self) -> Vec<GlobMatcher> {
         self.ignore

@@ -12,8 +12,8 @@
 use crate::packs::{entity_name, finish, Section};
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
-    Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode, AtlasInvariant,
-    AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
+    language_by_id, Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode,
+    AtlasInvariant, AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
 };
 use scc_graph::TrustedGraphView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1178,10 +1178,13 @@ fn push_contract(
     contracts.push(c);
 }
 
-/// Languages with a real extractor (the indexer's language map). Files in
+/// Languages with a real extractor come from `LANGUAGE_REGISTRY`. Files in
 /// any other language are scanned but never parsed — the honest `unparsed`
 /// remainder of the coverage map.
-const EXTRACTOR_LANGUAGES: [&str; 6] = ["python", "typescript", "javascript", "go", "java", "rust"];
+// trace:exempt reason=internal-detail
+fn is_extractor_language(lang: &str) -> bool {
+    language_by_id(lang).is_some_and(|c| c.extractor)
+}
 
 /// Deterministic model-coverage facts (Wave 9): what the model knows AND
 /// what it does not. Every line is computed from the trusted view + store —
@@ -1198,7 +1201,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     let total = files.len();
     let parsed = files
         .iter()
-        .filter(|(_, _, lang, _, _)| EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .filter(|(_, _, lang, _, _)| is_extractor_language(lang))
         .count();
     let pct = parsed
         .checked_mul(100)
@@ -1326,7 +1329,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     // ---- unparsed files ----
     let unparsed = files
         .iter()
-        .filter(|(_, _, lang, _, _)| !EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .filter(|(_, _, lang, _, _)| !is_extractor_language(lang))
         .count();
     out.insert(
         "unparsed_files".to_string(),
