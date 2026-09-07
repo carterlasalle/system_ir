@@ -615,6 +615,15 @@ impl Ctx {
         types.dedup();
         (types.len() == 1).then(|| types[0].to_string())
     }
+
+    /// Same-file type_spec already recorded — used to treat `Order(v)` as
+    /// conversion fuel when tree-sitter parses it as a call.
+    // trace:exempt reason=internal-detail
+    fn has_type(&self, name: &str) -> bool {
+        self.symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Type && s.name == name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,7 +2322,7 @@ fn one_hop_selector(node: Node, src: &[u8]) -> Option<(String, String)> {
     }
 }
 
-/// Type name from `&T{}` / `T{}` / `new(T)` / a uniquely typed ident.
+/// Type name from `&T{}` / `T{}` / `new(T)` / assertion / conversion / typed ident.
 // trace:exempt reason=internal-detail
 fn go_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
     while matches!(n.kind(), "unary_expression" | "parenthesized_expression") {
@@ -2322,16 +2331,32 @@ fn go_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
     match n.kind() {
         "composite_literal" => go_simple_type_name(n.child_by_field_name("type"), src),
         "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        "type_assertion_expression" | "type_conversion_expression" => go_cast_type_name(n, src),
         "call_expression" => {
             let fn_n = n.child_by_field_name("function")?;
-            if clean(node_text(Some(fn_n), src)) != "new" {
-                return None;
+            let name = clean(node_text(Some(fn_n), src));
+            if name == "new" {
+                let args = n.child_by_field_name("arguments")?;
+                return go_simple_type_name(args.named_child(0), src);
             }
-            let args = n.child_by_field_name("arguments")?;
-            go_simple_type_name(args.named_child(0), src)
+            if fn_n.kind() == "identifier" && ctx.has_type(&name) {
+                return go_is_simple_ident(&name).then_some(name);
+            }
+            None
         }
         _ => None,
     }
+}
+
+/// `v.(*Order)` / `Order(v)` — simple types only. Generic conversions are
+/// skipped because tree-sitter-go also parses `fs[i](3)` that way.
+// trace:v1 id=impl.scc.extract.go.type-assert work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn go_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    let ty = n.child_by_field_name("type")?;
+    if ty.kind() == "generic_type" {
+        return None;
+    }
+    go_simple_type_name(Some(ty), src)
 }
 
 /// Pointer-stripped simple type name. Slices, maps, and channels stay unbound.
@@ -3229,6 +3254,66 @@ func factory() {
                 .iter()
                 .any(|b| b.scope == "factory" && b.name == "x"),
             "opaque factory call must not mint a type bind: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.type-assert verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.go.type-assert
+    fn type_assert_and_conversion_binds() {
+        let ef = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(v any) {
+	x := v.(*Order)
+	x.Process()
+	y := Order(v)
+	y.Process()
+}
+func mixed(v any) {
+	z := v.(*Order)
+	z = v.(*Invoice)
+	z.Process()
+}
+func indexed(fs []func(int), i int) {
+	w := fs[i](3)
+	w.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "type assertion bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "type conversion bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting assertion must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "indexed" && b.name == "w"),
+            "index-then-call must not mint a type bind: {:?}",
             ef.type_binds
         );
     }

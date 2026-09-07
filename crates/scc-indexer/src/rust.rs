@@ -2003,7 +2003,7 @@ fn one_hop_self_field(node: Node, src: &[u8]) -> Option<String> {
     }
 }
 
-/// Type name from `Invoice {}` / `&Invoice {}` / `Invoice::new()`.
+/// Type name from `Invoice {}` / `&Invoice {}` / `Invoice::new()` / `v as Order`.
 // trace:exempt reason=internal-detail
 fn rust_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
     while matches!(
@@ -2022,9 +2022,16 @@ fn rust_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
             rust_simple_type_name(&clean(node_text(n.child_by_field_name("name"), src)))
         }
         "call_expression" => rust_ctor_type_name(n, src),
+        "type_cast_expression" => rust_cast_type_name(n, src),
         "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
         _ => None,
     }
+}
+
+/// `v as Order` / `v as &Order`.
+// trace:v1 id=impl.scc.extract.rust.type-cast work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn rust_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    rust_simple_type_name(&clean(node_text(n.child_by_field_name("type"), src)))
 }
 
 // trace:exempt reason=internal-detail
@@ -3234,6 +3241,45 @@ fn factory() {
                 .any(|b| b.scope == "factory" && b.name == "x"),
             "opaque factory call must not mint a type bind: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.rust.type-cast
+    fn type_cast_binds_from_as_expression() {
+        let ef = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(v: Order) {
+    let y = v as Order;
+    y.process();
+}
+fn mixed(v: Order, w: Invoice) {
+    let mut z = v as Order;
+    z = w as Invoice;
+    z.process();
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "as-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting as-cast must tombstone fuel: {z:?}"
         );
     }
 }

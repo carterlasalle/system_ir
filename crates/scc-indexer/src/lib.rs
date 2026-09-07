@@ -1734,4 +1734,64 @@ fn mixed() {
             "must not spray Invoice.process from mixed: {mixed_calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go.type-assert verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.go.type-assert
+    fn index_pins_go_type_assert_and_conversion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.go"),
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(v any) {
+	x := v.(*Order)
+	x.Process()
+	y := Order(v)
+	y.Process()
+}
+func mixed(v any) {
+	z := v.(*Order)
+	z = v.(*Invoice)
+	z.Process()
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Order.Process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Invoice.Process");
+        let handle = scc_core::symbol_id(&idx.store.repo_id, "w.go", "handle");
+        let mixed = scc_core::symbol_id(&idx.store.repo_id, "w.go", "mixed");
+        let rels = idx.store.all_relationships().unwrap();
+        let handle_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == handle)
+            .collect();
+        assert!(
+            handle_calls.iter().any(|r| r.object == order),
+            "handle must CALL Order.Process: {handle_calls:?}"
+        );
+        assert!(
+            !handle_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process: {handle_calls:?}"
+        );
+        let mixed_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == mixed)
+            .collect();
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == order),
+            "conflicting assertion must not pin Order.Process: {mixed_calls:?}"
+        );
+        assert!(
+            !mixed_calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process from mixed: {mixed_calls:?}"
+        );
+    }
 }

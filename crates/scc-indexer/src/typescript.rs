@@ -336,6 +336,9 @@ impl LanguageExtractor for TypeScriptExtractor {
                     {
                         out.type_binds.push(b);
                     }
+                    if let Some(b) = ts_type_bind_from_ident_assign(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
                 }
             "call_expression" => {
                 let Some(function) = node.child_by_field_name("function") else {
@@ -2223,6 +2226,35 @@ fn ts_new_ctor_name(node: &Node, src: &[u8]) -> Option<String> {
     ts_simple_type_name(&ctor, src)
 }
 
+/// `new Order()`, `v as Order`, `<Order>v`. Unwraps parentheses / non-null.
+// trace:v1 id=impl.scc.extract.ts.type-cast work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn ts_rhs_type_name(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cur = *node;
+    loop {
+        match cur.kind() {
+            "parenthesized_expression" | "non_null_expression" => {
+                cur = cur.named_child(0)?;
+            }
+            "new_expression" => return ts_new_ctor_name(&cur, src),
+            "as_expression" => {
+                let n = cur.named_child_count();
+                if n < 2 {
+                    return None;
+                }
+                return ts_simple_type_name(&cur.named_child(n - 1)?, src);
+            }
+            "type_assertion" => {
+                let args = cur.named_child(0)?;
+                if args.kind() == "type_arguments" {
+                    return ts_simple_type_name(&args.named_child(0)?, src);
+                }
+                return ts_simple_type_name(&args, src);
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Class name from `ctx.class` or `Class.method` caller (methods clear `class`).
 // trace:exempt reason=internal-detail
 fn ts_enclosing_class(ctx: &Ctx) -> Option<String> {
@@ -2298,7 +2330,7 @@ fn ts_type_bind_from_this_assign(
         return None;
     }
     let right = node.child_by_field_name("right")?;
-    let type_name = if let Some(ty) = ts_new_ctor_name(&right, src) {
+    let type_name = if let Some(ty) = ts_rhs_type_name(&right, src) {
         ty
     } else if right.kind() == "identifier" {
         let rhs = node_text(&right, src).trim();
@@ -2309,6 +2341,27 @@ fn ts_type_bind_from_this_assign(
     };
     Some(TypeBind {
         scope: class,
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
+/// `x = v as Order` — caller-scoped assignment fuel (tombstone when types differ).
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_ident_assign(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&left, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let right = node.child_by_field_name("right")?;
+    let type_name = ts_rhs_type_name(&right, src)?;
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
         name: name.to_string(),
         type_name,
         line: line_of(node),
@@ -2331,11 +2384,7 @@ fn ts_type_bind_from_declarator(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<Ty
         .and_then(|t| ts_simple_type_name(&t, src));
     if ty.is_none() {
         if let Some(v) = node.child_by_field_name("value") {
-            if v.kind() == "new_expression" {
-                if let Some(ctor) = v.child_by_field_name("constructor") {
-                    ty = ts_simple_type_name(&ctor, src);
-                }
-            }
+            ty = ts_rhs_type_name(&v, src);
         }
     }
     Some(TypeBind {
@@ -3663,6 +3712,39 @@ mod tests {
                 .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
             "new Order bind missing: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.ts.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.ts.type-cast
+    fn as_and_angle_cast_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nfunction handle(v: unknown) {\n  const y = v as Order;\n  y.process();\n  const z = <Order>v;\n  z.process();\n}\nfunction mixed(v: unknown) {\n  let x = v as Order;\n  x = v as Invoice;\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "as-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "z" && b.type_name == "Order"),
+            "angle-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        let x: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            x.contains(&"Order") && x.contains(&"Invoice"),
+            "conflicting as-cast must tombstone fuel: {x:?}"
         );
     }
 

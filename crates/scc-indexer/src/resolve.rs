@@ -2068,6 +2068,143 @@ fn factory() {
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.go.type-assert verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.go.type-assert
+    fn go_type_assert_and_conversion_pin_and_tombstone() {
+        use crate::go::GoExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(v any) {
+	x := v.(*Order)
+	x.Process()
+	y := Order(v)
+	y.Process()
+	x.inner.Process()
+}
+func mixed(v any) {
+	z := v.(*Order)
+	z = v.(*Invoice)
+	z.Process()
+}
+"#;
+        let ef = GoExtractor::default().extract(&SourceFile::new("w.go", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.go", &ef.symbols);
+        idx.set_type_binds("w.go", &ef.type_binds);
+        let resolved = resolve_calls("w.go", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let handle_id = scc_core::symbol_id("repo", "w.go", "handle");
+        let x = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.Process" && c.caller_id == handle_id)
+            .expect("x.Process");
+        assert_eq!(
+            x.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.Process")
+            .expect("y.Process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.inner.Process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let z = resolved
+            .iter()
+            .find(|c| c.callee_name == "z.Process")
+            .expect("z.Process");
+        assert_eq!(z.callee_id, None, "conflicting assertion must not pin");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.rust.type-cast
+    fn rust_as_cast_pin_and_tombstone() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::rust::RustExtractor;
+        let src = r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(v: Order) {
+    let y = v as Order;
+    y.process();
+    y.inner.process();
+}
+fn mixed(v: Order, w: Invoice) {
+    let mut z = v as Order;
+    z = w as Invoice;
+    z.process();
+}
+"#;
+        let ef = RustExtractor::default().extract(&SourceFile::new("w.rs", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.rs", &ef.symbols);
+        idx.set_type_binds("w.rs", &ef.type_binds);
+        let resolved = resolve_calls("w.rs", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.process")
+            .expect("y.process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Order.process"))
+        );
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let z = resolved
+            .iter()
+            .find(|c| c.callee_name == "z.process")
+            .expect("z.process");
+        assert_eq!(z.callee_id, None, "conflicting as-cast must not pin");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.ts.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.ts.type-cast
+    fn ts_as_cast_pin_and_tombstone() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::typescript::TypeScriptExtractor;
+        let src = "class Order { process() {} }\nclass Invoice { process() {} }\nfunction handle(v: unknown) {\n  const y = v as Order;\n  y.process();\n  y.inner.process();\n}\nfunction mixed(v: unknown) {\n  let x = v as Order;\n  x = v as Invoice;\n  x.process();\n}\n";
+        let ef = TypeScriptExtractor::default().extract(&SourceFile::new("w.ts", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.ts", &ef.symbols);
+        idx.set_type_binds("w.ts", &ef.type_binds);
+        let resolved = resolve_calls("w.ts", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let handle_id = scc_core::symbol_id("repo", "w.ts", "handle");
+        let y = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.process" && c.caller_id == handle_id)
+            .expect("y.process");
+        assert_eq!(
+            y.callee_id,
+            Some(scc_core::symbol_id("repo", "w.ts", "Order.process"))
+        );
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "y.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let mixed_id = scc_core::symbol_id("repo", "w.ts", "mixed");
+        let x = resolved
+            .iter()
+            .find(|c| c.callee_name == "x.process" && c.caller_id == mixed_id)
+            .expect("x.process");
+        assert_eq!(x.callee_id, None, "conflicting as-cast must not pin");
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.java.unprefixed-field-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
     fn java_unprefixed_field_pins_and_local_shadows() {
         use crate::java::JavaExtractor;
