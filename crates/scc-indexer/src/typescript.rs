@@ -9,7 +9,7 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, Route,
     SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -327,6 +327,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                     if let Some(b) = ts_type_bind_from_declarator(&node, &ctx, src) {
                         out.type_binds.push(b);
                     }
+                    ts_record_fn_alias_declarator(&node, &ctx, &mut out, src);
                 }
                 "required_parameter" | "optional_parameter" => {
                     if let Some(b) = ts_type_bind_from_param(&node, &ctx, src) {
@@ -347,6 +348,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                     if let Some(b) = ts_type_bind_from_ident_assign(&node, &ctx, src) {
                         out.type_binds.push(b);
                     }
+                    ts_record_fn_alias_assign(&node, &ctx, &mut out, src);
                 }
             "call_expression" => {
                 let Some(function) = node.child_by_field_name("function") else {
@@ -504,6 +506,7 @@ impl LanguageExtractor for TypeScriptExtractor {
             .collect();
         out.type_binds
             .retain(|b| b.type_name.is_empty() || known.contains(&b.type_name));
+        out.fn_binds = crate::model::normalize_fn_binds(std::mem::take(&mut out.fn_binds));
 
         out
         }
@@ -2285,6 +2288,84 @@ fn ts_new_ctor_name(node: &Node, src: &[u8]) -> Option<String> {
     ts_simple_type_name(&ctor, src)
 }
 
+/// `const f = helper` / `const f = () => {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.typescript.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn ts_record_fn_alias_declarator(node: &Node, ctx: &Ctx, out: &mut ExtractedFile, src: &[u8]) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    if name_node.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let typed = ts_rhs_type_name(&value, src).is_some();
+    crate::model::record_fn_rhs(
+        &mut out.fn_binds,
+        ctx.caller.clone().unwrap_or_default(),
+        name.to_string(),
+        ts_fn_rhs(&value, src),
+        typed,
+        line_of(node),
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn ts_record_fn_alias_assign(node: &Node, ctx: &Ctx, out: &mut ExtractedFile, src: &[u8]) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(&left, src).trim();
+    if name.is_empty() {
+        return;
+    }
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+    let typed = ts_rhs_type_name(&right, src).is_some();
+    crate::model::record_fn_rhs(
+        &mut out.fn_binds,
+        ctx.caller.clone().unwrap_or_default(),
+        name.to_string(),
+        ts_fn_rhs(&right, src),
+        typed,
+        line_of(node),
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn ts_fn_rhs(node: &Node, src: &[u8]) -> FnRhs {
+    let mut cur = *node;
+    loop {
+        match cur.kind() {
+            "parenthesized_expression" | "non_null_expression" => {
+                let Some(inner) = cur.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                cur = inner;
+            }
+            "identifier" => {
+                let name = node_text(&cur, src).trim();
+                return if name.is_empty() {
+                    FnRhs::Other
+                } else {
+                    FnRhs::Ident(name.to_string())
+                };
+            }
+            "arrow_function" | "function_expression" => return FnRhs::Lambda,
+            _ => return FnRhs::Other,
+        }
+    }
+}
+
 /// `new Order()`, `v as Order`, `<Order>v`. Unwraps parentheses / non-null.
 // trace:v1 id=impl.scc.extract.ts.type-cast work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
 fn ts_rhs_type_name(node: &Node, src: &[u8]) -> Option<String> {
@@ -3775,6 +3856,39 @@ mod tests {
                 .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
             "new Order bind missing: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.typescript.fn-alias
+    fn function_alias_binds_from_ident_arrow_and_clobber() {
+        let ef = extract(
+            "app.ts",
+            "function helper() { return 1; }\nfunction other() { return 2; }\nfunction run() {\n  const f = helper;\n  f();\n}\nfunction mixed() {\n  let g = helper;\n  g = other;\n  g();\n}\nfunction lam() {\n  const h = () => 1;\n  h();\n}\n",
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "arrow must tombstone: {:?}",
+            ef.fn_binds
         );
     }
 

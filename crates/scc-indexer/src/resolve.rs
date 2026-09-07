@@ -5,19 +5,21 @@
 //! 2. unique typed local/param (Rule 2) then class-name receiver `Cls.m()`
 //!    (Rule 2c: unique class-like def, local/param names veto, no spray;
 //!    CHA/base walk when `Cls` itself does not define `m`);
-//! 3. local symbol in the same file;
-//! 4. imported member (`import { a as b }` / `from m import a`) resolved to
+//! 3. function-alias bind for bare `f()` (local then file-scope; never fall
+//!    back to a same-named global);
+//! 4. local symbol in the same file;
+//! 5. imported member (`import { a as b }` / `from m import a`) resolved to
 //!    the target file's exported symbol;
-//! 5. imported module namespace (`import * as ns`, `import m`) → member on
+//! 6. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 6. `self`/`this` sibling methods, else unique class-like / CHA on the
+//! 7. `self`/`this` sibling methods, else unique class-like / CHA on the
 //!    enclosing class; `super` walks bases only. Plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
-//! 7. confirmed external import root → `external_api` entity;
-//! 8. otherwise: unresolved (counted; never silently treated as external).
+//! 8. confirmed external import root → `external_api` entity;
+//! 9. otherwise: unresolved (counted; never silently treated as external).
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
-use crate::model::{Call, Import, ImportType, Symbol, SymbolKind, TypeBind};
+use crate::model::{Call, FnBind, Import, ImportType, Symbol, SymbolKind, TypeBind};
 use crate::recv::{classify_callee, split_recv_path, RecvFact};
 use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -50,6 +52,8 @@ pub struct FileSymbols {
     pub file_entity_id: String,
     /// Local type binds for this file (constructor / annotation / param).
     pub type_binds: Vec<TypeBind>,
+    /// Function-alias binds for this file (`f = helper`).
+    pub fn_binds: Vec<FnBind>,
     /// Simple-ident bases for class-like symbols in this file.
     pub class_bases: BTreeMap<String, Vec<String>>,
 }
@@ -119,6 +123,13 @@ impl SymbolIndex {
     pub fn set_type_binds(&mut self, path: &str, binds: &[TypeBind]) {
         if let Some(fs) = self.files.get_mut(path) {
             fs.type_binds = binds.to_vec();
+        }
+    }
+
+    /// Attach extract-time function-alias binds used by bare `f()` pinning.
+    pub fn set_fn_binds(&mut self, path: &str, binds: &[FnBind]) {
+        if let Some(fs) = self.files.get_mut(path) {
+            fs.fn_binds = binds.to_vec();
         }
     }
 
@@ -403,6 +414,11 @@ pub fn resolve_calls(
         .get(path)
         .map(|f| f.type_binds.as_slice())
         .unwrap_or(&[]);
+    let fn_binds: &[FnBind] = index
+        .files
+        .get(path)
+        .map(|f| f.fn_binds.as_slice())
+        .unwrap_or(&[]);
 
     let caller_ctx = |call: &Call| -> String {
         match &call.caller {
@@ -566,6 +582,40 @@ pub fn resolve_calls(
                 0,
             ));
             continue;
+        }
+
+        // Function-alias bind: `f = helper; f()` — before the local-name
+        // ladder, so a same-named global is never a false edge.
+        if recv == RecvKind::None {
+            match fn_ptr_hit(&call, root, path, index, fn_binds, &binding) {
+                FnPtrHit::Pin(id) => {
+                    out.push(emit(
+                        caller_id,
+                        Some(id),
+                        call.callee.clone(),
+                        0.9,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
+                    continue;
+                }
+                FnPtrHit::Block => {
+                    out.push(emit(
+                        caller_id,
+                        None,
+                        call.callee.clone(),
+                        0.4,
+                        call.line,
+                        ResolutionClass::UnresolvedLikelyInternal,
+                        recv,
+                        0,
+                    ));
+                    continue;
+                }
+                FnPtrHit::Miss => {}
+            }
         }
 
         // Bare local symbol.
@@ -792,6 +842,116 @@ pub fn quality_from_calls(calls: &[ResolvedCall]) -> scc_core::AnalysisQuality {
         q.record_call(c.class, false);
     }
     q
+}
+
+/// Ripwire `fnPtrBindingTarget` analog: a visible var→function bind for a
+/// bare `f()` pins through the binding and never falls back to a global `f`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FnPtrHit {
+    Miss,
+    Pin(String),
+    Block,
+}
+
+// trace:v1 id=impl.scc.resolve.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn fn_ptr_hit(
+    call: &Call,
+    root: &str,
+    path: &str,
+    index: &SymbolIndex,
+    fn_binds: &[FnBind],
+    binding: &HashMap<&str, (String, String)>,
+) -> FnPtrHit {
+    if root.is_empty() {
+        return FnPtrHit::Miss;
+    }
+    let scope = call.caller.as_deref().unwrap_or("");
+    let local_has = has_fn_bind(fn_binds, Some(scope), root);
+    let file_has = has_fn_bind(fn_binds, Some(""), root);
+    if !local_has && !file_has {
+        return FnPtrHit::Miss;
+    }
+    let local_t = unique_fn_target(fn_binds, Some(scope), root);
+    let file_t = unique_fn_target(fn_binds, Some(""), root);
+    let chosen = if local_has && file_has {
+        match (local_t, file_t) {
+            (Some(a), Some(b)) if a == b && !a.is_empty() => Some(a),
+            _ => None,
+        }
+    } else if local_has {
+        local_t.filter(|s| !s.is_empty())
+    } else {
+        file_t.filter(|s| !s.is_empty())
+    };
+    match chosen {
+        Some(name) => unique_function_id(index, path, name, binding)
+            .map(FnPtrHit::Pin)
+            .unwrap_or(FnPtrHit::Block),
+        None => FnPtrHit::Block,
+    }
+}
+
+fn unique_fn_target<'a>(binds: &'a [FnBind], scope: Option<&str>, var: &str) -> Option<&'a str> {
+    let scope = scope.unwrap_or("");
+    let mut targets: Vec<&str> = binds
+        .iter()
+        .filter(|b| b.scope == scope && b.name == var)
+        .map(|b| b.target.as_str())
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.len() == 1 {
+        Some(targets[0])
+    } else {
+        None
+    }
+}
+
+fn has_fn_bind(binds: &[FnBind], scope: Option<&str>, var: &str) -> bool {
+    let scope = scope.unwrap_or("");
+    binds.iter().any(|b| b.scope == scope && b.name == var)
+}
+
+/// Unique in-repo Function named `name`. Local Function wins; a local
+/// non-function symbol or import binding vetoes the rest of the repo.
+/// Two same-named Functions across files stay unresolved. Classes are
+/// never pins (constructor aliases are out of scope).
+fn unique_function_id(
+    index: &SymbolIndex,
+    local_path: &str,
+    name: &str,
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(fs) = index.files.get(local_path) {
+        if let Some((sym, id)) = fs.by_name.get(name) {
+            return (sym.kind == SymbolKind::Function).then(|| id.clone());
+        }
+    }
+    if let Some((target_file, exported)) = binding.get(name) {
+        if target_file.starts_with("external:") {
+            return None;
+        }
+        let fs = index.files.get(target_file.as_str())?;
+        let (sym, id) = fs.by_name.get(exported.as_str())?;
+        return (sym.kind == SymbolKind::Function).then(|| id.clone());
+    }
+    let mut found: Option<String> = None;
+    for fs in index.files.values() {
+        let Some((sym, id)) = fs.by_name.get(name) else {
+            continue;
+        };
+        if sym.kind != SymbolKind::Function {
+            continue;
+        }
+        if found.as_ref().is_some_and(|existing| existing != id) {
+            return None;
+        }
+        found = Some(id.clone());
+    }
+    found
 }
 
 /// Unique type for `(scope, var)` or None when missing / tombstoned (≥2 types).
@@ -3405,5 +3565,89 @@ class Svc {
             "Python owned.process must not pin via Java field-as-receiver"
         );
         assert_eq!(resolved[0].recv, RecvKind::NamedVariable);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.resolve.fn-alias
+    fn python_fn_alias_pins_and_never_sprays_same_named_global() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let src = "def helper():\n    return 1\ndef f():\n    return 2\ndef run():\n    f = helper\n    f()\ndef mixed():\n    g = helper\n    g = f\n    g()\ndef lam():\n    h = lambda: 1\n    h()\nf2 = helper\ndef file_scope():\n    f2()\n";
+        let ef = PythonExtractor::default().extract(&SourceFile::new("w.py", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.py", &ef.symbols);
+        idx.set_fn_binds("w.py", &ef.fn_binds);
+        let resolved = resolve_calls("w.py", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let run_id = scc_core::symbol_id("repo", "w.py", "run");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "f" && c.caller_id == run_id)
+            .expect("run f()");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "helper"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "f")),
+            "must not spray to the same-named global function"
+        );
+        assert_eq!(hit.class, ResolutionClass::ResolvedInternal);
+        let mixed_id = scc_core::symbol_id("repo", "w.py", "mixed");
+        let g = resolved
+            .iter()
+            .find(|c| c.callee_name == "g" && c.caller_id == mixed_id)
+            .expect("mixed g()");
+        assert_eq!(g.callee_id, None, "two targets must tombstone");
+        let lam_id = scc_core::symbol_id("repo", "w.py", "lam");
+        let h = resolved
+            .iter()
+            .find(|c| c.callee_name == "h" && c.caller_id == lam_id)
+            .expect("lam h()");
+        assert_eq!(h.callee_id, None, "lambda must block the name ladder");
+        assert_ne!(
+            h.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "f"))
+        );
+        let fs_id = scc_core::symbol_id("repo", "w.py", "file_scope");
+        let f2 = resolved
+            .iter()
+            .find(|c| c.callee_name == "f2" && c.caller_id == fs_id)
+            .expect("file_scope f2()");
+        assert_eq!(
+            f2.callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "helper")),
+            "file-scope alias must pin helper"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.fn-alias-split verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.resolve.fn-alias
+    fn two_same_named_functions_across_files_stay_unresolved() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let a = PythonExtractor::default().extract(&SourceFile::new(
+            "a.py",
+            "def helper():\n    return 1\n",
+        ));
+        let b = PythonExtractor::default().extract(&SourceFile::new(
+            "b.py",
+            "def helper():\n    return 2\n",
+        ));
+        let w = PythonExtractor::default().extract(&SourceFile::new(
+            "w.py",
+            "def run():\n    f = helper\n    f()\n",
+        ));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &a.symbols);
+        idx.add_file("b.py", &b.symbols);
+        idx.add_file("w.py", &w.symbols);
+        idx.set_fn_binds("w.py", &w.fn_binds);
+        let resolved = resolve_calls("w.py", &w.calls, &w.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "f")
+            .expect("f()");
+        assert_eq!(hit.callee_id, None, "two helpers must not spray");
     }
 }

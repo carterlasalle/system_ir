@@ -495,6 +495,7 @@ impl Ctx {
             cli_flags: std::collections::BTreeMap::new(),
             facts,
             type_binds: self.type_binds,
+            fn_binds: Vec::new(),
             class_bases: java_class_bases(&self.class_bases),
         }
     }

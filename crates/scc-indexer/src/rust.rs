@@ -15,7 +15,7 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
@@ -507,6 +507,8 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
     /// Struct-field type binds. Extract-time only.
     type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`let f = helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
     /// `impl Trait for T` → (T, [Trait, ...]) for CHA.
     class_bases: Vec<(String, Vec<String>)>,
 }
@@ -602,6 +604,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds: self.type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
             class_bases: rust_class_bases(&self.class_bases),
         }
     }
@@ -1565,6 +1568,7 @@ impl RustExtractor {
             }
             if left.kind() == "identifier" {
                 let name = clean(node_text(Some(left), src));
+                rust_record_fn_alias(ctx, name.clone(), right, src, line);
                 if let Some(ty) = rust_rhs_type_name(right, src, ctx) {
                     ctx.push_type_bind(name, ty, line);
                 }
@@ -1587,6 +1591,7 @@ impl RustExtractor {
                     ctx.push_type_bind(name.clone(), ty, line);
                 }
                 if let Some(val) = node.child_by_field_name("value") {
+                    rust_record_fn_alias(ctx, name.clone(), val, src, line);
                     if let Some(ty) = rust_rhs_type_name(val, src, ctx) {
                         ctx.push_type_bind(name, ty, line);
                     }
@@ -2051,6 +2056,49 @@ fn one_hop_self_field(node: Node, src: &[u8]) -> Option<String> {
         None
     } else {
         Some(field)
+    }
+}
+
+/// `let f = helper` / `let f = || {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.rust.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn rust_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = rust_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        rust_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn rust_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    while matches!(
+        n.kind(),
+        "reference_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = n
+            .child_by_field_name("value")
+            .or_else(|| n.named_child(0))
+        else {
+            return FnRhs::Other;
+        };
+        n = inner;
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "closure_expression" => FnRhs::Lambda,
+        _ => FnRhs::Other,
     }
 }
 
@@ -3294,6 +3342,54 @@ fn factory() {
                 .any(|b| b.scope == "factory" && b.name == "x"),
             "opaque factory call must not mint a type bind: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.rust.fn-alias
+    fn function_alias_binds_from_ident_closure_and_clobber() {
+        let ef = extract(
+            r#"
+fn helper() {}
+fn other() {}
+fn run() {
+    let f = helper;
+    f();
+}
+fn mixed() {
+    let mut g = helper;
+    g = other;
+    g();
+}
+fn lam() {
+    let h = || {};
+    h();
+}
+"#,
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "closure must tombstone: {:?}",
+            ef.fn_binds
         );
     }
 

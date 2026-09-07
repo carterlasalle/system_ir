@@ -5,7 +5,7 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, Route,
     SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
@@ -544,6 +544,43 @@ fn constructor_type_name(right: Node, src: &[u8]) -> Option<String> {
     }
 }
 
+/// `f = helper` / `f = lambda` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.python.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn python_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = python_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        python_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn python_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    while n.kind() == "parenthesized_expression" {
+        let Some(inner) = n.named_child(0) else {
+            return FnRhs::Other;
+        };
+        n = inner;
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "lambda" => FnRhs::Lambda,
+        _ => FnRhs::Other,
+    }
+}
+
 /// `Order()` / uniquely typed ident (`x = y`).
 // trace:v1 id=impl.scc.extract.python.ident-copy work=WORK-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co satisfies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident implements=PLAN-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co
 fn python_rhs_type_name(n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
@@ -604,6 +641,8 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
     /// Local constructor / annotation / parameter type binds.
     type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`f = helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -931,6 +970,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
             class_bases,
         }
         }
@@ -1621,6 +1661,7 @@ impl PythonExtractor {
                         }
                     }
                     if let Some(r) = right {
+                        python_record_fn_alias(ctx, name.clone(), r, src, line);
                         if let Some(ty) = python_rhs_type_name(r, src, ctx) {
                             ctx.push_type_bind(name, ty, line);
                         }
@@ -3785,6 +3826,45 @@ class QueryBuilder:
         assert!(
             w.contains(&"Order") && w.contains(&"Invoice"),
             "conflicting copy/ctor must tombstone fuel: {w:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.python.fn-alias
+    fn function_alias_binds_from_ident_lambda_and_clobber() {
+        let ef = extract(
+            "def helper():\n    return 1\ndef other():\n    return 2\nclass Order:\n    def process(self):\n        pass\ndef run():\n    f = helper\n    f()\ndef mixed():\n    g = helper\n    g = other\n    g()\ndef lam():\n    h = lambda: 1\n    h()\ndef typed(x: Order):\n    y = x\n    y()\n",
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "lambda must tombstone: {:?}",
+            ef.fn_binds
+        );
+        assert!(
+            !ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "typed" && b.name == "y"),
+            "type-copy ident must not mint a fn bind: {:?}",
+            ef.fn_binds
         );
     }
 

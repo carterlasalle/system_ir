@@ -238,6 +238,7 @@ impl Indexer {
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(path, &ef.symbols);
             index.set_type_binds(path, &ef.type_binds);
+            index.set_fn_binds(path, &ef.fn_binds);
             index.set_class_bases(path, &ef.class_bases);
             extracted.insert(path.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
@@ -614,6 +615,7 @@ impl Indexer {
             let fail_hits = failures::scan_failures(&content, f.language.as_str());
             index.add_file(p, &ef.symbols);
             index.set_type_binds(p, &ef.type_binds);
+            index.set_fn_binds(p, &ef.fn_binds);
             index.set_class_bases(p, &ef.class_bases);
             extracted.insert(p.clone(), (f.clone(), ef, cfg_hits, fail_hits));
         }
@@ -2560,5 +2562,119 @@ class Svc {
                 && r.object == cold_base
         });
         assert!(cold_hit, "cold index must also CALL Open.open");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.resolve.fn-alias
+    fn index_pins_python_fn_alias_and_not_same_named_global() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.py"),
+            "def helper():\n    return 1\ndef f():\n    return 2\ndef run():\n    f = helper\n    return f()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let helper = scc_core::symbol_id(&idx.store.repo_id, "w.py", "helper");
+        let global_f = scc_core::symbol_id(&idx.store.repo_id, "w.py", "f");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.py", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == helper),
+            "run must CALL helper via alias: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == global_f),
+            "must not spray to global f: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.fn-alias-langs verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.resolve.fn-alias
+    fn index_pins_ts_go_rust_fn_alias_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.ts"),
+            "function helper() { return 1; }\nfunction f() { return 2; }\nfunction run() {\n  const f = helper;\n  return f();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.go"),
+            "package app\nfunc helper() {}\nfunc f() {}\nfunc run() {\n\tf := helper\n\tf()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.rs"),
+            "fn helper() {}\nfn f() {}\nfn run() {\n    let f = helper;\n    f();\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rels = idx.store.all_relationships().unwrap();
+        for (path, caller) in [("w.ts", "run"), ("w.go", "run"), ("w.rs", "run")] {
+            let helper = scc_core::symbol_id(&idx.store.repo_id, path, "helper");
+            let global_f = scc_core::symbol_id(&idx.store.repo_id, path, "f");
+            let run = scc_core::symbol_id(&idx.store.repo_id, path, caller);
+            let calls: Vec<_> = rels
+                .iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+                .collect();
+            assert!(
+                calls.iter().any(|r| r.object == helper),
+                "{path} run must CALL helper via alias: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|r| r.object == global_f),
+                "{path} must not spray to global f: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.fn-alias-incremental verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.python.fn-alias
+    fn index_fn_alias_survives_incremental_caller_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("helpers.py"), "def helper():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "from helpers import helper\ndef run():\n    f = helper\n    return f()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "from helpers import helper\ndef run():\n    f = helper\n    return f()  # touch\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+        let helper = scc_core::symbol_id(&idx.store.repo_id, "helpers.py", "helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.py", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == helper),
+            "incremental caller edit must still CALL imported helper: {calls:?}"
+        );
+        let (cold, _t2) = indexer_for(root);
+        cold.index().unwrap();
+        let cold_helper = scc_core::symbol_id(&cold.store.repo_id, "helpers.py", "helper");
+        let cold_run = scc_core::symbol_id(&cold.store.repo_id, "w.py", "run");
+        let cold_hit = cold.store.all_relationships().unwrap().iter().any(|r| {
+            r.predicate == scc_core::predicates::CALLS
+                && r.subject == cold_run
+                && r.object == cold_helper
+        });
+        assert!(cold_hit, "cold index must also CALL imported helper");
     }
 }

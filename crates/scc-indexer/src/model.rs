@@ -384,6 +384,10 @@ pub struct ExtractedFile {
     /// never stamped onto FILE entity attributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_binds: Vec<TypeBind>,
+    /// Per-scope function-alias binds (`f = helper`). Extract-time only;
+    /// never stamped onto FILE entity attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fn_binds: Vec<FnBind>,
     /// Simple-ident bases for class-like symbols in this file
     /// (`IERS_B` → `["IERS"]`). Persisted on CLASS entity attributes, never
     /// on FILE entities (incremental≡cold).
@@ -404,6 +408,85 @@ pub struct TypeBind {
     /// Type name as written (import alias or local class).
     pub type_name: String,
     pub line: u32,
+}
+
+/// One local / file-scope var → function ident used by bare `f()` pinning.
+/// Empty `target` is a lambda/clobber tombstone (binding exists; no pin).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FnBind {
+    /// Enclosing function/method name; empty at module / file scope.
+    #[serde(default)]
+    pub scope: String,
+    /// Local or file-scope variable name.
+    pub name: String,
+    /// Bound function ident; empty = lambda/clobber tombstone.
+    #[serde(default)]
+    pub target: String,
+    pub line: u32,
+}
+
+/// RHS shape for extract-time function-alias binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnRhs {
+    Ident(String),
+    Lambda,
+    Other,
+}
+
+fn fn_bind_name_ok(name: &str) -> bool {
+    !name.is_empty() && !matches!(name, "_" | "self" | "cls" | "this")
+}
+
+/// Record a function-alias bind. Ident copies a unique function name;
+/// lambda always tombstones; other RHS clobbers only when a bind already
+/// exists. Type-copy ident RHS is not a fn bind but clobbers a prior one.
+pub fn record_fn_rhs(
+    binds: &mut Vec<FnBind>,
+    scope: String,
+    name: String,
+    rhs: FnRhs,
+    typed_copy: bool,
+    line: u32,
+) {
+    if !fn_bind_name_ok(&name) {
+        return;
+    }
+    match rhs {
+        FnRhs::Ident(target) if !target.is_empty() && !typed_copy => {
+            binds.push(FnBind {
+                scope,
+                name,
+                target,
+                line,
+            });
+        }
+        FnRhs::Lambda => {
+            binds.push(FnBind {
+                scope,
+                name,
+                target: String::new(),
+                line,
+            });
+        }
+        FnRhs::Ident(_) | FnRhs::Other => {
+            if binds.iter().any(|b| b.scope == scope && b.name == name) {
+                binds.push(FnBind {
+                    scope,
+                    name,
+                    target: String::new(),
+                    line,
+                });
+            }
+        }
+    }
+}
+
+/// Sort function-alias binds for deterministic extract output.
+pub fn normalize_fn_binds(mut binds: Vec<FnBind>) -> Vec<FnBind> {
+    binds.sort_by(|a, b| {
+        (&a.scope, &a.name, a.line, &a.target).cmp(&(&b.scope, &b.name, b.line, &b.target))
+    });
+    binds
 }
 
 /// Last simple ident of a heritage clause (`pkg.IERS[T]` → `IERS`).

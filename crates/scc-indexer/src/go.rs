@@ -7,7 +7,7 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SemanticFact,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, SemanticFact,
     SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
@@ -469,6 +469,8 @@ struct Ctx {
     call_seq: BTreeMap<Option<String>, u32>,
     /// Struct-field and method-receiver type binds. Extract-time only.
     type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`f := helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -576,6 +578,7 @@ impl Ctx {
             cli_flags,
             facts,
             type_binds: self.type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
             ..ExtractedFile::default()
         }
     }
@@ -940,6 +943,9 @@ impl GoExtractor {
                 }
             } else if left.kind() == "identifier" {
                 let name = clean(node_text(Some(*left), src));
+                if let Some(rhs) = rights.get(i).copied() {
+                    go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+                }
                 if let Some(ty) = rhs {
                     ctx.push_type_bind(name, ty, line);
                 }
@@ -959,6 +965,9 @@ impl GoExtractor {
                 continue;
             }
             let name = clean(node_text(Some(*left), src));
+            if let Some(rhs) = rights.get(i).copied() {
+                go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+            }
             if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
                 ctx.push_type_bind(name, ty, line);
             }
@@ -981,6 +990,9 @@ impl GoExtractor {
         let rights = expr_nodes(node.child_by_field_name("value"));
         let line = node.start_position().row as u32 + 1;
         for (i, name) in names.into_iter().enumerate() {
+            if let Some(rhs) = rights.get(i).copied() {
+                go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+            }
             if let Some(ty) = declared.clone() {
                 ctx.push_type_bind(name.clone(), ty, line);
             }
@@ -2322,6 +2334,58 @@ fn one_hop_selector(node: Node, src: &[u8]) -> Option<(String, String)> {
     }
 }
 
+/// `f := helper` / `f := func() {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.go.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn go_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = go_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        go_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn go_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    loop {
+        match n.kind() {
+            "parenthesized_expression" => {
+                let Some(inner) = n.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                n = inner;
+            }
+            "unary_expression" => {
+                let op = clean(node_text(n.child(0), src));
+                if op != "&" {
+                    return FnRhs::Other;
+                }
+                let Some(inner) = n.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                n = inner;
+            }
+            _ => break,
+        }
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "func_literal" => FnRhs::Lambda,
+        _ => FnRhs::Other,
+    }
+}
+
 /// Type name from `&T{}` / `T{}` / `new(T)` / assertion / conversion / typed ident.
 // trace:exempt reason=internal-detail
 fn go_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
@@ -3255,6 +3319,55 @@ func factory() {
                 .any(|b| b.scope == "factory" && b.name == "x"),
             "opaque factory call must not mint a type bind: {:?}",
             ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.go.fn-alias
+    fn function_alias_binds_from_ident_literal_and_clobber() {
+        let ef = extract(
+            r#"
+package app
+func helper() {}
+func other() {}
+func run() {
+	f := helper
+	f()
+}
+func mixed() {
+	g := helper
+	g = other
+	g()
+}
+func lam() {
+	h := func() {}
+	h()
+}
+"#,
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "func literal must tombstone: {:?}",
+            ef.fn_binds
         );
     }
 
