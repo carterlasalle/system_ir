@@ -8,6 +8,31 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA_VERSION: &str = "0.1.0";
 
+pub mod handles;
+pub mod languages;
+pub mod lex;
+pub mod resolution;
+pub mod retrieval;
+
+pub use handles::{fnv1a64_hex, ContentHandle, HandleError, HandleKind};
+pub use languages::{
+    extracted_language_ids, language_by_id, language_registry, support_matrix_markdown,
+    LanguageCapability, LanguageTier, LANGUAGE_REGISTRY,
+};
+pub use lex::{
+    bm25_rank, bm25_scores, bm25_scores_with_stats, classify_query, extract_query_mentions,
+    is_exact_anchor, mention_matches_doc, path_matches_locus, ranking_arm_ids, relevance_hits,
+    relevance_hits_with_stats, route_query, subtokens, Bm25CorpusStats, LexDoc, LexField, QueryLocus,
+    QueryMention, QueryShape,
+    RankingArm, RelevanceHit, RetrievalPlan, BM25_B, BM25_K1, QUERY_MENTION_MAX_RAW, WEIGHT_BODY,
+    WEIGHT_DOC, WEIGHT_NAME, WEIGHT_PATH,
+};
+pub use resolution::{
+    choose_representation, AnalysisQuality, CallQuality, FileQuality, RecvKind,
+    RepresentationChoice, RepresentationKind, ResolutionClass,
+};
+pub use retrieval::{mean_reciprocal_rank, recall_at_k};
+
 // ---------------------------------------------------------------------------
 // Provenance
 // ---------------------------------------------------------------------------
@@ -497,6 +522,20 @@ pub enum FlowEdgeKind {
     Timeout,
     /// Compensation/rollback edge.
     Compensation,
+    /// State/data read.
+    Read,
+    /// State/data write.
+    Write,
+    /// Data transformation.
+    Transform,
+    /// Validation/schema check.
+    Validate,
+    /// Authorization/policy gate.
+    Authorize,
+    /// Cache lookup.
+    Cache,
+    /// Cache/state invalidation.
+    Invalidate,
 }
 
 /// One operation node in the canonical flow graph. The canonical graph
@@ -1174,6 +1213,17 @@ pub mod kinds {
     // Occurrence layer: one entity per (concept, path, owner, line) so
     // shared concepts never lose per-file provenance (Wave 13).
     pub const OCCURRENCE: &str = "occurrence";
+
+    /// All entity kinds. Tests fail if a `pub const` is added above and
+    /// omitted here.
+    pub const ALL: &[&str] = &[
+        FILE, SYMBOL, PACKAGE, MODULE, SYSTEM, SUBSYSTEM, SERVICE, COMPONENT, DEPLOYMENT_UNIT,
+        ROUTE, ENDPOINT, EVENT, TOPIC, QUEUE, DATA_ENTITY, DATA_STORE, TABLE, COLLECTION, CACHE,
+        EXTERNAL_SYSTEM, EXTERNAL_API, CONFIGURATION, FEATURE_FLAG, SECRET_REFERENCE, CONTRACT,
+        INVARIANT, TEST, TEST_SUITE, FLOW, WORKFLOW, STATE, EXPORT, ANNOTATION, FIELD, REGISTRY,
+        MIDDLEWARE, DI_BINDING, TRANSITION, RESOURCE, TRUST_BOUNDARY, SECURITY_CONTROL,
+        RUNTIME_OBSERVATION, SCHEMA, REACTIVE, OCCURRENCE,
+    ];
 }
 
 pub mod predicates {
@@ -1225,14 +1275,24 @@ pub mod predicates {
     /// (occurrence OCCURS concept).
     pub const OCCURS: &str = "occurs";
 
-    /// All predicates in the documented ontology.
+    /// All predicates in the documented ontology. Must include every
+    /// `pub const` in this module — `kinds`/`predicates` drift is a
+    /// silent ranking/export bug.
     pub const ALL: &[&str] = &[
         CONTAINS, IMPLEMENTS, INHERITS, IMPORTS, CALLS, READS, WRITES, QUERIES, OWNS, PUBLISHES,
-        CONSUMES, SUBSCRIBES, PRODUCES, TRANSFORMS, VALIDATES, ROUTES_TO, HANDLES, INVOKES,
-        DEPENDS_ON, DEPLOYED_WITH, DEPLOYED_IN, CONFIGURED_BY, PROTECTED_BY, CROSSES_BOUNDARY,
-        ENFORCES, TESTED_BY, PARTICIPATES_IN, PRECEDES, FOLLOWS, BRANCHES_TO, RETRIES,
-        FALLS_BACK_TO, OBSERVED_AS, DECLARED_AS, IMPLEMENTED_BY, OCCURS,
+        CONSUMES, SUBSCRIBES, PRODUCES, TRANSFORMS, VALIDATES, DEFINES, COMPOSES, ROUTES_TO,
+        HANDLES, INVOKES, DEPENDS_ON, DEPLOYED_WITH, DEPLOYED_IN, CONFIGURED_BY, PROTECTED_BY,
+        CROSSES_BOUNDARY, ENFORCES, TESTED_BY, PARTICIPATES_IN, PRECEDES, FOLLOWS, BRANCHES_TO,
+        RETRIES, FALLS_BACK_TO, OBSERVED_AS, DECLARED_AS, IMPLEMENTED_BY, EXPORTS, ANNOTATES,
+        REGISTERS, INJECTS, HANDLES_CALLBACK, DECORATES, OCCURS,
     ];
+}
+
+/// Authoritative kind and predicate ids. Rankers, exporters, and tests
+/// must derive from these slices rather than a second hand-maintained list.
+// trace:v1 id=impl.scc.core.ontology-registry work=WORK-ripwire-lessons-phase1 satisfies=REQ-ontology-single-source
+pub fn ontology_registries() -> (&'static [&'static str], &'static [&'static str]) {
+    (kinds::ALL, predicates::ALL)
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,13 +1657,14 @@ pub struct ReferenceEdge {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // trace:exempt reason=internal-detail
 // trace:v1 id=impl.crates-scc-core-src-lib.ReferenceKind work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 pub enum ReferenceKind {
     Read,
     Write,
+    #[default]
     Call,
     TypeUse,
     Instantiate,
@@ -1613,6 +1674,9 @@ pub enum ReferenceKind {
     Register,
     Import,
     Export,
+    Macro,
+    FieldAccess,
+    Construct,
 }
 
 // trace:exempt reason=internal-detail
@@ -1631,6 +1695,9 @@ impl ReferenceKind {
             ReferenceKind::Register => "register",
             ReferenceKind::Import => "import",
             ReferenceKind::Export => "export",
+            ReferenceKind::Macro => "macro",
+            ReferenceKind::FieldAccess => "field_access",
+            ReferenceKind::Construct => "construct",
         }
     }
 }
@@ -1779,6 +1846,14 @@ pub struct StructuralSourceUnit {
     pub representation: String,
     pub revision: String,
     pub content: String,
+    /// Stable content handle for lazy exact-source retrieval. Empty when
+    /// the compiler has no repo/epoch identity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
+    /// Why EXACT vs STRUCTURAL/SIGNATURES was chosen. Empty when no
+    /// on-disk body was available to compare.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub representation_reason: String,
 }
 
 /// The deterministic startup artifact (Atlas + Surface), hash-stable per
@@ -2172,5 +2247,37 @@ mod tests {
         });
         let c: ContextArtifact = serde_json::from_value(legacy).unwrap();
         assert_eq!(c.content_hash, "");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.core.predicate-registry-complete verifies=REQ-ontology-single-source exercises=impl.scc.core.ontology-registry
+    fn predicate_and_kind_registries_are_complete() {
+        // Mutation gate: dropping DEFINES/COMPOSES/EXPORTS from ALL used to
+        // compile while ranking/export silently omitted those edges.
+        let (kind_ids, predicate_ids) = ontology_registries();
+        for required in [
+            predicates::DEFINES,
+            predicates::COMPOSES,
+            predicates::EXPORTS,
+            predicates::ANNOTATES,
+            predicates::REGISTERS,
+            predicates::INJECTS,
+            predicates::HANDLES_CALLBACK,
+            predicates::DECORATES,
+            predicates::OCCURS,
+        ] {
+            assert!(
+                predicate_ids.contains(&required),
+                "predicates::ALL missing {required}"
+            );
+        }
+        for required in [kinds::FIELD, kinds::SCHEMA, kinds::TRUST_BOUNDARY, kinds::OCCURRENCE]
+        {
+            assert!(kind_ids.contains(&required), "kinds::ALL missing {required}");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for p in predicate_ids {
+            assert!(seen.insert(*p), "duplicate predicate in ALL: {p}");
+        }
     }
 }

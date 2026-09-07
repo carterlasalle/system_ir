@@ -12,22 +12,74 @@ use scc_store::Store;
 use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+// trace:exempt reason=internal-detail
 pub struct Impact {
     pub files: Vec<String>,
-    pub components: Vec<String>,          // component ids
-    pub flows: Vec<String>,               // flow ids
-    pub upstream: Vec<String>,            // component ids that depend on affected
-    pub downstream: Vec<String>,          // component ids affected depends on
-    pub contracts: Vec<String>,           // route ids
-    pub data: Vec<String>,                // store/data entity ids
-    pub invariants: Vec<String>,          // invariant ids
-    pub tests: Vec<String>,               // test entity ids
-    pub risk: String,                     // low | medium | high
+    pub components: Vec<String>, // component ids
+    pub flows: Vec<String>,      // flow ids
+    pub upstream: Vec<String>,   // component ids that depend on affected
+    pub downstream: Vec<String>, // component ids affected depends on
+    pub contracts: Vec<String>,  // route ids
+    pub data: Vec<String>,       // store/data entity ids
+    pub invariants: Vec<String>, // invariant ids
+    pub tests: Vec<String>,      // test entity ids
+    pub risk: String,            // low | medium | high
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Historical co-change partners not in the current file set.
+    /// Never merged into `components` / `flows` / `contracts` / `data`.
+    #[serde(default)]
+    pub forgotten_partners: Vec<ForgottenPartner>,
 }
 
-// trace:v1 id=impl.scc.impact work=WORK-SCC-013 satisfies=REQ-SCC-IR
+/// A file that historically changes with an affected file but is not in
+/// the current impact file set. Reason is always `cochange` here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+// trace:exempt reason=internal-detail
+pub struct ForgottenPartner {
+    pub file: String,
+    pub partner: String,
+    pub commits: u32,
+    pub reason: String,
+}
+
+/// Co-change partners of `changed` that are not themselves in `changed`.
+/// Deterministic: sorted by commits desc, then file, then partner.
+// trace:v1 id=impl.scc.impact.forgotten-partners work=WORK-ripwire-lessons-phase6 satisfies=REQ-forgotten-impact-partners
+pub fn forgotten_cochange_partners(
+    pairs: &[crate::cochange::CochangePair],
+    changed: &[String],
+) -> Vec<ForgottenPartner> {
+    let changed_set: std::collections::BTreeSet<&str> =
+        changed.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<ForgottenPartner> = Vec::new();
+    for pair in pairs {
+        let (file, partner) = if changed_set.contains(pair.a.as_str())
+            && !changed_set.contains(pair.b.as_str())
+        {
+            (pair.a.clone(), pair.b.clone())
+        } else if changed_set.contains(pair.b.as_str()) && !changed_set.contains(pair.a.as_str()) {
+            (pair.b.clone(), pair.a.clone())
+        } else {
+            continue;
+        };
+        out.push(ForgottenPartner {
+            file,
+            partner,
+            commits: pair.commits,
+            reason: "cochange".into(),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.commits
+            .cmp(&a.commits)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.partner.cmp(&b.partner))
+    });
+    out
+}
+
+// trace:v1 id=impl.scc.impact work=WORK-SCC-013 satisfies=REQ-forgotten-impact-partners,REQ-SCC-IR
 pub fn compute_impact(
     view: &TrustedGraphView,
     store: &Store,
@@ -208,9 +260,10 @@ pub fn compute_impact(
 
     // invariants whose scope intersects affected entities
     for inv in &view.invariants() {
-        let scoped = inv.scope.iter().any(|s| {
-            affected_comps.contains(s) || imp.data.contains(s)
-        });
+        let scoped = inv
+            .scope
+            .iter()
+            .any(|s| affected_comps.contains(s) || imp.data.contains(s));
         if scoped {
             imp.invariants.push(inv.id.clone());
         }
@@ -229,14 +282,18 @@ pub fn compute_impact(
 
     // risk: high if critical invariants affected or contracts changed;
     // medium if flows affected; else low
-    let critical_invariants = imp.invariants.iter().filter(|iid| {
-        graph
-            .invariants
-            .iter()
-            .find(|i| i.id == **iid)
-            .map(|i| i.severity == Severity::Critical)
-            .unwrap_or(false)
-    }).count();
+    let critical_invariants = imp
+        .invariants
+        .iter()
+        .filter(|iid| {
+            graph
+                .invariants
+                .iter()
+                .find(|i| i.id == **iid)
+                .map(|i| i.severity == Severity::Critical)
+                .unwrap_or(false)
+        })
+        .count();
     if critical_invariants > 0 || !imp.contracts.is_empty() {
         imp.risk = "high".into();
         if critical_invariants > 0 {
@@ -256,7 +313,19 @@ pub fn compute_impact(
         imp.risk = "low".into();
     }
     if !imp.tests.is_empty() {
-        imp.notes.push(format!("{} test(s) exercise the affected code", imp.tests.len()));
+        imp.notes.push(format!(
+            "{} test(s) exercise the affected code",
+            imp.tests.len()
+        ));
+    }
+
+    let pairs = crate::cochange::cached_cochange_pairs(store).unwrap_or_default();
+    imp.forgotten_partners = forgotten_cochange_partners(&pairs, &imp.files);
+    if !imp.forgotten_partners.is_empty() {
+        imp.notes.push(format!(
+            "{} forgotten co-change partner(s) — historical, not EXTRACTED impact",
+            imp.forgotten_partners.len()
+        ));
     }
 
     Ok(imp)
@@ -290,13 +359,18 @@ fn component_candidates(comps: &[scc_core::Entity]) -> Vec<crate::components::Co
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| crate::components::BOUNDARY_CODE_REGION.to_string()),
-                intent: c.attributes.get("intent").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                intent: c
+                    .attributes
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             }
         })
         .collect()
 }
 
 /// Files/symbols in the current diff (git diff --name-only).
+// trace:exempt reason=internal-detail
 pub fn diff_files(store: &Store, base: Option<&str>) -> Result<Vec<String>> {
     let root = &store.root;
     let mut cmd = std::process::Command::new("git");
@@ -307,9 +381,10 @@ pub fn diff_files(store: &Store, base: Option<&str>) -> Result<Vec<String>> {
         cmd.arg("HEAD");
     }
     cmd.arg("--");
-    let out = cmd.current_dir(root).output().map_err(|e| {
-        scc_store::StoreError::NotInitialized(format!("git diff failed: {e}"))
-    })?;
+    let out = cmd
+        .current_dir(root)
+        .output()
+        .map_err(|e| scc_store::StoreError::NotInitialized(format!("git diff failed: {e}")))?;
     let mut files = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim();
@@ -325,6 +400,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn empty_impact() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -335,5 +411,37 @@ mod tests {
         let imp = compute_impact(&v, &store, &[], &[]).unwrap();
         assert!(imp.components.is_empty());
         assert_eq!(imp.risk, "low");
+        assert!(imp.forgotten_partners.is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.impact.forgotten-partners verifies=REQ-forgotten-impact-partners exercises=impl.scc.impact.forgotten-partners
+    fn forgotten_partners_are_not_semantic_impact() {
+        let pairs = vec![
+            crate::cochange::CochangePair {
+                a: "src/a.py".into(),
+                b: "src/b.py".into(),
+                commits: 3,
+            },
+            crate::cochange::CochangePair {
+                a: "src/a.py".into(),
+                b: "src/c.py".into(),
+                commits: 2,
+            },
+        ];
+        let found = forgotten_cochange_partners(&pairs, &["src/a.py".into()]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].partner, "src/b.py");
+        assert_eq!(found[0].commits, 3);
+        assert_eq!(found[0].reason, "cochange");
+        assert_eq!(found[1].partner, "src/c.py");
+        let none = forgotten_cochange_partners(
+            &pairs,
+            &["src/a.py".into(), "src/b.py".into(), "src/c.py".into()],
+        );
+        assert!(
+            none.is_empty(),
+            "partners already in the change set are not forgotten"
+        );
     }
 }

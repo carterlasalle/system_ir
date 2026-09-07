@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// trace:exempt reason=internal-detail
 pub enum Language {
     Python,
     TypeScript,
@@ -25,10 +26,22 @@ pub enum Language {
     Markdown,
     Shell,
     Sql,
+    C,
+    Cpp,
+    Objc,
+    Csharp,
+    Ruby,
+    Php,
+    Lua,
+    Swift,
+    Kotlin,
+    Protobuf,
     Other,
 }
 
+// trace:exempt reason=internal-detail
 impl Language {
+    // trace:exempt reason=internal-detail
     pub fn as_str(&self) -> &'static str {
         match self {
             Language::Python => "python",
@@ -47,12 +60,68 @@ impl Language {
             Language::Markdown => "markdown",
             Language::Shell => "shell",
             Language::Sql => "sql",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Objc => "objc",
+            Language::Csharp => "csharp",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
+            Language::Lua => "lua",
+            Language::Swift => "swift",
+            Language::Kotlin => "kotlin",
+            Language::Protobuf => "protobuf",
             Language::Other => "other",
         }
     }
+
+    /// Config/infra extractors run for these languages (not AST walkers).
+    // trace:exempt reason=internal-detail
+    pub fn is_config_extract(self) -> bool {
+        matches!(
+            self,
+            Language::Env
+                | Language::Json
+                | Language::Yaml
+                | Language::Dockerfile
+                | Language::Terraform
+                | Language::Protobuf
+        )
+    }
+
+    /// Every classified language. Tests bind this to LANGUAGE_REGISTRY.
+    pub const ALL: &[Language] = &[
+        Language::Python,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Go,
+        Language::Rust,
+        Language::Java,
+        Language::Json,
+        Language::Yaml,
+        Language::Toml,
+        Language::Env,
+        Language::Dockerfile,
+        Language::Compose,
+        Language::Terraform,
+        Language::Markdown,
+        Language::Shell,
+        Language::Sql,
+        Language::C,
+        Language::Cpp,
+        Language::Objc,
+        Language::Csharp,
+        Language::Ruby,
+        Language::Php,
+        Language::Lua,
+        Language::Swift,
+        Language::Kotlin,
+        Language::Protobuf,
+        Language::Other,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// trace:exempt reason=internal-detail
 pub enum FileKind {
     Source,
     Test,
@@ -95,6 +164,7 @@ pub enum ScanError {
 
 /// Filesystem sandbox: canonicalize and verify a candidate path stays inside
 /// the repository root. Symlinks pointing outside the root are rejected.
+// trace:exempt reason=internal-detail
 pub fn sandbox_path(root: &Path, candidate: &Path) -> Result<PathBuf, ScanError> {
     let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let joined = if candidate.is_absolute() {
@@ -102,20 +172,24 @@ pub fn sandbox_path(root: &Path, candidate: &Path) -> Result<PathBuf, ScanError>
     } else {
         root_c.join(candidate)
     };
-    let canon = joined.canonicalize().map_err(|_| ScanError::Escape(joined.clone()))?;
+    let canon = joined
+        .canonicalize()
+        .map_err(|_| ScanError::Escape(joined.clone()))?;
     if !canon.starts_with(&root_c) {
         return Err(ScanError::Escape(canon));
     }
     Ok(canon)
 }
 
+// trace:exempt reason=internal-detail
 fn is_test_path(path: &Path, language: Language) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let dir = path.parent().and_then(|p| p.to_str()).unwrap_or("");
     let dirs = dir.split('/').collect::<Vec<_>>();
     match language {
         Language::Python => {
-            name.starts_with("test_") || name.ends_with("_test.py")
+            name.starts_with("test_")
+                || name.ends_with("_test.py")
                 || dirs.contains(&"tests")
                 || dirs.contains(&"test")
         }
@@ -139,10 +213,15 @@ fn is_test_path(path: &Path, language: Language) -> bool {
     }
 }
 
+// trace:exempt reason=internal-detail
 fn classify(path: &Path) -> Option<(Language, FileKind)> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lname = name.to_ascii_lowercase();
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
 
     let language = if lname.starts_with(".env") {
@@ -162,6 +241,16 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
             "md" | "mdx" | "rst" => Language::Markdown,
             "sh" | "bash" | "zsh" => Language::Shell,
             "sql" => Language::Sql,
+            "c" | "h" => Language::C,
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
+            "m" | "mm" => Language::Objc,
+            "cs" => Language::Csharp,
+            "rb" => Language::Ruby,
+            "php" => Language::Php,
+            "lua" => Language::Lua,
+            "swift" => Language::Swift,
+            "kt" | "kts" => Language::Kotlin,
+            "proto" => Language::Protobuf,
             "env" => Language::Env,
             "" => {
                 if lname == "dockerfile" {
@@ -181,7 +270,9 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
     let is_infra_file = matches!(language, Language::Terraform)
         || lname == "dockerfile"
         || (language == Language::Yaml
-            && (lname.starts_with("compose") || parent.contains(".github") || lname.starts_with("helm")))
+            && (lname.starts_with("compose")
+                || parent.contains(".github")
+                || lname.starts_with("helm")))
         || lname == "docker-compose.yml"
         || lname == "docker-compose.yaml";
 
@@ -191,7 +282,16 @@ fn classify(path: &Path) -> Option<(Language, FileKind)> {
         FileKind::Docs
     } else if is_infra_file {
         FileKind::Infra
-    } else if matches!(language, Language::Json | Language::Yaml | Language::Toml | Language::Env | Language::Dockerfile | Language::Sql) {
+    } else if matches!(
+        language,
+        Language::Json
+            | Language::Yaml
+            | Language::Toml
+            | Language::Env
+            | Language::Dockerfile
+            | Language::Sql
+            | Language::Protobuf
+    ) {
         FileKind::Config
     } else {
         FileKind::Source
@@ -207,12 +307,13 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 
 /// Walk the repository, honoring `.gitignore` and the configured ignore
 /// globs, and classify every file.
+// trace:exempt reason=internal-detail
 pub fn scan_repo(root: &Path, config: &IndexConfig) -> Result<Vec<ScannedFile>, ScanError> {
     let mut out = Vec::new();
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false) // include dotfiles (.env, .scc/intent.yaml); .git is
-                       // excluded by git_ignore and our ignore globs
+        // excluded by git_ignore and our ignore globs
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
@@ -307,6 +408,7 @@ pub fn language_histogram(files: &[ScannedFile]) -> BTreeMap<String, usize> {
 }
 
 /// Repo-relative path of a file under root, or None if it escapes.
+// trace:exempt reason=internal-detail
 pub fn relative_of(root: &Path, abs: &Path) -> Option<String> {
     let root_c = root.canonicalize().ok()?;
     let abs_c = abs.canonicalize().ok()?;
@@ -315,7 +417,10 @@ pub fn relative_of(root: &Path, abs: &Path) -> Option<String> {
         return None;
     }
     let s = rel.to_string_lossy().replace('\\', "/");
-    if Path::new(&s).components().any(|c| matches!(c, Component::ParentDir)) {
+    if Path::new(&s)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
         return None;
     }
     Some(s)
@@ -326,6 +431,47 @@ mod tests {
     use super::*;
 
     #[test]
+    // trace:v1 id=test.scc.scan.registry-covers-classified verifies=REQ-language-support-matrix exercises=impl.scc.core.language-registry
+    fn classified_languages_are_in_the_support_registry() {
+        for lang in Language::ALL {
+            if *lang == Language::Other {
+                continue;
+            }
+            assert!(
+                scc_core::language_registry()
+                    .iter()
+                    .any(|c| c.id == lang.as_str()),
+                "scan Language::{} missing from LANGUAGE_REGISTRY",
+                lang.as_str()
+            );
+        }
+        for id in scc_core::extracted_language_ids() {
+            assert!(
+                Language::ALL.iter().any(|l| l.as_str() == id),
+                "extracted language {id} is not classified by scan"
+            );
+            let cap = scc_core::language_by_id(id).unwrap();
+            assert_eq!(
+                cap.tier,
+                scc_core::LanguageTier::SemanticDeep,
+                "{id} extractor is not tier A"
+            );
+        }
+        assert!(scc_core::language_by_id("c").is_some());
+        assert!(scc_core::language_by_id("c").unwrap().extractor);
+        assert_eq!(classify(Path::new("src/foo.c")).unwrap().0, Language::C);
+        assert_eq!(classify(Path::new("src/foo.cpp")).unwrap().0, Language::Cpp);
+        assert_eq!(classify(Path::new("src/foo.hxx")).unwrap().0, Language::Cpp);
+        assert_eq!(classify(Path::new("src/foo.rb")).unwrap().0, Language::Ruby);
+        assert!(!scc_core::language_by_id("objc").unwrap().extractor);
+        assert_eq!(
+            scc_core::language_by_id("objc").unwrap().tier,
+            scc_core::LanguageTier::IndexSearch
+        );
+    }
+
+    #[test]
+    // trace:exempt reason=internal-detail
     fn classify_various() {
         assert_eq!(
             classify(Path::new("src/app.py")).unwrap().1,
@@ -343,10 +489,7 @@ mod tests {
             classify(Path::new("docker-compose.yml")),
             Some((Language::Yaml, FileKind::Infra))
         );
-        assert_eq!(
-            classify(Path::new("README.md")).unwrap().1,
-            FileKind::Docs
-        );
+        assert_eq!(classify(Path::new("README.md")).unwrap().1, FileKind::Docs);
         assert_eq!(classify(Path::new("logo.png")), None);
         assert_eq!(
             classify(Path::new(".env.example")).unwrap().0,
@@ -356,6 +499,31 @@ mod tests {
             classify(Path::new("Dockerfile")).unwrap().0,
             Language::Dockerfile
         );
+        assert_eq!(
+            classify(Path::new("contracts/orders.proto")),
+            Some((Language::Protobuf, FileKind::Config))
+        );
+        let proto = scc_core::language_by_id("protobuf").unwrap();
+        assert_eq!(proto.tier, scc_core::LanguageTier::DataConfig);
+        assert!(!proto.extractor);
+        assert!(proto.contracts);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.scan.indexsearch-classified verifies=REQ-scan-classifies-registry-languages exercises=impl.scc.core.language-registry
+    fn indexsearch_registry_languages_are_scan_classified() {
+        for cap in scc_core::language_registry() {
+            if cap.tier != scc_core::LanguageTier::IndexSearch {
+                continue;
+            }
+            let ext = cap
+                .extensions
+                .first()
+                .expect("index/search languages list an extension");
+            let (lang, _) = classify(Path::new(&format!("src/sample.{ext}"))).expect("classified");
+            assert_eq!(lang.as_str(), cap.id, "scan vs registry id for .{ext}");
+            assert!(!cap.extractor, "{} must not claim an extractor", cap.id);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-mod golden;
+mod common;
 
 // trace:v1 id=test.scc.surface-signatures verifies=REQ-SCC-IR exercises=impl.scc.extract.rust,impl.scc.extract.python,impl.scc.extract.typescript,impl.scc.extract.go,impl.scc.extract.java,impl.scc.write,impl.scc.surface
 #[test]
@@ -27,7 +27,7 @@ fn rust_header_survives_index_and_surface() {
 
     // The surface renders the exact header (not a truncated/one-line
     // reconstruction): each source line appears indented 4 spaces.
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered(expect)),
         "surface must render the full multi-line rust header:\n{out}"
@@ -47,7 +47,7 @@ fn python_header_survives_index_and_surface() {
         "def build(\n        self,\n        fields: List[str],\n        where: Optional[str] = None,\n        order_by: str = \"id\",\n    ) -> \"QueryBuilder\""
     );
 
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered(expect)),
         "surface must render the full multi-line python header:\n{out}"
@@ -67,7 +67,7 @@ fn typescript_header_survives_index_and_surface() {
     let expect = "async findByOwner(\n    owner: string,\n    opts?: { limit?: number },\n  ): Promise<Incident[]>";
     assert_eq!(header_of(&attrs, "ts_surface.ts", "IncidentRepo.findByOwner"), expect);
 
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered(expect)),
         "surface must render the full multi-line typescript header:\n{out}"
@@ -90,7 +90,7 @@ fn go_header_survives_index_and_surface() {
         "func (r *Reporter) Merge(values ...string) string"
     );
 
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered(expect)),
         "surface must render the full multi-line go header:\n{out}"
@@ -111,7 +111,7 @@ fn java_header_survives_index_and_surface() {
     let expect = "public List<T> findIncidents(\n        String owner,\n        int limit\n    ) throws IOException";
     assert_eq!(header_of(&attrs, "java_surface.java", "IncidentService.findIncidents"), expect);
 
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered(expect)),
         "surface must render the full multi-line java header:\n{out}"
@@ -125,7 +125,7 @@ fn overload_symbols_are_separate_entries_with_distinct_indexes() {
     let (_repo, dir, _attrs) = index_and_attrs();
     // Two same-name `Calc.foo` methods with different parameter lists are
     // two separate store entities with distinct overload_index values.
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value = serde_json::from_str(&ir).expect("system-ir.json parses");
     let mut foos: Vec<serde_json::Value> = Vec::new();
     for e in v["entities"].as_array().expect("entities array") {
@@ -160,7 +160,7 @@ fn overload_symbols_are_separate_entries_with_distinct_indexes() {
 
     // The surface renders both overloads as separate entries carrying
     // their exact headers.
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     assert!(
         out.contains(&rendered("public int foo(int a)")),
         "surface renders overload 0 header:\n{out}"
@@ -177,10 +177,10 @@ fn overload_symbols_are_separate_entries_with_distinct_indexes() {
 // trace:exempt reason=unit-test
 fn index_and_attrs(
 ) -> (tempfile::TempDir, std::path::PathBuf, BTreeMap<(String, String), serde_json::Value>) {
-    let repo = golden::copy_fixture("surface-signatures");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let repo = common::copy_fixture("surface-signatures");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value = serde_json::from_str(&ir).expect("system-ir.json parses");
     let mut attrs = BTreeMap::new();
     for e in v["entities"].as_array().expect("entities array") {

@@ -9,8 +9,8 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, Route,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Language, Node, Parser};
@@ -153,6 +153,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     docstring: leading_jsdoc(&node, src),
                                     parent: None,
                                 });
+                                let bases = collect_heritage_idents(&node, src);
+                                if !bases.is_empty() {
+                                    out.class_bases.push((name.clone(), bases));
+                                }
                                 for (policy, pline) in collect_retries(&node, src) {
                                     out.retries.push(Retry {
                                         symbol: name.clone(),
@@ -199,7 +203,7 @@ impl LanguageExtractor for TypeScriptExtractor {
                             let name = node_text(&name_node, src).to_string();
                             if !name.is_empty() {
                                 out.symbols.push(Symbol {
-                                    name,
+                                    name: name.clone(),
                                     kind: SymbolKind::Interface,
                                     signature: None,
                                     decl_header: decl_header_of(&node, src),
@@ -209,6 +213,10 @@ impl LanguageExtractor for TypeScriptExtractor {
                                     docstring: leading_jsdoc(&node, src),
                                     parent: None,
                                 });
+                                let bases = collect_heritage_idents(&node, src);
+                                if !bases.is_empty() {
+                                    out.class_bases.push((name, bases));
+                                }
                             }
                         }
                     }
@@ -315,6 +323,33 @@ impl LanguageExtractor for TypeScriptExtractor {
                         }
                     }
                 }
+                "variable_declarator" => {
+                    if let Some(b) = ts_type_bind_from_declarator(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                    ts_record_fn_alias_declarator(&node, &ctx, &mut out, src);
+                }
+                "required_parameter" | "optional_parameter" => {
+                    if let Some(b) = ts_type_bind_from_param(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                }
+                "public_field_definition" => {
+                    if let Some(b) = ts_type_bind_from_class_field(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                }
+                "assignment_expression" => {
+                    if let Some(b) =
+                        ts_type_bind_from_this_assign(&node, &ctx, &out.type_binds, src)
+                    {
+                        out.type_binds.push(b);
+                    }
+                    if let Some(b) = ts_type_bind_from_ident_assign(&node, &ctx, src) {
+                        out.type_binds.push(b);
+                    }
+                    ts_record_fn_alias_assign(&node, &ctx, &mut out, src);
+                }
             "call_expression" => {
                 let Some(function) = node.child_by_field_name("function") else {
                     push_children(&mut frames, &node, &ctx, src);
@@ -372,19 +407,23 @@ impl LanguageExtractor for TypeScriptExtractor {
                 let seq = call_seq.entry(ctx.caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = ts_call_cfg(node);
-                out.calls.push(Call {
-                    caller: ctx.caller.clone(),
-                    callee: callee.clone(),
-                    line,
-                    known_receiver: known_receiver(&function),
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: ts_call_is_awaited(node, &callee),
-                    returns_value: ts_call_returns_value(node),
-                });
+                out.calls.push(
+                    Call {
+                        caller: ctx.caller.clone(),
+                        callee: callee.clone(),
+                        line,
+                        known_receiver: known_receiver(&function),
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: ts_call_is_awaited(node, &callee),
+                        returns_value: ts_call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
             }
             _ => {}
         }
@@ -448,6 +487,26 @@ impl LanguageExtractor for TypeScriptExtractor {
                 parent: None,
             });
         }
+
+        let known: BTreeSet<String> = out
+            .symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+                )
+            })
+            .map(|s| s.name.clone())
+            .chain(
+                out.imports
+                    .iter()
+                    .flat_map(|i| i.names.iter().map(|(local, _)| local.clone())),
+            )
+            .collect();
+        out.type_binds
+            .retain(|b| b.type_name.is_empty() || known.contains(&b.type_name));
+        out.fn_binds = crate::model::normalize_fn_binds(std::mem::take(&mut out.fn_binds));
 
         out
         }
@@ -708,7 +767,57 @@ fn implemented_interfaces(node: &Node, src: &[u8]) -> Vec<String> {
     out
 }
 
-/// Deterministic total order over facts: (family, owner/symbol, secondary,
+/// Simple-ident `extends` / `implements` types on a class or interface.
+// trace:v1 id=impl.scc.extract.typescript.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn collect_heritage_idents(node: &Node, src: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = node.walk();
+    for child in node.named_children(&mut cur) {
+        match child.kind() {
+            "class_heritage"
+            | "extends_clause"
+            | "implements_clause"
+            | "extends_type_clause"
+            | "heritage_clause"
+            | "extends_class_clause" => {
+                collect_heritage_idents_in(&child, src, &mut out);
+            }
+            _ => {}
+        }
+    }
+    let mut b = out;
+    b.sort();
+    b.dedup();
+    b.retain(|s| crate::model::simple_heritage_ident(s).is_some());
+    b
+}
+
+// trace:exempt reason=internal-detail
+fn collect_heritage_idents_in(node: &Node, src: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            if let Some(s) = crate::model::simple_heritage_ident(node_text(node, src)) {
+                out.push(s);
+            }
+        }
+        "nested_type_identifier" | "member_expression" | "qualified_type" => {
+            if let Some(s) = crate::model::simple_heritage_ident(node_text(node, src)) {
+                out.push(s);
+            }
+        }
+        "generic_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_heritage_idents_in(&t, src, out);
+            }
+        }
+        _ => {
+            let mut c = node.walk();
+            for ch in node.named_children(&mut c) {
+                collect_heritage_idents_in(&ch, src, out);
+            }
+        }
+    }
+}
 /// tertiary). Identical facts sort adjacent so `dedup` collapses them.
 fn fact_sort_key(f: &SemanticFact) -> (u8, String, String, String) {
     match f {
@@ -2141,6 +2250,315 @@ fn line_of(node: &Node) -> u32 {
     node.start_position().row as u32 + 1
 }
 
+// trace:exempt reason=internal-detail
+fn ts_simple_type_name(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cur = *node;
+    if cur.kind() == "type_annotation" {
+        if let Some(c) = cur.named_child(0) {
+            cur = c;
+        }
+    }
+    match cur.kind() {
+        "type_identifier" | "identifier" => {
+            let n = node_text(&cur, src).trim();
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.to_string())
+            }
+        }
+        _ => {
+            let n = node_text(&cur, src).trim();
+            if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !n.is_empty() {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+// trace:exempt reason=internal-detail
+fn ts_new_ctor_name(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = node.child_by_field_name("constructor")?;
+    ts_simple_type_name(&ctor, src)
+}
+
+/// `const f = helper` / `const f = () => {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.typescript.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn ts_record_fn_alias_declarator(node: &Node, ctx: &Ctx, out: &mut ExtractedFile, src: &[u8]) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    if name_node.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let typed = ts_rhs_type_name(&value, src).is_some();
+    crate::model::record_fn_rhs(
+        &mut out.fn_binds,
+        ctx.caller.clone().unwrap_or_default(),
+        name.to_string(),
+        ts_fn_rhs(&value, src),
+        typed,
+        line_of(node),
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn ts_record_fn_alias_assign(node: &Node, ctx: &Ctx, out: &mut ExtractedFile, src: &[u8]) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(&left, src).trim();
+    if name.is_empty() {
+        return;
+    }
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+    let typed = ts_rhs_type_name(&right, src).is_some();
+    crate::model::record_fn_rhs(
+        &mut out.fn_binds,
+        ctx.caller.clone().unwrap_or_default(),
+        name.to_string(),
+        ts_fn_rhs(&right, src),
+        typed,
+        line_of(node),
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn ts_fn_rhs(node: &Node, src: &[u8]) -> FnRhs {
+    let mut cur = *node;
+    loop {
+        match cur.kind() {
+            "parenthesized_expression" | "non_null_expression" => {
+                let Some(inner) = cur.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                cur = inner;
+            }
+            "identifier" => {
+                let name = node_text(&cur, src).trim();
+                return if name.is_empty() {
+                    FnRhs::Other
+                } else {
+                    FnRhs::Ident(name.to_string())
+                };
+            }
+            "arrow_function" | "function_expression" => return FnRhs::Lambda,
+            _ => return FnRhs::Other,
+        }
+    }
+}
+
+/// `new Order()`, `v as Order`, `<Order>v`. Unwraps parentheses / non-null.
+// trace:v1 id=impl.scc.extract.ts.type-cast work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn ts_rhs_type_name(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cur = *node;
+    loop {
+        match cur.kind() {
+            "parenthesized_expression" | "non_null_expression" => {
+                cur = cur.named_child(0)?;
+            }
+            "new_expression" => return ts_new_ctor_name(&cur, src),
+            "as_expression" => {
+                let n = cur.named_child_count();
+                if n < 2 {
+                    return None;
+                }
+                return ts_simple_type_name(&cur.named_child(n - 1)?, src);
+            }
+            "type_assertion" => {
+                let args = cur.named_child(0)?;
+                if args.kind() == "type_arguments" {
+                    return ts_simple_type_name(&args.named_child(0)?, src);
+                }
+                return ts_simple_type_name(&args, src);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Class name from `ctx.class` or `Class.method` caller (methods clear `class`).
+// trace:exempt reason=internal-detail
+fn ts_enclosing_class(ctx: &Ctx) -> Option<String> {
+    if let Some(c) = &ctx.class {
+        return (!c.is_empty()).then(|| c.clone());
+    }
+    let caller = ctx.caller.as_deref()?;
+    let (class, rest) = caller.split_once('.')?;
+    if class.is_empty() || rest.is_empty() {
+        None
+    } else {
+        Some(class.to_string())
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn ts_unique_bind_type(binds: &[TypeBind], scope: &str, name: &str) -> Option<String> {
+    let mut types: Vec<&str> = binds
+        .iter()
+        .filter(|b| b.scope == scope && b.name == name)
+        .map(|b| b.type_name.as_str())
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    (types.len() == 1).then(|| types[0].to_string())
+}
+
+/// Class field `repo: Order` / `repo = new Order()`.
+// trace:v1 id=impl.scc.extract.typescript.field-type work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
+fn ts_type_bind_from_class_field(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let class = ts_enclosing_class(ctx)?;
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut ty = node
+        .child_by_field_name("type")
+        .and_then(|t| ts_simple_type_name(&t, src));
+    if ty.is_none() {
+        if let Some(v) = node.child_by_field_name("value") {
+            ty = ts_new_ctor_name(&v, src);
+        }
+    }
+    Some(TypeBind {
+        scope: class,
+        name: name.to_string(),
+        type_name: ty?,
+        line: line_of(node),
+    })
+}
+
+/// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique type in this method.
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_this_assign(
+    node: &Node,
+    ctx: &Ctx,
+    binds: &[TypeBind],
+    src: &[u8],
+) -> Option<TypeBind> {
+    let class = ts_enclosing_class(ctx)?;
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let obj = left.child_by_field_name("object")?;
+    if node_text(&obj, src).trim() != "this" {
+        return None;
+    }
+    let prop = left.child_by_field_name("property")?;
+    let name = node_text(&prop, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let right = node.child_by_field_name("right")?;
+    let type_name = if let Some(ty) = ts_rhs_type_name(&right, src) {
+        ty
+    } else if right.kind() == "identifier" {
+        let rhs = node_text(&right, src).trim();
+        let scope = ctx.caller.clone().unwrap_or_default();
+        ts_unique_bind_type(binds, &scope, rhs)?
+    } else {
+        return None;
+    };
+    Some(TypeBind {
+        scope: class,
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
+/// `x = v as Order` — caller-scoped assignment fuel (tombstone when types differ).
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_ident_assign(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&left, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let right = node.child_by_field_name("right")?;
+    let type_name = ts_rhs_type_name(&right, src)?;
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn ts_type_bind_from_declarator(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let name_node = node.child_by_field_name("name")?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&name_node, src).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let line = line_of(node);
+    let mut ty = node
+        .child_by_field_name("type")
+        .and_then(|t| ts_simple_type_name(&t, src));
+    if ty.is_none() {
+        if let Some(v) = node.child_by_field_name("value") {
+            ty = ts_rhs_type_name(&v, src);
+        }
+    }
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
+        name: name.to_string(),
+        type_name: ty?,
+        line,
+    })
+}
+
+// Untyped identifier params are empty-type shadows so `Order.process()`
+// cannot pin the class when a parameter is named `Order`.
+// trace:v1 id=impl.scc.extract.typescript.param-shadow work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
+fn ts_type_bind_from_param(node: &Node, ctx: &Ctx, src: &[u8]) -> Option<TypeBind> {
+    let pat = node.child_by_field_name("pattern")?;
+    if pat.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&pat, src).trim();
+    if name.is_empty() || name == "this" {
+        return None;
+    }
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|ty_node| ts_simple_type_name(&ty_node, src))
+        .unwrap_or_default();
+    Some(TypeBind {
+        scope: ctx.caller.clone().unwrap_or_default(),
+        name: name.to_string(),
+        type_name,
+        line: line_of(node),
+    })
+}
+
 /// The defining source expression of a node, bounded to 200 chars
 /// (single-line, whitespace-collapsed) — enough to carry the concrete
 /// code form (`z.object({ name: z.string() })`) into the atlas without
@@ -3416,6 +3834,190 @@ mod tests {
 
     fn find_call<'a>(calls: &'a [Call], callee: &str) -> Vec<&'a Call> {
         calls.iter().filter(|c| c.callee == callee).collect()
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.type-binds verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn new_expression_and_param_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nfunction handle(x: Order) {\n  const y = new Order();\n  y.process();\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "new Order bind missing: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.extract.typescript.fn-alias
+    fn function_alias_binds_from_ident_arrow_and_clobber() {
+        let ef = extract(
+            "app.ts",
+            "function helper() { return 1; }\nfunction other() { return 2; }\nfunction run() {\n  const f = helper;\n  f();\n}\nfunction mixed() {\n  let g = helper;\n  g = other;\n  g();\n}\nfunction lam() {\n  const h = () => 1;\n  h();\n}\n",
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "arrow must tombstone: {:?}",
+            ef.fn_binds
+        );
+        let const_src = extract(
+            "app.ts",
+            "const helper = () => 1;\nconst LIMIT = 10;\nfunction run() {\n  const f = helper;\n  f();\n}\n",
+        );
+        let helper = const_src
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!(helper.kind, SymbolKind::Const);
+        assert!(helper.signature.is_some());
+        assert!(
+            const_src
+                .fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "const helper alias missing: {:?}",
+            const_src.fn_binds
+        );
+        let limit = const_src
+            .symbols
+            .iter()
+            .find(|s| s.name == "LIMIT")
+            .expect("LIMIT");
+        assert_eq!(limit.kind, SymbolKind::Const);
+        assert_eq!(limit.signature, None);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.param-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.extract.typescript.param-shadow
+    fn untyped_params_are_empty_shadow_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nfunction handle(Order, x: Order) {\n  Order.process();\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "Order"
+                && b.type_name.is_empty()),
+            "untyped param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "typed param must still bind: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.typescript.class-bases
+    fn class_bases_include_extends_and_implements() {
+        let ef = extract(
+            "app.ts",
+            "class IERS { open() {} }\nclass IERS_B extends IERS implements Closeable { }\ninterface Closeable { close(): void }\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.contains(&"IERS".to_string()) && b.contains(&"Closeable".to_string())
+            }),
+            "IERS_B heritage missing: {:?}",
+            ef.class_bases
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.ts.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.ts.type-cast
+    fn as_and_angle_cast_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nfunction handle(v: unknown) {\n  const y = v as Order;\n  y.process();\n  const z = <Order>v;\n  z.process();\n}\nfunction mixed(v: unknown) {\n  let x = v as Order;\n  x = v as Invoice;\n  x.process();\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "as-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "z" && b.type_name == "Order"),
+            "angle-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        let x: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            x.contains(&"Order") && x.contains(&"Invoice"),
+            "conflicting as-cast must tombstone fuel: {x:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.typescript.field-type verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.extract.typescript.field-type
+    fn class_field_and_this_assign_type_binds() {
+        let ef = extract(
+            "app.ts",
+            "class Order { process() {} }\nclass Invoice { process() {} }\nclass Svc {\n  repo: Order;\n  constructor(other: Invoice) {\n    this.owned = new Order();\n    this.other = other;\n  }\n  run() { return this.owned.process(); }\n}\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "class field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = new Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "this.other = param bind missing: {:?}",
+            ef.type_binds
+        );
     }
 
     #[test]

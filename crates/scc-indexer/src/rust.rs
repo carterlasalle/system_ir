@@ -10,11 +10,13 @@
 //! their methods are emitted as Method symbols named `Type.method` so the
 //! native resolver's `self`/`this` rule can resolve `self.method()` calls
 //! (resolve.rs splits on '.' — `Type::method` names would never resolve).
+//! Trait methods are `Trait.method`. `impl Trait for T` records Trait as a
+//! simple-ident base of T for CHA.
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -503,6 +505,12 @@ struct Ctx {
     module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Struct-field type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`let f = helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
+    /// `impl Trait for T` → (T, [Trait, ...]) for CHA.
+    class_bases: Vec<(String, Vec<String>)>,
 }
 
 // trace:exempt reason=internal-detail
@@ -516,7 +524,18 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
-// trace:exempt reason=internal-detail
+
+    /// Innermost `impl Type` scope, used to attribute `self.field = …` binds.
+    // trace:exempt reason=internal-detail
+    fn enclosing_impl(&self) -> Option<String> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|s| s.is_impl)
+            .map(|s| s.name.clone())
+    }
+
+    // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let cli_flags = self
             .cli_flags
@@ -584,8 +603,52 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds: self.type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
+            class_bases: rust_class_bases(&self.class_bases),
         }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() || name == "_" || name == "self" {
+            return;
         }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
+
+    /// Struct-scoped field type from the declared type (`Order`, `&Order`, `Box<Order>`).
+    // trace:v1 id=impl.scc.extract.rust.field-type work=WORK-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-type-narrowin satisfies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t implements=PLAN-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-type-narrowin
+    fn bind_field_type(&mut self, owner: String, field: String, declared_ty: Option<String>, line: u32) {
+        if let Some(ty) = declared_ty {
+            self.push_type_bind_in(owner, field, ty, line);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +657,7 @@ impl Ctx {
 
 // trace:exempt reason=internal-detail
 impl RustExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             // trait method declarations have no body (function_signature_item)
@@ -607,6 +671,8 @@ impl RustExtractor {
             "use_declaration" => self.record_use(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
             "macro_invocation" => self.record_macro_invocation(node, ctx, src),
+            "assignment_expression" => self.record_field_assign(node, ctx, src),
+            "let_declaration" => self.record_let(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -762,6 +828,7 @@ impl RustExtractor {
             name: sym_name,
             is_impl: false,
         });
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -882,10 +949,21 @@ impl RustExtractor {
             }
         }
         // Trait bodies contain function declarations (contracts, default
-        // impls); struct/enum bodies have none. Walk everything uniformly.
-        self.walk_children(node, ctx, src);
+        // impls); struct/enum bodies have none. Walk trait methods under a
+        // Type.method scope so CHA can pin Trait.m.
+        if kind == SymbolKind::Interface {
+            ctx.scopes.push(Scope {
+                name: name.clone(),
+                is_impl: true,
+            });
+            self.walk_children(node, ctx, src);
+            ctx.scopes.pop();
+        } else {
+            self.walk_children(node, ctx, src);
+        }
     }
 
+    // trace:exempt reason=internal-detail
     fn walk_impl(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         // Receiver type of the impl (`impl Trait for Type` -> Type). Generic
         // parameters are dropped from the name.
@@ -894,6 +972,7 @@ impl RustExtractor {
             .map(|t| clean(node_text(Some(t), src)))
             .unwrap_or_default();
         let type_name = type_name.split('<').next().unwrap_or("").trim().to_string();
+        let type_name = rust_heritage_ident(&type_name).unwrap_or(type_name);
         if type_name.is_empty() {
             self.walk_children(node, ctx, src);
             return;
@@ -902,7 +981,8 @@ impl RustExtractor {
         // `impl Deserialize for T` (last path segment, so `serde::Serialize`
         // counts) are Serialization-pair sides around the type.
         if let Some(trait_node) = node.child_by_field_name("trait") {
-            let trait_name = clean(node_text(Some(trait_node), src))
+            let trait_text = clean(node_text(Some(trait_node), src));
+            let trait_name = trait_text
                 .rsplit("::")
                 .next()
                 .unwrap_or("")
@@ -913,6 +993,7 @@ impl RustExtractor {
                     .or_default()
                     .insert(trait_name);
             }
+            record_trait_impl(ctx, &type_name, &trait_text);
         }
         ctx.scopes.push(Scope {
             name: type_name,
@@ -923,6 +1004,9 @@ impl RustExtractor {
     }
 
 // trace:exempt reason=internal-detail
+    /// `mod x;` (no body) is a file-module declaration. Inline
+    /// `mod x { ... }` keeps a Module symbol and must not mint `mod:x`.
+    // trace:v1 id=impl.scc.extract.rust.mod-file work=WORK-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor satisfies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p implements=PLAN-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-precise-impor
     fn walk_mod(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let name = clean(node_text(node.child_by_field_name("name"), src));
         if name.is_empty() {
@@ -948,6 +1032,15 @@ impl RustExtractor {
             ctx.facts.push(SemanticFact::PublicExport {
                 symbol: name.clone(),
                 kind: "module".to_string(),
+            });
+        }
+        let text = node_text(Some(node), src);
+        if !text.contains('{') {
+            ctx.imports.push(Import {
+                module: format!("mod:{name}"),
+                names: vec![(name.clone(), name.clone())],
+                line: start_line,
+                r#type: ImportType::Module,
             });
         }
         // Module bodies are walked WITHOUT a scope push: nested items keep
@@ -1203,19 +1296,23 @@ impl RustExtractor {
                     let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                     *seq += 1;
                     let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                    ctx.calls.push(Call {
-                        caller,
-                        callee,
-                        line: node.start_position().row as u32 + 1,
-                        known_receiver: known_receiver(fn_node, src),
-                        conditional,
-                        lexical_order: *seq - 1,
-                        control_block: control_block.map(str::to_string),
-                        inside_loop,
-                        inside_try,
-                        awaited: call_is_awaited(node),
-                        returns_value: call_returns_value(node),
-                    });
+                    ctx.calls.push(
+                        Call {
+                            caller,
+                            callee,
+                            line: node.start_position().row as u32 + 1,
+                            known_receiver: known_receiver(fn_node, src),
+                            conditional,
+                            lexical_order: *seq - 1,
+                            control_block: control_block.map(str::to_string),
+                            inside_loop,
+                            inside_try,
+                            awaited: call_is_awaited(node),
+                            returns_value: call_returns_value(node),
+                            ..Default::default()
+                        }
+                        .finish(),
+                    );
                     self.record_store_ref(node, fn_node, ctx, src);
                 }
             }
@@ -1401,6 +1498,7 @@ impl RustExtractor {
     /// Struct fields (state surface). A field is mutable when its type
     /// uses an interior-mutability/atomic wrapper; plain fields are
     /// immutable under Rust's ownership rules.
+    // trace:exempt reason=internal-detail
     fn record_struct_fields(&self, node: Node, owner: &str, ctx: &mut Ctx, src: &[u8]) {
         const MUTABLE_TYPES: &[&str] = &[
             "Cell<",
@@ -1431,11 +1529,18 @@ impl RustExtractor {
                         if !fname.is_empty() {
                             let ftype = node_text(f.child_by_field_name("type"), src);
                             let mutable = MUTABLE_TYPES.iter().any(|t| ftype.contains(t));
+                            let line = f.start_position().row as u32 + 1;
                             ctx.facts.push(SemanticFact::Field {
                                 owner: owner.to_string(),
-                                name: fname,
+                                name: fname.clone(),
                                 mutable,
                             });
+                            ctx.bind_field_type(
+                                owner.to_string(),
+                                fname,
+                                rust_simple_type_name(ftype),
+                                line,
+                            );
                         }
                         if has_serde
                             && pending
@@ -1454,6 +1559,84 @@ impl RustExtractor {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// `self.owned = Invoice {}` — class-scoped field bind from a one-hop
+    /// self-field assignment. A different type than the struct declaration
+    /// tombstones at resolve time.
+    // trace:v1 id=impl.scc.extract.rust.field-assign work=WORK-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme satisfies=REQ-implement-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-fi implements=PLAN-phase-14-of-scc-x-ripwire-lessons-rust-extract-time-self-field-assignme
+    fn record_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        let line = node.start_position().row as u32 + 1;
+        if let (Some(left), Some(right)) = (left, right) {
+            if let Some(class) = ctx.enclosing_impl() {
+                if let Some(field) = one_hop_self_field(left, src) {
+                    if let Some(ty) = rust_rhs_type_name(right, src, ctx) {
+                        ctx.push_type_bind_in(class, field, ty, line);
+                    }
+                }
+            }
+            if left.kind() == "identifier" {
+                let name = clean(node_text(Some(left), src));
+                rust_record_fn_alias(ctx, name.clone(), right, src, line);
+                if let Some(ty) = rust_rhs_type_name(right, src, ctx) {
+                    ctx.push_type_bind(name, ty, line);
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `let x = Order {}` / `let x: Order = ...` — caller-scoped local bind.
+    // trace:v1 id=impl.scc.extract.rust.local-type work=WORK-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa satisfies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time implements=PLAN-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa
+    fn record_let(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(pat) = node.child_by_field_name("pattern") {
+            if pat.kind() == "identifier" {
+                let name = clean(node_text(Some(pat), src));
+                let line = node.start_position().row as u32 + 1;
+                if let Some(ty) = node
+                    .child_by_field_name("type")
+                    .and_then(|t| rust_simple_type_name(&clean(node_text(Some(t), src))))
+                {
+                    ctx.push_type_bind(name.clone(), ty, line);
+                }
+                if let Some(val) = node.child_by_field_name("value") {
+                    rust_record_fn_alias(ctx, name.clone(), val, src, line);
+                    if let Some(ty) = rust_rhs_type_name(val, src, ctx) {
+                        ctx.push_type_bind(name, ty, line);
+                    }
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// Typed parameters (`fn handle(x: Order)`) bind in the current callable.
+    // trace:exempt reason=internal-detail
+    fn bind_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let Some(pat) = p.child_by_field_name("pattern") else {
+                continue;
+            };
+            if pat.kind() != "identifier" {
+                continue;
+            }
+            let name = clean(node_text(Some(pat), src));
+            let Some(ty) =
+                rust_simple_type_name(&clean(node_text(p.child_by_field_name("type"), src)))
+            else {
+                continue;
+            };
+            ctx.push_type_bind(name, ty, p.start_position().row as u32 + 1);
         }
     }
 
@@ -1770,6 +1953,38 @@ fn turbofish_type(fn_node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
+/// Last simple ident of a Rust type/trait path (`std::io::Write` → `Write`).
+// trace:exempt reason=internal-detail
+fn rust_heritage_ident(text: &str) -> Option<String> {
+    crate::model::simple_heritage_ident(&text.replace("::", "."))
+}
+
+/// Merge `impl Trait for T` rows then keep simple-ident bases.
+// trace:v1 id=impl.scc.extract.rust.class-bases work=WORK-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h satisfies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo implements=PLAN-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h
+fn rust_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    let mut merged: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (class, bases) in raw {
+        merged
+            .entry(class.clone())
+            .or_default()
+            .extend(bases.iter().cloned());
+    }
+    let pairs: Vec<(String, Vec<String>)> = merged.into_iter().collect();
+    crate::model::normalize_class_bases(&pairs)
+}
+
+/// Record `impl Trait for T` as CHA fuel on T.
+// trace:v1 id=impl.scc.extract.rust.trait-impl work=WORK-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h satisfies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo implements=PLAN-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-for-t-as-cha-h
+fn record_trait_impl(ctx: &mut Ctx, type_name: &str, trait_text: &str) {
+    let Some(tr) = rust_heritage_ident(trait_text) else {
+        return;
+    };
+    if type_name.is_empty() {
+        return;
+    }
+    ctx.class_bases.push((type_name.to_string(), vec![tr]));
+}
+
 /// Field type of a `#[serde(flatten)]` field as the composed parent schema
 /// name: strips an outer `Option<...>`, rejects qualified/generic types
 /// (only plain local type names are resolvable).
@@ -1782,6 +1997,164 @@ fn flatten_parent_type(f: Node, src: &[u8]) -> Option<String> {
         return None;
     }
     Some(t)
+}
+
+/// Simple type name for field-type narrowing. Strips `&`/`&mut` and one
+/// `Box`/`Arc`/`Rc`/`Option` wrapper. Qualified and remaining-generic types stay unbound.
+// trace:exempt reason=internal-detail
+fn rust_simple_type_name(text: &str) -> Option<String> {
+    let mut t = text.trim();
+    t = t.strip_prefix('&').unwrap_or(t).trim();
+    t = t.strip_prefix("mut ").unwrap_or(t).trim();
+    for wrap in ["Box<", "Arc<", "Rc<", "Option<"] {
+        if let Some(rest) = t.strip_prefix(wrap) {
+            if let Some(inner) = rest.strip_suffix('>') {
+                t = inner.trim();
+                break;
+            }
+        }
+    }
+    if t.is_empty() || t.contains("::") || t.contains('<') || t.contains('>') {
+        return None;
+    }
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if matches!(
+        t,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "str"
+            | "char"
+            | "String"
+            | "Self"
+            | "self"
+    ) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// One-hop `self.field`; longer chains and non-self roots are skipped.
+// trace:exempt reason=internal-detail
+fn one_hop_self_field(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "field_expression" {
+        return None;
+    }
+    let val = node.child_by_field_name("value")?;
+    if val.kind() != "self" {
+        return None;
+    }
+    let field = clean(node_text(node.child_by_field_name("field"), src));
+    if field.is_empty() {
+        None
+    } else {
+        Some(field)
+    }
+}
+
+/// `let f = helper` / `let f = || {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.rust.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn rust_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = rust_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        rust_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn rust_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    while matches!(
+        n.kind(),
+        "reference_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = n
+            .child_by_field_name("value")
+            .or_else(|| n.named_child(0))
+        else {
+            return FnRhs::Other;
+        };
+        n = inner;
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "closure_expression" => FnRhs::Lambda,
+        _ => FnRhs::Other,
+    }
+}
+
+/// Type name from `Invoice {}` / `&Invoice {}` / `Invoice::new()` / `v as Order`.
+// trace:exempt reason=internal-detail
+fn rust_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    while matches!(
+        n.kind(),
+        "reference_expression"
+            | "parenthesized_expression"
+            | "try_expression"
+            | "await_expression"
+    ) {
+        n = n
+            .child_by_field_name("value")
+            .or_else(|| n.named_child(0))?;
+    }
+    match n.kind() {
+        "struct_expression" => {
+            rust_simple_type_name(&clean(node_text(n.child_by_field_name("name"), src)))
+        }
+        "call_expression" => rust_ctor_type_name(n, src),
+        "type_cast_expression" => rust_cast_type_name(n, src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        _ => None,
+    }
+}
+
+/// `v as Order` / `v as &Order`.
+// trace:v1 id=impl.scc.extract.rust.type-cast work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn rust_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    rust_simple_type_name(&clean(node_text(n.child_by_field_name("type"), src)))
+}
+
+// trace:exempt reason=internal-detail
+fn rust_ctor_type_name(n: Node, src: &[u8]) -> Option<String> {
+    let fn_n = n.child_by_field_name("function")?;
+    let text = clean(node_text(Some(fn_n), src));
+    let (ty, method) = text.rsplit_once("::")?;
+    if !matches!(method, "new" | "default" | "from") {
+        return None;
+    }
+    let ty = ty.rsplit("::").next().unwrap_or(ty);
+    rust_simple_type_name(ty)
 }
 
 /// Derive names of a `#[derive(...)]` attribute run, last path segment
@@ -1916,6 +2289,7 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.extract.rust.symbols verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
     fn symbols_methods_signatures() {
         let ef = extract(
             r#"use std::collections::HashMap;
@@ -1986,9 +2360,10 @@ impl Service {
 
         // trait method declarations (no body) are recorded too; the
         // receiver is dropped from the signature like method symbols
-        let save = find_symbol(&ef, "save");
-        assert_eq!(save.kind, SymbolKind::Function);
+        let save = find_symbol(&ef, "Store.save");
+        assert_eq!(save.kind, SymbolKind::Method);
         assert!(!save.exported);
+        assert_eq!(save.parent.as_deref(), Some("Store"));
         assert_eq!(save.signature.as_deref(), Some("fn save(job: &str)"));
 
         let m = find_symbol(&ef, "internal");
@@ -2048,6 +2423,24 @@ impl Service {
         assert_eq!(imps[6].names, vec![("domain".into(), "domain".into())]);
         assert_eq!(imps[7].module, "crate::domain::Service");
         assert_eq!(imps[7].names, vec![("Service".into(), "Service".into())]);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.mod-file verifies=REQ-implement-phase-27-of-scc-x-ripwire-lessons-absorb-rust-step-a-path-p exercises=impl.scc.extract.rust.mod-file
+    fn bodyless_mod_emits_mod_target_inline_does_not() {
+        let ef = extract("mod geo;\nmod inner {\n    fn f() {}\n}\n");
+        assert!(
+            ef.imports.iter().any(|i| i.module == "mod:geo"),
+            "body-less mod geo; must emit mod:geo: {:?}",
+            ef.imports
+        );
+        assert!(
+            !ef.imports.iter().any(|i| i.module == "mod:inner"),
+            "inline mod inner {{ }} must not emit mod:inner: {:?}",
+            ef.imports
+        );
+        assert!(ef.symbols.iter().any(|s| s.name == "geo" && s.kind == SymbolKind::Module));
+        assert!(ef.symbols.iter().any(|s| s.name == "inner" && s.kind == SymbolKind::Module));
     }
 
     #[test]
@@ -2831,5 +3224,273 @@ impl Handler {
         // Struct header ends at the name (no body braces).
         let h = find_symbol(&ef, "Handler");
         assert_eq!(h.decl_header.as_deref(), Some("pub struct Handler"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.field-type verifies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t exercises=impl.scc.extract.rust.field-type
+    fn field_type_binds_from_struct_fields() {
+        let ef = extract(
+            r#"
+struct Order;
+impl Order { fn process(&self) {} }
+struct Invoice;
+impl Invoice { fn process(&self) {} }
+struct Svc {
+    repo: Order,
+    boxed: Box<Order>,
+    borrowed: &Order,
+}
+impl Svc {
+    fn run(&self) { self.repo.process(); }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "plain field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "boxed" && b.type_name == "Order"),
+            "Box<Order> bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "borrowed" && b.type_name == "Order"),
+            "&Order bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Invoice {};
+        self.owned.process();
+    }
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment tombstone fuel missing: {types:?}"
+        );
+        let same = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&mut self) {
+        self.owned = Order {};
+        self.owned.process();
+    }
+}
+"#,
+        );
+        let same_types: Vec<_> = same
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
+            "same-type assignment must stay unique Order: {same_types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.rust.local-type
+    fn local_type_binds_from_let_and_params() {
+        let ef = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(x: Order) {
+    let y = Order {};
+    y.process();
+    x.process();
+    y.inner.process();
+}
+fn mixed() {
+    let mut z = Order {};
+    z = Invoice {};
+    z.process();
+}
+fn factory() {
+    let x = make_order();
+    x.process();
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "let bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting local assignment must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "factory" && b.name == "x"),
+            "opaque factory call must not mint a type bind: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.rust.fn-alias
+    fn function_alias_binds_from_ident_closure_and_clobber() {
+        let ef = extract(
+            r#"
+fn helper() {}
+fn other() {}
+fn run() {
+    let f = helper;
+    f();
+}
+fn mixed() {
+    let mut g = helper;
+    g = other;
+    g();
+}
+fn lam() {
+    let h = || {};
+    h();
+}
+"#,
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "closure must tombstone: {:?}",
+            ef.fn_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.type-cast verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.rust.type-cast
+    fn type_cast_binds_from_as_expression() {
+        let ef = extract(
+            r#"
+struct Order {}
+impl Order { fn process(&self) {} }
+struct Invoice {}
+impl Invoice { fn process(&self) {} }
+fn handle(v: Order) {
+    let y = v as Order;
+    y.process();
+}
+fn mixed(v: Order, w: Invoice) {
+    let mut z = v as Order;
+    z = w as Invoice;
+    z.process();
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "as-cast bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting as-cast must tombstone fuel: {z:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.class-bases verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.trait-impl
+    fn class_bases_from_impl_trait_for_type() {
+        let ef = extract(
+            "trait Open { fn open(&self); }\nstruct IERS_B;\nimpl Open for IERS_B {}\nimpl std::fmt::Display for IERS_B { fn fmt(&self) {} }\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.iter().any(|x| x == "Open") && b.iter().any(|x| x == "Display")
+            }),
+            "impl Trait for T must record simple-ident bases: {:?}",
+            ef.class_bases
+        );
+        let open = find_symbol(&ef, "Open.open");
+        assert_eq!(open.kind, SymbolKind::Method);
+        assert_eq!(open.parent.as_deref(), Some("Open"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.trait-method verifies=REQ-implement-phase-24-of-scc-x-ripwire-lessons-absorb-rust-impl-trait-fo exercises=impl.scc.extract.rust.class-bases
+    fn two_trait_impls_merge_and_generic_paths_strip() {
+        let ef = extract(
+            "trait A<T> { fn m(&self); }\ntrait B { fn m(&self); }\nstruct C;\nimpl A<u8> for C {}\nimpl B for C {}\n",
+        );
+        let row = ef
+            .class_bases
+            .iter()
+            .find(|(c, _)| c == "C")
+            .unwrap_or_else(|| panic!("C bases: {:?}", ef.class_bases));
+        assert_eq!(row.1, vec!["A".to_string(), "B".to_string()]);
     }
 }

@@ -300,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.graph.boundary-display-pure work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing
     fn display_does_not_mutate_the_store() {
         // P0 regression: boundary_crossings() is a pure read. Calling it
         // (atlas/verify) must not delete or add relationships.
@@ -315,9 +316,13 @@ mod tests {
         // compiles them, so an un-recompiled store renders empty
         assert!(lines.is_empty(), "{lines:?}");
 
-        // after the pipeline compiles, the display renders them without
-        // touching the database again
-        crate::recompile(&store).unwrap();
+        // Compile crossings without reclustering: a full `recompile()` would
+        // replace components from an empty file set and drop the hand-built
+        // units under vanished-entity cleanup (needed for incremental≡cold).
+        let compiled = compile_boundaries(&graph, &store).unwrap();
+        for (rel, src) in compiled {
+            store.insert_relationship(&rel, &src).unwrap();
+        }
         let after_compile = store.all_relationships().unwrap().len();
         assert!(after_compile > before, "compile inserts crossings");
         let before2 = store.all_relationships().unwrap().len();

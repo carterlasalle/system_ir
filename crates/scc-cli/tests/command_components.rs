@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-mod golden;
+mod common;
 // trace:v1 id=test.scc.cli-components verifies=REQ-SCC-IR exercises=impl.scc.components
 
 #[test]
@@ -14,11 +14,11 @@ fn cli_service_fixture_yields_cli_boundary_component() {
     // repo root — the whole repo is the CLI package, so the root component
     // must carry boundary_kind=cli (evidence-backed), not the bare
     // code-region/root fallback.
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value =
         serde_json::from_str(&ir).expect("system-ir.json parses");
     let entities = v["entities"].as_array().expect("entities array");
@@ -50,7 +50,7 @@ fn cli_service_fixture_yields_cli_boundary_component() {
     assert_eq!(paths, &vec![serde_json::json!("root")], "cli component paths: {paths:?}");
 
     // `scc components` lists the CLI command component
-    let listed = golden::run_ok(&dir, &["components"]);
+    let listed = common::run_ok(&dir, &["components"]);
     assert!(listed.contains("root"), "components must list root: {listed}");
 }
 
@@ -59,11 +59,11 @@ fn non_cli_repo_keeps_code_region_boundaries() {
     // http-service-python has no cli-subcommand/cli_flags evidence: its dir
     // components must stay generic code-region boundaries (no spurious cli
     // components invented).
-    let repo = golden::copy_fixture("http-service-python");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("http-service-python");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value =
         serde_json::from_str(&ir).expect("system-ir.json parses");
     let entities = v["entities"].as_array().expect("entities array");

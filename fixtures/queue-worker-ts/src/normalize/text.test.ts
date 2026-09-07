@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalize } from "../src/normalize/text";
-import { resolveStreetName } from "../src/geo/resolver";
+import { normalize } from "./text";
+import { resolveStreetName } from "../geo/resolver";
 
 describe("normalize", () => {
   it("preserves raw text on resolver failure", () => {

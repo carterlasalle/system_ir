@@ -6,13 +6,13 @@
 
 use std::path::Path;
 
-mod golden;
+mod common;
 // trace:v1 id=test.scc.behavior verifies=REQ-SCC-FLOW exercises=impl.scc.flows,impl.scc.flowgraph
 
 /// Parse the `scc export flow-graphs.json` output for the given fixture
 /// (indexed natively — no `resolve` pass ever runs in these tests).
 fn flow_graphs(dir: &Path) -> serde_json::Value {
-    let out = golden::run_ok(dir, &["export", "flow-graphs.json"]);
+    let out = common::run_ok(dir, &["export", "flow-graphs.json"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("flow-graphs.json parses");
     assert!(v.is_array() && !v.as_array().unwrap().is_empty(), "fixture yields flow graphs");
     v
@@ -24,9 +24,9 @@ fn native_same_file_calls_yield_sequence_flow_with_extracted_steps() {
     // handle -> normalize -> {validate, parse}. The native extractor
     // resolves every callee to a local symbol, so the canonical flow graph
     // exists with EXTRACTED edges — no LSP, no resolve, no pyright.
-    let repo = golden::copy_fixture("behavior-native");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("behavior-native");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
     let graphs = flow_graphs(&dir);
     let graphs = graphs.as_array().unwrap();
@@ -90,11 +90,11 @@ fn native_same_file_calls_yield_sequence_flow_with_extracted_steps() {
 fn atlas_flows_section_shows_native_chain() {
     // The rendered atlas FLOWS section must show the native chain: the
     // `run` sequence flow with handle/normalize/validate/parse steps.
-    let repo = golden::copy_fixture("behavior-native");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("behavior-native");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let atlas = golden::run_ok(&dir, &["atlas"]);
+    let atlas = common::run_ok(&dir, &["atlas"]);
     let flows = atlas
         .split("FLOWS")
         .nth(1)

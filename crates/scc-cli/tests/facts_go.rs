@@ -4,8 +4,8 @@
 //! IR export, with gin GET/POST routes and gorilla mux routes registered as
 //! contract endpoints (closing the go-routes gap).
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 // trace:v1 id=test.scc.facts.go verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.go
 
 fn go_facts_service() -> tempfile::TempDir {

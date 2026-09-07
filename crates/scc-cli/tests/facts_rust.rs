@@ -5,16 +5,16 @@
 
 use std::collections::BTreeMap;
 
-mod golden;
+mod common;
 // trace:v1 id=test.scc.facts.rust verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.rust
 
 #[test]
 fn rust_facts_surface_in_system_ir() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value = serde_json::from_str(&ir).expect("system-ir.json parses");
 
     let entities = v["entities"].as_array().expect("entities array");

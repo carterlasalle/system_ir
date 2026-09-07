@@ -6,12 +6,18 @@
 //! are dropped before truncation.
 
 use crate::rank::terms;
+use crate::structural_source::file_handle;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
-use scc_core::{entity_id, estimate_tokens, Provenance, Severity};
+use scc_core::{
+    entity_id, estimate_tokens, path_matches_locus, route_query, truncate_to_budget, Provenance,
+    Severity,
+};
 use scc_graph::TrustedGraphView;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+#[derive(Debug, Clone)]
+// trace:exempt reason=internal-detail
 pub(crate) struct Section {
     pub(crate) title: String,
     pub(crate) body: String,
@@ -41,6 +47,7 @@ struct RenderOutcome {
     exceeded_soft_budget: bool,
 }
 
+// trace:exempt reason=internal-detail
 fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (String, RenderOutcome) {
     let mut sections = sections;
     let mut outcome = RenderOutcome {
@@ -53,11 +60,7 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
     let mut content = assemble(&sections);
     let mut tokens = estimate_tokens(&content);
     while tokens > budget {
-        let min_priority = sections
-            .iter()
-            .map(|s| s.priority)
-            .min()
-            .unwrap_or(10);
+        let min_priority = sections.iter().map(|s| s.priority).min().unwrap_or(10);
         if min_priority >= 9 {
             break; // cannot drop anything else
         }
@@ -104,6 +107,73 @@ pub(crate) fn finish(
         pack.hard_truncated || !pack.dropped_sections.is_empty() || pack.exceeded_soft_budget;
 }
 
+/// Inspectable fixed-quota packer. Production [`finish`] stays adaptive.
+/// Truncated buckets are named in `dropped_sections` as `quota:<bucket>`.
+// trace:v1 id=impl.scc.context.finish-rollover work=WORK-ripwire-lessons-phase3 satisfies=REQ-budget-rollover
+pub(crate) fn finish_with_rollover(
+    pack: &mut ContextPack,
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+) {
+    let original = estimate_tokens(&assemble(&sections));
+    let mut buckets: [Vec<Section>; 6] = Default::default();
+    for s in sections {
+        buckets[quota_bucket(&s.title)].push(s);
+    }
+    let used: [usize; 6] = std::array::from_fn(|i| estimate_tokens(&assemble(&buckets[i])));
+    let filled = crate::budget::fill_task_context_quotas(budget, &used);
+    let mut kept: Vec<Section> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (i, secs) in buckets.into_iter().enumerate() {
+        let assembled = assemble(&secs);
+        let grant = filled[i].granted;
+        if filled[i].truncated > 0 {
+            dropped.push(format!("quota:{}", filled[i].name));
+            let fitted = truncate_to_budget(&assembled, grant.max(1));
+            kept.push(Section::new(
+                &format!("{} (truncated)", filled[i].name),
+                fitted,
+                5,
+            ));
+        } else {
+            kept.extend(secs);
+        }
+    }
+    for w in warnings {
+        kept.push(Section::new("WARNING", format!("{w}\n"), 10));
+    }
+    pack.content = assemble(&kept);
+    pack.budget = budget;
+    pack.tokens = estimate_tokens(&pack.content);
+    pack.original_tokens = original;
+    pack.dropped_sections = dropped;
+    pack.hard_truncated = pack
+        .dropped_sections
+        .iter()
+        .any(|d| d.starts_with("quota:"));
+    pack.exceeded_soft_budget = pack.tokens > budget;
+    pack.truncated = pack.hard_truncated || pack.exceeded_soft_budget;
+}
+
+// trace:exempt reason=internal-detail
+fn quota_bucket(title: &str) -> usize {
+    match title {
+        "TASK"
+        | "SYSTEM ROLE"
+        | "RELEVANT COMPONENTS"
+        | "DATA OWNERSHIP"
+        | "LOCUS"
+        | "IDENTITY"
+        | "COMPONENTS" => 0,
+        "UPSTREAM" | "DOWNSTREAM" | "CONTRACTS" => 1,
+        "IMPLEMENTATION" => 2,
+        "PRIMARY FLOW" | "SECONDARY FLOWS" | "FLOWS" => 3,
+        "TESTS" | "INVARIANTS" => 4,
+        _ => 5,
+    }
+}
+
 fn assemble(sections: &[Section]) -> String {
     let mut out = String::new();
     for s in sections {
@@ -122,18 +192,13 @@ fn component_short(view: &TrustedGraphView, id: &str) -> String {
     name.to_string()
 }
 
-fn format_evidence_tags(
-    ctx: &ContextCompiler,
-    entity_ids: &[String],
-) -> String {
+// trace:exempt reason=internal-detail
+fn format_evidence_tags(ctx: &ContextCompiler, entity_ids: &[String]) -> String {
     let counts = ctx.evidence_summary(entity_ids);
     if counts.is_empty() {
         return String::new();
     }
-    let mut parts: Vec<String> = counts
-        .iter()
-        .map(|(k, v)| format!("{v} {k}"))
-        .collect();
+    let mut parts: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
     parts.sort();
     format!("[evidence: {}]", parts.join(", "))
 }
@@ -363,6 +428,7 @@ pub fn task(
 }
 
 /// `task` with optional semantic scorer + reranker (SCC-071).
+// trace:exempt reason=internal-detail
 pub fn task_with_rankers(
     ctx: &ContextCompiler,
     goal: &str,
@@ -375,15 +441,27 @@ pub fn task_with_rankers(
     let mut pack = ContextPack::new("task", &ctx.revision());
     let goal_terms = terms(goal);
 
+    let locus = resolve_goal_loci(ctx, goal);
+    let mut files_buf: Vec<String> = files.to_vec();
+    let mut symbols_buf: Vec<String> = symbols.to_vec();
+    if let Some(loc) = &locus {
+        for f in &loc.files {
+            if !files_buf.iter().any(|x| x == f) {
+                files_buf.push(f.clone());
+            }
+        }
+        for s in &loc.symbols {
+            if !symbols_buf.iter().any(|x| x == s) {
+                symbols_buf.push(s.clone());
+            }
+        }
+    }
+    let files = files_buf.as_slice();
+    let symbols = symbols_buf.as_slice();
+
     // ---- candidate generation ----
     let candidates = crate::rank::collect_lexical_candidates_full(
-        ctx.store,
-        &ctx.view,
-        goal,
-        symbols,
-        24,
-        scorer,
-        reranker,
+        ctx.store, &ctx.view, goal, symbols, 24, scorer, reranker,
     );
     let entity_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
 
@@ -394,20 +472,24 @@ pub fn task_with_rankers(
             symbol_files.insert(e.id.clone(), f.to_string());
         }
     }
-    // component containing each file
-    let mut file_component: HashMap<String, String> = HashMap::new();
+    // Every component that CONTAINS a file: merged clusters *and* member
+    // regions. Last-write-wins hid `root`/`services` after type narrowing
+    // merged them into `root+services`.
+    let mut file_components: HashMap<String, BTreeSet<String>> = HashMap::new();
     for c in ctx.store.components().unwrap_or_default() {
         for r in ctx.view.out_pred(&c.id, scc_core::predicates::CONTAINS) {
-            file_component.insert(r.object.clone(), c.id.clone());
+            file_components
+                .entry(r.object.clone())
+                .or_default()
+                .insert(c.id.clone());
         }
     }
-    // symbol -> component
-    let mut symbol_component: HashMap<String, String> = HashMap::new();
+    let mut symbol_components: HashMap<String, BTreeSet<String>> = HashMap::new();
     for (sid, f) in &symbol_files {
-        if let Some(cid) = file_component
-            .get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f))
+        if let Some(cids) =
+            file_components.get(&entity_id(&ctx.view.graph.repo_id, kinds::FILE, f))
         {
-            symbol_component.insert(sid.clone(), cid.clone());
+            symbol_components.insert(sid.clone(), cids.clone());
         }
     }
 
@@ -415,14 +497,14 @@ pub fn task_with_rankers(
     let mut affected_comps: BTreeSet<String> = BTreeSet::new();
     for c in &candidates {
         if c.kind == kinds::SYMBOL {
-            if let Some(cid) = symbol_component.get(&c.id) {
-                affected_comps.insert(cid.clone());
+            if let Some(cids) = symbol_components.get(&c.id) {
+                affected_comps.extend(cids.iter().cloned());
             }
         } else if c.kind == kinds::COMPONENT {
             affected_comps.insert(c.id.clone());
         } else if c.kind == kinds::FILE {
-            if let Some(cid) = file_component.get(&c.id) {
-                affected_comps.insert(cid.clone());
+            if let Some(cids) = file_components.get(&c.id) {
+                affected_comps.extend(cids.iter().cloned());
             }
         } else if c.kind == kinds::ROUTE {
             if let Some(h) = ctx
@@ -431,16 +513,16 @@ pub fn task_with_rankers(
                 .and_then(|e| e.attributes.get("handler"))
                 .and_then(|v| v.as_str())
             {
-                if let Some(cid) = symbol_component.get(h) {
-                    affected_comps.insert(cid.clone());
+                if let Some(cids) = symbol_components.get(h) {
+                    affected_comps.extend(cids.iter().cloned());
                 }
             }
         }
     }
     for f in files {
         let fid = entity_id(&ctx.view.graph.repo_id, kinds::FILE, f);
-        if let Some(cid) = file_component.get(&fid) {
-            affected_comps.insert(cid.clone());
+        if let Some(cids) = file_components.get(&fid) {
+            affected_comps.extend(cids.iter().cloned());
         }
     }
 
@@ -484,9 +566,9 @@ pub fn task_with_rankers(
 
     // contracts: routes handled by symbols in affected comps
     let mut contracts: BTreeSet<String> = BTreeSet::new();
-    let affected_syms: HashSet<&String> = symbol_component
+    let affected_syms: HashSet<&String> = symbol_components
         .iter()
-        .filter(|(_, c)| affected_comps.contains(*c))
+        .filter(|(_, cids)| cids.iter().any(|c| affected_comps.contains(c)))
         .map(|(s, _)| s)
         .collect();
     for sid in &affected_syms {
@@ -520,44 +602,8 @@ pub fn task_with_rankers(
         }
     }
 
-    // tests exercising affected symbols, plus tests whose file imports an
-    // affected file (the test may exercise behavior through imports that
-    // token-matching misses)
-    let mut tests: BTreeSet<String> = BTreeSet::new();
-    for sid in &affected_syms {
-        for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
-            tests.insert(r.object.clone());
-        }
-    }
-    {
-        let affected_files: BTreeSet<String> = affected_syms
-            .iter()
-            .filter_map(|sid| {
-                ctx.view
-                    .entity(sid.as_str())
-                    .and_then(|e| e.attributes.get("file"))
-                    .and_then(|v| v.as_str())
-                    .map(|f| f.to_string())
-            })
-            .collect();
-        for (id, _name, file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
-            if affected_files.is_empty() {
-                break;
-            }
-            let imports = ctx.store.imports_in_file(&file).unwrap_or_default();
-            let hits_affected = imports.iter().any(|(module, _names, _line, _typ)| {
-                let target = resolve_module_ref(&file, module);
-                affected_files.iter().any(|f| {
-                    *f == target
-                        || f.starts_with(&format!("{target}."))
-                        || *f == format!("{target}/__init__.py")
-                })
-            });
-            if hits_affected {
-                tests.insert(id.clone());
-            }
-        }
-    }
+    // tests_to_run: each test carries why it was selected
+    let tests = collect_tests_to_run(ctx, &affected_syms, &affected_comps, &owned_stores);
 
     // retries/failures in affected components
     let mut retries: Vec<String> = Vec::new();
@@ -588,11 +634,12 @@ pub fn task_with_rankers(
     };
     sections.push(Section::new(
         "TASK",
-        format!(
-            "Goal: {goal}\nExplicit files: {files_disp}\nExplicit symbols: {symbols_disp}",
-        ),
+        format!("Goal: {goal}\nExplicit files: {files_disp}\nExplicit symbols: {symbols_disp}",),
         10,
     ));
+    if let Some(loc) = &locus {
+        sections.push(Section::new("LOCUS", loc.body.clone(), 9));
+    }
 
     // SYSTEM ROLE
     let purpose = ctx
@@ -716,8 +763,18 @@ pub fn task_with_rankers(
             .in_pred(store_id, scc_core::predicates::WRITES)
             .into_iter()
             .map(|r| {
-                let comp = symbol_component.get(&r.subject).cloned();
-                comp.map(|c| component_short(&ctx.view, &c))
+                symbol_components
+                    .get(&r.subject)
+                    .map(|cids| {
+                        let mut names: Vec<String> = cids
+                            .iter()
+                            .map(|c| component_short(&ctx.view, c))
+                            .collect();
+                        names.sort();
+                        names.dedup();
+                        names.join(", ")
+                    })
+                    .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| entity_name(&ctx.view, &r.subject))
             })
             .collect();
@@ -783,10 +840,7 @@ pub fn task_with_rankers(
                 .and_then(|i| i.get("paths"))
                 .and_then(|p| p.as_array())
             {
-                let ps: Vec<&str> = paths
-                    .iter()
-                    .filter_map(|p| p.as_str())
-                    .collect();
+                let ps: Vec<&str> = paths.iter().filter_map(|p| p.as_str()).collect();
                 if !ps.is_empty() {
                     impl_body.push_str(&format!("{}: {}\n", c.name, ps.join(", ")));
                 }
@@ -814,23 +868,10 @@ pub fn task_with_rankers(
         sections.push(Section::new("IMPLEMENTATION", impl_body, 7));
     }
 
-    // TESTS (with file locations so the agent can open them directly)
+    // TESTS TO RUN (with file locations and reasons)
     let mut test_body = String::new();
-    for tid in &tests {
-        let file = ctx
-            .view
-            .entity(tid)
-            .and_then(|e| e.attributes.get("file"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if file.is_empty() {
-            test_body.push_str(&format!("- {}\n", entity_name(&ctx.view, tid)));
-        } else {
-            test_body.push_str(&format!(
-                "- {} ({file})\n",
-                entity_name(&ctx.view, tid)
-            ));
-        }
+    for (tid, reasons) in &tests {
+        test_body.push_str(&format_test_to_run(ctx, tid, reasons));
     }
     if !test_body.is_empty() {
         sections.push(Section::new("TESTS", test_body, 7));
@@ -862,9 +903,9 @@ pub fn task_with_rankers(
         }
     }
     ids.extend(downstream.iter().cloned());
-    ids.extend(tests.iter().cloned());
+    ids.extend(tests.keys().cloned());
     // the files containing included tests (agents must find them)
-    for tid in &tests {
+    for tid in tests.keys() {
         if let Some(f) = ctx
             .view
             .entity(tid)
@@ -887,6 +928,31 @@ pub fn task_with_rankers(
     }
     sections.push(Section::new("EVIDENCE STATUS", ev_body, 5));
 
+    let analysis_quality = ctx
+        .store
+        .meta_get("analysis_quality")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<scc_core::AnalysisQuality>(&s).ok());
+    if let Some(ref q) = analysis_quality {
+        sections.push(Section::new("ANALYSIS QUALITY", q.compact_line() + "\n", 4));
+    }
+
+    // Compact fetch keys (handles) survive after bodies are dropped.
+    // Not a fifth context level — lazy Level-3 identity, not extra ontology.
+    let fetch = fetch_handle_list(ctx, files, &candidates);
+    if !fetch.is_empty() {
+        sections.push(Section::new("FETCH", fetch, 8));
+    }
+
+    // Exact source last: bodies fill leftover budget and are the first
+    // section dropped. Never a fifth context level — this is Level 3
+    // inside Task Context, after semantic sections.
+    let exact = exact_source_tail(ctx, files, &candidates);
+    if !exact.is_empty() {
+        sections.push(Section::new("EXACT SOURCE", exact, 1));
+    }
+
     let warnings = ctx_warnings(ctx);
     let stale_note = ctx
         .stale_paths
@@ -898,9 +964,113 @@ pub fn task_with_rankers(
 
     pack.entity_ids = ids;
     pack.evidence_summary = ev_summary;
-    finish(&mut pack, sections, budget, all_warnings);
+    pack.analysis_quality = analysis_quality;
+    match ctx.settings.pack_allocator {
+        crate::PackAllocator::AdaptivePriority => {
+            finish(&mut pack, sections, budget, all_warnings);
+        }
+        crate::PackAllocator::FixedRollover => {
+            finish_with_rollover(&mut pack, sections, budget, all_warnings);
+        }
+    }
     pack.compression_policy = Some(compression_policy(goal));
     pack
+}
+
+const EXACT_SOURCE_FILES: usize = 6;
+const EXACT_SOURCE_LINES: usize = 40;
+const FETCH_HANDLE_FILES: usize = 12;
+
+/// Compact `path handle=scc://...` lines so agents can lazy-fetch exact
+/// source and refuse stale hashes. Survives after EXACT SOURCE bodies drop.
+// trace:v1 id=impl.scc.context.fetch-handles work=WORK-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as satisfies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei implements=PLAN-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as
+fn fetch_handle_list(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+) -> String {
+    let paths = collect_task_paths(ctx, files, candidates, FETCH_HANDLE_FILES);
+    let mut body = String::new();
+    for path in &paths {
+        let handle = file_handle(ctx, path);
+        body.push_str(&format!("- {path} handle={handle}\n"));
+    }
+    body
+}
+
+// trace:exempt reason=internal-detail
+fn collect_task_paths(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+    cap: usize,
+) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut push = |p: &str| {
+        if p.is_empty() {
+            return;
+        }
+        if !paths.iter().any(|x| x == p) {
+            paths.push(p.to_string());
+        }
+    };
+    for f in files {
+        if !crate::repo_path::is_repo_relative(f) {
+            continue;
+        }
+        push(f);
+    }
+    for c in candidates {
+        if c.kind != kinds::SYMBOL {
+            continue;
+        }
+        if let Some(f) = ctx
+            .view
+            .entity(&c.id)
+            .and_then(|e| e.attributes.get("file"))
+            .and_then(|v| v.as_str())
+        {
+            push(f);
+        }
+    }
+    paths.truncate(cap);
+    paths
+}
+
+/// Level-3 exact excerpts for Task Context. Truncation is disclosed
+/// (`shown=`/`total=`/`capped=`). Priority 1 so semantic sections win.
+// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
+fn exact_source_tail(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+) -> String {
+    let paths = collect_task_paths(ctx, files, candidates, EXACT_SOURCE_FILES);
+    let mut body = String::new();
+    let root = &ctx.store.root;
+    for path in &paths {
+        let Some(text) = crate::repo_path::read_repo_text(root, path) else {
+            continue;
+        };
+        let total = text.lines().count();
+        if total == 0 {
+            continue;
+        }
+        let shown = total.min(EXACT_SOURCE_LINES);
+        let capped = u8::from(shown < total);
+        let handle = file_handle(ctx, path);
+        body.push_str(&format!(
+            "# {path} handle={handle} shown={shown} total={total} capped={capped}\n"
+        ));
+        for (i, line) in text.lines().enumerate() {
+            if i >= shown {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    body
 }
 
 /// RTK output-compression policy derived from the task (docs §49/§11):
@@ -940,6 +1110,7 @@ fn compression_policy(goal: &str) -> serde_json::Value {
 // component_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     let mut pack = ContextPack::new("component", &ctx.revision());
     let comp = ctx
@@ -949,10 +1120,9 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .into_iter()
         .find(|c| c.id == id_or_name || c.name == id_or_name);
     let Some(comp) = comp else {
-        pack.content = format!(
-            "# COMPONENT NOT FOUND\nNo component matches '{id_or_name}'.\n"
-        );
-        pack.warnings.push(format!("unknown component: {id_or_name}"));
+        pack.content = format!("# COMPONENT NOT FOUND\nNo component matches '{id_or_name}'.\n");
+        pack.warnings
+            .push(format!("unknown component: {id_or_name}"));
         return pack;
     };
     pack.entity_ids.push(comp.id.clone());
@@ -975,7 +1145,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "RESPONSIBILITY",
-        if resp.is_empty() { "(none)".into() } else { format!("{}\n", resp.join("\n")) },
+        if resp.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", resp.join("\n"))
+        },
         10,
     ));
 
@@ -984,14 +1158,22 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .get("implementation")
         .and_then(|i| i.get("paths"))
         .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let symbols: Vec<String> = comp
         .attributes
         .get("implementation")
         .and_then(|i| i.get("symbols"))
         .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let mut impl_body = String::new();
     if !paths.is_empty() {
@@ -1014,7 +1196,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "OWNS",
-        if owned.is_empty() { "(none)".into() } else { format!("{}\n", owned.join(", ")) },
+        if owned.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", owned.join(", "))
+        },
         10,
     ));
 
@@ -1034,7 +1220,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .unwrap_or_default();
     sections.push(Section::new(
         "DEPENDS_ON",
-        if deps.is_empty() { "(none)".into() } else { format!("{}\n", deps.join("\n")) },
+        if deps.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", deps.join("\n"))
+        },
         8,
     ));
 
@@ -1042,7 +1232,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         .attributes
         .get("retries")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     if !retries.is_empty() {
         sections.push(Section::new(
@@ -1056,7 +1250,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     let mut flows: Vec<String> = Vec::new();
     for f in &ctx.view.flows() {
         if f.steps.iter().any(|s| s.actor.contains(&comp.id)) {
-            flows.push(format!("- {} [{}]", f.name, f.trigger.clone().unwrap_or_default()));
+            flows.push(format!(
+                "- {} [{}]",
+                f.name,
+                f.trigger.clone().unwrap_or_default()
+            ));
         }
     }
     if !flows.is_empty() {
@@ -1077,11 +1275,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
     tests.sort();
     tests.dedup();
     if !tests.is_empty() {
-        sections.push(Section::new(
-            "TESTS",
-            format!("{}\n", tests.join("\n")),
-            7,
-        ));
+        sections.push(Section::new("TESTS", format!("{}\n", tests.join("\n")), 7));
     }
 
     sections.push(Section::new(
@@ -1098,6 +1292,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 // flow_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
     let flows = ctx.view.flows();
     let Some(f) = flows.iter().find(|f| f.id == fid) else {
@@ -1146,10 +1341,7 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
         if ev_tags.is_empty() {
             body.push_str("(none)");
         } else {
-            let parts: Vec<String> = ev_tags
-                .iter()
-                .map(|(k, v)| format!("{v} {k}"))
-                .collect();
+            let parts: Vec<String> = ev_tags.iter().map(|(k, v)| format!("{v} {k}")).collect();
             body.push_str(&parts.join(", "));
         }
         body.push('\n');
@@ -1192,6 +1384,7 @@ pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
 // impact_context
 // ---------------------------------------------------------------------------
 
+// trace:v1 id=impl.scc.context.impact-forgotten work=WORK-ripwire-lessons-phase6 satisfies=REQ-forgotten-impact-partners
 pub fn impact(
     ctx: &ContextCompiler,
     files: &[String],
@@ -1302,18 +1495,22 @@ pub fn impact(
         .collect();
     sections.push(Section::new(
         "CONTRACTS",
-        if contracts.is_empty() { "(none)".into() } else { format!("{}\n", contracts.join(", ")) },
+        if contracts.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", contracts.join(", "))
+        },
         9,
     ));
 
-    let data: Vec<String> = imp
-        .data
-        .iter()
-        .map(|d| entity_name(&ctx.view, d))
-        .collect();
+    let data: Vec<String> = imp.data.iter().map(|d| entity_name(&ctx.view, d)).collect();
     sections.push(Section::new(
         "DATA",
-        if data.is_empty() { "(none)".into() } else { format!("{}\n", data.join(", ")) },
+        if data.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", data.join(", "))
+        },
         9,
     ));
 
@@ -1344,11 +1541,29 @@ pub fn impact(
         .collect();
     sections.push(Section::new(
         "TESTS",
-        if tests.is_empty() { "(none)".into() } else { format!("{}\n", tests.join(", ")) },
+        if tests.is_empty() {
+            "(none)".into()
+        } else {
+            format!("{}\n", tests.join(", "))
+        },
         7,
     ));
 
-    sections.push(Section::new("RISK", format!("{}\n", imp.risk.to_uppercase()), 10));
+    sections.push(Section::new(
+        "RISK",
+        format!("{}\n", imp.risk.to_uppercase()),
+        10,
+    ));
+    if !imp.forgotten_partners.is_empty() {
+        let mut body = String::new();
+        for p in &imp.forgotten_partners {
+            body.push_str(&format!(
+                "{} ({} ×{} with {}) — historical; not EXTRACTED impact\n",
+                p.partner, p.reason, p.commits, p.file
+            ));
+        }
+        sections.push(Section::new("FORGOTTEN PARTNERS", body, 6));
+    }
     if !imp.notes.is_empty() {
         sections.push(Section::new(
             "NOTES",
@@ -1366,6 +1581,7 @@ pub fn impact(
 // verify_context
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
 pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     let mut pack = ContextPack::new("verify", &ctx.revision());
     let mut sections: Vec<Section> = Vec::new();
@@ -1432,13 +1648,19 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
         if !known(&r.subject) {
             dangling += 1;
             if dangling <= 5 {
-                inv.push_str(&format!("dangling subject: {} — {}\n", r.subject, r.predicate));
+                inv.push_str(&format!(
+                    "dangling subject: {} — {}\n",
+                    r.subject, r.predicate
+                ));
             }
         }
         if !known(&r.object) {
             dangling += 1;
             if dangling <= 5 {
-                inv.push_str(&format!("dangling object: {} — {}\n", r.predicate, r.object));
+                inv.push_str(&format!(
+                    "dangling object: {} — {}\n",
+                    r.predicate, r.object
+                ));
             }
         }
     }
@@ -1450,9 +1672,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
             no_evidence += 1;
         }
     }
-    inv.push_str(&format!(
-        "RESOLVED facts without evidence: {no_evidence}\n"
-    ));
+    inv.push_str(&format!("RESOLVED facts without evidence: {no_evidence}\n"));
     // 3. critical invariants unenforced
     let unenforced = ctx
         .view
@@ -1460,7 +1680,9 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
         .iter()
         .filter(|i| i.severity == Severity::Critical && i.enforced_by.is_empty())
         .count();
-    inv.push_str(&format!("Critical invariants without enforcing tests: {unenforced}\n"));
+    inv.push_str(&format!(
+        "Critical invariants without enforcing tests: {unenforced}\n"
+    ));
     // 4. inferred claims
     let inferred = ctx
         .view
@@ -1563,6 +1785,242 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     pack
 }
 
+// trace:exempt reason=internal-detail
+struct LocusHits {
+    files: Vec<String>,
+    symbols: Vec<String>,
+    body: String,
+}
+
+/// Map stack/error FILE:LINE frames onto indexed files and innermost symbols.
+// trace:v1 id=impl.scc.context.stack-locus work=WORK-ripwire-lessons-phase3 satisfies=REQ-stack-locus-ingest
+fn resolve_goal_loci(ctx: &crate::ContextCompiler, goal: &str) -> Option<LocusHits> {
+    let plan = route_query(goal);
+    if !plan.prefer_locus || plan.loci.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for loc in &plan.loci {
+        let mapped_file = ctx
+            .view
+            .entities_of_kind(kinds::FILE)
+            .into_iter()
+            .map(|e| e.name.clone())
+            .find(|p| path_matches_locus(p, &loc.path));
+        let mapped_file = mapped_file.or_else(|| {
+            ctx.view
+                .entities_of_kind(kinds::SYMBOL)
+                .into_iter()
+                .find_map(|e| {
+                    e.attributes
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .filter(|p| path_matches_locus(p, &loc.path))
+                        .map(|p| p.to_string())
+                })
+        });
+        match mapped_file {
+            None => {
+                body.push_str(&format!(
+                    "- {}:{} — unmapped (not fabricated)\n",
+                    loc.path, loc.line
+                ));
+            }
+            Some(path) => {
+                if !files.iter().any(|f| f == &path) {
+                    files.push(path.clone());
+                }
+                let enclosed = innermost_enclosing_symbol(ctx, &path, loc.line);
+                if let Some(name) = &enclosed {
+                    if !symbols.iter().any(|s| s == name) {
+                        symbols.push(name.clone());
+                    }
+                }
+                match enclosed {
+                    Some(name) => {
+                        body.push_str(&format!("- {path}:{} → symbol {name}\n", loc.line))
+                    }
+                    None => body.push_str(&format!(
+                        "- {path}:{} → file (no enclosing symbol)\n",
+                        loc.line
+                    )),
+                }
+            }
+        }
+    }
+    Some(LocusHits {
+        files,
+        symbols,
+        body,
+    })
+}
+
+// trace:exempt reason=internal-detail
+fn innermost_enclosing_symbol(
+    ctx: &crate::ContextCompiler,
+    file: &str,
+    line: u32,
+) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for e in ctx.view.entities_of_kind(kinds::SYMBOL) {
+        let Some(f) = e.attributes.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !path_matches_locus(f, file) && f != file {
+            continue;
+        }
+        let start = e
+            .attributes
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let end = e
+            .attributes
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(start)) as u32;
+        if start == 0 || line < start || line > end {
+            continue;
+        }
+        let span = end.saturating_sub(start);
+        if best.as_ref().map(|(s, _)| span < *s).unwrap_or(true) {
+            best = Some((span, e.name.clone()));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// tests_to_run: test id → reasons (`direct`, `import`, `contract`, `state`).
+// trace:v1 id=impl.scc.context.tests-to-run work=WORK-ripwire-lessons-phase3 satisfies=REQ-tests-to-run-reasons,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
+fn collect_tests_to_run(
+    ctx: &crate::ContextCompiler,
+    affected_syms: &HashSet<&String>,
+    affected_comps: &BTreeSet<String>,
+    owned_stores: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<&'static str>> {
+    let mut tests: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    for sid in affected_syms {
+        for r in ctx.view.out_pred(sid, scc_core::predicates::TESTED_BY) {
+            tests.entry(r.object.clone()).or_default().insert("direct");
+        }
+        for pred in [
+            scc_core::predicates::HANDLES,
+            scc_core::predicates::IMPLEMENTS,
+        ] {
+            for r in ctx.view.out_pred(sid, pred) {
+                let Some(target) = ctx.view.entity(&r.object) else {
+                    continue;
+                };
+                if target.kind != kinds::CONTRACT && target.kind != kinds::ROUTE {
+                    continue;
+                }
+                for t in ctx
+                    .view
+                    .out_pred(&r.object, scc_core::predicates::TESTED_BY)
+                {
+                    tests
+                        .entry(t.object.clone())
+                        .or_default()
+                        .insert("contract");
+                }
+            }
+        }
+    }
+    let affected_files: BTreeSet<String> = affected_syms
+        .iter()
+        .filter_map(|sid| {
+            ctx.view
+                .entity(sid.as_str())
+                .and_then(|e| e.attributes.get("file"))
+                .and_then(|v| v.as_str())
+                .map(|f| f.to_string())
+        })
+        .collect();
+    if !affected_files.is_empty() {
+        for (id, _name, file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
+            let imports = ctx.store.imports_in_file(&file).unwrap_or_default();
+            let hits_affected = imports.iter().any(|(module, _names, _line, _typ)| {
+                let target = resolve_module_ref(&file, module);
+                affected_files.iter().any(|f| {
+                    *f == target
+                        || f.starts_with(&format!("{target}."))
+                        || *f == format!("{target}/__init__.py")
+                })
+            });
+            if hits_affected {
+                tests.entry(id).or_default().insert("import");
+            }
+        }
+    }
+    let mut state_ids: BTreeSet<String> = BTreeSet::new();
+    for sid in owned_stores {
+        if is_state_like(ctx.view.entity(sid).map(|e| e.kind.as_str())) {
+            state_ids.insert(sid.clone());
+        }
+    }
+    for cid in affected_comps {
+        for r in ctx.view.out_pred(cid, scc_core::predicates::OWNS) {
+            if is_state_like(ctx.view.entity(&r.object).map(|e| e.kind.as_str())) {
+                state_ids.insert(r.object.clone());
+            }
+        }
+    }
+    if !state_ids.is_empty() {
+        for (id, _name, _file, _kind, _sym) in ctx.store.tests().unwrap_or_default() {
+            let reads = ctx
+                .view
+                .out_pred(&id, scc_core::predicates::READS)
+                .iter()
+                .any(|r| state_ids.contains(&r.object));
+            let writes = ctx
+                .view
+                .out_pred(&id, scc_core::predicates::WRITES)
+                .iter()
+                .any(|r| state_ids.contains(&r.object));
+            if reads || writes {
+                tests.entry(id).or_default().insert("state");
+            }
+        }
+    }
+    tests
+}
+
+// trace:exempt reason=internal-detail
+fn is_state_like(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some(kinds::STATE)
+            | Some(kinds::DATA_STORE)
+            | Some(kinds::DATA_ENTITY)
+            | Some(kinds::TABLE)
+            | Some(kinds::COLLECTION)
+            | Some(kinds::CACHE)
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn format_test_to_run(
+    ctx: &crate::ContextCompiler,
+    tid: &str,
+    reasons: &BTreeSet<&'static str>,
+) -> String {
+    let name = entity_name(&ctx.view, tid);
+    let file = ctx
+        .view
+        .entity(tid)
+        .and_then(|e| e.attributes.get("file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let why = reasons.iter().copied().collect::<Vec<_>>().join(", ");
+    if file.is_empty() {
+        format!("- {name} — {why}\n")
+    } else {
+        format!("- {name} ({file}) — {why}\n")
+    }
+}
+
 /// Resolve a module specifier (relative or dotted) to a repo-relative path
 /// prefix, mirroring the indexer's import normalization.
 fn resolve_module_ref(from_file: &str, module: &str) -> String {
@@ -1605,5 +2063,542 @@ fn severity_str(s: Severity) -> &'static str {
         Severity::Medium => "medium",
         Severity::High => "high",
         Severity::Critical => "critical",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scc_core::{Entity, Provenance, Relationship};
+    use scc_store::Store;
+
+    #[test]
+    // trace:v1 id=test.scc.context.task-files-sandbox verifies=REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.context.repo-sandbox,impl.scc.context.exact-source-last
+    fn task_context_files_stay_inside_the_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.py"), "IN_REPO = 1\n").unwrap();
+        std::fs::write(dir.path().join("secret.py"), "OUTSIDE_SECRET = 1\n").unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let body = exact_source_tail(
+            &ctx,
+            &[
+                "ok.py".into(),
+                "../secret.py".into(),
+                "/etc/passwd".into(),
+            ],
+            &[],
+        );
+        assert!(body.contains("IN_REPO"), "{body}");
+        assert!(!body.contains("OUTSIDE_SECRET"), "{body}");
+        assert!(!body.contains("/etc/passwd"), "{body}");
+        assert!(!body.contains("secret.py"), "{body}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_direct_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:fn".to_string();
+        let tid = "t:test_fn".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_handle_list");
+        te.attr("file", serde_json::json!("tests/test_a.py"));
+        store
+            .insert_entity(&te, &["tests/test_a.py".into()])
+            .unwrap();
+        let rel = Relationship::new(
+            "rel:tb",
+            sid.clone(),
+            scc_core::predicates::TESTED_BY,
+            tid.clone(),
+            Provenance::Extracted,
+        );
+        store.insert_relationship(&rel, "src/a.py").unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found
+            .get(&tid)
+            .expect("direct TESTED_BY must list the test");
+        assert!(reasons.contains("direct"));
+        let line = format_test_to_run(&ctx, &tid, reasons);
+        assert!(line.contains("direct"), "{line}");
+        assert!(line.contains("test_handle_list"), "{line}");
+        assert!(line.contains("tests/test_a.py"), "{line}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-import verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_import_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:fn".to_string();
+        let tid = "t:import_test".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_via_import");
+        te.attr("file", serde_json::json!("tests/test_a.py"));
+        store
+            .insert_entity(&te, &["tests/test_a.py".into()])
+            .unwrap();
+        store
+            .insert_test(&tid, "test_via_import", "tests/test_a.py", "unit", None)
+            .unwrap();
+        store
+            .insert_imports(
+                "tests/test_a.py",
+                &[("src.a".into(), vec![], 1, "module".into())],
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found
+            .get(&tid)
+            .expect("import of affected file must list the test");
+        assert!(reasons.contains("import"));
+        assert!(!reasons.contains("direct"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-contract verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_contract_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let sid = "s:handler".to_string();
+        let cid = "c:list".to_string();
+        let tid = "t:contract".to_string();
+        let mut se = Entity::new(&sid, kinds::SYMBOL, "handleList");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        store
+            .insert_entity(
+                &Entity::new(&cid, kinds::CONTRACT, "GET /list"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_list_route");
+        te.attr("file", serde_json::json!("tests/test_routes.py"));
+        store
+            .insert_entity(&te, &["tests/test_routes.py".into()])
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:h",
+                    sid.clone(),
+                    scc_core::predicates::HANDLES,
+                    cid.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:ct",
+                    cid.clone(),
+                    scc_core::predicates::TESTED_BY,
+                    tid.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_routes.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let affected: HashSet<&String> = [&sid].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &affected, &BTreeSet::new(), &BTreeSet::new());
+        let reasons = found
+            .get(&tid)
+            .expect("contract TESTED_BY must list the test");
+        assert!(reasons.contains("contract"));
+        assert!(!reasons.contains("direct"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-state verifies=REQ-tests-to-run-reasons exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_state_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let comp = "comp:orders".to_string();
+        let st = "state:orders_db".to_string();
+        let tid = "t:state".to_string();
+        store
+            .insert_entity(
+                &Entity::new(&comp, kinds::COMPONENT, "orders"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_entity(
+                &Entity::new(&st, kinds::STATE, "orders_db"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_orders_state");
+        te.attr("file", serde_json::json!("tests/test_state.py"));
+        store
+            .insert_entity(&te, &["tests/test_state.py".into()])
+            .unwrap();
+        store
+            .insert_test(
+                &tid,
+                "test_orders_state",
+                "tests/test_state.py",
+                "unit",
+                None,
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:owns",
+                    comp.clone(),
+                    scc_core::predicates::OWNS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:rd",
+                    tid.clone(),
+                    scc_core::predicates::READS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_state.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let comps: BTreeSet<String> = [comp].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &HashSet::new(), &comps, &BTreeSet::new());
+        let reasons = found.get(&tid).expect("state READS must list the test");
+        assert!(reasons.contains("state"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.tests-to-run-store verifies=REQ-tests-to-run-reasons,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.context.tests-to-run
+    fn tests_to_run_records_state_reason_for_data_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let comp = "comp:orders".to_string();
+        let st = "store:orders_db".to_string();
+        let tid = "t:store".to_string();
+        store
+            .insert_entity(
+                &Entity::new(&comp, kinds::COMPONENT, "orders"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_entity(
+                &Entity::new(&st, kinds::DATA_STORE, "orders_db"),
+                &["src/a.py".into()],
+            )
+            .unwrap();
+        let mut te = Entity::new(&tid, kinds::TEST, "test_orders_store");
+        te.attr("file", serde_json::json!("tests/test_store.py"));
+        store
+            .insert_entity(&te, &["tests/test_store.py".into()])
+            .unwrap();
+        store
+            .insert_test(
+                &tid,
+                "test_orders_store",
+                "tests/test_store.py",
+                "unit",
+                None,
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:owns-store",
+                    comp.clone(),
+                    scc_core::predicates::OWNS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "src/a.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:rd-store",
+                    tid.clone(),
+                    scc_core::predicates::READS,
+                    st.clone(),
+                    Provenance::Extracted,
+                ),
+                "tests/test_store.py",
+            )
+            .unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let comps: BTreeSet<String> = [comp].into_iter().collect();
+        let found = collect_tests_to_run(&ctx, &HashSet::new(), &comps, &BTreeSet::new());
+        let reasons = found.get(&tid).expect("store READS must list the test");
+        assert!(reasons.contains("state"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.stack-locus verifies=REQ-stack-locus-ingest exercises=impl.scc.context.stack-locus
+    fn stack_locus_seeds_file_and_innermost_symbol() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def inner():\n    x = 1\n").unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let fe = Entity::new("f:app", kinds::FILE, "src/app.py");
+        store.insert_entity(&fe, &["src/app.py".into()]).unwrap();
+        let mut outer = Entity::new("s:outer", kinds::SYMBOL, "outer");
+        outer.attr("file", serde_json::json!("src/app.py"));
+        outer.attr("start_line", serde_json::json!(1u32));
+        outer.attr("end_line", serde_json::json!(20u32));
+        store.insert_entity(&outer, &["src/app.py".into()]).unwrap();
+        let mut inner = Entity::new("s:inner", kinds::SYMBOL, "inner");
+        inner.attr("file", serde_json::json!("src/app.py"));
+        inner.attr("start_line", serde_json::json!(10u32));
+        inner.attr("end_line", serde_json::json!(12u32));
+        store.insert_entity(&inner, &["src/app.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let goal = "Traceback (most recent call last):\n  File \"src/app.py\", line 11, in inner\nValueError: boom\n";
+        let hits = resolve_goal_loci(&ctx, goal).expect("locus");
+        assert!(hits.files.iter().any(|f| f == "src/app.py"));
+        assert_eq!(hits.symbols, vec!["inner".to_string()]);
+        assert!(hits.body.contains("inner"));
+        let miss = resolve_goal_loci(
+            &ctx,
+            "Traceback (most recent call last):\n  File \"src/missing.py\", line 1, in x\nValueError: x\n",
+        )
+        .unwrap();
+        assert!(miss.body.contains("unmapped"));
+        assert!(miss.files.is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.finish-rollover verifies=REQ-budget-rollover exercises=impl.scc.context.finish-rollover
+    fn finish_with_rollover_discloses_truncated_quota() {
+        let mut pack = ContextPack::new("task", "rev");
+        let huge = "word ".repeat(4000);
+        let sections = vec![
+            Section::new("TASK", "goal\n".into(), 10),
+            Section::new("IMPLEMENTATION", huge, 7),
+        ];
+        finish_with_rollover(&mut pack, sections, 200, Vec::new());
+        assert!(
+            pack.dropped_sections.iter().any(|d| d == "quota:source"),
+            "{:?}",
+            pack.dropped_sections
+        );
+        assert!(pack.truncated);
+        assert!(pack.content.contains("truncated") || pack.hard_truncated);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.impact-forgotten verifies=REQ-forgotten-impact-partners exercises=impl.scc.context.impact-forgotten
+    fn impact_pack_discloses_forgotten_partners_without_merging_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        fn git(root: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "SCC Test"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        for i in 0..2 {
+            std::fs::write(root.join("src/a.py"), format!("a = {i}\n")).unwrap();
+            std::fs::write(root.join("src/b.py"), format!("b = {i}\n")).unwrap();
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let pack = impact(&ctx, &["src/a.py".into()], &[], None);
+        assert!(
+            pack.content.contains("FORGOTTEN PARTNERS"),
+            "missing section: {}",
+            pack.content
+        );
+        assert!(pack.content.contains("src/b.py"), "{}", pack.content);
+        assert!(pack.content.contains("cochange"), "{}", pack.content);
+        assert!(
+            !pack.content.contains("AFFECTED COMPONENTS\nsrc/b.py"),
+            "partner must not become affected: {}",
+            pack.content
+        );
+        assert!(pack.content.contains("historical; not EXTRACTED impact"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.exact-source-last verifies=REQ-exact-source-dominance exercises=impl.scc.context.exact-source-last
+    fn task_pack_puts_exact_source_last_and_drops_it_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "def handle_list():\n    return [1, 2, 3]\n";
+        std::fs::write(root.join("src/a.py"), src).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mut se = Entity::new("s:fn", kinds::SYMBOL, "handle_list");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let fat = task(&ctx, "handle list", &["src/a.py".into()], &[], 50_000);
+        let idx_exact = fat
+            .content
+            .find("EXACT SOURCE")
+            .expect("exact source must appear when budget allows");
+        let idx_task = fat.content.find("TASK").expect("task header");
+        assert!(
+            idx_exact > idx_task,
+            "exact source must follow semantic sections"
+        );
+        assert!(
+            fat.content.contains("shown=2 total=2 capped=0"),
+            "{}",
+            fat.content
+        );
+        assert!(fat.content.contains("def handle_list()"), "{}", fat.content);
+        assert!(
+            fat.content.contains("FETCH") && fat.content.contains("handle=scc://"),
+            "task pack must stamp fetch handles: {}",
+            fat.content
+        );
+        let thin = task(&ctx, "handle list", &["src/a.py".into()], &[], 80);
+        assert!(
+            thin.dropped_sections.iter().any(|s| s == "EXACT SOURCE"),
+            "exact source is priority 1 and must drop first: {:?}",
+            thin.dropped_sections
+        );
+        assert!(
+            !thin.content.contains("EXACT SOURCE"),
+            "dropped exact source must not remain in content: {}",
+            thin.content
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.fetch-handles verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.context.fetch-handles
+    fn task_pack_stamps_fetch_handles_that_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "def handle_list():\n    return [1, 2, 3]\n";
+        std::fs::write(root.join("src/a.py"), src).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mut se = Entity::new("s:fn", kinds::SYMBOL, "handle_list");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let pack = task(&ctx, "handle list", &["src/a.py".into()], &[], 50_000);
+        let handle = pack
+            .content
+            .lines()
+            .find_map(|l| l.split("handle=").nth(1))
+            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string())
+            .expect("handle in FETCH or EXACT SOURCE");
+        assert!(handle.starts_with("scc://"), "{handle}");
+        let resolved =
+            crate::structural_source::resolve_handle_to_path(&root, &handle).expect("fresh handle");
+        assert_eq!(resolved, "src/a.py");
+        let stale = format!(
+            "{}@aaaaaaaaaaaaaaaa",
+            handle.rsplit_once('@').map(|(p, _)| p).unwrap_or(&handle)
+        );
+        let err = crate::structural_source::resolve_handle_to_path(&root, &stale).unwrap_err();
+        assert!(err.contains("stale"), "{err}");
     }
 }

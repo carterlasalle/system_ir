@@ -2,8 +2,8 @@
 //! (lifecycle/workflow), runtime reconciliation, CI checks, and evidence
 //! import/export round trips (docs/EPICS_AND_TICKETS.md EPIC-050/140/160/180).
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 const STATE_MACHINE_PY: &str = r#"
 from enum import Enum

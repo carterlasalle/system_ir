@@ -5,10 +5,13 @@
 //! evidence status, and warnings. STALE facts never enter trusted sections.
 
 pub mod atlas;
+pub mod budget;
 pub mod context_ledger;
 pub mod packs;
 pub mod pagerank;
 pub mod rank;
+pub mod relevance;
+mod repo_path;
 pub mod selector;
 pub mod startup;
 pub mod structural_source;
@@ -41,9 +44,24 @@ pub struct ContextSettings {
     /// configuration so enabling/disabling embeddings invalidates cached
     /// packs.
     pub rank_salt: String,
+    /// Production default is adaptive-priority dropping. FixedRollover is
+    /// the inspectable Ripwire-style allocator; do not switch default
+    /// without ablation.
+    pub pack_allocator: PackAllocator,
 }
 
+/// How task packs spend their token budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// trace:exempt reason=internal-detail
+pub enum PackAllocator {
+    #[default]
+    AdaptivePriority,
+    FixedRollover,
+}
+
+// trace:exempt reason=internal-detail
 impl Default for ContextSettings {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         ContextSettings {
             startup_tokens: 6000,
@@ -51,6 +69,7 @@ impl Default for ContextSettings {
             atlas_tokens: 15000,
             include_low_confidence_inference: false,
             rank_salt: String::new(),
+            pack_allocator: PackAllocator::AdaptivePriority,
         }
     }
 }
@@ -92,6 +111,10 @@ pub struct ContextPack {
     /// what to preserve when compressing shell output for the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_policy: Option<serde_json::Value>,
+    /// Compact analyzer-health summary (machine-readable). Absent when the
+    /// index has not persisted gauges yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_quality: Option<scc_core::AnalysisQuality>,
 }
 
 impl ContextPack {
@@ -111,6 +134,7 @@ impl ContextPack {
             exceeded_soft_budget: false,
             truncated: false,
             compression_policy: None,
+            analysis_quality: None,
         }
     }
 }
@@ -132,6 +156,7 @@ pub struct ContextCompiler<'a> {
     evidence: std::cell::RefCell<Option<std::collections::HashMap<String, scc_core::Evidence>>>,
 }
 
+// trace:exempt reason=internal-detail
 impl<'a> ContextCompiler<'a> {
     pub fn new(
         store: &'a Store,
@@ -299,6 +324,7 @@ impl<'a> ContextCompiler<'a> {
     }
 
     /// `task_context` with optional semantic scorer and reranker (SCC-071).
+    // trace:exempt reason=internal-detail
     pub fn task_context_with_rankers(
         &self,
         goal: &str,
@@ -326,6 +352,10 @@ impl<'a> ContextCompiler<'a> {
             }
             h.update(budget.to_string().as_bytes());
             h.update(self.settings.rank_salt.as_bytes());
+            h.update(match self.settings.pack_allocator {
+                PackAllocator::AdaptivePriority => b"alloc:adaptive",
+                PackAllocator::FixedRollover => b"alloc:rollover",
+            });
             h.update(epoch.as_bytes());
             let mut stale: Vec<&String> = self.stale_paths.iter().collect();
             stale.sort();

@@ -59,6 +59,14 @@ SCOPED_TASKS = canonical_writable_tasks()
 BUDGET = h.DEFAULT_BUDGET
 
 
+def infer_agent_name(agent_cmd):
+    """Basename of argv[0]. A claude command must never be recorded as Codex."""
+    if not agent_cmd or not str(agent_cmd).strip():
+        return "unknown"
+    first = str(agent_cmd).split()[0]
+    return Path(first).name or first
+
+
 NATIVE_SCC_VARIANTS = ("scc-full", "scc-atlas", "scc-surface", "scc-atlas-surface")
 
 INFRA_STATUSES = (
@@ -307,7 +315,7 @@ def main(argv):
         tasks = [t for t in SCOPED_TASKS if t["id"] in wanted]
     variants = tuple(v.strip() for v in args.variants.split(",") if v.strip())
     agent_cmd = args.agent_cmd or WRITABLE_AGENT_CMD
-    agent_label = args.agent_label or agent_cmd.split()[0]
+    agent_label = args.agent_label or infer_agent_name(agent_cmd)
 
     # Reproducibility metadata (§33).
     def _git(cwd, *a):
@@ -327,6 +335,7 @@ def main(argv):
         "model_label": args.model_label,
         "scc_commit": _git(scc_root, "rev-parse", "HEAD"),
         "scc_dirty": bool(_git(scc_root, "status", "--porcelain")),
+        "harness_revision": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
         "benchmark_harness_commit": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
         "tasks_corpus_hash": tasks_hash,
         "evaluators_hash": evaluators_hash,
@@ -427,23 +436,40 @@ def compute_summary(cells, ids, variants):
         }
         for v in variants}
 
-    for other in variants:
-        if other == "raw":
-            continue
-        pair = paired_ids("raw", other)
+    def paired_ci(left, right):
+        pair = paired_ids(left, right)
         if not pair:
-            summary[f"paired_{other}_minus_raw"] = None
-            continue
-        a = [1.0 if cells[f"{other}/{i}"]["task_success"] else 0.0 for i in pair]
-        b = [1.0 if cells[f"raw/{i}"]["task_success"] else 0.0 for i in pair]
+            return None
+        a = [1.0 if cells[f"{left}/{i}"]["task_success"] else 0.0 for i in pair]
+        b = [1.0 if cells[f"{right}/{i}"]["task_success"] else 0.0 for i in pair]
         mean_diff, lo, hi = h.paired_bootstrap_ci(a, b)
-        summary[f"paired_{other}_minus_raw"] = {
+        return {
             "n_paired": len(pair),
             "mean_diff": mean_diff,
             "ci95": [lo, hi],
             "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
                         else "CI excludes zero"),
         }
+
+    for other in variants:
+        if other == "raw":
+            continue
+        summary[f"paired_{other}_minus_raw"] = paired_ci(other, "raw")
+
+    # Write-protocol contract names (SCC minus baseline / aider / repomix).
+    summary["paired_ci_scc_minus_raw"] = paired_ci("scc-full", "raw")
+    summary["paired_ci_scc_minus_aider"] = paired_ci("scc-full", "aider-repomap")
+    summary["paired_ci_scc_minus_repomix"] = paired_ci("scc-full", "repomix-compress")
+
+    micro_vals = []
+    for v in variants:
+        for i in ids:
+            cell = cells.get(f"{v}/{i}")
+            if cell is None or cell.get("error"):
+                continue
+            micro_vals.append(1.0 if cell.get("task_success") else 0.0)
+    summary["micro_task_success"] = (
+        (sum(micro_vals) / len(micro_vals)) if micro_vals else None)
     return summary
 
 

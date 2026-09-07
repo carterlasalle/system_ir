@@ -34,6 +34,25 @@ pub fn evidence_id(path: &str, kind: &str, symbol: &str, line: u32) -> String {
     format!("evidence:{}", &h.finalize().to_hex()[..12])
 }
 
+/// CLASS entity heritage for Rule 2c CHA. Never stamped on FILE entities.
+// trace:v1 id=impl.scc.write.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn class_bases_for_symbol<'a>(
+    kind: SymbolKind,
+    name: &str,
+    ef: &'a ExtractedFile,
+) -> Option<&'a Vec<String>> {
+    if !matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+    ) {
+        return None;
+    }
+    ef.class_bases
+        .iter()
+        .find(|(n, bases)| n == name && !bases.is_empty())
+        .map(|(_, bases)| bases)
+}
+
 // trace:exempt reason=internal-detail
 pub struct Writer<'a> {
     pub store: &'a Store,
@@ -111,6 +130,7 @@ impl<'a> Writer<'a> {
                 crate::resolve::ImportTarget::External { name } => {
                     (kinds::EXTERNAL_API, name.as_str())
                 }
+                crate::resolve::ImportTarget::Unresolved { .. } => continue,
             };
             let target_id = entity_id(self.repo_id, kind, key);
             // §26: native module-graph resolution is a deterministic
@@ -119,6 +139,7 @@ impl<'a> Writer<'a> {
             let provenance = match &ri.target {
                 crate::resolve::ImportTarget::Internal { .. } => Provenance::Extracted,
                 crate::resolve::ImportTarget::External { .. } => Provenance::Extracted,
+                crate::resolve::ImportTarget::Unresolved { .. } => continue,
             };
             let ev = self.ev(path, "import", &ri.module, ri.line);
             self.store.insert_evidence(&ev)?;
@@ -187,6 +208,9 @@ impl<'a> Writer<'a> {
             }
             if let Some(doc) = &sym.docstring {
                 se.attr("docstring", serde_json::json!(truncate(doc, 240)));
+            }
+            if let Some(bases) = class_bases_for_symbol(sym.kind, &sym.name, ef) {
+                se.attr("class_bases", serde_json::json!(bases));
             }
             let ev = self.ev(path, "symbol", &sym.name, sym.start_line);
             self.store.insert_evidence(&ev)?;

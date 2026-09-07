@@ -1,91 +1,12 @@
 //! Golden-repository integration tests (docs/TEST_PLAN.md §3): the
 //! http-service-python fixture must produce the expected System IR.
+//!
+//! Helpers live in `tests/common/` so other integration binaries can share
+//! `copy_fixture` / `run_ok` without compiling this file's `#[test]`s.
 
-use std::path::PathBuf;
-use std::process::Command;
+mod common;
+use common::*;
 // trace:v1 id=test.scc.golden verifies=REQ-SCC-IR exercises=impl.scc.cli,impl.scc.store
-
-// trace:v1 id=test.crates-scc-cli-tests-golden.scc
-pub fn scc() -> &'static str {
-    env!("CARGO_BIN_EXE_scc")
-}
-
-/// Copy a fixture tree (minus its `.scc` state) into a fresh tempdir under a
-/// fixed `repo` directory so repository ids are stable across runs.
-// trace:v1 id=test.crates-scc-cli-tests-golden.copy-fixture
-pub fn copy_fixture(name: &str) -> tempfile::TempDir {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("fixtures")
-        .join(name);
-    let dst = tempfile::TempDir::new().unwrap();
-    let repo_dir = dst.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    copy_tree(&src, &repo_dir);
-    dst
-}
-
-// trace:v1 id=test.crates-scc-cli-tests-golden.copy-tree
-pub fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == ".scc" {
-            continue; // state, not fixture content
-        }
-        let from = entry.path();
-        let to = dst.join(&name);
-        if from.is_dir() {
-            std::fs::create_dir_all(&to).unwrap();
-            copy_tree(&from, &to);
-        } else {
-            std::fs::copy(&from, &to).unwrap();
-        }
-    }
-}
-
-/// The directory the fixture was copied into (the `scc` repo root).
-// trace:v1 id=test.crates-scc-cli-tests-golden.workdir
-pub fn workdir(tmp: &std::path::Path) -> std::path::PathBuf {
-    tmp.join("repo")
-}
-
-// trace:v1 id=test.crates-scc-cli-tests-golden.run
-pub fn run(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(scc())
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("scc binary runs")
-}
-
-// trace:v1 id=test.crates-scc-cli-tests-golden.run-ok
-pub fn run_ok(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = run(dir, args);
-    assert!(
-        out.status.success(),
-        "`scc {}` failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
-
-/// A valid CFG branch condition: a control-block kind (if/else/for/while/
-/// try/catch/match/switch/with/do/loop/finally/select) or the legacy
-/// `conditional: <op>` format from pre-CFG indexes.
-// trace:v1 id=test.crates-scc-cli-tests-golden.is-cfg-condition
-pub fn is_cfg_condition(c: &str) -> bool {
-    matches!(
-        c,
-        "if" | "else" | "for" | "while" | "try" | "catch" | "match" | "switch"
-            | "with" | "do" | "loop" | "select"
-    ) || c.starts_with("conditional:")
-}
-
 #[test]
 // trace:v1 id=test.crates-scc-cli-tests-golden.http-service-produces-expected-ir
 fn http_service_produces_expected_ir() {
@@ -541,4 +462,28 @@ fn query_and_export_formats() {
     assert_eq!(v["schema"], "ccg");
     assert!(v["layers"]["L0"].is_object());
     assert!(v["layers"]["L1"]["architecture"].is_array());
+}
+
+#[test]
+// trace:v1 id=test.scc-cli.golden-not-reexported verifies=REQ-implement-stop-re-running-the-golden-integration-suite-in-every-scc-cl exercises=impl.scc-cli.tests.common-helpers
+fn other_integration_binaries_do_not_mod_golden() {
+    let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut offenders = Vec::new();
+    for ent in std::fs::read_dir(&tests_dir).unwrap() {
+        let path = ent.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        if path.file_name().unwrap() == "golden.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        if text.contains("mod golden;") {
+            offenders.push(path.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "mod golden re-runs the golden suite in each binary: {offenders:?}"
+    );
 }

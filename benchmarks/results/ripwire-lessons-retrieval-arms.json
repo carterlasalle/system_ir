@@ -1,0 +1,31 @@
+{
+  "kind": "retrieval-ablation",
+  "corpus": "benchmarks/tasks.json",
+  "tasks": 21,
+  "k": 10,
+  "production_ranker_changed": false,
+  "decision": "Keep production-blended. Lexical-then-graph wins MRR and R@1/R@5; production-blended wins R@10. Mixed signal on a small fixture corpus is not a switch.",
+  "arms": [
+    {
+      "arm": "lexical-then-graph",
+      "recall_at_1": 0.122,
+      "recall_at_5": 0.413,
+      "recall_at_10": 0.561,
+      "mrr": 0.831
+    },
+    {
+      "arm": "query-routed",
+      "recall_at_1": 0.122,
+      "recall_at_5": 0.413,
+      "recall_at_10": 0.552,
+      "mrr": 0.831
+    },
+    {
+      "arm": "production-blended",
+      "recall_at_1": 0.075,
+      "recall_at_5": 0.398,
+      "recall_at_10": 0.594,
+      "mrr": 0.645
+    }
+  ]
+}

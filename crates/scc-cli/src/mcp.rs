@@ -148,7 +148,7 @@ fn tools() -> Vec<Tool> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "files": {"type": "array", "items": {"type": "string"}, "description": "Repository-relative file paths"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Repository-relative file paths or scc:// content handles"},
                     "goal": {"type": "string", "description": "Task goal; resolves to the task-matched files (build_surface Task mode)"},
                     "token_budget": {"type": "integer", "description": "Optional token budget (default context.structural_source, 6000)"}
                 }

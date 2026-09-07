@@ -22,7 +22,7 @@
 //! (root-to-leaf service paths, deduped per trace) into the
 //! `trace_signatures` table.
 
-use scc_core::{kinds, now_rfc3339, predicates, Entity, Provenance};
+use scc_core::{kinds, now_rfc3339, predicates, Entity, Provenance, Relationship};
 use scc_store::rusqlite::params;
 use scc_store::{ModelEpochKind, Store};
 use serde::Deserialize;
@@ -50,6 +50,7 @@ pub struct TraceStats {
 /// Static vs observed call-edge comparison, two-way (static vs observed)
 /// plus three-way (declared intent vs static vs observed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+// trace:exempt reason=internal-detail
 pub struct Reconciliation {
     /// `"src -> tgt"` edges seen at runtime.
     pub observed_edges: Vec<String>,
@@ -77,6 +78,11 @@ pub struct Reconciliation {
     /// `static \ (declared ∪ observed)` (drift kind `static_unobserved`,
     /// LOW). Only populated when runtime data exists.
     pub static_only: Vec<String>,
+    /// Number of existing CALLS edges that received an `OBSERVED_AS`
+    /// confirmation this pass. Zero when nothing matched; never counts
+    /// fabricated CALLS.
+    #[serde(default)]
+    pub observed_upgrades: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,8 +251,8 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
             .as_ref()
             .map(|r| r.attributes.as_slice())
             .unwrap_or(&[]);
-        let service = attr_string(resource_attrs, "service.name")
-            .unwrap_or_else(|| "unknown".to_string());
+        let service =
+            attr_string(resource_attrs, "service.name").unwrap_or_else(|| "unknown".to_string());
         for ss in rs.scope_spans {
             for sp in ss.spans {
                 let latency_ms = sp
@@ -311,7 +317,11 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
     // average (docs/TEST_PLAN.md §15).
     let mut edges = 0usize;
     for ((source, target), (count, latency, errors)) in &agg {
-        let avg_latency = if *count > 0 { latency / *count as f64 } else { 0.0 };
+        let avg_latency = if *count > 0 {
+            latency / *count as f64
+        } else {
+            0.0
+        };
         store
             .conn
             .execute(
@@ -367,7 +377,11 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
             continue;
         }
         for (labels, (latency, errors, path_count)) in paths {
-            let avg_latency = if path_count > 0 { latency / path_count as f64 } else { 0.0 };
+            let avg_latency = if path_count > 0 {
+                latency / path_count as f64
+            } else {
+                0.0
+            };
             store
                 .upsert_trace_signature(&labels.join(" -> "), avg_latency, errors)
                 .map_err(|e| format!("upsert trace signature: {e}"))?;
@@ -384,6 +398,9 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
 
     let total_spans = agg.values().map(|(count, _, _)| *count).sum::<u64>() as usize;
     let error_spans = agg.values().map(|(_, _, errors)| *errors).sum::<u64>() as usize;
+    if edges > 0 {
+        let _ = upgrade_observed_calls(store);
+    }
     Ok(TraceStats {
         spans: total_spans,
         edges,
@@ -401,6 +418,7 @@ pub fn ingest_otlp_json(store: &Store, body: &str) -> Result<TraceStats, String>
 /// trace ingestion are left untouched. No trace-path signatures are recorded
 /// here: this shape carries no trace structure (no span tree to walk), so
 /// only aggregated edges are produced.
+// trace:exempt reason=internal-detail
 pub fn ingest_simple_edges(store: &Store, body: &str) -> Result<TraceStats, String> {
     if body.trim().is_empty() {
         return Ok(TraceStats {
@@ -450,6 +468,7 @@ pub fn ingest_simple_edges(store: &Store, body: &str) -> Result<TraceStats, Stri
         store
             .bump_epoch(ModelEpochKind::Runtime)
             .map_err(|e| format!("bump runtime epoch: {e}"))?;
+        let _ = upgrade_observed_calls(store);
     }
     Ok(TraceStats {
         spans: 0,
@@ -552,6 +571,7 @@ fn component_name(store: &Store, id: &str, components: &[Entity]) -> String {
 /// `steps` list declares no edges, and if no declared flows exist the
 /// declared set is empty (findings then reduce to observed-only vs
 /// static-only comparisons).
+// trace:exempt reason=internal-detail
 fn declared_edges(store: &Store) -> Result<BTreeSet<String>, String> {
     let claims = store
         .intent_claims()
@@ -567,13 +587,11 @@ fn declared_edges(store: &Store) -> Result<BTreeSet<String>, String> {
         let labels: Vec<String> = steps
             .iter()
             .filter_map(|s| {
-                s.as_str()
-                    .map(String::from)
-                    .or_else(|| {
-                        s.get("component")
-                            .and_then(|c| c.as_str())
-                            .map(String::from)
-                    })
+                s.as_str().map(String::from).or_else(|| {
+                    s.get("component")
+                        .and_then(|c| c.as_str())
+                        .map(String::from)
+                })
             })
             .collect();
         for pair in labels.windows(2) {
@@ -612,6 +630,74 @@ fn persist_reconcile_findings(
     Ok(changed)
 }
 
+/// Confirm matching static CALLS with OBSERVED_AS. Never rewrites CALLS
+/// provenance and never invents CALLS for observed-only traffic.
+// trace:v1 id=impl.scc.runtime.observed-upgrade work=WORK-ripwire-lessons-phase6 satisfies=REQ-observed-call-upgrade,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
+pub fn upgrade_observed_calls(store: &Store) -> Result<usize, String> {
+    let observed = runtime_edges(store)?;
+    if observed.is_empty() {
+        return Ok(0);
+    }
+    let rels = store
+        .all_relationships()
+        .map_err(|e| format!("load relationships: {e}"))?;
+    let components = store
+        .entities_by_kind(kinds::COMPONENT)
+        .map_err(|e| format!("load components: {e}"))?;
+    let mut upgrades = 0usize;
+    for edge in &observed {
+        if edge.source == "root" || edge.source == edge.target {
+            continue;
+        }
+        for rel in &rels {
+            if rel.predicate != predicates::CALLS {
+                continue;
+            }
+            if !matches!(rel.provenance, Provenance::Extracted | Provenance::Resolved) {
+                continue;
+            }
+            let source = component_name(store, &rel.subject, &components);
+            let target = component_name(store, &rel.object, &components);
+            if source != edge.source || target != edge.target {
+                continue;
+            }
+            let existing = store
+                .relationships_between(&rel.subject, predicates::OBSERVED_AS, &rel.object)
+                .map_err(|e| format!("lookup observed_as: {e}"))?;
+            if existing
+                .iter()
+                .any(|e| e.provenance == Provenance::Observed)
+            {
+                continue;
+            }
+            let src_path = store
+                .get_entity(&rel.subject)
+                .ok()
+                .flatten()
+                .and_then(|e| {
+                    e.attributes
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "runtime".to_string());
+            let obs = Relationship::new(
+                crate::write::rel_id(&["observed_as", &rel.subject, &rel.object]),
+                rel.subject.clone(),
+                predicates::OBSERVED_AS,
+                rel.object.clone(),
+                Provenance::Observed,
+            )
+            .with_confidence(1.0);
+            store
+                .insert_relationship(&obs, &src_path)
+                .map_err(|e| format!("insert observed_as: {e}"))?;
+            upgrades += 1;
+        }
+    }
+    Ok(upgrades)
+}
+
 /// Compare declared intent vs static evidence-grade `calls` vs observed
 /// runtime edges, all at component granularity.
 ///
@@ -626,7 +712,9 @@ fn persist_reconcile_findings(
 ///
 /// Findings are persisted (deduplicated across runs) and the Derived epoch
 /// is bumped when new findings land, so epoch-keyed packs pick them up.
+// trace:v1 id=impl.scc.runtime.reconcile work=WORK-ripwire-lessons-phase6 satisfies=REQ-observed-call-upgrade
 pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
+    let observed_upgrades = upgrade_observed_calls(store)?;
     let observed: BTreeSet<String> = runtime_edges(store)?
         .into_iter()
         .map(|e| format!("{} -> {}", e.source, e.target))
@@ -662,27 +750,15 @@ pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
     // three-way diff -> drift findings (edge strings as messages)
     let mut findings: Vec<(String, String, String)> = Vec::new();
     for e in observed.difference(&declared) {
-        findings.push((
-            "undeclared_observed".into(),
-            "high".into(),
-            e.clone(),
-        ));
+        findings.push(("undeclared_observed".into(), "high".into(), e.clone()));
     }
     if has_runtime {
         for e in declared.difference(&observed) {
-            findings.push((
-                "declared_unobserved".into(),
-                "medium".into(),
-                e.clone(),
-            ));
+            findings.push(("declared_unobserved".into(), "medium".into(), e.clone()));
         }
         let known: BTreeSet<String> = declared.union(&observed).cloned().collect();
         for e in static_set.difference(&known) {
-            findings.push((
-                "static_unobserved".into(),
-                "low".into(),
-                e.clone(),
-            ));
+            findings.push(("static_unobserved".into(), "low".into(), e.clone()));
         }
     }
     if persist_reconcile_findings(store, &findings)? {
@@ -714,6 +790,7 @@ pub fn reconcile(store: &Store) -> Result<Reconciliation, String> {
         observed_only,
         declared_only,
         static_only,
+        observed_upgrades,
     })
 }
 
@@ -835,16 +912,31 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn otlp_ingest_defensive_inputs() {
         let (store, _dir) = tmp_store();
         // Empty body -> zero stats, no error.
         let stats = ingest_otlp_json(&store, "").unwrap();
-        assert_eq!(stats, TraceStats { spans: 0, edges: 0, errors: 0 });
+        assert_eq!(
+            stats,
+            TraceStats {
+                spans: 0,
+                edges: 0,
+                errors: 0
+            }
+        );
         assert!(runtime_edges(&store).unwrap().is_empty());
 
         // Well-formed JSON without spans -> zero stats.
         let stats = ingest_otlp_json(&store, "{}").unwrap();
-        assert_eq!(stats, TraceStats { spans: 0, edges: 0, errors: 0 });
+        assert_eq!(
+            stats,
+            TraceStats {
+                spans: 0,
+                edges: 0,
+                errors: 0
+            }
+        );
 
         // Malformed JSON -> Err.
         assert!(ingest_otlp_json(&store, "not json").is_err());
@@ -852,12 +944,19 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn simple_edges_ingest_shape() {
         let (store, _dir) = tmp_store();
-        let body =
-            r#"[{"source": "api", "target": "db", "count": 3}, {"source": "web", "target": "api"}]"#;
+        let body = r#"[{"source": "api", "target": "db", "count": 3}, {"source": "web", "target": "api"}]"#;
         let stats = ingest_simple_edges(&store, body).unwrap();
-        assert_eq!(stats, TraceStats { spans: 0, edges: 2, errors: 0 });
+        assert_eq!(
+            stats,
+            TraceStats {
+                spans: 0,
+                edges: 2,
+                errors: 0
+            }
+        );
 
         let edges = runtime_edges(&store).unwrap();
         assert_eq!(find_edge(&edges, "api", "db").count, 3);
@@ -873,7 +972,10 @@ mod tests {
         // A bare object is accepted as a single edge.
         let stats = ingest_simple_edges(&store, r#"{"source": "x", "target": "y"}"#).unwrap();
         assert_eq!(stats.edges, 1);
-        assert_eq!(find_edge(&runtime_edges(&store).unwrap(), "x", "y").count, 1);
+        assert_eq!(
+            find_edge(&runtime_edges(&store).unwrap(), "x", "y").count,
+            1
+        );
 
         // Empty body and malformed JSON.
         assert_eq!(ingest_simple_edges(&store, "").unwrap().edges, 0);
@@ -897,15 +999,22 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn reconcile_static_vs_observed() {
         let (store, _dir) = tmp_store();
 
         // Components: api owns src/api, db owns src/db.
         store
-            .insert_entity(&component("repo://repo/component/api", "api", &["src/api"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/api", "api", &["src/api"]),
+                &[],
+            )
             .unwrap();
         store
-            .insert_entity(&component("repo://repo/component/db", "db", &["src/db"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/db", "db", &["src/db"]),
+                &[],
+            )
             .unwrap();
 
         // Symbols with file attributes.
@@ -928,7 +1037,9 @@ mod tests {
             &query,
             Provenance::Resolved,
         );
-        store.insert_relationship(&rel1, "src/api/handler.rs").unwrap();
+        store
+            .insert_relationship(&rel1, "src/api/handler.rs")
+            .unwrap();
         let rel2 = Relationship::new(
             "rel:2",
             &fetch_user,
@@ -936,7 +1047,9 @@ mod tests {
             &helper,
             Provenance::Resolved,
         );
-        store.insert_relationship(&rel2, "src/api/handler.rs").unwrap();
+        store
+            .insert_relationship(&rel2, "src/api/handler.rs")
+            .unwrap();
 
         // Not calls, and not RESOLVED: both must be ignored.
         let rel3 = Relationship::new(
@@ -946,7 +1059,9 @@ mod tests {
             &query,
             Provenance::Resolved,
         );
-        store.insert_relationship(&rel3, "src/api/handler.rs").unwrap();
+        store
+            .insert_relationship(&rel3, "src/api/handler.rs")
+            .unwrap();
         let rel4 = Relationship::new(
             "rel:4",
             &fetch_user,
@@ -954,7 +1069,9 @@ mod tests {
             &query,
             Provenance::Extracted,
         );
-        store.insert_relationship(&rel4, "src/api/handler.rs").unwrap();
+        store
+            .insert_relationship(&rel4, "src/api/handler.rs")
+            .unwrap();
 
         // Observed edges: api -> db (matches static), web -> api (runtime only).
         ingest_simple_edges(
@@ -990,6 +1107,78 @@ mod tests {
         assert!(r.observed_only.is_empty());
         assert!(r.declared_only.is_empty());
         assert!(r.static_only.is_empty());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.runtime.observed-upgrade verifies=REQ-observed-call-upgrade,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.runtime.observed-upgrade
+    fn observed_upgrades_calls_without_rewriting_extracted() {
+        let (store, _dir) = tmp_store();
+        store
+            .insert_entity(
+                &component("repo://repo/component/api", "api", &["src/api"]),
+                &[],
+            )
+            .unwrap();
+        store
+            .insert_entity(
+                &component("repo://repo/component/db", "db", &["src/db"]),
+                &[],
+            )
+            .unwrap();
+        let fetch_user = symbol_id("repo", "src/api/handler.rs", "fetch_user");
+        let query = symbol_id("repo", "src/db/pool.rs", "query");
+        for e in [
+            symbol_entity("src/api/handler.rs", "fetch_user"),
+            symbol_entity("src/db/pool.rs", "query"),
+        ] {
+            store.insert_entity(&e, &[]).unwrap();
+        }
+        let calls = Relationship::new(
+            "rel:extracted-calls",
+            &fetch_user,
+            predicates::CALLS,
+            &query,
+            Provenance::Extracted,
+        );
+        store
+            .insert_relationship(&calls, "src/api/handler.rs")
+            .unwrap();
+        ingest_simple_edges(
+            &store,
+            r#"[{"source": "api", "target": "db"}, {"source": "web", "target": "api"}]"#,
+        )
+        .unwrap();
+        let rec = reconcile(&store).unwrap();
+        assert_eq!(
+            rec.observed_upgrades, 0,
+            "ingest already attached OBSERVED_AS; reconcile must not recount: {rec:?}"
+        );
+
+        let rels = store.all_relationships().unwrap();
+        let calls_rows: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == predicates::CALLS)
+            .collect();
+        assert_eq!(calls_rows.len(), 1, "must not invent CALLS: {calls_rows:?}");
+        assert_eq!(calls_rows[0].id, "rel:extracted-calls");
+        assert_eq!(calls_rows[0].provenance, Provenance::Extracted);
+        assert!(
+            rels.iter().any(|r| r.predicate == predicates::OBSERVED_AS
+                && r.subject == fetch_user
+                && r.object == query
+                && r.provenance == Provenance::Observed),
+            "expected OBSERVED_AS on the extracted pair, got {rels:?}"
+        );
+        assert!(
+            !rels.iter().any(|r| r.predicate == predicates::CALLS
+                && (r.subject.contains("web") || r.object.contains("web"))),
+            "observed-only traffic must not become CALLS"
+        );
+        let again = reconcile(&store).unwrap();
+        assert_eq!(
+            again.observed_upgrades, 0,
+            "idempotent reconcile must not recount existing OBSERVED_AS: {again:?}"
+        );
     }
 
     /// Trace: one `api` root span with two `db` children — the two
@@ -1029,6 +1218,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn otlp_ingest_records_trace_signatures() {
         let (store, _dir) = tmp_store();
         assert!(store.trace_signatures().unwrap().is_empty());
@@ -1045,7 +1235,11 @@ mod tests {
         );
 
         let sigs = store.trace_signatures().unwrap();
-        assert_eq!(sigs.len(), 1, "identical root-to-leaf paths dedupe per trace");
+        assert_eq!(
+            sigs.len(),
+            1,
+            "identical root-to-leaf paths dedupe per trace"
+        );
         let (sig, count, latency, errors, last) = &sigs[0];
         assert_eq!(sig, "root -> api -> db");
         assert_eq!(*count, 1);
@@ -1090,15 +1284,22 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn reconcile_three_way_findings() {
         let (store, _dir) = tmp_store();
 
         // Components: api owns src/api, db owns src/db; helper unmappable.
         store
-            .insert_entity(&component("repo://repo/component/api", "api", &["src/api"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/api", "api", &["src/api"]),
+                &[],
+            )
             .unwrap();
         store
-            .insert_entity(&component("repo://repo/component/db", "db", &["src/db"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/db", "db", &["src/db"]),
+                &[],
+            )
             .unwrap();
         let fetch_user = symbol_id("repo", "src/api/handler.rs", "fetch_user");
         let query = symbol_id("repo", "src/db/pool.rs", "query");
@@ -1115,9 +1316,16 @@ mod tests {
             ("rel:1", &fetch_user, &query),
             ("rel:2", &fetch_user, &helper),
         ] {
-            let rel =
-                Relationship::new(rid, subject, predicates::CALLS, object, Provenance::Resolved);
-            store.insert_relationship(&rel, "src/api/handler.rs").unwrap();
+            let rel = Relationship::new(
+                rid,
+                subject,
+                predicates::CALLS,
+                object,
+                Provenance::Resolved,
+            );
+            store
+                .insert_relationship(&rel, "src/api/handler.rs")
+                .unwrap();
         }
         // Declared flow steps: api -> db -> cache (db -> cache never observed).
         store
@@ -1154,11 +1362,22 @@ mod tests {
         let mut by_kind_sev: BTreeMap<String, String> = BTreeMap::new();
         for (_, kind, sev, msg, _) in &findings {
             by_kind.entry(kind.clone()).or_default().push(msg.clone());
-            by_kind_sev.entry(kind.clone()).or_insert_with(|| sev.clone());
+            by_kind_sev
+                .entry(kind.clone())
+                .or_insert_with(|| sev.clone());
         }
-        assert_eq!(by_kind.get("undeclared_observed").unwrap(), &vec!["web -> api".to_string()]);
-        assert_eq!(by_kind.get("declared_unobserved").unwrap(), &vec!["db -> cache".to_string()]);
-        assert_eq!(by_kind.get("static_unobserved").unwrap(), &vec!["api -> helper".to_string()]);
+        assert_eq!(
+            by_kind.get("undeclared_observed").unwrap(),
+            &vec!["web -> api".to_string()]
+        );
+        assert_eq!(
+            by_kind.get("declared_unobserved").unwrap(),
+            &vec!["db -> cache".to_string()]
+        );
+        assert_eq!(
+            by_kind.get("static_unobserved").unwrap(),
+            &vec!["api -> helper".to_string()]
+        );
         assert_eq!(by_kind_sev.get("undeclared_observed").unwrap(), "high");
         assert_eq!(by_kind_sev.get("declared_unobserved").unwrap(), "medium");
         assert_eq!(by_kind_sev.get("static_unobserved").unwrap(), "low");
@@ -1169,13 +1388,20 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn reconcile_three_way_without_runtime_data() {
         let (store, _dir) = tmp_store();
         store
-            .insert_entity(&component("repo://repo/component/api", "api", &["src/api"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/api", "api", &["src/api"]),
+                &[],
+            )
             .unwrap();
         store
-            .insert_entity(&component("repo://repo/component/db", "db", &["src/db"]), &[])
+            .insert_entity(
+                &component("repo://repo/component/db", "db", &["src/db"]),
+                &[],
+            )
             .unwrap();
         let fetch_user = symbol_id("repo", "src/api/handler.rs", "fetch_user");
         let query = symbol_id("repo", "src/db/pool.rs", "query");
@@ -1192,7 +1418,9 @@ mod tests {
             &query,
             Provenance::Resolved,
         );
-        store.insert_relationship(&rel, "src/api/handler.rs").unwrap();
+        store
+            .insert_relationship(&rel, "src/api/handler.rs")
+            .unwrap();
         store
             .replace_intent_claims(&[(
                 "flow".into(),
@@ -1204,8 +1432,14 @@ mod tests {
         // suppressed (they only make sense once observations exist), and no
         // finding fires because observed is empty.
         let r = reconcile(&store).unwrap();
-        assert!(r.declared_only.is_empty(), "declared_unobserved requires runtime data");
-        assert!(r.static_only.is_empty(), "static_unobserved requires runtime data");
+        assert!(
+            r.declared_only.is_empty(),
+            "declared_unobserved requires runtime data"
+        );
+        assert!(
+            r.static_only.is_empty(),
+            "static_unobserved requires runtime data"
+        );
         assert!(r.observed_only.is_empty());
         assert!(store.drift_findings(true).unwrap().is_empty());
     }
