@@ -10,7 +10,8 @@
 //!    the target file's exported symbol;
 //! 5. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 6. `self`/`this` sibling methods, plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
+//! 6. `self`/`this` sibling methods, else unique class-like / CHA on the
+//!    enclosing class; `super` walks bases only. Plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
 //! 7. confirmed external import root → `external_api` entity;
 //! 8. otherwise: unresolved (counted; never silently treated as external).
 //!
@@ -492,8 +493,25 @@ pub fn resolve_calls(
             continue;
         }
 
-        // super(): never spray onto the caller's class.
+        // super.m() / super().m(): walk bases only — never the enclosing class.
         if recv == RecvKind::Super {
+            if split_recv_path(&call.callee).len() == 2 {
+                if let Some(class) = enclosing_class(&call, path, index) {
+                    if let Some(id) = rule1_enclosing_method(index, &class, method, true) {
+                        out.push(emit(
+                            caller_id,
+                            Some(id),
+                            call.callee.clone(),
+                            0.9,
+                            call.line,
+                            ResolutionClass::ResolvedInternal,
+                            recv,
+                            1,
+                        ));
+                        continue;
+                    }
+                }
+            }
             out.push(emit(
                 caller_id,
                 None,
@@ -507,7 +525,7 @@ pub fn resolve_calls(
             continue;
         }
 
-        // this/self → sibling of the enclosing class only.
+        // this/self → sibling of the enclosing class, else unique class-like / CHA.
         if recv.is_instance_self() {
             if let Some(class) = enclosing_class(&call, path, index) {
                 if let Some(m) = sibling_method(&methods_by_class, &class, method) {
@@ -516,6 +534,19 @@ pub fn resolve_calls(
                         Some(scc_core::symbol_id(repo_id, path, &m.name)),
                         call.callee.clone(),
                         0.98,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
+                    continue;
+                }
+                if let Some(id) = rule1_enclosing_method(index, &class, method, false) {
+                    out.push(emit(
+                        caller_id,
+                        Some(id),
+                        call.callee.clone(),
+                        0.9,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -945,6 +976,24 @@ fn class_bases_of_unique(index: &SymbolIndex, type_name: &str) -> Option<Vec<Str
         found = Some(fs.class_bases.get(type_name).cloned().unwrap_or_default());
     }
     found
+}
+
+/// Ripwire Rule 1 (`rule1BaseWalk`): pin `self.m()` / `this.m()` via own
+/// type then CHA; `super.m()` / `super().m()` walk bases only (`skip_self`).
+/// Two hitting bases at one level stay unresolved. No C++ bare-name Rule 1.
+/// Field chains never reach here.
+// trace:v1 id=impl.scc.resolve.rule1 work=WORK-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-super-base-wa satisfies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s implements=PLAN-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-super-base-wa
+fn rule1_enclosing_method(
+    index: &SymbolIndex,
+    class: &str,
+    method: &str,
+    skip_self: bool,
+) -> Option<String> {
+    if skip_self {
+        method_on_bases(index, class, method)
+    } else {
+        unique_class_like_method(index, class, method)
+    }
 }
 
 /// Ripwire `methodOnTypeOrBases` BFS: shallowest level with exactly one
@@ -1873,6 +1922,264 @@ mod tests {
             resolved[0].callee_id,
             Some(scc_core::symbol_id("repo", "w.py", "IERS.open"))
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.self-cha verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn self_open_on_derived_class_pins_unique_base() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        idx.add_file("iers.py", &[mk_symbol("IERS", SymbolKind::Class), open]);
+        let mut run = mk_symbol("IERS_B.run", SymbolKind::Method);
+        run.parent = Some("IERS_B".into());
+        let iers_b = mk_symbol("IERS_B", SymbolKind::Class);
+        idx.add_file("iers_b.py", &[iers_b, run.clone()]);
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        for callee in ["self.open", "this.open"] {
+            let resolved = resolve_calls(
+                "iers_b.py",
+                &[Call {
+                    caller: Some("IERS_B.run".into()),
+                    callee: callee.into(),
+                    line: 3,
+                    known_receiver: true,
+                    ..Default::default()
+                }
+                .finish()],
+                std::slice::from_ref(&run),
+                &[],
+                &idx,
+                "repo",
+            );
+            assert_eq!(
+                resolved[0].callee_id,
+                Some(scc_core::symbol_id("repo", "iers.py", "IERS.open")),
+                "{callee}"
+            );
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.self-sibling-beats-cha verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn self_open_prefers_own_class_over_base() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut base_open = mk_symbol("IERS.open", SymbolKind::Method);
+        base_open.parent = Some("IERS".into());
+        idx.add_file(
+            "iers.py",
+            &[mk_symbol("IERS", SymbolKind::Class), base_open],
+        );
+        let mut own_open = mk_symbol("IERS_B.open", SymbolKind::Method);
+        own_open.parent = Some("IERS_B".into());
+        let mut run = mk_symbol("IERS_B.run", SymbolKind::Method);
+        run.parent = Some("IERS_B".into());
+        let syms = vec![
+            mk_symbol("IERS_B", SymbolKind::Class),
+            own_open,
+            run.clone(),
+        ];
+        idx.add_file("iers_b.py", &syms);
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        let resolved = resolve_calls(
+            "iers_b.py",
+            &[Call {
+                caller: Some("IERS_B.run".into()),
+                callee: "self.open".into(),
+                line: 4,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "iers_b.py", "IERS_B.open"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.super-cha verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn super_open_skips_own_class_and_pins_base() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut base_open = mk_symbol("IERS.open", SymbolKind::Method);
+        base_open.parent = Some("IERS".into());
+        idx.add_file(
+            "iers.py",
+            &[mk_symbol("IERS", SymbolKind::Class), base_open],
+        );
+        let mut own_open = mk_symbol("IERS_B.open", SymbolKind::Method);
+        own_open.parent = Some("IERS_B".into());
+        let mut run = mk_symbol("IERS_B.run", SymbolKind::Method);
+        run.parent = Some("IERS_B".into());
+        let syms = vec![
+            mk_symbol("IERS_B", SymbolKind::Class),
+            own_open,
+            run.clone(),
+        ];
+        idx.add_file("iers_b.py", &syms);
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        for callee in ["super.open", "super().open"] {
+            let resolved = resolve_calls(
+                "iers_b.py",
+                &[Call {
+                    caller: Some("IERS_B.run".into()),
+                    callee: callee.into(),
+                    line: 4,
+                    known_receiver: true,
+                    ..Default::default()
+                }
+                .finish()],
+                &syms,
+                &[],
+                &idx,
+                "repo",
+            );
+            assert_eq!(
+                resolved[0].callee_id,
+                Some(scc_core::symbol_id("repo", "iers.py", "IERS.open")),
+                "{callee}"
+            );
+            assert_eq!(resolved[0].recv, RecvKind::Super, "{callee}");
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.self-cha-split verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn self_method_two_hitting_bases_unresolved() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_m = mk_symbol("A.m", SymbolKind::Method);
+        a_m.parent = Some("A".into());
+        idx.add_file("a.py", &[mk_symbol("A", SymbolKind::Class), a_m]);
+        let mut b_m = mk_symbol("B.m", SymbolKind::Method);
+        b_m.parent = Some("B".into());
+        idx.add_file("b.py", &[mk_symbol("B", SymbolKind::Class), b_m]);
+        let mut run = mk_symbol("C.run", SymbolKind::Method);
+        run.parent = Some("C".into());
+        idx.add_file("c.py", &[mk_symbol("C", SymbolKind::Class), run.clone()]);
+        idx.set_class_bases("c.py", &[("C".into(), vec!["A".into(), "B".into()])]);
+        let resolved = resolve_calls(
+            "c.py",
+            &[Call {
+                caller: Some("C.run".into()),
+                callee: "self.m".into(),
+                line: 3,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&run),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.super-cha-split verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn super_method_two_hitting_bases_unresolved() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut a_m = mk_symbol("A.m", SymbolKind::Method);
+        a_m.parent = Some("A".into());
+        idx.add_file("a.py", &[mk_symbol("A", SymbolKind::Class), a_m]);
+        let mut b_m = mk_symbol("B.m", SymbolKind::Method);
+        b_m.parent = Some("B".into());
+        idx.add_file("b.py", &[mk_symbol("B", SymbolKind::Class), b_m]);
+        let mut own = mk_symbol("C.m", SymbolKind::Method);
+        own.parent = Some("C".into());
+        let mut run = mk_symbol("C.run", SymbolKind::Method);
+        run.parent = Some("C".into());
+        let syms = vec![mk_symbol("C", SymbolKind::Class), own, run.clone()];
+        idx.add_file("c.py", &syms);
+        idx.set_class_bases("c.py", &[("C".into(), vec!["A".into(), "B".into()])]);
+        let resolved = resolve_calls(
+            "c.py",
+            &[Call {
+                caller: Some("C.run".into()),
+                callee: "super().m".into(),
+                line: 4,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            &syms,
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].recv, RecvKind::Super);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.super-field-chain verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn super_field_chain_stays_unresolved() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        idx.add_file("iers.py", &[mk_symbol("IERS", SymbolKind::Class), open]);
+        let mut run = mk_symbol("IERS_B.run", SymbolKind::Method);
+        run.parent = Some("IERS_B".into());
+        idx.add_file(
+            "iers_b.py",
+            &[mk_symbol("IERS_B", SymbolKind::Class), run.clone()],
+        );
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        let resolved = resolve_calls(
+            "iers_b.py",
+            &[Call {
+                caller: Some("IERS_B.run".into()),
+                callee: "super().client.open".into(),
+                line: 3,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&run),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].recv, RecvKind::Super);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.self-field-not-rule1 verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn self_field_chain_does_not_use_rule1() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut open = mk_symbol("IERS.open", SymbolKind::Method);
+        open.parent = Some("IERS".into());
+        idx.add_file("iers.py", &[mk_symbol("IERS", SymbolKind::Class), open]);
+        let mut run = mk_symbol("IERS_B.run", SymbolKind::Method);
+        run.parent = Some("IERS_B".into());
+        idx.add_file(
+            "iers_b.py",
+            &[mk_symbol("IERS_B", SymbolKind::Class), run.clone()],
+        );
+        idx.set_class_bases("iers_b.py", &[("IERS_B".into(), vec!["IERS".into()])]);
+        let resolved = resolve_calls(
+            "iers_b.py",
+            &[Call {
+                caller: Some("IERS_B.run".into()),
+                callee: "self.client.open".into(),
+                line: 3,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            std::slice::from_ref(&run),
+            &[],
+            &idx,
+            "repo",
+        );
+        assert_eq!(resolved[0].callee_id, None);
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfSelf);
     }
 
     #[test]

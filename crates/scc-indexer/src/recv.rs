@@ -92,6 +92,17 @@ fn looks_type_name(name: &str) -> bool {
         && name != "SUPER"
 }
 
+/// Python `super().open()` arrives as callee `super().open`; the receiver
+/// token is still `super`.
+// trace:v1 id=impl.scc.recv.super-call work=WORK-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-super-base-wa satisfies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s implements=PLAN-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-super-base-wa
+fn super_recv_root(seg: &str) -> &str {
+    if seg == "super()" {
+        "super"
+    } else {
+        seg
+    }
+}
+
 /// Classify a callee expression captured by an extractor.
 // trace:v1 id=impl.scc.recv.classify work=WORK-ripwire-lessons-phase1 satisfies=REQ-receiver-aware-resolution
 pub fn classify_callee(callee: &str) -> RecvFact {
@@ -116,7 +127,7 @@ pub fn classify_callee(callee: &str) -> RecvFact {
     if segs.len() == 1 {
         return RecvFact::bare(&segs[0], role);
     }
-    let root = segs[0].as_str();
+    let root = super_recv_root(segs[0].as_str());
     let method = segs[segs.len() - 1].clone();
     let used_colon = trimmed.contains("::");
     match (root, segs.len()) {
@@ -273,5 +284,14 @@ mod tests {
         let mac = classify_callee("println!");
         assert_eq!(mac.role, ReferenceKind::Macro);
         assert_eq!(mac.recv, RecvKind::None);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.recv.super-call verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.recv.super-call
+    fn python_super_call_is_super_receiver() {
+        let sup = classify_callee("super().open");
+        assert_eq!(sup.recv, RecvKind::Super);
+        assert_eq!(sup.method, "open");
+        assert_eq!(sup.root, "super");
     }
 }

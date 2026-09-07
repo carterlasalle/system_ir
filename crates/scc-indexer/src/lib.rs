@@ -2210,4 +2210,211 @@ class Svc {
         });
         assert!(cold_hit, "cold index must also CALL IERS.open");
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.self-cha verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn index_self_open_on_derived_pins_unique_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iers_b.py"),
+            "class IERS_B(IERS):\n    def run(self):\n        return self.open()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.py", "IERS.open");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "iers_b.py", "IERS_B.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "IERS_B.run self.open must CALL IERS.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.super-cha verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.recv.super-call
+    fn index_super_open_skips_own_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iers_b.py"),
+            "class IERS_B(IERS):\n    def open(self):\n        return 2\n    def run(self):\n        return super().open()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.py", "IERS.open");
+        let own = scc_core::symbol_id(&idx.store.repo_id, "iers_b.py", "IERS_B.open");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "iers_b.py", "IERS_B.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "super().open must CALL IERS.open: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == own),
+            "super().open must not pin own IERS_B.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.self-cha-split verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn index_self_two_bases_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.py"),
+            "class A:\n    def m(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.py"),
+            "class B:\n    def m(self):\n        return 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("c.py"),
+            "class C(A, B):\n    def run(self):\n        return self.m()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "a.py", "A.m");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "b.py", "B.m");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "c.py", "C.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a || r.object == b),
+            "two hitting bases must not spray self.m: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.self-cha-java verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn index_java_this_and_super_cha() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Iers.java"),
+            "class IERS {\n    void open() {}\n}\nclass IERS_B extends IERS {\n    void open() {}\n    void run() { this.open(); super.open(); }\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let own = scc_core::symbol_id(&idx.store.repo_id, "Iers.java", "IERS_B.open");
+        let base = scc_core::symbol_id(&idx.store.repo_id, "Iers.java", "IERS.open");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "Iers.java", "IERS_B.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == own),
+            "this.open must CALL IERS_B.open: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "super.open must CALL IERS.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.self-cha-ts verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.resolve.rule1
+    fn index_ts_this_and_super_cha() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.ts"),
+            "class IERS { open() {} }\nclass IERS_B extends IERS {\n  open() {}\n  run() { this.open(); super.open(); }\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let own = scc_core::symbol_id(&idx.store.repo_id, "iers.ts", "IERS_B.open");
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.ts", "IERS.open");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "iers.ts", "IERS_B.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == own),
+            "this.open must CALL IERS_B.open: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "super.open must CALL IERS.open: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.self-cha-incremental verifies=REQ-implement-phase-23-of-scc-x-ripwire-lessons-absorb-rule-1-self-this-s exercises=impl.scc.write.class-bases
+    fn index_self_cha_survives_incremental_base_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iers_b.py"),
+            "class IERS_B(IERS):\n    def run(self):\n        return self.open()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        std::fs::write(
+            root.join("iers.py"),
+            "class IERS:\n    def open(self):\n        return 1\n# touch\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+        let base = scc_core::symbol_id(&idx.store.repo_id, "iers.py", "IERS.open");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "iers_b.py", "IERS_B.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == base),
+            "incremental base edit must still CALL IERS.open via persisted heritage: {calls:?}"
+        );
+        let (cold, _t2) = indexer_for(root);
+        cold.index().unwrap();
+        let cold_base = scc_core::symbol_id(&cold.store.repo_id, "iers.py", "IERS.open");
+        let cold_run = scc_core::symbol_id(&cold.store.repo_id, "iers_b.py", "IERS_B.run");
+        let cold_hit = cold.store.all_relationships().unwrap().iter().any(|r| {
+            r.predicate == scc_core::predicates::CALLS
+                && r.subject == cold_run
+                && r.object == cold_base
+        });
+        assert!(cold_hit, "cold index must also CALL IERS.open");
+    }
 }
