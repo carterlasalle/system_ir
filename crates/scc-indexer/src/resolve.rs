@@ -420,6 +420,21 @@ pub fn resolve_calls(
             ));
             continue;
         }
+        if let Some(id) =
+            receiver_field_type_callee_id(recv, &fact, &call, path, index, type_binds, &binding)
+        {
+            out.push(emit(
+                caller_id,
+                Some(id),
+                call.callee.clone(),
+                0.9,
+                call.line,
+                ResolutionClass::ResolvedInternal,
+                recv,
+                1,
+            ));
+            continue;
+        }
 
         // Field chains: do not pin the intermediate name or the terminal
         // method (`self.client.process`, `db.users.findMany`). If the chain
@@ -734,6 +749,35 @@ fn field_type_callee_id(
     }
     let field = fact.field_name.as_deref()?;
     let class = enclosing_class(call, path, index)?;
+    let ty = unique_bound_type(type_binds, Some(&class), field)?;
+    method_id_for_type(index, path, ty, &fact.method, binding)
+}
+
+/// Pin `s.field.m()` (exactly one field hop) when `s` is uniquely typed as
+/// the enclosing type and that type has a unique field type for `field`.
+// trace:v1 id=impl.scc.resolve.receiver-field-type-narrow work=WORK-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow satisfies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field implements=PLAN-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow
+fn receiver_field_type_callee_id(
+    recv: RecvKind,
+    fact: &RecvFact,
+    call: &Call,
+    path: &str,
+    index: &SymbolIndex,
+    type_binds: &[TypeBind],
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    if recv != RecvKind::FieldOfVariable {
+        return None;
+    }
+    if split_recv_path(&call.callee).len() != 3 {
+        return None;
+    }
+    let root = fact.recv_var.as_deref().unwrap_or(fact.root.as_str());
+    let class = enclosing_class(call, path, index)?;
+    let root_ty = unique_bound_type(type_binds, call.caller.as_deref(), root)?;
+    if root_ty != class {
+        return None;
+    }
+    let field = fact.field_name.as_deref()?;
     let ty = unique_bound_type(type_binds, Some(&class), field)?;
     method_id_for_type(index, path, ty, &fact.method, binding)
 }
@@ -1507,5 +1551,110 @@ class Svc {
             .expect("longer chain call");
         assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
         assert_eq!(chain.recv, RecvKind::FieldOfThis);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.go.receiver-field-type-extract verifies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field exercises=impl.scc.resolve.receiver-field-type-narrow
+    fn go_extract_then_resolve_pins_receiver_field() {
+        use crate::go::GoExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() { s.owned.Process() }
+func (s *Svc) Chain() { s.owned.inner.Process() }
+"#;
+        let ef = GoExtractor::default().extract(&SourceFile::new("w.go", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "binds: {:?}",
+            ef.type_binds
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.go", &ef.symbols);
+        idx.set_type_binds("w.go", &ef.type_binds);
+        let resolved = resolve_calls("w.go", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "s.owned.Process")
+            .expect("s.owned.Process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Invoice.Process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
+        assert_eq!(hit.recv, RecvKind::FieldOfVariable);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "s.owned.inner.Process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        assert_eq!(chain.recv, RecvKind::FieldOfVariable);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.go.receiver-field-type-tombstone verifies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field exercises=impl.scc.resolve.receiver-field-type-narrow
+    fn two_receiver_field_types_do_not_pin() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut run = mk_symbol("Svc.Run", SymbolKind::Method);
+        run.parent = Some("Svc".into());
+        let mut order_p = mk_symbol("Order.Process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.Process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Type),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Type),
+            inv_p,
+            mk_symbol("Svc", SymbolKind::Type),
+            run,
+        ];
+        idx.add_file("w.go", &syms);
+        idx.set_type_binds(
+            "w.go",
+            &[
+                TypeBind {
+                    scope: "Svc".into(),
+                    name: "owned".into(),
+                    type_name: "Order".into(),
+                    line: 1,
+                },
+                TypeBind {
+                    scope: "Svc".into(),
+                    name: "owned".into(),
+                    type_name: "Invoice".into(),
+                    line: 2,
+                },
+                TypeBind {
+                    scope: "Svc.Run".into(),
+                    name: "s".into(),
+                    type_name: "Svc".into(),
+                    line: 3,
+                },
+            ],
+        );
+        let calls = vec![Call {
+            caller: Some("Svc.Run".into()),
+            callee: "s.owned.Process".into(),
+            line: 4,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.go", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(resolved[0].callee_id, None, "tombstone must not pin");
+        assert_eq!(resolved[0].recv, RecvKind::FieldOfVariable);
+        assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
     }
 }

@@ -8,7 +8,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -467,6 +467,8 @@ struct Ctx {
     module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Struct-field and method-receiver type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -573,9 +575,28 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds: self.type_binds,
             ..ExtractedFile::default()
         }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() {
+            return;
         }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +733,10 @@ impl GoExtractor {
             }
         }
         ctx.scopes.push(sym_name);
+        if let Some((rname, rty)) = receiver_name_and_type(node.child_by_field_name("receiver"), src)
+        {
+            ctx.push_type_bind(rname, rty, start_line);
+        }
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -810,12 +835,21 @@ impl GoExtractor {
                                     }
                                 }
                             }
+                            let field_ty = go_simple_type_name(fd.child_by_field_name("type"), src);
+                            let fline = fd.start_position().row as u32 + 1;
                             for fname in field_names {
                                 ctx.facts.push(SemanticFact::Field {
                                     owner: name.clone(),
-                                    name: fname,
+                                    name: fname.clone(),
                                     mutable: true,
                                 });
+                                self.bind_field_type(
+                                    ctx,
+                                    name.clone(),
+                                    fname,
+                                    field_ty.clone(),
+                                    fline,
+                                );
                             }
                         }
                     }
@@ -837,6 +871,21 @@ impl GoExtractor {
                     }
                 }
             }
+        }
+    }
+
+    /// Struct-scoped field type from the declared (pointer-stripped) type.
+    // trace:v1 id=impl.scc.extract.go.field-type work=WORK-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow satisfies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field implements=PLAN-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow
+    fn bind_field_type(
+        &self,
+        ctx: &mut Ctx,
+        owner: String,
+        field: String,
+        declared_ty: Option<String>,
+        line: u32,
+    ) {
+        if let Some(ty) = declared_ty {
+            ctx.push_type_bind_in(owner, field, ty, line);
         }
     }
 
@@ -2050,12 +2099,76 @@ fn method_has_own_type_param(method: Node, ty: &str, src: &[u8]) -> bool {
     false
 }
 
+// trace:exempt reason=internal-detail
 fn receiver_type(receiver: Option<Node>, src: &[u8]) -> Option<String> {
+    go_simple_type_name(
+        receiver.and_then(|plist| {
+            let mut cursor = plist.walk();
+            let pd = plist.named_children(&mut cursor).next()?;
+            pd.child_by_field_name("type")
+        }),
+        src,
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn receiver_name_and_type(receiver: Option<Node>, src: &[u8]) -> Option<(String, String)> {
     let plist = receiver?;
     let mut cursor = plist.walk();
     let pd = plist.named_children(&mut cursor).next()?;
-    let t = pd.child_by_field_name("type")?;
-    let mut n = t;
+    let name = clean(node_text(pd.child_by_field_name("name"), src));
+    let ty = go_simple_type_name(pd.child_by_field_name("type"), src)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some((name, ty))
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn go_is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            s,
+            "bool"
+                | "byte"
+                | "complex64"
+                | "complex128"
+                | "error"
+                | "float32"
+                | "float64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "rune"
+                | "string"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+                | "any"
+                | "comparable"
+                | "true"
+                | "false"
+                | "nil"
+        )
+}
+
+/// Pointer-stripped simple type name. Slices, maps, and channels stay unbound.
+// trace:exempt reason=internal-detail
+fn go_simple_type_name(node: Option<Node>, src: &[u8]) -> Option<String> {
+    let mut n = node?;
     loop {
         match n.kind() {
             "pointer_type" | "parenthesized_type" => {
@@ -2070,15 +2183,17 @@ fn receiver_type(receiver: Option<Node>, src: &[u8]) -> Option<String> {
                 };
                 n = name;
             }
+            "slice_type" | "array_type" | "map_type" | "channel_type" | "function_type"
+            | "interface_type" => return None,
             _ => break,
         }
     }
     let text = clean(node_text(Some(n), src));
-    let text = text.split('[').next().unwrap_or("").trim().to_string();
-    if text.is_empty() {
-        None
+    let text = text.split('[').next().unwrap_or("").trim();
+    if go_is_simple_ident(text) {
+        Some(text.to_string())
     } else {
-        Some(text)
+        None
     }
 }
 
@@ -2785,6 +2900,61 @@ mod tests {
         assert_eq!(
             v.decl_header.as_deref(),
             Some("func (r *Reporter) Merge(values ...string) string")
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.field-type verifies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field exercises=impl.scc.extract.go.field-type
+    fn field_type_binds_from_struct_and_receiver() {
+        let ef = extract(
+            r#"
+package app
+
+type Order struct{}
+
+func (o *Order) Process() {}
+
+type Invoice struct{}
+
+func (i *Invoice) Process() {}
+
+type Svc struct {
+	repo  *Order
+	owned *Order
+}
+
+func (s *Svc) Run() {
+	s.owned.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "struct field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "owned field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.Run" && b.name == "s" && b.type_name == "Svc"),
+            "receiver bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.type_name == "Process" || b.name == "s" && b.scope == "Svc"),
+            "must not bind methods as fields: {:?}",
+            ef.type_binds
         );
     }
 }
