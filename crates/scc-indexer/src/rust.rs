@@ -14,7 +14,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -503,6 +503,8 @@ struct Ctx {
     module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Struct-field type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -584,9 +586,30 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
-            type_binds: Vec::new(),
+            type_binds: self.type_binds,
         }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() {
+            return;
         }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    /// Struct-scoped field type from the declared type (`Order`, `&Order`, `Box<Order>`).
+    // trace:v1 id=impl.scc.extract.rust.field-type work=WORK-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-type-narrowin satisfies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t implements=PLAN-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-type-narrowin
+    fn bind_field_type(&mut self, owner: String, field: String, declared_ty: Option<String>, line: u32) {
+        if let Some(ty) = declared_ty {
+            self.push_type_bind_in(owner, field, ty, line);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1429,7 @@ impl RustExtractor {
     /// Struct fields (state surface). A field is mutable when its type
     /// uses an interior-mutability/atomic wrapper; plain fields are
     /// immutable under Rust's ownership rules.
+    // trace:exempt reason=internal-detail
     fn record_struct_fields(&self, node: Node, owner: &str, ctx: &mut Ctx, src: &[u8]) {
         const MUTABLE_TYPES: &[&str] = &[
             "Cell<",
@@ -1436,11 +1460,18 @@ impl RustExtractor {
                         if !fname.is_empty() {
                             let ftype = node_text(f.child_by_field_name("type"), src);
                             let mutable = MUTABLE_TYPES.iter().any(|t| ftype.contains(t));
+                            let line = f.start_position().row as u32 + 1;
                             ctx.facts.push(SemanticFact::Field {
                                 owner: owner.to_string(),
-                                name: fname,
+                                name: fname.clone(),
                                 mutable,
                             });
+                            ctx.bind_field_type(
+                                owner.to_string(),
+                                fname,
+                                rust_simple_type_name(ftype),
+                                line,
+                            );
                         }
                         if has_serde
                             && pending
@@ -1787,6 +1818,60 @@ fn flatten_parent_type(f: Node, src: &[u8]) -> Option<String> {
         return None;
     }
     Some(t)
+}
+
+/// Simple type name for field-type narrowing. Strips `&`/`&mut` and one
+/// `Box`/`Arc`/`Rc`/`Option` wrapper. Qualified and remaining-generic types stay unbound.
+// trace:exempt reason=internal-detail
+fn rust_simple_type_name(text: &str) -> Option<String> {
+    let mut t = text.trim();
+    t = t.strip_prefix('&').unwrap_or(t).trim();
+    t = t.strip_prefix("mut ").unwrap_or(t).trim();
+    for wrap in ["Box<", "Arc<", "Rc<", "Option<"] {
+        if let Some(rest) = t.strip_prefix(wrap) {
+            if let Some(inner) = rest.strip_suffix('>') {
+                t = inner.trim();
+                break;
+            }
+        }
+    }
+    if t.is_empty() || t.contains("::") || t.contains('<') || t.contains('>') {
+        return None;
+    }
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if matches!(
+        t,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "str"
+            | "char"
+            | "String"
+            | "Self"
+            | "self"
+    ) {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 /// Derive names of a `#[derive(...)]` attribute run, last path segment
@@ -2836,5 +2921,47 @@ impl Handler {
         // Struct header ends at the name (no body braces).
         let h = find_symbol(&ef, "Handler");
         assert_eq!(h.decl_header.as_deref(), Some("pub struct Handler"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.rust.field-type verifies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t exercises=impl.scc.extract.rust.field-type
+    fn field_type_binds_from_struct_fields() {
+        let ef = extract(
+            r#"
+struct Order;
+impl Order { fn process(&self) {} }
+struct Invoice;
+impl Invoice { fn process(&self) {} }
+struct Svc {
+    repo: Order,
+    boxed: Box<Order>,
+    borrowed: &Order,
+}
+impl Svc {
+    fn run(&self) { self.repo.process(); }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "plain field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "boxed" && b.type_name == "Order"),
+            "Box<Order> bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "borrowed" && b.type_name == "Order"),
+            "&Order bind missing: {:?}",
+            ef.type_binds
+        );
     }
 }

@@ -1657,4 +1657,54 @@ func (s *Svc) Chain() { s.owned.inner.Process() }
         assert_eq!(resolved[0].recv, RecvKind::FieldOfVariable);
         assert_eq!(resolved[0].class, ResolutionClass::UnresolvedLikelyInternal);
     }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rust.field-type-extract verifies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t exercises=impl.scc.extract.rust.field-type
+    fn rust_extract_then_resolve_pins_self_field() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::rust::RustExtractor;
+        let src = r#"
+struct Order;
+impl Order { fn process(&self) {} }
+struct Invoice;
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc {
+    fn run(&self) { self.owned.process(); }
+    fn chain(&self) { self.owned.inner.process(); }
+}
+"#;
+        let ef = RustExtractor::default().extract(&SourceFile::new("w.rs", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "binds: {:?}",
+            ef.type_binds
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.rs", &ef.symbols);
+        idx.set_type_binds("w.rs", &ef.type_binds);
+        let resolved = resolve_calls("w.rs", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "self.owned.process")
+            .expect("self.owned.process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.rs", "Invoice.process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
+        assert_eq!(hit.recv, RecvKind::FieldOfSelf);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "self.owned.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        assert_eq!(chain.recv, RecvKind::FieldOfSelf);
+    }
 }

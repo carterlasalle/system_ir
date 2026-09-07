@@ -1377,4 +1377,41 @@ func (s *Svc) Run() { s.owned.Process() }
             "must not spray Invoice.Process: {calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rust.field-type-narrow verifies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t exercises=impl.scc.extract.rust.field-type
+    fn index_pins_rust_self_field_call_to_field_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.rs"),
+            r#"
+struct Order;
+impl Order { fn process(&self) {} }
+struct Invoice;
+impl Invoice { fn process(&self) {} }
+struct Svc { owned: Order }
+impl Svc { fn run(&self) { self.owned.process(); } }
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "Invoice.process");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.rs", "Svc.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "Svc.run must CALL Order.process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {calls:?}"
+        );
+    }
 }
