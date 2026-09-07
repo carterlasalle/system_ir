@@ -2732,4 +2732,160 @@ class Svc {
             "LIMIT alias must not pin helper: {bad_calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rule3-include-file verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn index_rule3_python_wildcard_pins_unique_imported_helper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.py"),
+            "def helper():\n    return 1\ndef foo():\n    return 0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b.py"), "def helper():\n    return 2\n").unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "from a import *\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("both.py"),
+            "from a import *\nfrom b import *\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("neither.py"), "def run():\n    return helper()\n").unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a_helper = scc_core::symbol_id(&idx.store.repo_id, "a.py", "helper");
+        let b_helper = scc_core::symbol_id(&idx.store.repo_id, "b.py", "helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.py", "run");
+        let both = scc_core::symbol_id(&idx.store.repo_id, "both.py", "run");
+        let neither = scc_core::symbol_id(&idx.store.repo_id, "neither.py", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let run_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            run_calls.iter().any(|r| r.object == a_helper),
+            "wildcard import of a must CALL a.helper: {run_calls:?}"
+        );
+        assert!(
+            !run_calls.iter().any(|r| r.object == b_helper),
+            "must not spray to b.helper: {run_calls:?}"
+        );
+        let both_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == both)
+            .collect();
+        assert!(
+            !both_calls.iter().any(|r| r.object == a_helper)
+                && !both_calls.iter().any(|r| r.object == b_helper),
+            "both imported defining files must stay unresolved: {both_calls:?}"
+        );
+        let neither_calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == neither)
+            .collect();
+        assert!(
+            !neither_calls.iter().any(|r| r.object == a_helper)
+                && !neither_calls.iter().any(|r| r.object == b_helper),
+            "no import must not spray: {neither_calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rule3-langs verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn index_rule3_ts_imported_file_pins_without_named_helper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.ts"),
+            "export function helper() { return 1; }\nexport function foo() { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.ts"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("w.ts"),
+            "import { foo } from \"./a\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a_helper = scc_core::symbol_id(&idx.store.repo_id, "a.ts", "helper");
+        let b_helper = scc_core::symbol_id(&idx.store.repo_id, "b.ts", "helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.ts", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == a_helper),
+            "importing ./a must CALL a.helper even when helper is not named: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == b_helper),
+            "must not spray to b.helper: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.rule3-incremental verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn index_rule3_survives_incremental_caller_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("pkg/a.py"),
+            "def helper():\n    return 1\ndef foo():\n    return 0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("other/a.py"), "def helper():\n    return 2\n").unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "from pkg.a import foo\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        std::fs::write(
+            root.join("w.py"),
+            "from pkg.a import foo\ndef run():\n    return helper()  # touch\n",
+        )
+        .unwrap();
+        idx.index().unwrap();
+        let pkg = scc_core::symbol_id(&idx.store.repo_id, "pkg/a.py", "helper");
+        let other = scc_core::symbol_id(&idx.store.repo_id, "other/a.py", "helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.py", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == pkg),
+            "path-precise pkg.a must pin after incremental edit: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == other),
+            "must not basename-guess other/a.py: {calls:?}"
+        );
+        let (cold, _t2) = indexer_for(root);
+        cold.index().unwrap();
+        let cold_pkg = scc_core::symbol_id(&cold.store.repo_id, "pkg/a.py", "helper");
+        let cold_run = scc_core::symbol_id(&cold.store.repo_id, "w.py", "run");
+        let cold_hit = cold.store.all_relationships().unwrap().iter().any(|r| {
+            r.predicate == scc_core::predicates::CALLS
+                && r.subject == cold_run
+                && r.object == cold_pkg
+        });
+        assert!(cold_hit, "cold index must also CALL pkg/a.py helper");
+    }
 }

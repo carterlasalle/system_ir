@@ -12,17 +12,21 @@
 //!    the target file's exported symbol;
 //! 6. imported module namespace (`import * as ns`, `import m`) → member on
 //!    the target file;
-//! 7. `self`/`this` sibling methods, else unique class-like / CHA on the
+//! 7. Rule 3 include-file: path-precise Internal import files; pin a
+//!    bare name when exactly one imported file defines that callable
+//!    (same-file defs stay on the local ladder; 0 or ≥2 imported
+//!    defining files stay unresolved; never basename-guess);
+//! 8. `self`/`this` sibling methods, else unique class-like / CHA on the
 //!    enclosing class; `super` walks bases only. Plus one-hop `self.field.m()` / `this.field.m()` when the field type is unique;
-//! 8. confirmed external import root → `external_api` entity;
-//! 9. otherwise: unresolved (counted; never silently treated as external).
+//! 9. confirmed external import root → `external_api` entity;
+//! 10. otherwise: unresolved (counted; never silently treated as external).
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
 use crate::model::{Call, FnBind, Import, ImportType, Symbol, SymbolKind, TypeBind};
 use crate::recv::{classify_callee, split_recv_path, RecvFact};
 use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedCall {
@@ -396,6 +400,13 @@ pub fn resolve_calls(
             ImportTarget::Unresolved { .. } => {}
         }
     }
+    let imported_files: BTreeSet<&str> = resolved_imports
+        .iter()
+        .filter_map(|ri| match &ri.target {
+            ImportTarget::Internal { file, .. } => Some(file.as_str()),
+            _ => None,
+        })
+        .collect();
 
     // local symbols by name
     let local: HashMap<&str, &Symbol> = symbols.iter().map(|s| (s.name.as_str(), s)).collect();
@@ -587,7 +598,15 @@ pub fn resolve_calls(
         // Function-alias bind: `f = helper; f()` — before the local-name
         // ladder, so a same-named global is never a false edge.
         if recv == RecvKind::None {
-            match fn_ptr_hit(&call, root, path, index, fn_binds, &binding) {
+            match fn_ptr_hit(
+                &call,
+                root,
+                path,
+                index,
+                fn_binds,
+                &binding,
+                &imported_files,
+            ) {
                 FnPtrHit::Pin(id) => {
                     out.push(emit(
                         caller_id,
@@ -729,6 +748,23 @@ pub fn resolve_calls(
             continue;
         }
 
+        // Rule 3: unique imported defining file for a bare name.
+        if recv == RecvKind::None {
+            if let Some(id) = rule3_include_file_id(index, path, root, &imported_files) {
+                out.push(emit(
+                    caller_id,
+                    Some(id),
+                    call.callee.clone(),
+                    0.9,
+                    call.line,
+                    ResolutionClass::ResolvedInternal,
+                    recv,
+                    1,
+                ));
+                continue;
+            }
+        }
+
         // Rule 2c: `Cls.m()` — the receiver token is the type. Typed locals
         // win (Rule 2); any local/param of that name vetoes the class pin.
         if recv == RecvKind::StaticType {
@@ -861,6 +897,7 @@ fn fn_ptr_hit(
     index: &SymbolIndex,
     fn_binds: &[FnBind],
     binding: &HashMap<&str, (String, String)>,
+    imported_files: &BTreeSet<&str>,
 ) -> FnPtrHit {
     if root.is_empty() {
         return FnPtrHit::Miss;
@@ -884,7 +921,7 @@ fn fn_ptr_hit(
         file_t.filter(|s| !s.is_empty())
     };
     match chosen {
-        Some(name) => unique_function_id(index, path, name, binding)
+        Some(name) => unique_function_id(index, path, name, binding, imported_files)
             .map(FnPtrHit::Pin)
             .unwrap_or(FnPtrHit::Block),
         None => FnPtrHit::Block,
@@ -915,13 +952,15 @@ fn has_fn_bind(binds: &[FnBind], scope: Option<&str>, var: &str) -> bool {
 /// Unique in-repo Function named `name`, or Const with a signature
 /// (TypeScript function-valued `const helper = () => {}`). Local hit
 /// wins; a local non-callable symbol or import binding vetoes the rest
-/// of the repo. Two same-named callables across files stay unresolved.
-/// Classes and signature-less consts (`LIMIT = 10`) are never pins.
+/// of the repo. Rule 3 then pins a unique imported defining file.
+/// Two same-named callables across files stay unresolved unless Rule 3
+/// narrows. Classes and signature-less consts (`LIMIT = 10`) are never pins.
 fn unique_function_id(
     index: &SymbolIndex,
     local_path: &str,
     name: &str,
     binding: &HashMap<&str, (String, String)>,
+    imported_files: &BTreeSet<&str>,
 ) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -938,6 +977,9 @@ fn unique_function_id(
         let fs = index.files.get(target_file.as_str())?;
         let (sym, id) = fs.by_name.get(exported.as_str())?;
         return is_fn_alias_target(sym).then(|| id.clone());
+    }
+    if let Some(id) = rule3_include_file_id(index, local_path, name, imported_files) {
+        return Some(id);
     }
     let mut found: Option<String> = None;
     for fs in index.files.values() {
@@ -957,6 +999,53 @@ fn unique_function_id(
 
 fn is_fn_alias_target(sym: &Symbol) -> bool {
     sym.kind == SymbolKind::Function || (sym.kind == SymbolKind::Const && sym.signature.is_some())
+}
+
+/// Ripwire `rule3IncludeFile` analog: pin a bare name to the unique
+/// path-precise Internal import file that defines it. Same-file names
+/// stay on the local ladder. Unresolved/external imports contribute
+/// nothing. 0 or ≥2 imported defining files stay unresolved. Never
+/// invents a target and never basename-guesses.
+// trace:v1 id=impl.scc.resolve.rule3-include-file work=WORK-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-include-file-nar satisfies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl implements=PLAN-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-include-file-nar
+fn rule3_include_file_id(
+    index: &SymbolIndex,
+    caller_path: &str,
+    name: &str,
+    imported_files: &BTreeSet<&str>,
+) -> Option<String> {
+    if name.is_empty() || imported_files.is_empty() {
+        return None;
+    }
+    if index
+        .files
+        .get(caller_path)
+        .is_some_and(|fs| fs.by_name.contains_key(name))
+    {
+        return None;
+    }
+    let mut chosen: Option<&str> = None;
+    for file in imported_files {
+        if *file == caller_path {
+            continue;
+        }
+        let Some(fs) = index.files.get(*file) else {
+            continue;
+        };
+        let Some((sym, _)) = fs.by_name.get(name) else {
+            continue;
+        };
+        if !is_fn_alias_target(sym) {
+            continue;
+        }
+        match chosen {
+            None => chosen = Some(*file),
+            Some(_) => return None,
+        }
+    }
+    let file = chosen?;
+    let fs = index.files.get(file)?;
+    let (sym, id) = fs.by_name.get(name)?;
+    is_fn_alias_target(sym).then(|| id.clone())
 }
 
 /// Unique type for `(scope, var)` or None when missing / tombstoned (≥2 types).
@@ -2401,11 +2490,7 @@ mod tests {
         let mut own = mk_symbol("IERS_B.open", SymbolKind::Method);
         own.parent = Some("IERS_B".into());
         let handle = mk_symbol("handle", SymbolKind::Function);
-        let syms = vec![
-            mk_symbol("IERS_B", SymbolKind::Class),
-            own,
-            handle.clone(),
-        ];
+        let syms = vec![mk_symbol("IERS_B", SymbolKind::Class), own, handle.clone()];
         idx.add_file("w.rs", &syms);
         idx.set_class_bases("w.rs", &[("IERS_B".into(), vec!["Open".into()])]);
         idx.set_type_binds(
@@ -3610,10 +3695,7 @@ class Svc {
             .find(|c| c.callee_name == "h" && c.caller_id == lam_id)
             .expect("lam h()");
         assert_eq!(h.callee_id, None, "lambda must block the name ladder");
-        assert_ne!(
-            h.callee_id,
-            Some(scc_core::symbol_id("repo", "w.py", "f"))
-        );
+        assert_ne!(h.callee_id, Some(scc_core::symbol_id("repo", "w.py", "f")));
         let fs_id = scc_core::symbol_id("repo", "w.py", "file_scope");
         let f2 = resolved
             .iter()
@@ -3631,14 +3713,10 @@ class Svc {
     fn two_same_named_functions_across_files_stay_unresolved() {
         use crate::model::{LanguageExtractor, SourceFile};
         use crate::python::PythonExtractor;
-        let a = PythonExtractor::default().extract(&SourceFile::new(
-            "a.py",
-            "def helper():\n    return 1\n",
-        ));
-        let b = PythonExtractor::default().extract(&SourceFile::new(
-            "b.py",
-            "def helper():\n    return 2\n",
-        ));
+        let a = PythonExtractor::default()
+            .extract(&SourceFile::new("a.py", "def helper():\n    return 1\n"));
+        let b = PythonExtractor::default()
+            .extract(&SourceFile::new("b.py", "def helper():\n    return 2\n"));
         let w = PythonExtractor::default().extract(&SourceFile::new(
             "w.py",
             "def run():\n    f = helper\n    f()\n",
@@ -3649,10 +3727,7 @@ class Svc {
         idx.add_file("w.py", &w.symbols);
         idx.set_fn_binds("w.py", &w.fn_binds);
         let resolved = resolve_calls("w.py", &w.calls, &w.symbols, &[], &idx, "repo");
-        let hit = resolved
-            .iter()
-            .find(|c| c.callee_name == "f")
-            .expect("f()");
+        let hit = resolved.iter().find(|c| c.callee_name == "f").expect("f()");
         assert_eq!(hit.callee_id, None, "two helpers must not spray");
     }
 
@@ -3669,7 +3744,10 @@ class Svc {
             .find(|s| s.name == "helper")
             .expect("helper");
         assert_eq!(helper.kind, SymbolKind::Const);
-        assert!(helper.signature.is_some(), "function-valued const needs a signature");
+        assert!(
+            helper.signature.is_some(),
+            "function-valued const needs a signature"
+        );
         let mut idx = SymbolIndex::new("repo");
         idx.add_file("w.ts", &ef.symbols);
         idx.set_fn_binds("w.ts", &ef.fn_binds);
@@ -3694,9 +3772,301 @@ class Svc {
             .iter()
             .find(|c| c.callee_name == "h" && c.caller_id == bad_id)
             .expect("bad h()");
-        assert_eq!(
-            h.callee_id, None,
-            "signature-less const LIMIT must not pin"
+        assert_eq!(h.callee_id, None, "signature-less const LIMIT must not pin");
+    }
+
+    fn internal_import(file: &str, names: &[(&str, &str)]) -> ResolvedImport {
+        ResolvedImport {
+            local_file: "w.py".into(),
+            module: file.to_string(),
+            target: ImportTarget::Internal {
+                file: file.into(),
+                name_map: HashMap::new(),
+                namespace: false,
+            },
+            names: names
+                .iter()
+                .map(|(local, imported)| ((*local).to_string(), (*imported).to_string()))
+                .collect(),
+            line: 1,
+        }
+    }
+
+    fn helper_call(caller: &str) -> Call {
+        Call {
+            caller: Some(caller.into()),
+            callee: "helper".into(),
+            line: 3,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rule3-include-file verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn rule3_unique_imported_file_pins_and_controls_refuse() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file(
+            "a.py",
+            &[
+                mk_symbol("helper", SymbolKind::Function),
+                mk_symbol("foo", SymbolKind::Function),
+            ],
         );
+        idx.add_file("b.py", &[mk_symbol("helper", SymbolKind::Function)]);
+        let run = mk_symbol("run", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&run));
+        let calls = vec![helper_call("run")];
+        let run_syms = std::slice::from_ref(&run);
+
+        let only_a = resolve_calls(
+            "w.py",
+            &calls,
+            run_syms,
+            &[internal_import("a.py", &[("foo", "foo")])],
+            &idx,
+            "repo",
+        );
+        let hit = only_a
+            .iter()
+            .find(|c| c.callee_name == "helper")
+            .expect("helper()");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "helper")),
+            "exactly one imported defining file must pin"
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "b.py", "helper"))
+        );
+        assert_eq!(hit.class, ResolutionClass::ResolvedInternal);
+
+        let neither = resolve_calls("w.py", &calls, run_syms, &[], &idx, "repo");
+        assert_eq!(
+            neither[0].callee_id, None,
+            "no import must not spray to either helper"
+        );
+
+        let both = resolve_calls(
+            "w.py",
+            &calls,
+            run_syms,
+            &[
+                internal_import("a.py", &[("foo", "foo")]),
+                internal_import("b.py", &[]),
+            ],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            both[0].callee_id, None,
+            "two imported defining files must stay unresolved"
+        );
+
+        let unresolved = resolve_calls(
+            "w.py",
+            &calls,
+            run_syms,
+            &[ResolvedImport {
+                local_file: "w.py".into(),
+                module: "./missing".into(),
+                target: ImportTarget::Unresolved {
+                    name: "./missing".into(),
+                },
+                names: vec![],
+                line: 1,
+            }],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            unresolved[0].callee_id, None,
+            "unresolved import must not contribute a Rule 3 file"
+        );
+
+        let local = mk_symbol("helper", SymbolKind::Function);
+        idx.add_file("w.py", &[run.clone(), local.clone()]);
+        let same_file = resolve_calls(
+            "w.py",
+            &calls,
+            &[run.clone(), local],
+            &[internal_import("a.py", &[])],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            same_file[0].callee_id,
+            Some(scc_core::symbol_id("repo", "w.py", "helper")),
+            "same-file def must win"
+        );
+        assert_ne!(
+            same_file[0].callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "helper"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rule3-path-precise verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn rule3_is_path_precise_not_basename() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file(
+            "pkg/a.py",
+            &[
+                mk_symbol("helper", SymbolKind::Function),
+                mk_symbol("foo", SymbolKind::Function),
+            ],
+        );
+        idx.add_file("other/a.py", &[mk_symbol("helper", SymbolKind::Function)]);
+        let run = mk_symbol("run", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&run));
+        let import = Import {
+            module: "pkg.a".into(),
+            names: vec![("foo".into(), "foo".into())],
+            line: 1,
+            r#type: ImportType::Member,
+        };
+        let target = idx.resolve_import("w.py", &import);
+        match &target {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "pkg/a.py"),
+            other => panic!("expected Internal pkg/a.py, got {other:?}"),
+        }
+        let resolved = resolve_calls(
+            "w.py",
+            &[helper_call("run")],
+            &[run],
+            &[ResolvedImport {
+                local_file: "w.py".into(),
+                module: import.module,
+                target,
+                names: vec![("foo".into(), "foo".into())],
+                line: 1,
+            }],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "pkg/a.py", "helper"))
+        );
+        assert_ne!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "other/a.py", "helper")),
+            "must not basename-guess other/a.py"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rule3-unique-imported verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn rule3_pins_unique_imported_when_globally_unique() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &[mk_symbol("helper", SymbolKind::Function)]);
+        let run = mk_symbol("run", SymbolKind::Function);
+        idx.add_file("w.py", std::slice::from_ref(&run));
+        let resolved = resolve_calls(
+            "w.py",
+            &[helper_call("run")],
+            &[run],
+            &[internal_import("a.py", &[])],
+            &idx,
+            "repo",
+        );
+        assert_eq!(
+            resolved[0].callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "helper")),
+            "SCC has no unique-across-repo bare ladder; unique imported file still pins"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rule3-fn-alias verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file,impl.scc.resolve.fn-alias
+    fn rule3_fn_alias_pins_unique_imported_helper() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let a = PythonExtractor::default()
+            .extract(&SourceFile::new("a.py", "def helper():\n    return 1\n"));
+        let b = PythonExtractor::default()
+            .extract(&SourceFile::new("b.py", "def helper():\n    return 2\n"));
+        let w = PythonExtractor::default().extract(&SourceFile::new(
+            "w.py",
+            "from a import foo\ndef run():\n    f = helper\n    f()\n",
+        ));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &a.symbols);
+        idx.add_file("b.py", &b.symbols);
+        idx.add_file("w.py", &w.symbols);
+        idx.set_fn_binds("w.py", &w.fn_binds);
+        let imports: Vec<ResolvedImport> = w
+            .imports
+            .iter()
+            .map(|imp| ResolvedImport {
+                local_file: "w.py".into(),
+                module: imp.module.clone(),
+                names: imp.names.clone(),
+                line: imp.line,
+                target: idx.resolve_import("w.py", imp),
+            })
+            .collect();
+        let resolved = resolve_calls("w.py", &w.calls, &w.symbols, &imports, &idx, "repo");
+        let hit = resolved.iter().find(|c| c.callee_name == "f").expect("f()");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "helper")),
+            "alias of helper must Rule-3 pin the unique imported defining file"
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "b.py", "helper"))
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.rule3-python-wildcard verifies=REQ-implement-phase-26-of-scc-x-ripwire-lessons-absorb-rule-3-import-incl exercises=impl.scc.resolve.rule3-include-file
+    fn python_wildcard_import_pins_unique_imported_helper() {
+        use crate::model::{LanguageExtractor, SourceFile};
+        use crate::python::PythonExtractor;
+        let a = PythonExtractor::default().extract(&SourceFile::new(
+            "a.py",
+            "def helper():\n    return 1\ndef foo():\n    return 0\n",
+        ));
+        let b = PythonExtractor::default()
+            .extract(&SourceFile::new("b.py", "def helper():\n    return 2\n"));
+        let w = PythonExtractor::default().extract(&SourceFile::new(
+            "w.py",
+            "from a import *\ndef run():\n    return helper()\n",
+        ));
+        assert!(
+            w.imports
+                .iter()
+                .any(|i| i.module == "a" && i.names.is_empty()),
+            "wildcard must not bind helper by name: {:?}",
+            w.imports
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("a.py", &a.symbols);
+        idx.add_file("b.py", &b.symbols);
+        idx.add_file("w.py", &w.symbols);
+        let imports: Vec<ResolvedImport> = w
+            .imports
+            .iter()
+            .map(|imp| ResolvedImport {
+                local_file: "w.py".into(),
+                module: imp.module.clone(),
+                names: imp.names.clone(),
+                line: imp.line,
+                target: idx.resolve_import("w.py", imp),
+            })
+            .collect();
+        let resolved = resolve_calls("w.py", &w.calls, &w.symbols, &imports, &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "helper")
+            .expect("helper()");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "a.py", "helper"))
+        );
+        assert_eq!(hit.class, ResolutionClass::ResolvedInternal);
     }
 }
