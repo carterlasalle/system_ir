@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-mod golden;
+mod common;
 
 fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -92,7 +92,7 @@ fn bench_atlas_fixtures_fallback_prints_table() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args(["bench", "atlas"])
         .current_dir(&root)
         .output()
@@ -137,7 +137,7 @@ fn bench_atlas_corpus_mode_with_explicit_dirs() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args([
             "bench",
             "atlas",
@@ -207,7 +207,7 @@ fn bench_atlas_holdout_compares_and_writes_results_file() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args([
             "bench",
             "atlas",
@@ -262,7 +262,7 @@ fn bench_atlas_holdout_errors_when_holdout_corpus_missing() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args([
             "bench",
             "atlas",
@@ -334,7 +334,7 @@ fn bench_atlas_blind_prints_aggregates_only_and_writes_results_file() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args(["bench", "atlas", "--blind"])
         .current_dir(tmp.path())
         .output()
@@ -400,7 +400,7 @@ fn bench_atlas_blind_refuses_diagnose() {
     std::fs::create_dir_all(tmp.path().join("benchmarks/blind-test")).unwrap();
     std::fs::create_dir_all(tmp.path().join("benchmarks/blind-test-ground-truth")).unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args(["bench", "atlas", "--blind", "--diagnose"])
         .current_dir(tmp.path())
         .output()
@@ -448,7 +448,7 @@ fn bench_atlas_blind_errors_when_manifest_changes() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args(["bench", "atlas", "--blind"])
         .current_dir(root)
         .output()
@@ -501,7 +501,7 @@ fn bench_atlas_blind_errors_when_clone_head_mismatches_lock() {
     )
     .unwrap();
 
-    let out = std::process::Command::new(golden::scc())
+    let out = std::process::Command::new(common::scc())
         .args(["bench", "atlas", "--blind"])
         .current_dir(root)
         .output()
@@ -565,7 +565,7 @@ fn bench_atlas_compare_applies_wave11_gates() {
     // validation contracts regress 0.50 -> 0.30 (beyond the 0.05 guard)
     std::fs::write(&new_fail, holdout_json(0.56, 0.56, 0.51, 0.30)).unwrap();
 
-    let scc = golden::scc();
+    let scc = common::scc();
     let pass = std::process::Command::new(scc)
         .args([
             "bench",

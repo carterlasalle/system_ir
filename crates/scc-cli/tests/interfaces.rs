@@ -1,8 +1,8 @@
 //! Export validation against `docs/system-ir.schema.json` and MCP end-to-end
 //! tests (docs/TEST_PLAN.md §14, docs/API_AND_INTEGRATIONS.md §1).
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 // trace:v1 id=test.scc.interfaces verifies=REQ-SCC-API exercises=impl.scc.mcp,impl.scc.http,impl.scc.cli

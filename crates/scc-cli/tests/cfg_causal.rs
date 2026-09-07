@@ -3,9 +3,9 @@
 //! awaited — drives branch edges, Next-edge ordering, and Async edges.
 //! Branches come from CFG evidence, never text heuristics.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 // trace:v1 id=test.scc.cfg verifies=REQ-SCC-FLOW exercises=impl.scc.flowgraph
 
 #[test]

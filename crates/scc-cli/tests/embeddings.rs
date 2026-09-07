@@ -2,7 +2,7 @@
 //! embedding model, `scc embed` + task context must surface entities the
 //! lexical pass misses. Skips gracefully when Ollama is unreachable.
 
-mod golden;
+mod common;
 
 fn ollama_available() -> bool {
     let cfg = scc_indexer::embed::EmbedConfig {
@@ -21,7 +21,7 @@ fn embeddings_surface_semantic_candidates() {
         return;
     }
     let repo = tempfile::TempDir::new().unwrap();
-    let root = golden::workdir(repo.path());
+    let root = common::workdir(repo.path());
     std::fs::create_dir_all(root.join("svc")).unwrap();
     std::fs::create_dir_all(root.join(".scc")).unwrap();
     std::fs::write(
@@ -34,11 +34,11 @@ fn embeddings_surface_semantic_candidates() {
         "schema: 1\ninference:\n  enabled: true\n  provider: ollama\n  embedding_model: all-minilm\n",
     )
     .unwrap();
-    golden::run_ok(&root, &["index", "--quiet"]);
-    golden::run_ok(&root, &["embed"]);
+    common::run_ok(&root, &["index", "--quiet"]);
+    common::run_ok(&root, &["embed"]);
 
     // goal with zero surface overlap: "cash movement handling"
-    let out = golden::run(
+    let out = common::run(
         &root,
         &["context", "task", "cash movement handling", "--json"],
     );
@@ -59,14 +59,14 @@ fn embeddings_surface_semantic_candidates() {
 #[test]
 fn inference_disabled_keeps_lexical_behavior() {
     let repo = tempfile::TempDir::new().unwrap();
-    let root = golden::workdir(repo.path());
+    let root = common::workdir(repo.path());
     std::fs::create_dir_all(root.join("svc")).unwrap();
     std::fs::write(
         root.join("svc/a.py"),
         "def helper():\n    return 1\n",
     )
     .unwrap();
-    golden::run_ok(&root, &["index", "--quiet"]);
-    let out = golden::run_ok(&root, &["context", "task", "helper", "--json"]);
+    common::run_ok(&root, &["index", "--quiet"]);
+    let out = common::run_ok(&root, &["context", "task", "helper", "--json"]);
     assert!(out.contains("helper"), "{out}");
 }

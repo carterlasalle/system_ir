@@ -5,16 +5,16 @@
 
 use std::collections::BTreeMap;
 
-mod golden;
+mod common;
 
 #[test]
 fn cli_surface_export_and_flows() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
     // export: entity name -> attributes
-    let ir = golden::run_ok(&dir, &["export", "system-ir.json"]);
+    let ir = common::run_ok(&dir, &["export", "system-ir.json"]);
     let v: serde_json::Value =
         serde_json::from_str(&ir).expect("system-ir.json parses");
     let entities = v["entities"].as_array().expect("entities array");
@@ -83,7 +83,7 @@ fn cli_surface_export_and_flows() {
     assert_eq!(eps_of("symbol", "dist/index.js"), vec!["entrypoint"]);
 
     // flows mention the subcommands (entrypoint symbols become flows)
-    let flows = golden::run_ok(&dir, &["flows"]);
+    let flows = common::run_ok(&dir, &["flows"]);
     assert!(flows.contains("serve"), "flows must mention serve: {flows}");
     assert!(flows.contains("deploy"), "flows must mention deploy: {flows}");
 }

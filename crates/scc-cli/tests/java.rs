@@ -3,8 +3,8 @@
 //! main entrypoint, an export with symbols in Main.java, and a "store" task
 //! pack that surfaces the JDBC store-write method.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 const CONFIG: &str = "languages:\n  java: true\n";
 

@@ -7,9 +7,9 @@
 //! annotations, registrations), `http-service-python` (routes + exports +
 //! contract strings).
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 
 /// The rendered atlas exposes the fact-layer sections, and the structured
 /// machine model carries exports as public-api entrypoints (so ground-truth

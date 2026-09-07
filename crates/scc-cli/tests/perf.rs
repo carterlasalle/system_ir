@@ -2,7 +2,8 @@
 //!
 //! Do **not** `mod golden` here. Cargo compiles that file as a submodule of
 //! this binary, so every `#[test]` in golden.rs would run again in parallel
-//! with the wall-clock gate and steal CPU on shared GHA runners.
+//! with the wall-clock gate and steal CPU on shared GHA runners. Shared
+//! helpers live in `tests/common/` (not auto-discovered as a test crate).
 //!
 //! The TEST_PLAN §16 figure is 50k cold < 30s. Current main (post-mission
 //! graph/surface work) indexes this fixture in ~40s release locally and

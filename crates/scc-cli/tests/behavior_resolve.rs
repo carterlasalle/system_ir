@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-mod golden;
+mod common;
 
 fn write_fixture(root: &Path) {
     std::fs::create_dir_all(root).unwrap();
@@ -65,7 +65,7 @@ fn bench_json(root: &Path, corpus: &Path, gt: &Path, extra: &[&str]) -> serde_js
         gt.to_str().unwrap().into(),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
-    let out = Command::new(golden::scc())
+    let out = Command::new(common::scc())
         .args(&args)
         .current_dir(root)
         .output()
@@ -110,12 +110,12 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
     let corpus = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus).unwrap();
     std::fs::create_dir_all(corpus.join("resolve-fixture")).unwrap();
-    golden::copy_tree(&fixture_src, &corpus.join("resolve-fixture"));
+    common::copy_tree(&fixture_src, &corpus.join("resolve-fixture"));
 
     let corpus_nor = tmp.path().join("corpus-nor");
     std::fs::create_dir_all(&corpus_nor).unwrap();
     std::fs::create_dir_all(corpus_nor.join("resolve-fixture")).unwrap();
-    golden::copy_tree(&fixture_src, &corpus_nor.join("resolve-fixture"));
+    common::copy_tree(&fixture_src, &corpus_nor.join("resolve-fixture"));
 
     // 1. The bench (default: resolve ON) indexes, resolves the call chain
     // through tsserver, and reports resolved_calls > 0; the behavior layer
@@ -155,7 +155,7 @@ fn resolve_seeds_behavior_flows_and_reports_resolved_calls() {
 
     // 2. The canonical flow graph for the route carries the resolved
     // chain: handleList -> db with a RESOLVED edge (the flow step ops).
-    let fg = Command::new(golden::scc())
+    let fg = Command::new(common::scc())
         .args(["export", "flow-graphs.json"])
         .current_dir(corpus.join("resolve-fixture"))
         .output()

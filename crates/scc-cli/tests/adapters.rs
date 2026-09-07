@@ -1,8 +1,8 @@
 //! External adapter integration tests (SCC-202/203/204/205): beads, CBM,
 //! hindsight import + pack enrichment + Context7 docs.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 // Fake Context7 server speaking the REAL v4 protocol (JSONL transport,
 // resolve-library-id + query-docs) — pinned by the live suite in

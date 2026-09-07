@@ -3,8 +3,8 @@
 //! registration / configuration / callback entities and their relationships
 //! in the exported System IR, deterministically.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 // trace:v1 id=test.scc.facts.typescript verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.typescript
 
 fn indexed_ir() -> (tempfile::TempDir, serde_json::Value) {

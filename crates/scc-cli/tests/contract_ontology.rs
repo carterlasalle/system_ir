@@ -7,9 +7,9 @@
 //! route/flag/topic/config facts → http/cli/event/config) and render the
 //! atlas CONTRACTS section as per-subclass groups.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 // trace:v1 id=test.scc.contract-ontology verifies=REQ-SCC-CTX exercises=impl.scc.atlas,impl.scc.extract.python,impl.scc.extract.typescript,impl.scc.extract.rust,impl.scc.extract.go,impl.scc.extract.java
 
 fn fixture() -> tempfile::TempDir {

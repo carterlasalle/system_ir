@@ -3,9 +3,9 @@
 //! and the hierarchical architecture clusterer — asserted end-to-end
 //! through `scc atlas` on fixtures across archetypes.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 use std::path::Path;
 // trace:v1 id=test.scc.ontology verifies=REQ-SCC-IR exercises=impl.scc.archetype,impl.scc.components,impl.scc.state
 
