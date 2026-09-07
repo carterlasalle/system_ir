@@ -8,7 +8,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, TypeBind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
@@ -426,6 +426,8 @@ struct Ctx {
     facts: Vec<SemanticFact>,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Local parameter and class-field type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -490,13 +492,62 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags: std::collections::BTreeMap::new(),
             facts,
-            type_binds: Vec::new(),
+            type_binds: self.type_binds,
         }
     }
 
     /// Any import whose module string starts with `prefix`.
     fn has_import(&self, prefix: &str) -> bool {
         self.imports.iter().any(|i| i.module.starts_with(prefix))
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() || name == "this" {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    /// Class name for `Class.method` scopes; `None` at compilation-unit level.
+    // trace:exempt reason=internal-detail
+    fn enclosing_class_name(&self) -> Option<String> {
+        if self.top_is_class() {
+            let n = self.top_name();
+            return (!n.is_empty()).then_some(n);
+        }
+        let top = self.top_name();
+        let (class, rest) = top.split_once('.')?;
+        if rest.is_empty() || class.is_empty() {
+            None
+        } else {
+            Some(class.to_string())
+        }
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
     }
 }
 
@@ -667,6 +718,58 @@ fn is_mockito_annotation(name: &str) -> bool {
 }
 
 // trace:exempt reason=internal-detail
+fn java_is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            s,
+            "void"
+                | "boolean"
+                | "byte"
+                | "short"
+                | "int"
+                | "long"
+                | "char"
+                | "float"
+                | "double"
+                | "var"
+        )
+}
+
+/// Simple class name from a Java type node. Generics and arrays stay unbound.
+// trace:exempt reason=internal-detail
+fn java_simple_type_name(node: Option<Node>, src: &[u8]) -> Option<String> {
+    let n = node?;
+    match n.kind() {
+        "generic_type" | "array_type" | "integral_type" | "floating_point_type" | "boolean_type"
+        | "void_type" => None,
+        "scoped_type_identifier" => {
+            let t = clean(node_text(Some(n), src));
+            let last = t.rsplit('.').next().unwrap_or(&t);
+            java_is_simple_ident(last).then(|| last.to_string())
+        }
+        _ => {
+            let t = clean(node_text(Some(n), src));
+            java_is_simple_ident(&t).then_some(t)
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn java_ctor_type(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "object_creation_expression" {
+        return None;
+    }
+    java_simple_type_name(node.child_by_field_name("type"), src)
+}
+
+// trace:exempt reason=internal-detail
 impl JavaExtractor {
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
@@ -677,6 +780,7 @@ impl JavaExtractor {
             "method_declaration" => self.walk_method(node, ctx, src),
             "constructor_declaration" => self.walk_constructor(node, ctx, src),
             "field_declaration" => self.walk_field(node, ctx, src),
+            "assignment_expression" => self.record_this_field_assign(node, ctx, src),
             "method_invocation" => self.record_call(node, ctx, src),
             "object_creation_expression" => self.record_creation(node, ctx, src),
             "import_declaration" => self.record_import(node, ctx, src),
@@ -865,6 +969,7 @@ impl JavaExtractor {
             is_class: false,
             is_interface: false,
         });
+        self.bind_formal_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -907,6 +1012,7 @@ impl JavaExtractor {
             is_class: false,
             is_interface: false,
         });
+        self.bind_formal_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -931,6 +1037,7 @@ impl JavaExtractor {
             && annotations_on(node, src)
                 .iter()
                 .any(|(n, _)| n == "Rule");
+        let declared_ty = java_simple_type_name(node.child_by_field_name("type"), src);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() != "variable_declarator" {
@@ -960,6 +1067,15 @@ impl JavaExtractor {
                 name: fname.clone(),
                 mutable,
             });
+            self.bind_field_type(
+                ctx,
+                class.clone(),
+                fname,
+                child.child_by_field_name("value"),
+                declared_ty.clone(),
+                start_line,
+                src,
+            );
             self.record_annotations(node, ctx, src, &fq);
             if has_rule {
                 ctx.facts.push(SemanticFact::Registration {
@@ -969,6 +1085,80 @@ impl JavaExtractor {
                 });
             }
         }
+    }
+
+    /// Class-scoped field type from the declared type, `new Foo()`, or a unique RHS ident.
+    // trace:v1 id=impl.scc.extract.java.field-type work=WORK-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni satisfies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na implements=PLAN-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni
+    fn bind_field_type(
+        &self,
+        ctx: &mut Ctx,
+        class: String,
+        field: String,
+        right: Option<Node>,
+        declared_ty: Option<String>,
+        line: u32,
+        src: &[u8],
+    ) {
+        if let Some(ty) = declared_ty {
+            ctx.push_type_bind_in(class.clone(), field.clone(), ty, line);
+        }
+        if let Some(r) = right {
+            if let Some(ty) = java_ctor_type(r, src) {
+                ctx.push_type_bind_in(class, field, ty, line);
+            } else if r.kind() == "identifier" {
+                let rhs = clean(node_text(Some(r), src));
+                if let Some(ty) = ctx.unique_local_type(&rhs) {
+                    ctx.push_type_bind_in(class, field, ty, line);
+                }
+            }
+        }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn bind_formal_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "formal_parameter" {
+                continue;
+            }
+            let name = clean(node_text(p.child_by_field_name("name"), src));
+            let Some(ty) = java_simple_type_name(p.child_by_field_name("type"), src) else {
+                continue;
+            };
+            let line = p.start_position().row as u32 + 1;
+            ctx.push_type_bind(name, ty, line);
+        }
+    }
+
+    /// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique param type.
+    // trace:exempt reason=internal-detail
+    fn record_this_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(class) = ctx.enclosing_class_name() {
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "field_access" {
+                    let obj = left.child_by_field_name("object");
+                    if clean(node_text(obj, src)) == "this" {
+                        let fname = clean(node_text(left.child_by_field_name("field"), src));
+                        if !fname.is_empty() {
+                            let line = node.start_position().row as u32 + 1;
+                            self.bind_field_type(
+                                ctx,
+                                class,
+                                fname,
+                                node.child_by_field_name("right"),
+                                None,
+                                line,
+                                src,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
     }
 
     /// Wave 9: annotation facts on a declaration targeting `target`.
@@ -2545,6 +2735,81 @@ public class IncidentService<T> implements Repository<T> {
         assert_eq!(
             im.decl_header.as_deref(),
             Some("List<T> find(String owner, int limit) throws IOException")
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.field-type verifies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na exercises=impl.scc.extract.java.field-type
+    fn field_type_binds_from_declaration_ctor_and_param() {
+        let ef = extract(
+            r#"
+class Order {
+    void process() {}
+}
+class Invoice {
+    void process() {}
+}
+class Svc {
+    private Order repo;
+    Svc(Invoice other) {
+        this.owned = new Order();
+        this.other = other;
+    }
+    void run() {
+        this.owned.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "field declaration bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = new Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "this.other = param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.Svc"
+                && b.name == "other"
+                && b.type_name == "Invoice"),
+            "constructor param bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    Svc() {
+        this.x = new Order();
+        this.x = new Invoice();
+    }
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "tombstone fuel missing: {types:?}"
         );
     }
 }

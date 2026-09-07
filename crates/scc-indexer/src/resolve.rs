@@ -1460,4 +1460,52 @@ mod tests {
         );
         assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
     }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.java.field-type-extract verifies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na exercises=impl.scc.extract.java.field-type
+    fn java_extract_then_resolve_pins_this_field() {
+        use crate::java::JavaExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    Svc() { this.owned = new Order(); }
+    void run() { this.owned.process(); }
+    void chain() { this.owned.inner.process(); }
+}
+"#;
+        let ef = JavaExtractor::default().extract(&SourceFile::new("W.java", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "binds: {:?}",
+            ef.type_binds
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("W.java", &ef.symbols);
+        idx.set_type_binds("W.java", &ef.type_binds);
+        let resolved = resolve_calls("W.java", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "this.owned.process")
+            .expect("this.owned.process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "W.java", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "W.java", "Invoice.process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
+        assert_eq!(hit.recv, RecvKind::FieldOfThis);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "this.owned.inner.process")
+            .expect("longer chain call");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        assert_eq!(chain.recv, RecvKind::FieldOfThis);
+    }
 }
