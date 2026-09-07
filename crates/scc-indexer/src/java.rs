@@ -549,6 +549,32 @@ impl Ctx {
         types.dedup();
         (types.len() == 1).then(|| types[0].to_string())
     }
+
+    /// Class-scoped field type from the declared type, `new Foo()`, or a unique RHS ident.
+    // trace:v1 id=impl.scc.extract.java.field-type work=WORK-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni satisfies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na implements=PLAN-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni
+    fn bind_field_type(
+        &mut self,
+        class: String,
+        field: String,
+        right: Option<Node>,
+        declared_ty: Option<String>,
+        line: u32,
+        src: &[u8],
+    ) {
+        if let Some(ty) = declared_ty {
+            self.push_type_bind_in(class.clone(), field.clone(), ty, line);
+        }
+        if let Some(r) = right {
+            if let Some(ty) = java_ctor_type(r, src) {
+                self.push_type_bind_in(class, field, ty, line);
+            } else if r.kind() == "identifier" {
+                let rhs = clean(node_text(Some(r), src));
+                if let Some(ty) = self.unique_local_type(&rhs) {
+                    self.push_type_bind_in(class, field, ty, line);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,8 +1093,7 @@ impl JavaExtractor {
                 name: fname.clone(),
                 mutable,
             });
-            self.bind_field_type(
-                ctx,
+            ctx.bind_field_type(
                 class.clone(),
                 fname,
                 child.child_by_field_name("value"),
@@ -1083,33 +1108,6 @@ impl JavaExtractor {
                     kind: "rule".to_string(),
                     target: fq,
                 });
-            }
-        }
-    }
-
-    /// Class-scoped field type from the declared type, `new Foo()`, or a unique RHS ident.
-    // trace:v1 id=impl.scc.extract.java.field-type work=WORK-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni satisfies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na implements=PLAN-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni
-    fn bind_field_type(
-        &self,
-        ctx: &mut Ctx,
-        class: String,
-        field: String,
-        right: Option<Node>,
-        declared_ty: Option<String>,
-        line: u32,
-        src: &[u8],
-    ) {
-        if let Some(ty) = declared_ty {
-            ctx.push_type_bind_in(class.clone(), field.clone(), ty, line);
-        }
-        if let Some(r) = right {
-            if let Some(ty) = java_ctor_type(r, src) {
-                ctx.push_type_bind_in(class, field, ty, line);
-            } else if r.kind() == "identifier" {
-                let rhs = clean(node_text(Some(r), src));
-                if let Some(ty) = ctx.unique_local_type(&rhs) {
-                    ctx.push_type_bind_in(class, field, ty, line);
-                }
             }
         }
     }
@@ -1144,8 +1142,7 @@ impl JavaExtractor {
                         let fname = clean(node_text(left.child_by_field_name("field"), src));
                         if !fname.is_empty() {
                             let line = node.start_position().row as u32 + 1;
-                            self.bind_field_type(
-                                ctx,
+                            ctx.bind_field_type(
                                 class,
                                 fname,
                                 node.child_by_field_name("right"),
