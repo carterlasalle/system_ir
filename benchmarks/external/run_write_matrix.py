@@ -333,7 +333,6 @@ def main(argv):
         "agent_label": agent_label,
         "agent_cmd": agent_cmd,
         "model_label": args.model_label,
-        "scc_revision": _git(scc_root, "rev-parse", "HEAD"),
         "scc_commit": _git(scc_root, "rev-parse", "HEAD"),
         "scc_dirty": bool(_git(scc_root, "status", "--porcelain")),
         "harness_revision": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
