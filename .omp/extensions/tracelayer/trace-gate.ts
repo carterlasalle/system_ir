@@ -21,13 +21,22 @@ export default function hook(pi: ExtensionAPI): void {
   // ignores the `input` option, which silently dropped every hook payload —
   // the gate then ran with an empty body and never blocked. Node's
   // spawnSync writes input to stdin reliably and runs under the Bun host.
+  const HOOK_TIMEOUT_MS = 30_000;
+
+  // TRACE_BIN / `trace` on PATH, then `uv run trace` (the installed layout).
   // trace:exempt reason=internal-helper
   const run = (args: string[], input: string): { code: number; out: string } => {
-    const res = spawnSync("uv", ["run", "trace", ...args], {
+    const opts = {
       input,
-      encoding: "utf8",
+      encoding: "utf8" as const,
       maxBuffer: 64 * 1024 * 1024,
-    });
+      timeout: HOOK_TIMEOUT_MS,
+      killSignal: "SIGTERM" as const,
+    };
+    const bin = process.env.TRACE_BIN;
+    const res = bin
+      ? spawnSync(bin, args, opts)
+      : spawnSync("uv", ["run", "trace", ...args], opts);
     const code = res.status ?? -1;
     return { code, out: String(res.stdout ?? "") };
   };
@@ -83,6 +92,30 @@ export default function hook(pi: ExtensionAPI): void {
     return { path, line, payload };
   };
 
+  // Parse a hook JSON body for a human-readable reason / block decision.
+  // Empty or malformed stdout is fail-closed.
+  // trace:exempt reason=internal-helper
+  const parseHook = (out: string): { reason: string; block: boolean; extra: string } => {
+    const trimmed = out.trim();
+    if (!trimmed) {
+      return { reason: "trace hook returned empty output", block: true, extra: "" };
+    }
+    try {
+      const d = JSON.parse(trimmed) as {
+        output?: string;
+        reason?: string;
+        decision?: string;
+        block?: boolean;
+      };
+      const extra = typeof d.output === "string" ? d.output : "";
+      const reason = (typeof d.reason === "string" && d.reason) || extra || "trace policy blocks this action";
+      const block = d.block === true || d.decision === "block";
+      return { reason, block, extra };
+    } catch {
+      return { reason: "trace hook returned malformed JSON", block: true, extra: "" };
+    }
+  };
+
   // Pre-authoring gate: pass the FULL proposed mutation so TraceLayer can
   // simulate the edit (new boundaries, modified untraced behavior).
   pi.on("tool_call", async (event, ctx) => {
@@ -96,15 +129,9 @@ export default function hook(pi: ExtensionAPI): void {
       session_id: sessionId(ctx),
     });
     const res = run(["hook", "pre-mutation", "--format", "json"], body);
-    if (res.code !== 0) {
-      let reason = "trace policy blocks this edit";
-      try {
-        const d = JSON.parse(res.out) as { output?: string };
-        if (typeof d.output === "string" && d.output) reason = d.output;
-      } catch {
-        // keep default reason
-      }
-      return { block: true, reason };
+    const parsed = parseHook(res.out);
+    if (res.code !== 0 || parsed.block) {
+      return { block: true, reason: parsed.reason || "trace policy blocks this edit" };
     }
   });
 
@@ -126,39 +153,32 @@ export default function hook(pi: ExtensionAPI): void {
     }
     const res = run(["hook", "post-mutation", "--format", "json"], body);
     if (res.code !== 0) return;
-    try {
-      const d = JSON.parse(res.out) as { output?: string };
-      if (typeof d.output !== "string" || !d.output) return;
-      const content = Array.isArray(event.content) ? [...event.content] : [];
-      content.push({
-        type: "text",
-        text: `\n\n<TraceLayer>\n${d.output}\n</TraceLayer>`,
-      });
-      return { content };
-    } catch {
-      return;
-    }
+    const parsed = parseHook(res.out);
+    if (parsed.block || !parsed.extra) return;
+    const content = Array.isArray(event.content) ? [...event.content] : [];
+    content.push({
+      type: "text",
+      text: `\n\n<TraceLayer>\n${parsed.extra}\n</TraceLayer>`,
+    });
+    return { content };
   });
 
   // Fail-closed completion gate: block while trace obligations or verify
   // fail. SessionStopEventResult carries decision/reason (or continuation
   // fields) — not a `block` property. The engine's stop hook ALSO runs the
-  // merge-grade auto-finalizer internally.
+  // merge-grade auto-finalizer internally. Empty/malformed stdout cannot
+  // fail open even when the process exits 0.
   pi.on("session_stop", async (event, _ctx) => {
     const body = JSON.stringify({ lifecycle: "wip", session_id: event.session_id });
     const res = run(["hook", "stop", "--format", "json"], body);
-    if (res.code !== 0) {
-      let reason = "trace verification has blocking failures";
-      try {
-        const d = JSON.parse(res.out) as { output?: string };
-        if (typeof d.output === "string" && d.output) reason = d.output;
-      } catch {
-        // keep default reason
-      }
-      // Diagnostics go to stderr (the OMP log); the block reason is returned
-      // to the session result.
+    const parsed = parseHook(res.out);
+    if (res.code !== 0 || parsed.block) {
+      const reason = parsed.reason || "trace verification has blocking failures";
       console.error(`trace gate: ${reason}`);
       return { decision: "block", reason };
+    }
+    if (parsed.extra) {
+      return { continue: true, additionalContext: parsed.extra };
     }
   });
 }

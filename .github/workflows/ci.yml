@@ -72,13 +72,22 @@ jobs:
           # many integration binaries at once, and the perf binary used to
           # re-run the golden suite via `mod golden`.
           cargo test --workspace -- --skip cold_index_50k_loc_under_30s
-          cargo test -p scc-cli --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
+          # The 30s contract is the product/release bound. Debug+test profile
+          # on a busy GHA VM after the workspace suite has measured 88s+110s
+          # on the same SHA that locally indexes far under 30s.
+          cargo test -p scc-cli --release --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
       # HERMETIC TraceLayer: pinned version via uv — no unpinned pip, no
       # continue-on-error. The gate fails CI when verification fails.
       - name: Install TraceLayer (pinned)
         run: uv tool install tracelayer==0.2.40
       - name: Trace policy gate
-        run: trace verify --changed
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v trace >/dev/null 2>&1; then
+            echo "TraceLayer CLI not on PATH after uv tool install" >&2
+            exit 1
+          fi
+          trace verify --changed
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test

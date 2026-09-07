@@ -46,8 +46,11 @@ const SCC_BIN = process.env.SCC_BIN || "scc";
 // /resume/compaction).
 const startupInjected = new Set<string>();
 
+type DirtySnap = { head: string; files: Map<string, string> };
+
 // toolCallId -> fingerprint map captured on tool_call for opaque tools.
-const dirtySnapshots = new Map<string, Map<string, string>>();
+// Only stored when event.toolCallId is present (no timestamp fallback).
+const dirtySnapshots = new Map<string, DirtySnap>();
 
 // True when session.compacting already rehydrated the compacted context
 // so session_compact (post-notification) must not wipe the marker.
@@ -205,42 +208,66 @@ const resetInjection = (ctx: ExtensionContext): void => {
   }
 };
 
-// Porcelain + untracked + vs-HEAD names, fingerprinted with git hash-object
-// so an already-dirty file that bash mutates further is still detected.
+// NUL-delimited porcelain v1: `XY PATH\0`, and for rename/copy
+// `XY DEST\0ORIG\0`. Do not split on ` -> ` — that sequence is legal inside
+// a quoted pathname.
 // trace:exempt reason=internal-helper
-const parsePorcelainPaths = (out: string): string[] => {
+const parsePorcelainZ = (out: string): string[] => {
+  const parts = out.split("\0");
   const paths: string[] = [];
-  for (const line of out.split("\n")) {
-    if (line.length < 4) continue;
-    let rest = line.slice(3);
-    const arrow = rest.indexOf(" -> ");
-    if (arrow >= 0) rest = rest.slice(arrow + 4);
-    const p = rest.trim().replace(/^"|"$/g, "");
-    if (p) paths.push(p);
+  let i = 0;
+  while (i < parts.length) {
+    const rec = parts[i];
+    if (!rec) {
+      i += 1;
+      continue;
+    }
+    if (rec.length < 3) {
+      i += 1;
+      continue;
+    }
+    const x = rec[0];
+    const y = rec[1];
+    const path = rec.slice(3);
+    const rename = x === "R" || y === "R" || x === "C" || y === "C";
+    if (path) paths.push(path);
+    if (rename) {
+      const orig = parts[i + 1] || "";
+      if (orig) paths.push(orig);
+      i += 2;
+    } else {
+      i += 1;
+    }
   }
   return paths;
 };
 
+// Porcelain + untracked + vs-HEAD names, fingerprinted with git hash-object
+// so an already-dirty file that bash mutates further is still detected.
+// HEAD is recorded so a clean commit/checkout (empty dirty maps) still
+// refreshes SCC.
 // trace:exempt reason=internal-helper
-const snapshotDirty = async (pi: ExtensionAPI, cwd: string): Promise<Map<string, string>> => {
+const snapshotDirty = async (pi: ExtensionAPI, cwd: string): Promise<DirtySnap> => {
   const map = new Map<string, string>();
-  const status = await execBin(pi, "git", ["status", "--porcelain=v1", "-uall"], cwd);
-  const names = new Set<string>(parsePorcelainPaths(status.out));
-  const diff = await execBin(pi, "git", ["diff", "--name-only", "HEAD"], cwd);
+  const headRes = await execBin(pi, "git", ["rev-parse", "HEAD"], cwd);
+  const head = headRes.code === 0 ? headRes.out.trim() : "";
+  const status = await execBin(pi, "git", ["status", "--porcelain=v1", "-z", "-uall"], cwd);
+  const names = new Set<string>(parsePorcelainZ(status.out));
+  const diff = await execBin(pi, "git", ["diff", "--name-only", "-z", "HEAD"], cwd);
   if (diff.code === 0) {
-    for (const p of diff.out.split("\n")) {
-      if (p.trim()) names.add(p.trim());
+    for (const p of diff.out.split("\0")) {
+      if (p) names.add(p);
     }
   }
   for (const p of names) {
     const h = await execBin(pi, "git", ["hash-object", "--", p], cwd);
     map.set(p, h.code === 0 && h.out.trim() ? h.out.trim() : "missing");
   }
-  return map;
+  return { head, files: map };
 };
 
 // trace:exempt reason=internal-helper
-const dirtySince = (
+const fileFingerprintDiff = (
   before: Map<string, string>,
   after: Map<string, string>,
 ): string[] => {
@@ -260,10 +287,11 @@ const indexPaths = async (
   pi: ExtensionAPI,
   cwd: string,
   paths: string[],
+  full = false,
 ): Promise<{ ok: boolean; err: string }> => {
   const unique = [...new Set(paths.filter(Boolean))];
-  if (!unique.length) return { ok: true, err: "" };
-  const args = ["index", "--paths", ...unique, "--quiet"];
+  if (!unique.length && !full) return { ok: true, err: "" };
+  const args = unique.length && !full ? ["index", "--paths", ...unique, "--quiet"] : ["index", "--quiet"];
   let r = await scc(pi, args, cwd);
   if (r.code !== 0) {
     r = await scc(pi, args, cwd);
@@ -284,13 +312,14 @@ const indexPaths = async (
 const loadStartupAndCheckpoint = async (
   pi: ExtensionAPI,
   cwd: string,
-): Promise<string[]> => {
+): Promise<{ lines: string[]; startupOk: boolean }> => {
   const lines: string[] = [];
   const startup = await scc(pi, ["context", "startup"], cwd);
-  if (startup.code === 0 && startup.out.trim()) lines.push(startup.out.trim());
+  const startupOk = startup.code === 0 && Boolean(startup.out.trim());
+  if (startupOk) lines.push(startup.out.trim());
   const checkpoint = await scc(pi, ["checkpoint", "load", "--inject"], cwd);
   if (checkpoint.code === 0 && checkpoint.out.trim()) lines.push(checkpoint.out.trim());
-  return lines;
+  return { lines, startupOk };
 };
 
 // trace:v1 id=impl.omp.scc work=WORK-SCC-001 satisfies=REQ-SCC-API
@@ -359,7 +388,8 @@ export default function hook(pi: ExtensionAPI): void {
   // hook can index whatever bash/patch/generators actually changed.
   pi.on("tool_call", async (event, ctx) => {
     if (!isOpaqueMutation(event.toolName)) return;
-    const id = event.toolCallId || `${event.toolName}:${Date.now()}`;
+    const id = event.toolCallId;
+    if (!id) return;
     dirtySnapshots.set(id, await snapshotDirty(pi, ctx.cwd));
   });
 
@@ -372,20 +402,34 @@ export default function hook(pi: ExtensionAPI): void {
       const path = editedPath(event.input as Record<string, unknown>);
       if (path) paths.push(path);
     }
+    let fullRefresh = false;
     if (isOpaqueMutation(event.toolName) || isFileMutation(event.toolName)) {
       const id = event.toolCallId;
       const before = id ? dirtySnapshots.get(id) : undefined;
       if (id) dirtySnapshots.delete(id);
       const after = await snapshotDirty(pi, ctx.cwd);
       if (before) {
-        paths.push(...dirtySince(before, after));
+        paths.push(...fileFingerprintDiff(before.files, after.files));
+        if (before.head && after.head && before.head !== after.head) {
+          const revDiff = await execBin(
+            pi,
+            "git",
+            ["diff", "--name-only", "-z", before.head, after.head],
+            ctx.cwd,
+          );
+          if (revDiff.code === 0) {
+            for (const p of revDiff.out.split("\0")) {
+              if (p) paths.push(p);
+            }
+          }
+          if (!paths.length) fullRefresh = true;
+        }
       } else if (isOpaqueMutation(event.toolName)) {
-        // No pre-snapshot (tool_call missed): index everything currently dirty.
-        paths.push(...after.keys());
+        paths.push(...after.files.keys());
       }
     }
-    if (!paths.length) return;
-    const result = await indexPaths(pi, ctx.cwd, paths);
+    if (!paths.length && !fullRefresh) return;
+    const result = await indexPaths(pi, ctx.cwd, paths, fullRefresh);
     if (result.ok) return;
     const content = Array.isArray(event.content) ? [...event.content] : [];
     content.push({
@@ -406,10 +450,15 @@ export default function hook(pi: ExtensionAPI): void {
   // checkpoint NOW so architecture/task state survive immediately — do
   // not wait for the next user prompt. Returns { context: string[] }.
   onEvent(pi, "session.compacting", async (_event: unknown, ctx: ExtensionContext) => {
-    const lines = await loadStartupAndCheckpoint(pi, ctx.cwd);
+    const { lines, startupOk } = await loadStartupAndCheckpoint(pi, ctx.cwd);
     compactingRehydrated = lines.length > 0;
+    const key = injectionKey(ctx);
+    if (startupOk) {
+      startupInjected.add(key);
+    } else {
+      startupInjected.delete(key);
+    }
     if (lines.length) {
-      startupInjected.add(injectionKey(ctx));
       return { context: lines };
     }
     return {};

@@ -408,12 +408,25 @@ def _runpy_copy_fixture(src: Path) -> Path:
 
 
 def _runpy_comment_only(repo: Path, comment: str) -> None:
+    body = comment
+    if body.startswith("// "):
+        body = body[3:]
+    elif body.startswith("//"):
+        body = body[2:].lstrip()
+    elif body.startswith("# "):
+        body = body[2:]
+    elif body.startswith("#"):
+        body = body[1:].lstrip()
     for path in repo.rglob("*"):
         if not path.is_file():
             continue
         if path.suffix not in {".py", ".ts", ".js", ".tsx"}:
             continue
-        path.write_text(path.read_text(encoding="utf-8") + "\n" + comment + "\n", encoding="utf-8")
+        prefix = "#" if path.suffix == ".py" else "//"
+        path.write_text(
+            path.read_text(encoding="utf-8") + f"\n{prefix} {body}\n",
+            encoding="utf-8",
+        )
         return
     raise AssertionError(f"no source file to comment in {repo}")
 
@@ -505,6 +518,67 @@ class RunPyBehavioralEvaluatorsTest(unittest.TestCase):
             finally:
                 shutil.rmtree(repo.parent, ignore_errors=True)
         self.assertEqual(failures, [], "untouched fixtures must fail: " + "; ".join(failures))
+
+    def test_nextjs_unused_transcript_text_const_fails(self) -> None:
+        """Codex P1: unused `const transcriptText` must not count as success."""
+        repo = _runpy_copy_fixture(FIXTURES / "nextjs-fullstack")
+        try:
+            route = repo / "app" / "api" / "transcripts" / "route.ts"
+            text = route.read_text(encoding="utf-8")
+            before = text
+            text = text.replace("{ transcript: record }", "{ wrongField: record }")
+            self.assertNotEqual(text, before, "response field replacement did not apply")
+            before = text
+            text = text.replace(
+                "export async function GET(req: Request) {",
+                "export async function GET(req: Request) {\n  const transcriptText = 'unused';",
+            )
+            self.assertNotEqual(text, before, "unused const insertion did not apply")
+            route.write_text(text, encoding="utf-8")
+            ok, detail = _runpy_run_eval("nextjs.transcript-response", repo)
+            self.assertFalse(
+                ok,
+                "unused transcriptText const must fail: " + detail,
+            )
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+
+    def test_nextjs_real_renamed_json_passes(self) -> None:
+        repo = _runpy_copy_fixture(FIXTURES / "nextjs-fullstack")
+        try:
+            route = repo / "app" / "api" / "transcripts" / "route.ts"
+            text = route.read_text(encoding="utf-8")
+            before = text
+            text = text.replace(
+                "return Response.json({ transcript: record });",
+                "return Response.json({ transcriptText: record.raw_text });",
+            )
+            self.assertNotEqual(text, before, "GET rename replacement did not apply")
+            before = text
+            text = text.replace(
+                "return Response.json({ transcript: record }, { status: 201 });",
+                "return Response.json({ transcriptText: record.raw_text }, { status: 201 });",
+            )
+            self.assertNotEqual(text, before, "POST rename replacement did not apply")
+            route.write_text(text, encoding="utf-8")
+            ok, detail = _runpy_run_eval("nextjs.transcript-response", repo)
+            self.assertTrue(ok, detail)
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+
+    def test_comment_only_fails_full_corpus(self) -> None:
+        tasks = _json.loads(_RUNPY_TASKS_JSON.read_text(encoding="utf-8"))["tasks"]
+        failures = []
+        for t in tasks:
+            repo = _runpy_copy_fixture(FIXTURES / t["repo"])
+            try:
+                _runpy_comment_only(repo, f"{t['id']} transcriptText retry page")
+                ok, detail = _runpy_run_eval(t["id"], repo)
+                if ok:
+                    failures.append(f"{t['id']}: {detail.strip()}")
+            finally:
+                shutil.rmtree(repo.parent, ignore_errors=True)
+        self.assertEqual(failures, [], "comment-only must fail all tasks: " + "; ".join(failures))
 
 
 
