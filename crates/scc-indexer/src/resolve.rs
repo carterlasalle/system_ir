@@ -25,7 +25,11 @@
 //! `.rs` → `crate::` / `super::` / `self::` / `mod:x`; `.py` → `mod.py` or
 //! `mod/__init__.py` (relative: includer dir; absolute: file + repo-root +
 //! unique source-root fallback); `.ts`/`.js` → relative `./`/`../` only
-//! (bare specifiers stay External). Two distinct hits contribute nothing.
+//! (bare specifiers stay External); `.go` → unique `{path}.go` or production
+//! files in `{path}/` (multi-file packages expand); `.java` → unique
+//! `dots/to/Type.java` (star imports contribute nothing). Two distinct
+//! package identities or type files contribute nothing. Go/Java never steal
+//! `.py`/`.ts`.
 //!
 //! Native resolution is EXTRACTED (candidate), never RESOLVED.
 
@@ -88,6 +92,12 @@ pub enum ImportTarget {
 enum UniqueHit {
     None,
     One(String),
+    Ambiguous,
+}
+
+enum GoPkgHit {
+    None,
+    Package(Vec<String>),
     Ambiguous,
 }
 
@@ -171,6 +181,12 @@ impl SymbolIndex {
         }
         if is_typescript_file(from_file) {
             return self.resolve_ts_import_target(from_file, import);
+        }
+        if from_file.ends_with(".go") {
+            return self.resolve_go_import_target(from_file, import);
+        }
+        if from_file.ends_with(".java") {
+            return self.resolve_java_import_target(from_file, import);
         }
         if import.module.starts_with('.') {
             // relative: join with dir of from_file, then normalize ./ and ..
@@ -439,6 +455,146 @@ impl SymbolIndex {
         }
         self.unique_existing(cands)
     }
+
+    /// Expand one extracted import to one or more resolve targets.
+    /// Go packages with several production `.go` files become one Internal
+    /// per file so Rule 3 sees the whole package. Other languages stay 1:1.
+    // trace:v1 id=impl.scc.resolve.import-expanded work=WORK-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step satisfies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language implements=PLAN-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step
+    pub fn resolve_import_expanded(&self, from_file: &str, import: &Import) -> Vec<ImportTarget> {
+        if from_file.ends_with(".go") {
+            return self.resolve_go_import_targets(from_file, import);
+        }
+        vec![self.resolve_import(from_file, import)]
+    }
+
+    pub fn resolved_imports(&self, from_file: &str, imports: &[Import]) -> Vec<ResolvedImport> {
+        imports
+            .iter()
+            .flat_map(|imp| {
+                self.resolve_import_expanded(from_file, imp)
+                    .into_iter()
+                    .map(|target| ResolvedImport {
+                        local_file: from_file.to_string(),
+                        module: imp.module.clone(),
+                        names: imp.names.clone(),
+                        line: imp.line,
+                        target,
+                    })
+            })
+            .collect()
+    }
+
+    fn resolve_go_import_target(&self, from_file: &str, import: &Import) -> ImportTarget {
+        go_pkg_hit_to_target(self.resolve_go_package(from_file, &import.module), import)
+    }
+
+    fn resolve_go_import_targets(&self, from_file: &str, import: &Import) -> Vec<ImportTarget> {
+        match self.resolve_go_package(from_file, &import.module) {
+            GoPkgHit::Package(files) => files
+                .into_iter()
+                .map(|file| ImportTarget::Internal {
+                    file,
+                    name_map: HashMap::new(),
+                    namespace: import.r#type == ImportType::Module,
+                })
+                .collect(),
+            other => vec![go_pkg_hit_to_target(other, import)],
+        }
+    }
+
+    /// Go package Step-A: unique `{path}.go` or the production `.go` files
+    /// directly in `{path}/`. Both layouts together degrade. Never steal
+    /// `.py`/`.ts`. No `go.mod`, no module-path suffix guessing.
+    // trace:v1 id=impl.scc.resolve.go-import work=WORK-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step satisfies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language implements=PLAN-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step
+    fn resolve_go_package(&self, from_file: &str, target: &str) -> GoPkgHit {
+        if target.is_empty() {
+            return GoPkgHit::None;
+        }
+        let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if target.starts_with("./") || target.starts_with("../") {
+            let joined = normalize_module_path(&rust_join(dir, target));
+            return self.go_consider_path(&joined);
+        }
+        let mut hit = self.go_consider_path(target);
+        for root in SOURCE_ROOTS {
+            hit = merge_go_pkg(hit, self.go_consider_path(&format!("{root}/{target}")));
+        }
+        hit
+    }
+
+    fn go_consider_path(&self, path: &str) -> GoPkgHit {
+        let path = normalize_module_path(path);
+        if path.is_empty() {
+            return GoPkgHit::None;
+        }
+        let file = format!("{path}.go");
+        let file_hit = is_go_prod_file(&file) && self.all_files.contains(&file);
+        let dir_files = self.go_prod_files_in_dir(&path);
+        match (file_hit, dir_files.is_empty()) {
+            (true, true) => GoPkgHit::Package(vec![file]),
+            (false, false) => GoPkgHit::Package(dir_files),
+            (true, false) => GoPkgHit::Ambiguous,
+            (false, true) => GoPkgHit::None,
+        }
+    }
+
+    fn go_prod_files_in_dir(&self, dir: &str) -> Vec<String> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut files: Vec<String> = self
+            .all_files
+            .iter()
+            .filter(|p| {
+                is_go_prod_file(p)
+                    && matches!(
+                        p.strip_prefix(&prefix),
+                        Some(rest) if !rest.is_empty() && !rest.contains('/')
+                    )
+            })
+            .cloned()
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn resolve_java_import_target(&self, _from_file: &str, import: &Import) -> ImportTarget {
+        if import.module.ends_with(".*") {
+            return ImportTarget::Unresolved {
+                name: import.module.clone(),
+            };
+        }
+        import_hit_to_target(
+            self.resolve_java_import(&import.module),
+            &import.module,
+            import.r#type == ImportType::Module,
+            true,
+        )
+    }
+
+    /// Java type-import Step-A: `com.foo.Bar` → unique `com/foo/Bar.java`.
+    /// Static `com.foo.Bar.BAZ` can pin `Bar.java` when the member file
+    /// misses. Star imports contribute nothing. Never steal `.py`/`.ts`.
+    /// Not namespace-as-file.
+    // trace:v1 id=impl.scc.resolve.java-import work=WORK-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step satisfies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language implements=PLAN-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language-gated-step
+    fn resolve_java_import(&self, target: &str) -> UniqueHit {
+        if target.is_empty() {
+            return UniqueHit::None;
+        }
+        let path = target.replace('.', "/");
+        let specific = self.unique_existing(java_file_candidates(&path));
+        if !matches!(specific, UniqueHit::None) {
+            return specific;
+        }
+        match path.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => {
+                self.unique_existing(java_file_candidates(parent))
+            }
+            _ => UniqueHit::None,
+        }
+    }
 }
 
 fn rust_is_project_import(module: &str) -> bool {
@@ -509,6 +665,80 @@ fn import_hit_to_target(
     }
 }
 
+fn go_pkg_hit_to_target(hit: GoPkgHit, import: &Import) -> ImportTarget {
+    match hit {
+        GoPkgHit::Package(files) => match files.as_slice() {
+            [file] => ImportTarget::Internal {
+                file: file.clone(),
+                name_map: HashMap::new(),
+                namespace: import.r#type == ImportType::Module,
+            },
+            _ => ImportTarget::Unresolved {
+                name: import.module.clone(),
+            },
+        },
+        GoPkgHit::Ambiguous => ImportTarget::Unresolved {
+            name: import.module.clone(),
+        },
+        GoPkgHit::None => ImportTarget::External {
+            name: import.module.clone(),
+        },
+    }
+}
+
+/// Unique-or-degrade a namespace member across one or more Internal files.
+/// Multi-file Go packages expand to several files; last-write must not win.
+fn unique_namespace_member(
+    index: &SymbolIndex,
+    files: &[String],
+    method: &str,
+) -> Option<String> {
+    if method.is_empty() {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    for file in files {
+        let Some((_, id)) = index
+            .files
+            .get(file.as_str())
+            .and_then(|fs| fs.by_name.get(method))
+        else {
+            continue;
+        };
+        if found.as_ref().is_some_and(|existing| existing != id) {
+            return None;
+        }
+        found = Some(id.clone());
+    }
+    found
+}
+
+fn merge_go_pkg(a: GoPkgHit, b: GoPkgHit) -> GoPkgHit {
+    match (a, b) {
+        (GoPkgHit::None, x) | (x, GoPkgHit::None) => x,
+        (GoPkgHit::Ambiguous, _) | (_, GoPkgHit::Ambiguous) => GoPkgHit::Ambiguous,
+        (GoPkgHit::Package(fa), GoPkgHit::Package(fb)) if fa == fb => GoPkgHit::Package(fa),
+        (GoPkgHit::Package(_), GoPkgHit::Package(_)) => GoPkgHit::Ambiguous,
+    }
+}
+
+fn is_go_prod_file(path: &str) -> bool {
+    path.ends_with(".go") && !path.ends_with("_test.go")
+}
+
+const JAVA_SOURCE_ROOTS: [&str; 2] = ["src/main/java", "src/test/java"];
+
+fn java_file_candidates(path: &str) -> Vec<String> {
+    let mut out = vec![format!("{path}.java")];
+    for root in SOURCE_ROOTS {
+        out.push(format!("{root}/{path}.java"));
+    }
+    for root in JAVA_SOURCE_ROOTS {
+        out.push(format!("{root}/{path}.java"));
+    }
+    out
+}
+
 /// Collapse `.`/`..` segments in a module path.
 fn normalize_module_path(p: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
@@ -532,7 +762,7 @@ fn normalize_module_path(p: &str) -> String {
 fn field_chain_root_callee(
     root: &str,
     binding: &HashMap<&str, (String, String)>,
-    namespaces: &HashMap<&str, String>,
+    namespaces: &HashMap<&str, Vec<String>>,
     index: &SymbolIndex,
     repo_id: &str,
 ) -> Option<(String, ResolutionClass)> {
@@ -550,8 +780,12 @@ fn field_chain_root_callee(
             .unwrap_or_else(|| scc_core::symbol_id(repo_id, target_file, exported));
         return Some((id, ResolutionClass::UnresolvedLikelyInternal));
     }
-    if let Some(ns_file) = namespaces.get(root) {
-        if let Some(fs) = index.files.get(ns_file.as_str()) {
+    if let Some(ns_files) = namespaces.get(root) {
+        let ns_file = match ns_files.as_slice() {
+            [f] => f.as_str(),
+            _ => return None,
+        };
+        if let Some(fs) = index.files.get(ns_file) {
             if let Some((_, id)) = fs.by_name.get(root) {
                 return Some((id.clone(), ResolutionClass::UnresolvedLikelyInternal));
             }
@@ -628,8 +862,9 @@ pub fn resolve_calls(
 ) -> Vec<ResolvedCall> {
     // local name -> (target file, exported name)
     let mut binding: HashMap<&str, (String, String)> = HashMap::new();
-    // namespace imports: local ns name -> target file
-    let mut namespaces: HashMap<&str, String> = HashMap::new();
+    // namespace imports: local ns name -> target file(s). Go packages expand
+    // to one Internal per production file; unique-or-degrade across them.
+    let mut namespaces: HashMap<&str, Vec<String>> = HashMap::new();
     for ri in resolved_imports {
         match &ri.target {
             ImportTarget::Internal {
@@ -644,7 +879,10 @@ pub fn resolve_calls(
                             let exported = default_symbol_name(index, file);
                             binding.insert(local.as_str(), (file.clone(), exported));
                         } else {
-                            namespaces.insert(local.as_str(), file.clone());
+                            let files = namespaces.entry(local.as_str()).or_default();
+                            if !files.iter().any(|f| f == file) {
+                                files.push(file.clone());
+                            }
                         }
                     }
                 } else {
@@ -985,17 +1223,14 @@ pub fn resolve_calls(
             continue;
         }
 
-        // Namespace import member (`import * as ns`, python `import m`).
-        if let Some(ns_file) = namespaces.get(root) {
+        // Namespace import member (`import * as ns`, python `import m`,
+        // Go `pkg.Helper` across an expanded package).
+        if let Some(ns_files) = namespaces.get(root) {
             if recv != RecvKind::None {
-                if let Some((_, id)) = index
-                    .files
-                    .get(ns_file.as_str())
-                    .and_then(|fs| fs.by_name.get(method))
-                {
+                if let Some(id) = unique_namespace_member(index, ns_files, method) {
                     out.push(emit(
                         caller_id,
-                        Some(id.clone()),
+                        Some(id),
                         call.callee.clone(),
                         0.97,
                         call.line,
@@ -2135,6 +2370,220 @@ mod tests {
         match py.resolve_import("w.py", &rust_imp("./x")) {
             ImportTarget::Unresolved { .. } => {}
             other => panic!("Python path-style ./x must not steal x.ts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.go-import verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.go-import,impl.scc.resolve.import-expanded
+    fn go_step_a_unique_or_degrade_and_never_steal() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("store.go", &[]);
+        idx.add_file("other/store.go", &[]);
+        idx.add_file("fmt.py", &[]);
+        idx.add_file("web/index.ts", &[]);
+        idx.add_file("main.go", &[]);
+        match idx.resolve_import("main.go", &rust_imp("store")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "store.go"),
+            other => panic!("import store expected store.go, got {other:?}"),
+        }
+        match idx.resolve_import("main.go", &rust_imp("store")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/store.go", "must not basename-guess other/store.go")
+            }
+            other => panic!("import store expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("main.go", &rust_imp("fmt")) {
+            ImportTarget::External { name } => assert_eq!(name, "fmt"),
+            other => panic!("fmt must stay External even if fmt.py exists, got {other:?}"),
+        }
+        match idx.resolve_import("main.go", &rust_imp("web")) {
+            ImportTarget::External { name } => assert_eq!(name, "web"),
+            other => panic!("Go must not steal web/index.ts, got {other:?}"),
+        }
+
+        let mut pkg = SymbolIndex::new("repo");
+        pkg.add_file("pkg/a.go", &[mk_symbol("helper", SymbolKind::Function)]);
+        pkg.add_file("pkg/b.go", &[mk_symbol("other", SymbolKind::Function)]);
+        pkg.add_file("pkg/a_test.go", &[mk_symbol("helper", SymbolKind::Function)]);
+        pkg.add_file("main.go", &[mk_symbol("run", SymbolKind::Function)]);
+        match pkg.resolve_import("main.go", &rust_imp("pkg")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "pkg"),
+            other => panic!("multi-file package must not pick one file, got {other:?}"),
+        }
+        let expanded = pkg.resolve_import_expanded("main.go", &rust_imp("pkg"));
+        let files: Vec<String> = expanded
+            .iter()
+            .filter_map(|t| match t {
+                ImportTarget::Internal { file, .. } => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files, vec!["pkg/a.go".to_string(), "pkg/b.go".to_string()]);
+        assert!(
+            !files.iter().any(|f| f.ends_with("_test.go")),
+            "production package must not include _test.go: {files:?}"
+        );
+
+        let mut amb = SymbolIndex::new("repo");
+        amb.add_file("pkg.go", &[]);
+        amb.add_file("pkg/a.go", &[]);
+        amb.add_file("main.go", &[]);
+        match amb.resolve_import("main.go", &rust_imp("pkg")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "pkg"),
+            other => panic!("pkg.go + pkg/ must degrade, got {other:?}"),
+        }
+
+        let mut src = SymbolIndex::new("repo");
+        src.add_file("src/util.go", &[]);
+        src.add_file("main.go", &[]);
+        match src.resolve_import("main.go", &rust_imp("util")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "src/util.go"),
+            other => panic!("unique src/util.go must pin, got {other:?}"),
+        }
+
+        let mut two = SymbolIndex::new("repo");
+        two.add_file("util.go", &[]);
+        two.add_file("src/util.go", &[]);
+        two.add_file("main.go", &[]);
+        match two.resolve_import("main.go", &rust_imp("util")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "util"),
+            other => panic!("util.go + src/util.go must degrade, got {other:?}"),
+        }
+
+        let mut only = SymbolIndex::new("repo");
+        only.add_file("other/store.go", &[]);
+        only.add_file("y.go", &[]);
+        only.add_file("main.go", &[]);
+        match only.resolve_import("main.go", &rust_imp("store")) {
+            ImportTarget::External { name } => assert_eq!(name, "store"),
+            other => panic!("must not basename-guess other/store.go, got {other:?}"),
+        }
+        match only.resolve_import("main.go", &rust_imp("github.com/x/y")) {
+            ImportTarget::External { name } => assert_eq!(name, "github.com/x/y"),
+            other => panic!("must not suffix-guess y.go from module path, got {other:?}"),
+        }
+
+        let mut rel = SymbolIndex::new("repo");
+        rel.add_file("cmd/main.go", &[]);
+        rel.add_file("cmd/store.go", &[]);
+        rel.add_file("store.go", &[]);
+        match rel.resolve_import("cmd/main.go", &rust_imp("./store")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "cmd/store.go"),
+            other => panic!("relative ./store must pin cmd/store.go, got {other:?}"),
+        }
+
+        let pkg_imp = Import {
+            module: "pkg".into(),
+            names: vec![("pkg".into(), "pkg".into())],
+            line: 1,
+            r#type: ImportType::Module,
+        };
+        let imps = pkg.resolved_imports("main.go", &[pkg_imp]);
+        let symbols = [mk_symbol("run", SymbolKind::Function)];
+        let bare = resolve_calls(
+            "main.go",
+            &[Call {
+                caller: Some("run".into()),
+                callee: "helper".into(),
+                line: 3,
+                known_receiver: false,
+                ..Default::default()
+            }
+            .finish()],
+            &symbols,
+            &imps,
+            &pkg,
+            "repo",
+        );
+        assert_eq!(
+            bare[0].callee_id,
+            Some(scc_core::symbol_id("repo", "pkg/a.go", "helper")),
+            "Rule 3 must pin unique helper in the expanded package"
+        );
+        assert_ne!(
+            bare[0].callee_id,
+            Some(scc_core::symbol_id("repo", "pkg/a_test.go", "helper")),
+            "_test.go must not participate in the production package"
+        );
+        let qual = resolve_calls(
+            "main.go",
+            &[Call {
+                caller: Some("run".into()),
+                callee: "pkg.helper".into(),
+                line: 4,
+                known_receiver: true,
+                ..Default::default()
+            }
+            .finish()],
+            &symbols,
+            &imps,
+            &pkg,
+            "repo",
+        );
+        assert_eq!(
+            qual[0].callee_id,
+            Some(scc_core::symbol_id("repo", "pkg/a.go", "helper")),
+            "pkg.helper must unique-or-degrade across expanded package files"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.java-import verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.java-import
+    fn java_step_a_unique_or_degrade_and_never_steal() {
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("com/foo/Bar.java", &[]);
+        idx.add_file("other/Bar.java", &[]);
+        idx.add_file("Bar.py", &[]);
+        idx.add_file("Main.java", &[]);
+        match idx.resolve_import("Main.java", &rust_imp("com.foo.Bar")) {
+            ImportTarget::Internal { file, .. } => assert_eq!(file, "com/foo/Bar.java"),
+            other => panic!("com.foo.Bar expected com/foo/Bar.java, got {other:?}"),
+        }
+        match idx.resolve_import("Main.java", &rust_imp("com.foo.Bar")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_ne!(file, "other/Bar.java", "must not basename-guess other/Bar.java")
+            }
+            other => panic!("com.foo.Bar expected Internal, got {other:?}"),
+        }
+        match idx.resolve_import("Main.java", &rust_imp("java.util.List")) {
+            ImportTarget::External { name } => assert_eq!(name, "java.util.List"),
+            other => panic!("java.util.List must stay External, got {other:?}"),
+        }
+        match idx.resolve_import("Main.java", &rust_imp("com.foo.*")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "com.foo.*"),
+            other => panic!("star import must not guess a file, got {other:?}"),
+        }
+        match idx.resolve_import("Main.java", &rust_imp("Bar")) {
+            ImportTarget::External { name } => assert_eq!(name, "Bar"),
+            other => panic!("Java must not steal Bar.py, got {other:?}"),
+        }
+
+        let mut maven = SymbolIndex::new("repo");
+        maven.add_file(
+            "src/main/java/com/example/Service.java",
+            &[mk_symbol("Service", SymbolKind::Class)],
+        );
+        maven.add_file("App.java", &[]);
+        match maven.resolve_import("App.java", &rust_imp("com.example.Service")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_eq!(file, "src/main/java/com/example/Service.java")
+            }
+            other => panic!("unique src/main/java Service must pin, got {other:?}"),
+        }
+        match maven.resolve_import("App.java", &rust_imp("com.example.Service.save")) {
+            ImportTarget::Internal { file, .. } => {
+                assert_eq!(file, "src/main/java/com/example/Service.java")
+            }
+            other => panic!("static member import must pin parent type file, got {other:?}"),
+        }
+
+        let mut amb = SymbolIndex::new("repo");
+        amb.add_file("com/foo/Bar.java", &[]);
+        amb.add_file("src/main/java/com/foo/Bar.java", &[]);
+        amb.add_file("Main.java", &[]);
+        match amb.resolve_import("Main.java", &rust_imp("com.foo.Bar")) {
+            ImportTarget::Unresolved { name } => assert_eq!(name, "com.foo.Bar"),
+            other => panic!("two Bar.java files must degrade, got {other:?}"),
         }
     }
 

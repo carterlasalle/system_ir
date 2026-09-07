@@ -267,20 +267,7 @@ impl Indexer {
                     | Language::Java
                     | Language::Rust
             ) {
-                resolved_imports = ef
-                    .imports
-                    .iter()
-                    .map(|imp| {
-                        let target = index.resolve_import(path, imp);
-                        ResolvedImport {
-                            local_file: path.clone(),
-                            module: imp.module.clone(),
-                            names: imp.names.clone(),
-                            line: imp.line,
-                            target,
-                        }
-                    })
-                    .collect();
+                resolved_imports = index.resolved_imports(path, &ef.imports);
                 resolved_calls = resolve::resolve_calls(
                     path,
                     &ef.calls,
@@ -632,20 +619,7 @@ impl Indexer {
                     | Language::Java
                     | Language::Rust
             ) {
-                resolved_imports = ef
-                    .imports
-                    .iter()
-                    .map(|imp| {
-                        let target = index.resolve_import(path, imp);
-                        ResolvedImport {
-                            local_file: path.clone(),
-                            module: imp.module.clone(),
-                            names: imp.names.clone(),
-                            line: imp.line,
-                            target,
-                        }
-                    })
-                    .collect();
+                resolved_imports = index.resolved_imports(path, &ef.imports);
                 resolved_calls = resolve::resolve_calls(
                     path,
                     &ef.calls,
@@ -777,25 +751,18 @@ impl Indexer {
             if imports.is_empty() {
                 continue;
             }
-            let resolved: Vec<ResolvedImport> = imports
-                .iter()
-                .map(|(module, names, line, _typ)| {
-                    let imp = model::Import {
+            let resolved: Vec<ResolvedImport> = {
+                let imps: Vec<model::Import> = imports
+                    .iter()
+                    .map(|(module, names, line, _typ)| model::Import {
                         module: module.clone(),
                         names: names.clone(),
                         line: *line,
                         r#type: model::ImportType::Module,
-                    };
-                    let target = index.resolve_import(&tf, &imp);
-                    ResolvedImport {
-                        local_file: tf.clone(),
-                        module: imp.module,
-                        names: imp.names,
-                        line: imp.line,
-                        target,
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
+                index.resolved_imports(&tf, &imps)
+            };
             let touches_changed = resolved.iter().any(|ri| match &ri.target {
                 resolve::ImportTarget::Internal { file, .. } => changed.contains(file.as_str()),
                 _ => false,
@@ -3210,6 +3177,291 @@ class Svc {
         assert!(
             !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
             "x.ts + x/index.ts must not guess a CALL: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go-import verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.go-import
+    fn index_go_import_pins_unique_package_not_decoy_or_py() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("store.go"),
+            "package store\n\nfunc Helper() int { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/store.go"),
+            "package store\n\nfunc Helper() int { return 9 }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("fmt.py"), "def Println(*args):\n    return 0\n").unwrap();
+        std::fs::write(
+            root.join("main.go"),
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"store\"\n)\n\nfunc useStore() int { return store.Helper() }\nfunc useFmt() { fmt.Println(\"x\") }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let calls_of = |file: &str, func: &str| {
+            let sub = scc_core::symbol_id(&rid, file, func);
+            rels.iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == sub)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let helper = scc_core::symbol_id(&rid, "store.go", "Helper");
+        let decoy = scc_core::symbol_id(&rid, "other/store.go", "Helper");
+        let use_store = calls_of("main.go", "useStore");
+        assert!(
+            use_store.iter().any(|r| r.object == helper),
+            "import store must CALL store.go Helper: {use_store:?}"
+        );
+        assert!(
+            !use_store.iter().any(|r| r.object == decoy),
+            "must not basename-guess other/store.go: {use_store:?}"
+        );
+        let py_println = scc_core::symbol_id(&rid, "fmt.py", "Println");
+        let use_fmt = calls_of("main.go", "useFmt");
+        assert!(
+            !use_fmt.iter().any(|r| r.object == py_println),
+            "import fmt must not steal fmt.py: {use_fmt:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go-import-expanded verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.go-import,impl.scc.resolve.import-expanded
+    fn index_go_multi_file_package_expands_and_rule3_pins_unique_helper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(
+            root.join("pkg/a.go"),
+            "package pkg\n\nfunc helper() int { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pkg/b.go"),
+            "package pkg\n\nfunc other() int { return 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pkg/a_test.go"),
+            "package pkg\n\nfunc helper() int { return 3 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("decoy.go"),
+            "package decoy\n\nfunc helper() int { return 9 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.go"),
+            "package main\n\nimport \"pkg\"\n\nfunc run() int { return pkg.helper() }\nfunc bare() int { return helper() }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let calls_of = |file: &str, func: &str| {
+            let sub = scc_core::symbol_id(&rid, file, func);
+            rels.iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == sub)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let helper = scc_core::symbol_id(&rid, "pkg/a.go", "helper");
+        let decoy = scc_core::symbol_id(&rid, "decoy.go", "helper");
+        let test_h = scc_core::symbol_id(&rid, "pkg/a_test.go", "helper");
+        let run = calls_of("main.go", "run");
+        assert!(
+            run.iter().any(|r| r.object == helper),
+            "pkg.helper must CALL pkg/a.go helper: {run:?}"
+        );
+        assert!(
+            !run.iter().any(|r| r.object == decoy),
+            "must not spray to decoy.go helper: {run:?}"
+        );
+        assert!(
+            !run.iter().any(|r| r.object == test_h),
+            "_test.go must not win the package member: {run:?}"
+        );
+        let bare = calls_of("main.go", "bare");
+        assert!(
+            bare.iter().any(|r| r.object == helper),
+            "bare helper() must Rule-3 pin unique imported pkg/a.go: {bare:?}"
+        );
+        assert!(
+            !bare.iter().any(|r| r.object == decoy)
+                && !bare.iter().any(|r| r.object == test_h),
+            "bare helper() must not guess decoy or _test.go: {bare:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go-import-degrade verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.go-import
+    fn index_go_import_degrades_when_file_and_dir_both_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(
+            root.join("pkg.go"),
+            "package pkg\n\nfunc Helper() int { return 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pkg/a.go"),
+            "package pkg\n\nfunc Helper() int { return 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.go"),
+            "package main\n\nimport \"pkg\"\n\nfunc run() int { return pkg.Helper() }\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "pkg.go", "Helper");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "pkg/a.go", "Helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "main.go", "run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
+            "pkg.go + pkg/ must not guess a CALL: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.java-import verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.java-import
+    fn index_java_import_pins_path_precise_type_not_decoy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("com/foo")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("com/foo/Bar.java"),
+            "package com.foo;\npublic class Bar {\n  public static int helper() { return 1; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/Bar.java"),
+            "package other;\npublic class Bar {\n  public static int helper() { return 9; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Bar.py"), "def helper():\n    return 0\n").unwrap();
+        std::fs::write(
+            root.join("Main.java"),
+            "import com.foo.Bar;\npublic class Main {\n  static int useBar() { return Bar.helper(); }\n  static int usePy() { return helper(); }\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let rid = idx.store.repo_id.clone();
+        let rels = idx.store.all_relationships().unwrap();
+        let calls_of = |file: &str, func: &str| {
+            let sub = scc_core::symbol_id(&rid, file, func);
+            rels.iter()
+                .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == sub)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let helper = scc_core::symbol_id(&rid, "com/foo/Bar.java", "Bar.helper");
+        let decoy = scc_core::symbol_id(&rid, "other/Bar.java", "Bar.helper");
+        let py = scc_core::symbol_id(&rid, "Bar.py", "helper");
+        let use_bar = calls_of("Main.java", "Main.useBar");
+        assert!(
+            use_bar.iter().any(|r| r.object == helper),
+            "import com.foo.Bar must CALL com/foo/Bar.java: {use_bar:?}"
+        );
+        assert!(
+            !use_bar.iter().any(|r| r.object == decoy),
+            "must not basename-guess other/Bar.java: {use_bar:?}"
+        );
+        let use_py = calls_of("Main.java", "Main.usePy");
+        assert!(
+            !use_py.iter().any(|r| r.object == py),
+            "Java must not steal Bar.py: {use_py:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.java-import-star verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.java-import
+    fn index_java_star_import_does_not_guess() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("com/foo")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("com/foo/Bar.java"),
+            "package com.foo;\npublic class Bar {\n  public static int helper() { return 1; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("other/Bar.java"),
+            "package other;\npublic class Bar {\n  public static int helper() { return 9; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("StarMain.java"),
+            "import com.foo.*;\npublic class StarMain {\n  static int useBar() { return Bar.helper(); }\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let a = scc_core::symbol_id(&idx.store.repo_id, "com/foo/Bar.java", "Bar.helper");
+        let b = scc_core::symbol_id(&idx.store.repo_id, "other/Bar.java", "Bar.helper");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "StarMain.java", "StarMain.useBar");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == a) && !calls.iter().any(|r| r.object == b),
+            "star import must not guess a Bar.helper CALL: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.java-import-maven verifies=REQ-implement-phase-29-of-scc-x-ripwire-lessons-absorb-remaining-language exercises=impl.scc.resolve.java-import
+    fn index_java_maven_source_root_unique_pin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/main/java/com/example")).unwrap();
+        std::fs::write(
+            root.join("src/main/java/com/example/Service.java"),
+            "package com.example;\npublic class Service {\n  public static int save() { return 1; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("App.java"),
+            "import com.example.Service;\npublic class App {\n  static int run() { return Service.save(); }\n}\n",
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let save = scc_core::symbol_id(
+            &idx.store.repo_id,
+            "src/main/java/com/example/Service.java",
+            "Service.save",
+        );
+        let run = scc_core::symbol_id(&idx.store.repo_id, "App.java", "App.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == save),
+            "unique src/main/java Service must pin: {calls:?}"
         );
     }
 }
