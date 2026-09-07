@@ -57,7 +57,7 @@ jobs:
       # suites run (external/ registry + evaluators/ contract).
       - name: Benchmark harness + adapter self-tests (no network)
         run: |
-          cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py
+          (cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py)
           uv run python benchmarks/evaluators/test_contract.py
       - name: OMP setup + generated-extension smoke
         run: |
