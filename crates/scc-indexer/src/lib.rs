@@ -1414,4 +1414,41 @@ impl Svc { fn run(&self) { self.owned.process(); } }
             "must not spray Invoice.process: {calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.java.unprefixed-field-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
+    fn index_pins_java_unprefixed_field_call_to_field_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("W.java"),
+            r#"
+class Order { void process() { } }
+class Invoice { void process() { } }
+class Svc {
+    private Order owned;
+    void run() { owned.process(); }
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Order.process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Invoice.process");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "W.java", "Svc.run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "Svc.run must CALL Order.process via unprefixed field: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.process: {calls:?}"
+        );
+    }
 }

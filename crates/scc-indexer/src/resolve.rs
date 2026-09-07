@@ -663,6 +663,27 @@ pub fn resolve_calls(
                         continue;
                     }
                 }
+                if let Some(id) = unprefixed_field_type_callee_id(
+                    recv,
+                    &fact,
+                    &call,
+                    path,
+                    index,
+                    type_binds,
+                    &binding,
+                ) {
+                    out.push(emit(
+                        caller_id,
+                        Some(id),
+                        call.callee.clone(),
+                        0.9,
+                        call.line,
+                        ResolutionClass::ResolvedInternal,
+                        recv,
+                        1,
+                    ));
+                    continue;
+                }
                 // Unknown typed variable: do not spray to every same-name method.
                 out.push(emit(
                     caller_id,
@@ -729,6 +750,13 @@ fn unique_bound_type<'a>(
     }
 }
 
+/// True when any bind exists for `(scope, var)`, including tombstones and
+/// untyped local shadows. A local of any kind vetoes field-as-receiver.
+fn has_bind(binds: &[TypeBind], scope: Option<&str>, var: &str) -> bool {
+    let scope = scope.unwrap_or("");
+    binds.iter().any(|b| b.scope == scope && b.name == var)
+}
+
 /// Pin `self.x.m()` / `this.x.m()` (exactly one field hop) to `{Type}.m`
 /// when the enclosing class has a unique field type and that method exists.
 // trace:v1 id=impl.scc.resolve.field-type-narrow work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
@@ -779,6 +807,42 @@ fn receiver_field_type_callee_id(
     }
     let field = fact.field_name.as_deref()?;
     let ty = unique_bound_type(type_binds, Some(&class), field)?;
+    method_id_for_type(index, path, ty, &fact.method, binding)
+}
+
+/// Pin Java `repo.save()` (exactly one named hop, no `this.`) to `{Type}.save`
+/// when `repo` is a unique field of the enclosing class and is not shadowed
+/// by a parameter or local. Python/TS/Go/Rust omit `this`/`self` only as a
+/// NameError / compile error, so this rule is `.java`-gated (Ripwire Rule 2b
+/// analogue; Ripwire itself gates C++/ObjC).
+// trace:v1 id=impl.scc.resolve.unprefixed-field-type work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
+fn unprefixed_field_type_callee_id(
+    recv: RecvKind,
+    fact: &RecvFact,
+    call: &Call,
+    path: &str,
+    index: &SymbolIndex,
+    type_binds: &[TypeBind],
+    binding: &HashMap<&str, (String, String)>,
+) -> Option<String> {
+    if recv != RecvKind::NamedVariable {
+        return None;
+    }
+    if !path.ends_with(".java") {
+        return None;
+    }
+    if split_recv_path(&call.callee).len() != 2 {
+        return None;
+    }
+    let root = fact.recv_var.as_deref().unwrap_or(fact.root.as_str());
+    if has_bind(type_binds, call.caller.as_deref(), root) {
+        return None;
+    }
+    let class = enclosing_class(call, path, index)?;
+    let ty = unique_bound_type(type_binds, Some(&class), root)?;
+    if ty.is_empty() {
+        return None;
+    }
     method_id_for_type(index, path, ty, &fact.method, binding)
 }
 
@@ -1706,5 +1770,134 @@ impl Svc {
             .expect("longer chain call");
         assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
         assert_eq!(chain.recv, RecvKind::FieldOfSelf);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.java.unprefixed-field-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
+    fn java_unprefixed_field_pins_and_local_shadows() {
+        use crate::java::JavaExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    private Order owned;
+    void run() { owned.process(); }
+    void chain() { owned.inner.process(); }
+    void shadowed() {
+        Invoice owned = new Invoice();
+        owned.process();
+    }
+}
+"#;
+        let ef = JavaExtractor::default().extract(&SourceFile::new("W.java", src));
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.shadowed"
+                && b.name == "owned"
+                && b.type_name == "Invoice"),
+            "local shadow bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.calls.iter().any(|c| c.callee == "owned.process"),
+            "unprefixed call missing: {:?}",
+            ef.calls.iter().map(|c| &c.callee).collect::<Vec<_>>()
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("W.java", &ef.symbols);
+        idx.set_type_binds("W.java", &ef.type_binds);
+        let resolved = resolve_calls("W.java", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "owned.process" && c.caller_id.contains("Svc.run"))
+            .or_else(|| {
+                resolved
+                    .iter()
+                    .filter(|c| c.callee_name == "owned.process")
+                    .min_by_key(|c| c.line)
+            })
+            .expect("unprefixed owned.process");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "W.java", "Order.process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "W.java", "Invoice.process"))
+        );
+        assert_eq!(hit.provenance, scc_core::Provenance::Extracted);
+        assert_eq!(hit.recv, RecvKind::NamedVariable);
+        let chain = resolved
+            .iter()
+            .find(|c| c.callee_name == "owned.inner.process")
+            .expect("longer unprefixed chain");
+        assert_eq!(chain.callee_id, None, "longer chain must stay unresolved");
+        let shadowed = resolved
+            .iter()
+            .find(|c| c.callee_name == "owned.process" && c.line > hit.line)
+            .or_else(|| {
+                resolved
+                    .iter()
+                    .filter(|c| c.callee_name == "owned.process")
+                    .max_by_key(|c| c.line)
+            })
+            .expect("shadowed owned.process");
+        assert_eq!(
+            shadowed.callee_id,
+            Some(scc_core::symbol_id("repo", "W.java", "Invoice.process")),
+            "local Invoice must win over field Order"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.java.unprefixed-field-python-safe verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.resolve.unprefixed-field-type
+    fn python_unprefixed_name_does_not_use_java_field_rule() {
+        let mut idx = SymbolIndex::new("repo");
+        let mut run = mk_symbol("Svc.run", SymbolKind::Method);
+        run.parent = Some("Svc".into());
+        let mut order_p = mk_symbol("Order.process", SymbolKind::Method);
+        order_p.parent = Some("Order".into());
+        let mut inv_p = mk_symbol("Invoice.process", SymbolKind::Method);
+        inv_p.parent = Some("Invoice".into());
+        let syms = vec![
+            mk_symbol("Order", SymbolKind::Class),
+            order_p,
+            mk_symbol("Invoice", SymbolKind::Class),
+            inv_p,
+            mk_symbol("Svc", SymbolKind::Class),
+            run,
+        ];
+        idx.add_file("w.py", &syms);
+        idx.set_type_binds(
+            "w.py",
+            &[TypeBind {
+                scope: "Svc".into(),
+                name: "owned".into(),
+                type_name: "Order".into(),
+                line: 1,
+            }],
+        );
+        let calls = vec![Call {
+            caller: Some("Svc.run".into()),
+            callee: "owned.process".into(),
+            line: 4,
+            known_receiver: true,
+            ..Default::default()
+        }
+        .finish()];
+        let resolved = resolve_calls("w.py", &calls, &syms, &[], &idx, "repo");
+        assert_eq!(
+            resolved[0].callee_id,
+            None,
+            "Python owned.process must not pin via Java field-as-receiver"
+        );
+        assert_eq!(resolved[0].recv, RecvKind::NamedVariable);
     }
 }

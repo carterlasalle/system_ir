@@ -16,6 +16,7 @@ use scc_core::{
     Entity, Evidence, Flow, Invariant, Provenance, Relationship, Repository, Severity, Snapshot,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -272,6 +273,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("repository not initialized: {0}")]
     NotInitialized(String),
+    #[error("index cache is corrupt (refusing to fabricate an empty index): {0}")]
+    Corrupt(String),
 }
 
 // trace:exempt reason=internal-detail
@@ -382,13 +385,61 @@ pub struct Store {
     pub repo_name: String,
 }
 
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
+/// Refuse a non-empty existing file that is not a SQLite database. Empty
+/// files are a fresh index. Truncation after the header is caught by
+/// `quick_check_existing_db` after open.
+// trace:v1 id=impl.scc.store.refuse-corrupt work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
+fn refuse_corrupt_existing_db(path: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(());
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let mut magic = [0u8; 16];
+    let n = f.read(&mut magic).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    if n < SQLITE_MAGIC.len() || magic.as_slice() != SQLITE_MAGIC {
+        return Err(StoreError::Corrupt(
+            "file is not a SQLite database".into(),
+        ));
+    }
+    Ok(())
+}
+
+// trace:exempt reason=internal-detail
+fn quick_check_existing_db(conn: &Connection) -> Result<()> {
+    let check: String = conn
+        .query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    if !check.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt(check));
+    }
+    Ok(())
+}
+
 // trace:exempt reason=internal-detail
 impl Store {
     /// Open (creating if needed) the SCC database at `path` for repository
-    /// rooted at `root`. `root` must exist.
+    /// rooted at `root`. `root` must exist. A truncated or garbage existing
+    /// file is refused rather than migrated into a fake empty index.
     // trace:exempt reason=internal-detail
     pub fn open(path: &Path, root: &Path) -> Result<Store> {
-        let conn = Connection::open(path)?;
+        let existed_nonempty = path.is_file()
+            && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+        refuse_corrupt_existing_db(path)?;
+        let conn = match Connection::open(path) {
+            Ok(c) => c,
+            Err(e) if existed_nonempty => {
+                return Err(StoreError::Corrupt(e.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if existed_nonempty {
+            quick_check_existing_db(&conn)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -2417,6 +2468,49 @@ mod tests {
         // reopen
         let s = Store::open(&db, &root).unwrap();
         assert!(s.get_entity("repo://t/component/a").unwrap().is_some());
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.store.refuse-corrupt verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.store.refuse-corrupt
+    fn truncated_or_garbage_db_refuses_to_open() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.path().join("scc.db");
+
+        std::fs::write(&db, b"not a sqlite database at all").unwrap();
+        let err = match Store::open(&db, &root) {
+            Err(e) => e,
+            Ok(_) => panic!("garbage db must not open"),
+        };
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "garbage must be Corrupt, got {err}"
+        );
+        assert!(
+            err.to_string().contains("corrupt") || err.to_string().contains("not a SQLite"),
+            "{err}"
+        );
+
+        {
+            let s = Store::open(&dir.path().join("fresh.db"), &root).unwrap();
+            s.meta_set("k", "v").unwrap();
+        }
+        let good = std::fs::read(dir.path().join("fresh.db")).unwrap();
+        assert!(good.len() > 32, "expected a real sqlite file");
+        std::fs::write(&db, &good[..32]).unwrap();
+        let err = match Store::open(&db, &root) {
+            Err(e) => e,
+            Ok(_) => panic!("truncated sqlite must not open"),
+        };
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "truncated sqlite must be Corrupt, got {err}"
+        );
+
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        Store::open(&empty, &root).expect("empty file is a fresh index");
     }
 
     #[test]

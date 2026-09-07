@@ -575,6 +575,60 @@ impl Ctx {
             }
         }
     }
+
+    /// Method-scoped local / catch / enhanced-for type, or an untyped shadow
+    /// so a same-named field cannot be used as an implicit receiver.
+    // trace:v1 id=impl.scc.extract.java.local-type work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
+    fn bind_local_type(
+        &mut self,
+        name: String,
+        declared_ty: Option<String>,
+        right: Option<Node>,
+        line: u32,
+        src: &[u8],
+    ) {
+        let scope = self.caller().unwrap_or_default();
+        if scope.is_empty() || name.is_empty() || name == "this" {
+            return;
+        }
+        let mut bound = false;
+        if let Some(ty) = declared_ty.filter(|t| t != "var") {
+            self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
+            bound = true;
+        }
+        if let Some(r) = right {
+            if let Some(ty) = java_ctor_type(r, src) {
+                self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
+                bound = true;
+            } else if r.kind() == "identifier" {
+                let rhs = clean(node_text(Some(r), src));
+                if let Some(ty) = self.unique_local_type(&rhs) {
+                    self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
+                    bound = true;
+                }
+            }
+        }
+        if !bound {
+            self.push_local_shadow(scope, name, line);
+        }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_local_shadow(&mut self, scope: String, name: String, line: u32) {
+        if self
+            .type_binds
+            .iter()
+            .any(|b| b.scope == scope && b.name == name)
+        {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name: String::new(),
+            line,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +851,7 @@ fn java_ctor_type(node: Node, src: &[u8]) -> Option<String> {
 
 // trace:exempt reason=internal-detail
 impl JavaExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             "class_declaration" => self.walk_type(node, ctx, src, SymbolKind::Class),
@@ -806,6 +861,9 @@ impl JavaExtractor {
             "method_declaration" => self.walk_method(node, ctx, src),
             "constructor_declaration" => self.walk_constructor(node, ctx, src),
             "field_declaration" => self.walk_field(node, ctx, src),
+            "local_variable_declaration" => self.walk_local_variable(node, ctx, src),
+            "enhanced_for_statement" => self.walk_enhanced_for(node, ctx, src),
+            "catch_formal_parameter" => self.walk_catch_param(node, ctx, src),
             "assignment_expression" => self.record_this_field_assign(node, ctx, src),
             "method_invocation" => self.record_call(node, ctx, src),
             "object_creation_expression" => self.record_creation(node, ctx, src),
@@ -1129,6 +1187,63 @@ impl JavaExtractor {
             let line = p.start_position().row as u32 + 1;
             ctx.push_type_bind(name, ty, line);
         }
+    }
+
+    /// Locals in a method: `Order owned = ...` / `var owned = new Order()`.
+    // trace:exempt reason=internal-detail
+    fn walk_local_variable(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let declared_ty = java_simple_type_name(node.child_by_field_name("type"), src);
+        let line = node.start_position().row as u32 + 1;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+            let name = clean(node_text(child.child_by_field_name("name"), src));
+            if name.is_empty() {
+                continue;
+            }
+            ctx.bind_local_type(
+                name,
+                declared_ty.clone(),
+                child.child_by_field_name("value"),
+                line,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `for (Invoice owned : items)` is a local that shadows a field.
+    // trace:exempt reason=internal-detail
+    fn walk_enhanced_for(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if !name.is_empty() {
+            ctx.bind_local_type(
+                name,
+                java_simple_type_name(node.child_by_field_name("type"), src),
+                None,
+                node.start_position().row as u32 + 1,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `catch (Exception owned)` shadows a same-named field.
+    // trace:exempt reason=internal-detail
+    fn walk_catch_param(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if !name.is_empty() {
+            ctx.bind_local_type(
+                name,
+                java_simple_type_name(node.child_by_field_name("type"), src),
+                None,
+                node.start_position().row as u32 + 1,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
     }
 
     /// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique param type.
@@ -2807,6 +2922,44 @@ class Svc {
         assert!(
             types.contains(&"Order") && types.contains(&"Invoice"),
             "tombstone fuel missing: {types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.local-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.extract.java.local-type
+    fn local_type_binds_shadow_fields() {
+        let ef = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    private Order owned;
+    void run() { owned.process(); }
+    void shadowed() {
+        Invoice owned = new Invoice();
+        owned.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.calls.iter().any(|c| c.callee == "owned.process"),
+            "unprefixed callee missing: {:?}",
+            ef.calls.iter().map(|c| &c.callee).collect::<Vec<_>>()
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.shadowed"
+                && b.name == "owned"
+                && b.type_name == "Invoice"),
+            "local bind missing: {:?}",
+            ef.type_binds
         );
     }
 }
