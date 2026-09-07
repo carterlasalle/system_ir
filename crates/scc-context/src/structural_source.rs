@@ -434,7 +434,8 @@ fn read_exact_span(root: &Path, path: &str, start: u32, end: u32) -> Option<Stri
     }
 }
 
-fn file_handle(compiler: &ContextCompiler, path: &str) -> String {
+// trace:exempt reason=internal-detail
+pub(crate) fn file_handle(compiler: &ContextCompiler, path: &str) -> String {
     let bytes = std::fs::read(compiler.store.root.join(path)).unwrap_or_default();
     let hash = if bytes.is_empty() {
         String::new()

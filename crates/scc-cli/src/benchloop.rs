@@ -434,6 +434,81 @@ fn walk_files(root: &Path, dir: &Path, visit: &mut impl FnMut(&str, &Path)) {
     }
 }
 
+/// Prefer FETCH `handle=scc://...` keys. Stale handles are refused (not
+/// guessed as a path). Packs without handles fall back to path matching.
+/// Path mentions may fill leftover slots only for files that were not
+/// refused via a stale handle.
+// trace:v1 id=impl.scc.cli.explore-handles work=WORK-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as satisfies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei implements=PLAN-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as
+fn files_from_pack(text: &str, root: &Path, indexed: &[String], k: usize) -> Vec<String> {
+    let (saw_handle, mut opened, refused) = files_from_handles(text, root, indexed, k);
+    if !saw_handle {
+        return files_from_text(text, indexed, k);
+    }
+    if opened.len() >= k {
+        return opened;
+    }
+    for p in files_from_text(text, indexed, k) {
+        if refused.contains(&p) || opened.iter().any(|x| x == &p) {
+            continue;
+        }
+        opened.push(p);
+        if opened.len() >= k {
+            break;
+        }
+    }
+    opened
+}
+
+// trace:exempt reason=internal-detail
+fn files_from_handles(
+    text: &str,
+    root: &Path,
+    indexed: &[String],
+    k: usize,
+) -> (bool, Vec<String>, BTreeSet<String>) {
+    let mut saw = false;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut refused = BTreeSet::new();
+    for raw in text.split_whitespace() {
+        let token = raw
+            .strip_prefix("handle=")
+            .unwrap_or(raw)
+            .trim_end_matches([',', ';', ')', ']']);
+        if !token.starts_with("scc://") {
+            continue;
+        }
+        saw = true;
+        match scc_context::structural_source::resolve_handle_to_path(root, token) {
+            Ok(p) => {
+                let hit = indexed
+                    .iter()
+                    .any(|i| i == &p || i.ends_with(&format!("/{p}")));
+                if hit && seen.insert(p.clone()) && out.len() < k {
+                    out.push(p);
+                }
+            }
+            Err(_) => {
+                if let Some(p) = path_from_handle(token) {
+                    refused.insert(p);
+                }
+            }
+        }
+    }
+    (saw, out, refused)
+}
+
+// trace:exempt reason=internal-detail
+fn path_from_handle(token: &str) -> Option<String> {
+    let h = scc_core::ContentHandle::parse(token).ok()?;
+    match h.kind {
+        scc_core::HandleKind::File => Some(h.key),
+        scc_core::HandleKind::Symbol => h.key.split_once("::").map(|(p, _)| p.to_string()),
+        scc_core::HandleKind::Span => h.key.split_once(":L").map(|(p, _)| p.to_string()),
+        _ => None,
+    }
+}
+
 // trace:exempt reason=internal-detail
 fn files_from_text(text: &str, indexed: &[String], k: usize) -> Vec<String> {
     let mut hits: Vec<(usize, String)> = Vec::new();
@@ -616,7 +691,7 @@ fn run_explore_arm(
         }
         LoopArm::Scc => {
             let pack = scc_pack(root, goal)?;
-            let opened = files_from_text(&pack, indexed, k);
+            let opened = files_from_pack(&pack, root, indexed, k);
             let jsonl = explore_pack_jsonl("task_context", goal, &opened);
             Ok(score_explore(task_id, repo, arm, "ran", &jsonl, root, gold, 1, 1.0, contaminated))
         }
@@ -976,6 +1051,46 @@ mod tests {
         let indexed = vec!["src/server.py".into(), "src/db.py".into()];
         let got = files_from_ripwire(xml, &indexed, 10);
         assert_eq!(got, vec!["src/server.py", "src/db.py"]);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.explore-handles verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.cli.explore-handles
+    fn explore_prefers_fetch_handles_and_refuses_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.py"), "print(1)\n").unwrap();
+        let hash = scc_core::fnv1a64_hex(b"print(1)\n");
+        let fresh = scc_core::ContentHandle::for_file("r", "e", "a.py", &hash).to_string();
+        let indexed = vec!["a.py".into()];
+        let pack = format!("FETCH\n- a.py handle={fresh}\n# a.py mentioned");
+        let got = files_from_pack(&pack, root, &indexed, 10);
+        assert_eq!(got, vec!["a.py"]);
+        let stale = scc_core::ContentHandle::for_file("r", "e", "a.py", "aaaaaaaaaaaaaaaa").to_string();
+        let refused = files_from_pack(
+            &format!("FETCH\n- a.py handle={stale}\n"),
+            root,
+            &indexed,
+            10,
+        );
+        assert!(
+            refused.is_empty(),
+            "stale handle must not fall back to guessing a.py: {refused:?}"
+        );
+        let fallback = files_from_pack("IMPLEMENTATION\na.py\n", root, &indexed, 10);
+        assert_eq!(fallback, vec!["a.py"]);
+        std::fs::write(root.join("b.py"), "print(2)\n").unwrap();
+        let indexed2 = vec!["a.py".into(), "b.py".into()];
+        let mixed = files_from_pack(
+            &format!("FETCH\n- a.py handle={stale}\nIMPLEMENTATION\nb.py\n"),
+            root,
+            &indexed2,
+            10,
+        );
+        assert_eq!(
+            mixed,
+            vec!["b.py"],
+            "stale a.py must stay refused while other paths can still fill: {mixed:?}"
+        );
     }
 
     #[test]

@@ -597,6 +597,21 @@ impl Ctx {
             line,
         });
     }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +620,7 @@ impl Ctx {
 
 // trace:exempt reason=internal-detail
 impl GoExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             "function_declaration" => self.walk_function(node, ctx, src),
@@ -623,6 +639,7 @@ impl GoExtractor {
             }
             "import_declaration" => self.record_import(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
+            "assignment_statement" => self.record_field_assign(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -887,6 +904,28 @@ impl GoExtractor {
         if let Some(ty) = declared_ty {
             ctx.push_type_bind_in(owner, field, ty, line);
         }
+    }
+
+    /// `s.owned = &Invoice{}` — class-scoped field bind from a one-hop
+    /// assignment whose root is uniquely typed as the owner. A different
+    /// type than the struct declaration tombstones at resolve time.
+    // trace:v1 id=impl.scc.extract.go.field-assign work=WORK-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as satisfies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei implements=PLAN-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as
+    fn record_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let lefts = expr_nodes(node.child_by_field_name("left"));
+        let rights = expr_nodes(node.child_by_field_name("right"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, left) in lefts.iter().enumerate() {
+            let Some((root, field)) = one_hop_selector(*left, src) else {
+                continue;
+            };
+            let Some(owner) = ctx.unique_local_type(&root) else {
+                continue;
+            };
+            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
+                ctx.push_type_bind_in(owner, field, ty, line);
+            }
+        }
+        self.walk_children(node, ctx, src);
     }
 
     /// `const_declaration` / `var_declaration` → one symbol per spec.
@@ -2165,6 +2204,60 @@ fn go_is_simple_ident(s: &str) -> bool {
         )
 }
 
+/// `left`/`right` of an assignment is an `expression_list` or a single expr.
+// trace:exempt reason=internal-detail
+fn expr_nodes(node: Option<Node>) -> Vec<Node> {
+    let Some(n) = node else {
+        return Vec::new();
+    };
+    if n.kind() == "expression_list" {
+        let mut c = n.walk();
+        n.named_children(&mut c).collect()
+    } else {
+        vec![n]
+    }
+}
+
+/// One-hop `root.field` selector; longer chains and non-identifiers are skipped.
+// trace:exempt reason=internal-detail
+fn one_hop_selector(node: Node, src: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "selector_expression" {
+        return None;
+    }
+    let field = clean(node_text(node.child_by_field_name("field"), src));
+    let op = node.child_by_field_name("operand")?;
+    if op.kind() != "identifier" {
+        return None;
+    }
+    let root = clean(node_text(Some(op), src));
+    if root.is_empty() || field.is_empty() {
+        None
+    } else {
+        Some((root, field))
+    }
+}
+
+/// Type name from `&T{}` / `T{}` / `new(T)` / a uniquely typed ident.
+// trace:exempt reason=internal-detail
+fn go_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    while matches!(n.kind(), "unary_expression" | "parenthesized_expression") {
+        n = n.named_child(0)?;
+    }
+    match n.kind() {
+        "composite_literal" => go_simple_type_name(n.child_by_field_name("type"), src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        "call_expression" => {
+            let fn_n = n.child_by_field_name("function")?;
+            if clean(node_text(Some(fn_n), src)) != "new" {
+                return None;
+            }
+            let args = n.child_by_field_name("arguments")?;
+            go_simple_type_name(args.named_child(0), src)
+        }
+        _ => None,
+    }
+}
+
 /// Pointer-stripped simple type name. Slices, maps, and channels stay unbound.
 // trace:exempt reason=internal-detail
 fn go_simple_type_name(node: Option<Node>, src: &[u8]) -> Option<String> {
@@ -2955,6 +3048,52 @@ func (s *Svc) Run() {
                 .any(|b| b.type_name == "Process" || b.name == "s" && b.scope == "Svc"),
             "must not bind methods as fields: {:?}",
             ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Invoice{}
+	s.owned.Process()
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment tombstone fuel missing: {types:?}"
+        );
+        let same = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Order{}
+	s.owned.Process()
+}
+"#,
+        );
+        let same_types: Vec<_> = same
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
+            "same-type assignment must stay unique Order: {same_types:?}"
         );
     }
 }

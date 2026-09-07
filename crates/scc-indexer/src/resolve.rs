@@ -1723,6 +1723,82 @@ func (s *Svc) Chain() { s.owned.inner.Process() }
     }
 
     #[test]
+    // trace:v1 id=test.scc.resolve.go.field-assign-tombstone verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.extract.go.field-assign
+    fn go_conflicting_field_assignment_does_not_pin() {
+        use crate::go::GoExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Invoice{}
+	s.owned.Process()
+}
+"#;
+        let ef = GoExtractor::default().extract(&SourceFile::new("w.go", src));
+        let types: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment must tombstone fuel: {types:?}"
+        );
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.go", &ef.symbols);
+        idx.set_type_binds("w.go", &ef.type_binds);
+        let resolved = resolve_calls("w.go", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "s.owned.Process")
+            .expect("s.owned.Process call");
+        assert_eq!(hit.callee_id, None, "conflicting assignment must not pin");
+        assert_eq!(hit.recv, RecvKind::FieldOfVariable);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.resolve.go.field-assign-same verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.extract.go.field-assign
+    fn go_same_type_field_assignment_still_pins() {
+        use crate::go::GoExtractor;
+        use crate::model::{LanguageExtractor, SourceFile};
+        let src = r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Order{}
+	s.owned.Process()
+}
+"#;
+        let ef = GoExtractor::default().extract(&SourceFile::new("w.go", src));
+        let mut idx = SymbolIndex::new("repo");
+        idx.add_file("w.go", &ef.symbols);
+        idx.set_type_binds("w.go", &ef.type_binds);
+        let resolved = resolve_calls("w.go", &ef.calls, &ef.symbols, &[], &idx, "repo");
+        let hit = resolved
+            .iter()
+            .find(|c| c.callee_name == "s.owned.Process")
+            .expect("s.owned.Process call");
+        assert_eq!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Order.Process"))
+        );
+        assert_ne!(
+            hit.callee_id,
+            Some(scc_core::symbol_id("repo", "w.go", "Invoice.Process"))
+        );
+    }
+
+    #[test]
     // trace:v1 id=test.scc.resolve.rust.field-type-extract verifies=REQ-implement-phase-11-of-scc-x-ripwire-lessons-rust-one-hop-self-field-t exercises=impl.scc.extract.rust.field-type
     fn rust_extract_then_resolve_pins_self_field() {
         use crate::model::{LanguageExtractor, SourceFile};

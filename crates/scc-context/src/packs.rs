@@ -6,6 +6,7 @@
 //! are dropped before truncation.
 
 use crate::rank::terms;
+use crate::structural_source::file_handle;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::kinds;
 use scc_core::{
@@ -937,6 +938,13 @@ pub fn task_with_rankers(
         sections.push(Section::new("ANALYSIS QUALITY", q.compact_line() + "\n", 4));
     }
 
+    // Compact fetch keys (handles) survive after bodies are dropped.
+    // Not a fifth context level — lazy Level-3 identity, not extra ontology.
+    let fetch = fetch_handle_list(ctx, files, &candidates);
+    if !fetch.is_empty() {
+        sections.push(Section::new("FETCH", fetch, 8));
+    }
+
     // Exact source last: bodies fill leftover budget and are the first
     // section dropped. Never a fifth context level — this is Level 3
     // inside Task Context, after semantic sections.
@@ -971,15 +979,32 @@ pub fn task_with_rankers(
 
 const EXACT_SOURCE_FILES: usize = 6;
 const EXACT_SOURCE_LINES: usize = 40;
+const FETCH_HANDLE_FILES: usize = 12;
 
-/// Level-3 exact excerpts for Task Context. Truncation is disclosed
-/// (`shown=`/`total=`/`capped=`). Priority 1 so semantic sections win.
-// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance
-fn exact_source_tail(
+/// Compact `path handle=scc://...` lines so agents can lazy-fetch exact
+/// source and refuse stale hashes. Survives after EXACT SOURCE bodies drop.
+// trace:v1 id=impl.scc.context.fetch-handles work=WORK-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as satisfies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei implements=PLAN-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as
+fn fetch_handle_list(
     ctx: &ContextCompiler,
     files: &[String],
     candidates: &[crate::rank::ScoredEntity],
 ) -> String {
+    let paths = collect_task_paths(ctx, files, candidates, FETCH_HANDLE_FILES);
+    let mut body = String::new();
+    for path in &paths {
+        let handle = file_handle(ctx, path);
+        body.push_str(&format!("- {path} handle={handle}\n"));
+    }
+    body
+}
+
+// trace:exempt reason=internal-detail
+fn collect_task_paths(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+    cap: usize,
+) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     let mut push = |p: &str| {
         if p.is_empty() {
@@ -1005,7 +1030,19 @@ fn exact_source_tail(
             push(f);
         }
     }
-    paths.truncate(EXACT_SOURCE_FILES);
+    paths.truncate(cap);
+    paths
+}
+
+/// Level-3 exact excerpts for Task Context. Truncation is disclosed
+/// (`shown=`/`total=`/`capped=`). Priority 1 so semantic sections win.
+// trace:v1 id=impl.scc.context.exact-source-last work=WORK-ripwire-lessons-phase1 satisfies=REQ-exact-source-dominance
+fn exact_source_tail(
+    ctx: &ContextCompiler,
+    files: &[String],
+    candidates: &[crate::rank::ScoredEntity],
+) -> String {
+    let paths = collect_task_paths(ctx, files, candidates, EXACT_SOURCE_FILES);
     let mut body = String::new();
     let root = &ctx.store.root;
     for path in &paths {
@@ -1018,8 +1055,9 @@ fn exact_source_tail(
         }
         let shown = total.min(EXACT_SOURCE_LINES);
         let capped = u8::from(shown < total);
+        let handle = file_handle(ctx, path);
         body.push_str(&format!(
-            "# {path} shown={shown} total={total} capped={capped}\n"
+            "# {path} handle={handle} shown={shown} total={total} capped={capped}\n"
         ));
         for (i, line) in text.lines().enumerate() {
             if i >= shown {
@@ -2388,6 +2426,11 @@ mod tests {
             fat.content
         );
         assert!(fat.content.contains("def handle_list()"), "{}", fat.content);
+        assert!(
+            fat.content.contains("FETCH") && fat.content.contains("handle=scc://"),
+            "task pack must stamp fetch handles: {}",
+            fat.content
+        );
         let thin = task(&ctx, "handle list", &["src/a.py".into()], &[], 80);
         assert!(
             thin.dropped_sections.iter().any(|s| s == "EXACT SOURCE"),
@@ -2399,5 +2442,43 @@ mod tests {
             "dropped exact source must not remain in content: {}",
             thin.content
         );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.fetch-handles verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.context.fetch-handles
+    fn task_pack_stamps_fetch_handles_that_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "def handle_list():\n    return [1, 2, 3]\n";
+        std::fs::write(root.join("src/a.py"), src).unwrap();
+        let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
+        let mut se = Entity::new("s:fn", kinds::SYMBOL, "handle_list");
+        se.attr("file", serde_json::json!("src/a.py"));
+        store.insert_entity(&se, &["src/a.py".into()]).unwrap();
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = crate::ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
+        let pack = task(&ctx, "handle list", &["src/a.py".into()], &[], 50_000);
+        let handle = pack
+            .content
+            .lines()
+            .find_map(|l| l.split("handle=").nth(1))
+            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string())
+            .expect("handle in FETCH or EXACT SOURCE");
+        assert!(handle.starts_with("scc://"), "{handle}");
+        let resolved =
+            crate::structural_source::resolve_handle_to_path(&root, &handle).expect("fresh handle");
+        assert_eq!(resolved, "src/a.py");
+        let stale = format!(
+            "{}@aaaaaaaaaaaaaaaa",
+            handle.rsplit_once('@').map(|(p, _)| p).unwrap_or(&handle)
+        );
+        let err = crate::structural_source::resolve_handle_to_path(&root, &stale).unwrap_err();
+        assert!(err.contains("stale"), "{err}");
     }
 }

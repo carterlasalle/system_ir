@@ -1451,4 +1451,86 @@ class Svc {
             "must not spray Invoice.process: {calls:?}"
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go.field-assign-tombstone verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.extract.go.field-assign
+    fn index_does_not_pin_go_field_after_conflicting_assignment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.go"),
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Invoice{}
+	s.owned.Process()
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Order.Process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Invoice.Process");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Svc.Run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            !calls.iter().any(|r| r.object == order),
+            "conflicting assignment must not pin Order.Process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process either: {calls:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.index.go.field-assign-same verifies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei exercises=impl.scc.extract.go.field-assign
+    fn index_pins_go_field_after_same_type_assignment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("w.go"),
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Order{}
+	s.owned.Process()
+}
+"#,
+        )
+        .unwrap();
+        let (idx, _t) = indexer_for(root);
+        idx.index().unwrap();
+        let order = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Order.Process");
+        let invoice = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Invoice.Process");
+        let run = scc_core::symbol_id(&idx.store.repo_id, "w.go", "Svc.Run");
+        let rels = idx.store.all_relationships().unwrap();
+        let calls: Vec<_> = rels
+            .iter()
+            .filter(|r| r.predicate == scc_core::predicates::CALLS && r.subject == run)
+            .collect();
+        assert!(
+            calls.iter().any(|r| r.object == order),
+            "same-type assignment must still pin Order.Process: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.object == invoice),
+            "must not spray Invoice.Process: {calls:?}"
+        );
+    }
 }
