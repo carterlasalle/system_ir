@@ -428,6 +428,34 @@ mod tests {
             ts.contains("hash-object") || ts.contains("porcelain"),
             "opaque mutations must snapshot dirty files: {ts}"
         );
+        assert!(
+            ts.contains("--porcelain=v1") && ts.contains("-z"),
+            "porcelain must be NUL-delimited (-z): {ts}"
+        );
+        assert!(
+            ts.contains("\"--name-only\"") || ts.contains("diff\", \"--name-only\""),
+            "HEAD revision diffs must use --name-only: {ts}"
+        );
+        assert!(
+            ts.contains("split(\"\\0\")") || ts.contains("split('\\0')") || ts.contains(".split(\"\\0\")"),
+            "revision diffs must split on NUL, not newlines: {ts}"
+        );
+        assert!(
+            ts.contains("rev-parse") && ts.contains("HEAD"),
+            "snapshots must record HEAD so clean-to-clean mutations refresh: {ts}"
+        );
+        assert!(
+            !ts.contains("toolName}:${Date.now()") && !ts.contains("toolName}:${Date.now()}"),
+            "dirtySnapshots must not use a Date.now() fallback id: {ts}"
+        );
+        assert!(
+            ts.contains("if (!id) return"),
+            "snapshots without toolCallId must be skipped: {ts}"
+        );
+        assert!(
+            ts.contains("startupOk"),
+            "compaction must track startup injection separately from checkpoint: {ts}"
+        );
     }
 
     #[test]

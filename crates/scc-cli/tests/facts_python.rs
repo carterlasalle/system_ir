@@ -3,9 +3,9 @@
 //! registration/configuration/callback entities and their typed
 //! relationships in the System IR export.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 // trace:v1 id=test.scc.facts.python verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.python
 
 #[test]

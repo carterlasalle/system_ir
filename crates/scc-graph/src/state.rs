@@ -110,10 +110,12 @@ pub fn is_cache_store(name: &str, technology: Option<&str>) -> bool {
 /// compiler builds it from the *current* candidate boundaries, so the
 /// result never depends on stale stored components).
 ///
-/// Returns `section -> sorted "COMP verb TARGET (PROV)" lines`. Section
-/// keys are [`STATE_SECTIONS`]; the map is a `BTreeMap` and every line set
-/// is sorted — output is deterministic for identical input.
-// trace:v1 id=impl.scc.state.authority work=WORK-SCC-005 satisfies=REQ-SCC-IR
+/// Returns `section -> sorted "COMP verb TARGET (PROV)" lines`. Function-level
+/// access is `{comp}::{symbol} {reads|writes|…} {target} ({PROV})` and never
+/// replaces component ownership. Section keys are [`STATE_SECTIONS`]; the
+/// map is a `BTreeMap` and every line set is sorted — output is
+/// deterministic for identical input.
+// trace:v1 id=impl.scc.state.authority work=WORK-SCC-005 satisfies=REQ-state-function-access,REQ-SCC-IR
 pub fn compile_state_authority(
     graph: &RealityGraph,
     symbol_comp: &HashMap<String, String>,
@@ -140,7 +142,20 @@ pub fn compile_state_authority(
     let mut symbol_ids: Vec<&String> = symbol_comp.keys().collect();
     symbol_ids.sort();
     for sym_id in symbol_ids {
-        let Some(comp) = comp_of(sym_id) else { continue };
+        let Some(comp) = comp_of(sym_id) else {
+            continue;
+        };
+        let sym_name = graph
+            .entities
+            .get(sym_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| {
+                sym_id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(sym_id.as_str())
+                    .to_string()
+            });
         let mut rels: Vec<&scc_core::Relationship> = graph.out_edges(sym_id);
         rels.sort_by(|a, b| {
             a.predicate
@@ -158,39 +173,148 @@ pub fn compile_state_authority(
                     if is_cache_store(&target.name, tech(graph, &r.object)) {
                         push(
                             S_CACHES,
-                            format!("{} writes {} ({})", comp, target.name, prov_str(&r.provenance)),
+                            format!(
+                                "{} writes {} ({})",
+                                comp,
+                                target.name,
+                                prov_str(&r.provenance)
+                            ),
                         );
-                    } else if target.kind == kinds::DATA_STORE || target.kind == kinds::DATA_ENTITY {
+                        push(
+                            S_CACHES,
+                            format!(
+                                "{}::{} writes {} ({})",
+                                comp,
+                                sym_name,
+                                target.name,
+                                prov_str(&r.provenance)
+                            ),
+                        );
+                    } else if target.kind == kinds::DATA_STORE || target.kind == kinds::DATA_ENTITY
+                    {
+                        let tgt = store_ref(graph, &r.object);
                         push(
                             S_PERSISTENT,
-                            format!("{} owns {} ({})", comp, store_ref(graph, &r.object), prov_str(&r.provenance)),
+                            format!("{} owns {} ({})", comp, tgt, prov_str(&r.provenance)),
+                        );
+                        push(
+                            S_PERSISTENT,
+                            format!(
+                                "{}::{} writes {} ({})",
+                                comp,
+                                sym_name,
+                                tgt,
+                                prov_str(&r.provenance)
+                            ),
                         );
                     }
                 }
-                predicates::READS => {
-                    if target.kind == kinds::DATA_STORE && is_cache_store(&target.name, tech(graph, &r.object)) {
+                predicates::READS | predicates::QUERIES => {
+                    let verb = if r.predicate == predicates::QUERIES {
+                        "queries"
+                    } else {
+                        "reads"
+                    };
+                    let cache = target.kind == kinds::DATA_STORE
+                        && is_cache_store(&target.name, tech(graph, &r.object));
+                    if cache {
+                        if r.predicate == predicates::READS {
+                            push(
+                                S_CACHES,
+                                format!(
+                                    "{} reads {} ({})",
+                                    comp,
+                                    target.name,
+                                    prov_str(&r.provenance)
+                                ),
+                            );
+                        }
                         push(
                             S_CACHES,
-                            format!("{} reads {} ({})", comp, target.name, prov_str(&r.provenance)),
+                            format!(
+                                "{}::{} {verb} {} ({})",
+                                comp,
+                                sym_name,
+                                target.name,
+                                prov_str(&r.provenance)
+                            ),
+                        );
+                    } else if target.kind == kinds::DATA_STORE || target.kind == kinds::DATA_ENTITY
+                    {
+                        // Readers are not owners: function-level access only.
+                        push(
+                            S_PERSISTENT,
+                            format!(
+                                "{}::{} {verb} {} ({})",
+                                comp,
+                                sym_name,
+                                store_ref(graph, &r.object),
+                                prov_str(&r.provenance)
+                            ),
                         );
                     }
                 }
                 predicates::PUBLISHES => {
                     push(
                         S_DERIVED,
-                        format!("{} publishes {} ({})", comp, target.name, prov_str(&r.provenance)),
+                        format!(
+                            "{} publishes {} ({})",
+                            comp,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
+                    );
+                    push(
+                        S_DERIVED,
+                        format!(
+                            "{}::{} publishes {} ({})",
+                            comp,
+                            sym_name,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
                     );
                 }
                 predicates::SUBSCRIBES => {
                     push(
                         S_DERIVED,
-                        format!("{} subscribes {} ({})", comp, target.name, prov_str(&r.provenance)),
+                        format!(
+                            "{} subscribes {} ({})",
+                            comp,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
+                    );
+                    push(
+                        S_DERIVED,
+                        format!(
+                            "{}::{} subscribes {} ({})",
+                            comp,
+                            sym_name,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
                     );
                 }
                 predicates::CONSUMES => {
                     push(
                         S_DERIVED,
-                        format!("{} consumes {} ({})", comp, target.name, prov_str(&r.provenance)),
+                        format!(
+                            "{} consumes {} ({})",
+                            comp,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
+                    );
+                    push(
+                        S_DERIVED,
+                        format!(
+                            "{}::{} consumes {} ({})",
+                            comp,
+                            sym_name,
+                            target.name,
+                            prov_str(&r.provenance)
+                        ),
                     );
                 }
                 predicates::REGISTERS => {
@@ -206,7 +330,12 @@ pub fn compile_state_authority(
                     if is_mw_registry {
                         push(
                             S_DERIVED,
-                            format!("{} registers {} ({})", comp, target.name, prov_str(&r.provenance)),
+                            format!(
+                                "{} registers {} ({})",
+                                comp,
+                                target.name,
+                                prov_str(&r.provenance)
+                            ),
                         );
                     }
                 }
@@ -250,7 +379,8 @@ pub fn compile_state_authority(
                 "{} owns {} ({tag}) ({})",
                 comp,
                 e.name,
-                prov.map(|p| prov_str(&p)).unwrap_or_else(|| "EXTRACTED".to_string())
+                prov.map(|p| prov_str(&p))
+                    .unwrap_or_else(|| "EXTRACTED".to_string())
             ),
         );
     }
@@ -362,10 +492,7 @@ pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
             } else {
                 r.object.clone()
             };
-            store_syms
-                .entry(target)
-                .or_default()
-                .insert(sym.clone());
+            store_syms.entry(target).or_default().insert(sym.clone());
         }
     }
     // configuration target -> symbols it configures (CONFIGURED_BY)
@@ -413,12 +540,15 @@ pub fn state_authority_groups(graph: &RealityGraph) -> Vec<BTreeSet<String>> {
 }
 
 /// One structured state-ownership claim: `component` owns/reads/registers
-/// `target` (evidence `provenance`). The structured bridge from the STATE &
-/// DATA AUTHORITY compiler into the atlas component `owns` claims, so the
-/// state fact layer is part of the machine model (not just rendered text).
+/// `target` (evidence `provenance`). `verb` is `owns` for write-derived
+/// ownership and `reads` for readers — atlas `owns` claims ignore reads so
+/// a reader is never promoted to owner. The structured bridge from the
+/// STATE & DATA AUTHORITY compiler into the atlas component `owns` claims.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+// trace:exempt reason=internal-detail
 pub struct StateClaim {
     pub component: String,
+    pub verb: String,
     pub target: String,
     pub provenance: String,
 }
@@ -427,8 +557,8 @@ pub struct StateClaim {
 /// [`compile_state_authority`]: WRITES to stores/caches, mutable FIELD /
 /// STATE / REGISTRY owners, CONFIGURED_BY configuration targets, topics
 /// (PUBLISHES/SUBSCRIBES/CONSUMES), and middleware/registry REGISTERS.
-/// Deterministic: sorted by (component, target, provenance).
-// trace:v1 id=impl.scc.state work=WORK-SCC-005 satisfies=REQ-SCC-IR
+/// Deterministic: sorted by (component, verb, target, provenance).
+// trace:v1 id=impl.scc.state work=WORK-SCC-005 satisfies=REQ-state-function-access,REQ-SCC-IR
 pub fn compile_state_claims(
     graph: &RealityGraph,
     symbol_comp: &HashMap<String, String>,
@@ -441,7 +571,9 @@ pub fn compile_state_claims(
     let mut symbol_ids: Vec<&String> = symbol_comp.keys().collect();
     symbol_ids.sort();
     for sym_id in symbol_ids {
-        let Some(comp) = comp_of(sym_id) else { continue };
+        let Some(comp) = comp_of(sym_id) else {
+            continue;
+        };
         let mut rels: Vec<&scc_core::Relationship> = graph.out_edges(sym_id);
         rels.sort_by(|a, b| {
             a.predicate
@@ -450,19 +582,21 @@ pub fn compile_state_claims(
                 .then_with(|| a.id.cmp(&b.id))
         });
         for r in rels {
-            let Some(target) = graph.entities.get(&r.object) else { continue };
+            let Some(target) = graph.entities.get(&r.object) else {
+                continue;
+            };
             let tgt = match r.predicate.as_str() {
                 predicates::WRITES => {
                     if target.kind == kinds::DATA_STORE || target.kind == kinds::DATA_ENTITY {
-                        Some(store_ref(graph, &r.object))
+                        Some(("owns", store_ref(graph, &r.object)))
                     } else {
-                        Some(target.name.clone())
+                        Some(("owns", target.name.clone()))
                     }
                 }
-                predicates::PUBLISHES
-                | predicates::SUBSCRIBES
-                | predicates::CONSUMES
-                | predicates::READS => Some(target.name.clone()),
+                predicates::READS | predicates::QUERIES => Some(("reads", target.name.clone())),
+                predicates::PUBLISHES | predicates::SUBSCRIBES | predicates::CONSUMES => {
+                    Some(("owns", target.name.clone()))
+                }
                 predicates::REGISTERS => {
                     let is_mw_registry = target.kind == kinds::MIDDLEWARE
                         || target.kind == kinds::REGISTRY
@@ -474,16 +608,17 @@ pub fn compile_state_claims(
                                 .map(|k| matches!(k, "middleware" | "registry"))
                                 .unwrap_or(false));
                     if is_mw_registry {
-                        Some(target.name.clone())
+                        Some(("owns", target.name.clone()))
                     } else {
                         None
                     }
                 }
                 _ => None,
             };
-            if let Some(t) = tgt {
+            if let Some((verb, t)) = tgt {
                 claims.insert(StateClaim {
                     component: comp.clone(),
+                    verb: verb.to_string(),
                     target: t,
                     provenance: prov_str(&r.provenance),
                 });
@@ -507,6 +642,7 @@ pub fn compile_state_claims(
             if let Some(comp) = comp_of(&r.subject) {
                 claims.insert(StateClaim {
                     component: comp,
+                    verb: "owns".into(),
                     target: e.name.clone(),
                     provenance: prov_str(&r.provenance),
                 });
@@ -523,6 +659,7 @@ pub fn compile_state_claims(
             if let Some(comp) = comp_of(&r.object) {
                 claims.insert(StateClaim {
                     component: comp,
+                    verb: "owns".into(),
                     target: cfg.name.clone(),
                     provenance: prov_str(&r.provenance),
                 });
@@ -548,6 +685,7 @@ pub fn compile_state_claims(
                 if let Some(comp) = comp_of(&r.subject) {
                     claims.insert(StateClaim {
                         component: comp,
+                        verb: "owns".into(),
                         target: format!("reactive: {} [{}]", e.name, access),
                         provenance: prov_str(&r.provenance),
                     });
@@ -563,7 +701,9 @@ pub fn compile_state_claims(
 
 /// Resolve a write target to a human store reference: data entities render
 /// as `store.entity`, stores as their name.
-fn store_ref(graph: &RealityGraph, id: &str) -> String {    match graph.entities.get(id) {
+// trace:exempt reason=internal-detail
+fn store_ref(graph: &RealityGraph, id: &str) -> String {
+    match graph.entities.get(id) {
         Some(e) if e.kind == kinds::DATA_ENTITY => e
             .attributes
             .get("store")
@@ -597,11 +737,14 @@ mod tests {
         (dir, store)
     }
 
-
+    // trace:exempt reason=internal-detail
     fn sym(store: &Store, path: &str, name: &str) -> String {
         let id = symbol_id(&store.repo_id, path, name);
         store
-            .insert_entity(&Entity::new(id.clone(), kinds::SYMBOL, name), &[path.into()])
+            .insert_entity(
+                &Entity::new(id.clone(), kinds::SYMBOL, name),
+                &[path.into()],
+            )
             .unwrap();
         id
     }
@@ -654,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn attributes_state_ownership_per_component() {
         let (_dir, store) = open();
         let repo = store.repo_id.clone();
@@ -831,8 +975,28 @@ mod tests {
             assert!(state.contains_key(k), "missing section {k}: {state:?}");
         }
         let persistent = &state[S_PERSISTENT];
-        assert_eq!(persistent.len(), 1, "{persistent:?}");
-        assert_eq!(persistent[0], "api owns db.users (EXTRACTED)");
+        assert!(
+            persistent
+                .iter()
+                .any(|l| l == "api owns db.users (EXTRACTED)"),
+            "component owns missing: {persistent:?}"
+        );
+        assert!(
+            persistent
+                .iter()
+                .any(|l| l == "api::create_user writes db.users (EXTRACTED)"),
+            "function writes missing: {persistent:?}"
+        );
+        assert!(
+            persistent
+                .iter()
+                .any(|l| l == "web::list_items reads db (EXTRACTED)"),
+            "function reads missing: {persistent:?}"
+        );
+        assert!(
+            !persistent.iter().any(|l| l.contains("web owns")),
+            "readers must not own: {persistent:?}"
+        );
         let runtime = &state[S_RUNTIME];
         assert_eq!(runtime.len(), 1, "{runtime:?}");
         assert_eq!(runtime[0], "api owns Cart.items (mutable) (EXTRACTED)");
@@ -841,13 +1005,26 @@ mod tests {
         let caches = &state[S_CACHES];
         assert_eq!(caches[0], "api reads redis (EXTRACTED)");
         let derived = &state[S_DERIVED];
-        assert!(derived.iter().any(|l| l.starts_with("api publishes user.created")), "{derived:?}");
-        assert!(derived.iter().any(|l| l == "api registers RequestLogger (EXTRACTED)"), "{derived:?}");
+        assert!(
+            derived
+                .iter()
+                .any(|l| l.starts_with("api publishes user.created")),
+            "{derived:?}"
+        );
+        assert!(
+            derived
+                .iter()
+                .any(|l| l == "api registers RequestLogger (EXTRACTED)"),
+            "{derived:?}"
+        );
 
-        // web has NO state claims anywhere
+        // web has NO ownership claims (reads are not owns)
         for k in STATE_SECTIONS {
             for line in &state[k] {
-                assert!(!line.starts_with("web "), "web must not own state: {line}");
+                assert!(
+                    !line.contains("web owns") && !line.starts_with("web owns"),
+                    "web must not own state: {line}"
+                );
             }
         }
 
@@ -855,6 +1032,81 @@ mod tests {
         let graph2 = RealityGraph::load(&store).unwrap();
         let state2 = compile_state_authority(&graph2, &symbol_comp);
         assert_eq!(state, state2);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.state.function-access verifies=REQ-state-function-access exercises=impl.scc.state.authority
+    fn function_access_is_not_ownership() {
+        let (_dir, store) = open();
+        let repo = store.repo_id.clone();
+        component(&store, "api", &["api/app.py"]);
+        component(&store, "web", &["web/app.py"]);
+        let writer = sym(&store, "api/app.py", "save");
+        attach(&store, "api", &writer, "api/app.py");
+        let reader = sym(&store, "web/app.py", "load");
+        attach(&store, "web", &reader, "web/app.py");
+        let db = entity_id(&repo, kinds::DATA_STORE, "orders");
+        store
+            .insert_entity(
+                &Entity::new(db.clone(), kinds::DATA_STORE, "orders"),
+                &["api/app.py".into()],
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:w",
+                    writer,
+                    predicates::WRITES,
+                    db.clone(),
+                    Provenance::Extracted,
+                ),
+                "api/app.py",
+            )
+            .unwrap();
+        store
+            .insert_relationship(
+                &Relationship::new(
+                    "rel:r",
+                    reader,
+                    predicates::READS,
+                    db,
+                    Provenance::Extracted,
+                ),
+                "web/app.py",
+            )
+            .unwrap();
+        let graph = RealityGraph::load(&store).unwrap();
+        let mut symbol_comp: HashMap<String, String> = HashMap::new();
+        for c in &graph.components {
+            for r in graph.out_pred(&c.id, predicates::CONTAINS) {
+                for sr in graph.out_pred(&r.object, predicates::CONTAINS) {
+                    symbol_comp.insert(sr.object.clone(), c.name.clone());
+                }
+            }
+        }
+        let state = compile_state_authority(&graph, &symbol_comp);
+        let persistent = &state[S_PERSISTENT];
+        assert!(persistent
+            .iter()
+            .any(|l| l == "api owns orders (EXTRACTED)"));
+        assert!(persistent
+            .iter()
+            .any(|l| l == "api::save writes orders (EXTRACTED)"));
+        assert!(persistent
+            .iter()
+            .any(|l| l == "web::load reads orders (EXTRACTED)"));
+        assert!(!persistent.iter().any(|l| l.contains("web owns")));
+        let claims = compile_state_claims(&graph, &symbol_comp);
+        assert!(claims
+            .iter()
+            .any(|c| c.component == "api" && c.verb == "owns" && c.target == "orders"));
+        assert!(claims
+            .iter()
+            .any(|c| c.component == "web" && c.verb == "reads" && c.target == "orders"));
+        assert!(!claims
+            .iter()
+            .any(|c| c.component == "web" && c.verb == "owns"));
     }
 
     #[test]
@@ -867,7 +1119,7 @@ mod tests {
         assert!(!is_cache_store("orders", None));
     }
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
 
     /// Wave 11/13: symbols OWNS-ing occurrences of the same REACTIVE
     /// concept form a shared-state authority group (the +4 clustering
@@ -875,7 +1127,7 @@ mod tests {
     /// to its owner symbol's component.
     #[test]
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
     fn reactive_state_owners_group_and_attribute() {
         let (_dir, store) = open();
         let repo = store.repo_id.clone();
@@ -954,7 +1206,9 @@ mod tests {
         // shared-reactive-ownership group: both owners in one group
         let groups = state_authority_groups(&RealityGraph::load(&store).unwrap());
         assert!(
-            groups.iter().any(|g| g.contains(&a) && g.contains(&b) && g.len() == 2),
+            groups
+                .iter()
+                .any(|g| g.contains(&a) && g.contains(&b) && g.len() == 2),
             "reactive owners must group: {groups:?}"
         );
 
@@ -990,6 +1244,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn non_mutable_fields_are_not_runtime_state() {
         let (_dir, store) = open();
         let repo = store.repo_id.clone();
@@ -1028,7 +1283,10 @@ mod tests {
         }
         let state = compile_state_authority(&graph, &symbol_comp);
         let runtime = state.get(S_RUNTIME).map(|v| v.as_slice()).unwrap_or(&[]);
-        assert!(runtime.is_empty(), "immutable field is not runtime state: {runtime:?}");
+        assert!(
+            runtime.is_empty(),
+            "immutable field is not runtime state: {runtime:?}"
+        );
     }
 
     /// Wave 9 symbol→state authority: module-level globals (owned by the

@@ -8,7 +8,7 @@
 use crate::facts;
 use crate::model::{
     Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, TypeBind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
@@ -426,8 +426,13 @@ struct Ctx {
     facts: Vec<SemanticFact>,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Local parameter and class-field type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
+    /// Superclass + interfaces for CHA (`IERS_B` → `["IERS"]`).
+    class_bases: Vec<(String, Vec<String>)>,
 }
 
+// trace:exempt reason=internal-detail
 impl Ctx {
     fn caller(&self) -> Option<String> {
         self.scopes.last().map(|s| s.name.clone())
@@ -442,6 +447,7 @@ impl Ctx {
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
     }
+    // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
         let mut facts = self.facts;
         // Contract subclass evidence (Contract ontology): serializer/
@@ -488,12 +494,133 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags: std::collections::BTreeMap::new(),
             facts,
+            type_binds: self.type_binds,
+            fn_binds: Vec::new(),
+            class_bases: java_class_bases(&self.class_bases),
         }
     }
 
     /// Any import whose module string starts with `prefix`.
     fn has_import(&self, prefix: &str) -> bool {
         self.imports.iter().any(|i| i.module.starts_with(prefix))
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() || name == "this" {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    /// Class name for `Class.method` scopes; `None` at compilation-unit level.
+    // trace:exempt reason=internal-detail
+    fn enclosing_class_name(&self) -> Option<String> {
+        if self.top_is_class() {
+            let n = self.top_name();
+            return (!n.is_empty()).then_some(n);
+        }
+        let top = self.top_name();
+        let (class, rest) = top.split_once('.')?;
+        if rest.is_empty() || class.is_empty() {
+            None
+        } else {
+            Some(class.to_string())
+        }
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
+
+    /// Class-scoped field type from the declared type, `new Foo()`, or a unique RHS ident.
+    // trace:v1 id=impl.scc.extract.java.field-type work=WORK-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni satisfies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na implements=PLAN-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-narrowing-uni
+    fn bind_field_type(
+        &mut self,
+        class: String,
+        field: String,
+        right: Option<Node>,
+        declared_ty: Option<String>,
+        line: u32,
+        src: &[u8],
+    ) {
+        if let Some(ty) = declared_ty {
+            self.push_type_bind_in(class.clone(), field.clone(), ty, line);
+        }
+        if let Some(r) = right {
+            if let Some(ty) = java_rhs_type_name(r, src, self) {
+                self.push_type_bind_in(class, field, ty, line);
+            }
+        }
+    }
+
+    /// Method-scoped local / catch / enhanced-for type, or an untyped shadow
+    /// so a same-named field cannot be used as an implicit receiver.
+    // trace:v1 id=impl.scc.extract.java.local-type work=WORK-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ satisfies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as implements=PLAN-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as-receiver-typ
+    fn bind_local_type(
+        &mut self,
+        name: String,
+        declared_ty: Option<String>,
+        right: Option<Node>,
+        line: u32,
+        src: &[u8],
+    ) {
+        let scope = self.caller().unwrap_or_default();
+        if scope.is_empty() || name.is_empty() || name == "this" {
+            return;
+        }
+        let mut bound = false;
+        if let Some(ty) = declared_ty.filter(|t| t != "var") {
+            self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
+            bound = true;
+        }
+        if let Some(r) = right {
+            if let Some(ty) = java_rhs_type_name(r, src, self) {
+                self.push_type_bind_in(scope.clone(), name.clone(), ty, line);
+                bound = true;
+            }
+        }
+        if !bound {
+            self.push_local_shadow(scope, name, line);
+        }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_local_shadow(&mut self, scope: String, name: String, line: u32) {
+        if self
+            .type_binds
+            .iter()
+            .any(|b| b.scope == scope && b.name == name)
+        {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name: String::new(),
+            line,
+        });
     }
 }
 
@@ -664,7 +791,83 @@ fn is_mockito_annotation(name: &str) -> bool {
 }
 
 // trace:exempt reason=internal-detail
+fn java_is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            s,
+            "void"
+                | "boolean"
+                | "byte"
+                | "short"
+                | "int"
+                | "long"
+                | "char"
+                | "float"
+                | "double"
+                | "var"
+        )
+}
+
+/// Simple class name from a Java type node. Generics and arrays stay unbound.
+// trace:exempt reason=internal-detail
+fn java_simple_type_name(node: Option<Node>, src: &[u8]) -> Option<String> {
+    let n = node?;
+    match n.kind() {
+        "generic_type" | "array_type" | "integral_type" | "floating_point_type" | "boolean_type"
+        | "void_type" => None,
+        "scoped_type_identifier" => {
+            let t = clean(node_text(Some(n), src));
+            let last = t.rsplit('.').next().unwrap_or(&t);
+            java_is_simple_ident(last).then(|| last.to_string())
+        }
+        _ => {
+            let t = clean(node_text(Some(n), src));
+            java_is_simple_ident(&t).then_some(t)
+        }
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn java_ctor_type(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "object_creation_expression" {
+        return None;
+    }
+    java_simple_type_name(node.child_by_field_name("type"), src)
+}
+
+/// `(Order)v` — simple types only. Arrays and generics stay unbound.
+// trace:v1 id=impl.scc.extract.java.type-cast work=WORK-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as-rule-2-fuel satisfies=REQ-implement-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as implements=PLAN-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as-rule-2-fuel
+fn java_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    if n.kind() != "cast_expression" {
+        return None;
+    }
+    java_simple_type_name(n.child_by_field_name("type"), src)
+}
+
+/// `new Order()`, `(Order)v`, or a uniquely typed identifier.
+// trace:exempt reason=internal-detail
+fn java_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    while n.kind() == "parenthesized_expression" {
+        n = n.named_child(0)?;
+    }
+    match n.kind() {
+        "object_creation_expression" => java_ctor_type(n, src),
+        "cast_expression" => java_cast_type_name(n, src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        _ => None,
+    }
+}
+
+// trace:exempt reason=internal-detail
 impl JavaExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             "class_declaration" => self.walk_type(node, ctx, src, SymbolKind::Class),
@@ -674,6 +877,10 @@ impl JavaExtractor {
             "method_declaration" => self.walk_method(node, ctx, src),
             "constructor_declaration" => self.walk_constructor(node, ctx, src),
             "field_declaration" => self.walk_field(node, ctx, src),
+            "local_variable_declaration" => self.walk_local_variable(node, ctx, src),
+            "enhanced_for_statement" => self.walk_enhanced_for(node, ctx, src),
+            "catch_formal_parameter" => self.walk_catch_param(node, ctx, src),
+            "assignment_expression" => self.record_this_field_assign(node, ctx, src),
             "method_invocation" => self.record_call(node, ctx, src),
             "object_creation_expression" => self.record_creation(node, ctx, src),
             "import_declaration" => self.record_import(node, ctx, src),
@@ -770,6 +977,16 @@ impl JavaExtractor {
                 });
             }
         }
+        {
+            let mut bases: Vec<String> = Vec::new();
+            if let Some(parent) = superclass_name(node, src) {
+                bases.push(parent);
+            }
+            bases.extend(implemented_interfaces(&node, src));
+            if !bases.is_empty() {
+                ctx.class_bases.push((name.clone(), bases));
+            }
+        }
         ctx.scopes.push(Scope {
             name: name.clone(),
             is_class: true,
@@ -862,6 +1079,7 @@ impl JavaExtractor {
             is_class: false,
             is_interface: false,
         });
+        self.bind_formal_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -904,6 +1122,7 @@ impl JavaExtractor {
             is_class: false,
             is_interface: false,
         });
+        self.bind_formal_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -928,6 +1147,7 @@ impl JavaExtractor {
             && annotations_on(node, src)
                 .iter()
                 .any(|(n, _)| n == "Rule");
+        let declared_ty = java_simple_type_name(node.child_by_field_name("type"), src);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() != "variable_declarator" {
@@ -957,6 +1177,14 @@ impl JavaExtractor {
                 name: fname.clone(),
                 mutable,
             });
+            ctx.bind_field_type(
+                class.clone(),
+                fname,
+                child.child_by_field_name("value"),
+                declared_ty.clone(),
+                start_line,
+                src,
+            );
             self.record_annotations(node, ctx, src, &fq);
             if has_rule {
                 ctx.facts.push(SemanticFact::Registration {
@@ -966,6 +1194,108 @@ impl JavaExtractor {
                 });
             }
         }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn bind_formal_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "formal_parameter" {
+                continue;
+            }
+            let name = clean(node_text(p.child_by_field_name("name"), src));
+            let Some(ty) = java_simple_type_name(p.child_by_field_name("type"), src) else {
+                continue;
+            };
+            let line = p.start_position().row as u32 + 1;
+            ctx.push_type_bind(name, ty, line);
+        }
+    }
+
+    /// Locals in a method: `Order owned = ...` / `var owned = new Order()`.
+    // trace:exempt reason=internal-detail
+    fn walk_local_variable(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let declared_ty = java_simple_type_name(node.child_by_field_name("type"), src);
+        let line = node.start_position().row as u32 + 1;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+            let name = clean(node_text(child.child_by_field_name("name"), src));
+            if name.is_empty() {
+                continue;
+            }
+            ctx.bind_local_type(
+                name,
+                declared_ty.clone(),
+                child.child_by_field_name("value"),
+                line,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `for (Invoice owned : items)` is a local that shadows a field.
+    // trace:exempt reason=internal-detail
+    fn walk_enhanced_for(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if !name.is_empty() {
+            ctx.bind_local_type(
+                name,
+                java_simple_type_name(node.child_by_field_name("type"), src),
+                None,
+                node.start_position().row as u32 + 1,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `catch (Exception owned)` shadows a same-named field.
+    // trace:exempt reason=internal-detail
+    fn walk_catch_param(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let name = clean(node_text(node.child_by_field_name("name"), src));
+        if !name.is_empty() {
+            ctx.bind_local_type(
+                name,
+                java_simple_type_name(node.child_by_field_name("type"), src),
+                None,
+                node.start_position().row as u32 + 1,
+                src,
+            );
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `this.x = new Foo()` or `this.x = repo` when `repo` has a unique param type.
+    // trace:exempt reason=internal-detail
+    fn record_this_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        if let Some(left) = node.child_by_field_name("left") {
+            let line = node.start_position().row as u32 + 1;
+            let right = node.child_by_field_name("right");
+            if left.kind() == "identifier" {
+                let name = clean(node_text(Some(left), src));
+                if !name.is_empty() && name != "this" {
+                    ctx.bind_local_type(name, None, right, line, src);
+                }
+            } else if left.kind() == "field_access" {
+                if let Some(class) = ctx.enclosing_class_name() {
+                    let obj = left.child_by_field_name("object");
+                    if clean(node_text(obj, src)) == "this" {
+                        let fname = clean(node_text(left.child_by_field_name("field"), src));
+                        if !fname.is_empty() {
+                            ctx.bind_field_type(class, fname, right, None, line, src);
+                        }
+                    }
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
     }
 
     /// Wave 9: annotation facts on a declaration targeting `target`.
@@ -1145,19 +1475,23 @@ impl JavaExtractor {
                 let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                ctx.calls.push(Call {
-                    caller,
-                    callee,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver,
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: false, // java has no syntactic await
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver,
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: false, // java has no syntactic await
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
                 self.record_store_ref(node, ctx, src);
                 // Wave 11: SPI plugin loading — `ServiceLoader.load(X.class)`
                 // registers X as a plugin extension point (import-gated on
@@ -1194,19 +1528,24 @@ impl JavaExtractor {
                 let seq = ctx.call_seq.entry(caller.clone()).or_insert(0);
                 *seq += 1;
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
-                ctx.calls.push(Call {
-                    caller,
-                    callee: type_name,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver: false,
-                    conditional,
-                    lexical_order: *seq - 1,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: false, // java has no syntactic await
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee: type_name,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver: false,
+                        role: scc_core::ReferenceKind::Construct,
+                        conditional,
+                        lexical_order: *seq - 1,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: false, // java has no syntactic await
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
             }
         }
         self.walk_children(node, ctx, src);
@@ -1638,6 +1977,12 @@ fn superclass_name(node: Node, src: &[u8]) -> Option<String> {
     } else {
         Some(simple.to_string())
     }
+}
+
+/// Simple-ident superclass + interfaces for Rule 2c CHA.
+// trace:v1 id=impl.scc.extract.java.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn java_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    crate::model::normalize_class_bases(raw)
 }
 
 /// First string literal argument of the annotation named `want`
@@ -2533,6 +2878,210 @@ public class IncidentService<T> implements Repository<T> {
         assert_eq!(
             im.decl_header.as_deref(),
             Some("List<T> find(String owner, int limit) throws IOException")
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.field-type verifies=REQ-implement-phase-9-of-scc-x-ripwire-lessons-java-one-hop-field-type-na exercises=impl.scc.extract.java.field-type
+    fn field_type_binds_from_declaration_ctor_and_param() {
+        let ef = extract(
+            r#"
+class Order {
+    void process() {}
+}
+class Invoice {
+    void process() {}
+}
+class Svc {
+    private Order repo;
+    Svc(Invoice other) {
+        this.owned = new Order();
+        this.other = other;
+    }
+    void run() {
+        this.owned.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "field declaration bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = new Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "this.other = param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.Svc"
+                && b.name == "other"
+                && b.type_name == "Invoice"),
+            "constructor param bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    Svc() {
+        this.x = new Order();
+        this.x = new Invoice();
+    }
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "tombstone fuel missing: {types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.local-type verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.extract.java.local-type
+    fn local_type_binds_shadow_fields() {
+        let ef = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    private Order owned;
+    void run() { owned.process(); }
+    void shadowed() {
+        Invoice owned = new Invoice();
+        owned.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.calls.iter().any(|c| c.callee == "owned.process"),
+            "unprefixed callee missing: {:?}",
+            ef.calls.iter().map(|c| &c.callee).collect::<Vec<_>>()
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.shadowed"
+                && b.name == "owned"
+                && b.type_name == "Invoice"),
+            "local bind missing: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.type-cast verifies=REQ-implement-phase-19-of-scc-x-ripwire-lessons-java-extract-time-cast-as exercises=impl.scc.extract.java.type-cast
+    fn cast_type_binds_from_var_assignment_and_field() {
+        let ef = extract(
+            r#"
+class Order { void process() {} }
+class Invoice { void process() {} }
+class Svc {
+    private Object owned;
+    void handle(Object v) {
+        var x = (Order) v;
+        x.process();
+        z = (Order) v;
+        this.owned = (Order) v;
+    }
+    void mixed(Object v) {
+        var y = (Order) v;
+        y = (Invoice) v;
+        y.process();
+    }
+    void not_a_bind(Object v) {
+        var a = (Order[]) v;
+        var b = (List<Order>) v;
+        a.process();
+        b.process();
+    }
+}
+"#,
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.handle"
+                && b.name == "x"
+                && b.type_name == "Order"),
+            "var x = (Order)v bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "Svc.handle"
+                && b.name == "z"
+                && b.type_name == "Order"),
+            "z = (Order)v assignment bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "this.owned = (Order)v bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc.mixed" && b.name == "y")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            mixed.contains(&"Order") && mixed.contains(&"Invoice"),
+            "conflicting cast assignment must tombstone fuel: {mixed:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.not_a_bind" && b.name == "a" && b.type_name == "Order"),
+            "array cast must not mint a bind: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.not_a_bind" && b.name == "b" && b.type_name == "Order"),
+            "generic cast must not mint a bind: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.java.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.java.class-bases
+    fn class_bases_include_superclass_and_interfaces() {
+        let ef = extract(
+            "package com.example;\nclass IERS { void open() {} }\nclass IERS_B extends IERS implements Closeable {}\n",
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "IERS_B" && b.contains(&"IERS".to_string()) && b.contains(&"Closeable".to_string())
+            }),
+            "IERS_B heritage missing: {:?}",
+            ef.class_bases
         );
     }
 }

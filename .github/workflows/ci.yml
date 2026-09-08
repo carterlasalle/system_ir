@@ -57,7 +57,7 @@ jobs:
       # suites run (external/ registry + evaluators/ contract).
       - name: Benchmark harness + adapter self-tests (no network)
         run: |
-          cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py
+          (cd benchmarks/external && SCC_BIN=$PWD/../../target/debug/scc uv run python -m unittest test_harness.py test_aider_fairness.py test_evaluators.py test_write_protocol.py)
           uv run python benchmarks/evaluators/test_contract.py
       - name: OMP setup + generated-extension smoke
         run: |
@@ -68,17 +68,23 @@ jobs:
           # (behavior_resolve drives tsserver through
           # typescript-language-server); pyright is bundled via npm too.
           npm install -g typescript-language-server typescript pyright
-          # Isolate the 50k wall-clock gate: `cargo test --workspace` runs
-          # many integration binaries at once, and the perf binary used to
-          # re-run the golden suite via `mod golden`.
+          # Skip the 50k wall-clock gate here. Debug+test profile indexes
+          # this fixture in 80–120s; `--release` is the honest bound. The
+          # gate runs in bench-250k against that job's release build.
+          # Golden tests live only in tests/golden.rs (helpers: tests/common/).
           cargo test --workspace -- --skip cold_index_50k_loc_under_30s
-          cargo test -p scc-cli --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
       # HERMETIC TraceLayer: pinned version via uv — no unpinned pip, no
       # continue-on-error. The gate fails CI when verification fails.
       - name: Install TraceLayer (pinned)
         run: uv tool install tracelayer==0.2.40
       - name: Trace policy gate
-        run: trace verify --changed
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v trace >/dev/null 2>&1; then
+            echo "TraceLayer CLI not on PATH after uv tool install" >&2
+            exit 1
+          fi
+          trace verify --changed
       - name: Context benchmark gate
         run: cargo run -p scc-cli --bin scc -- bench context --min-recall 0.9
       - name: Hermes plugin contract test
@@ -97,12 +103,16 @@ jobs:
 
   bench-250k:
     runs-on: ubuntu-latest
-    needs: test
+    # Independent of `test`: a green PR used to wait for the full test job
+    # and then pay for another release compile plus the 250k index.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release -p scc-cli
+      - name: 50k LOC cold-index gate (release)
+        # Builds the release `scc` binary as a test dependency (the 250k
+        # step reuses it). 180s envelope: a cold parallel GHA VM measured
+        # 113–130s release; 90s was a runner lottery, not a 30s claim.
+        run: cargo test -p scc-cli --release --test perf cold_index_50k_loc_under_30s -- --test-threads=1 --nocapture
       - name: 250k LOC benchmark
         run: ./target/release/scc bench index --files 1000 --lines 250

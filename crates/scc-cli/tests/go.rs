@@ -2,8 +2,8 @@
 //! must surface the main entrypoint in flows/atlas, symbols in the System IR
 //! export, and the store write symbol in a task pack for a "store" goal.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 // trace:v1 id=test.crates-scc-cli-tests-go.go-service work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn go_service() -> tempfile::TempDir {

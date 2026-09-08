@@ -24,6 +24,10 @@ ureq = { version = "2", features = ["json"] }
 ruzstd = "0.6"
 tempfile = "3"
 ignore = "0.4"
+# trace:v1 id=ops.scc-indexer-cfamily-grammars work=WORK-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extractors-with-path satisfies=REQ-implement-phase-30-of-scc-x-ripwire-lessons-absorb-c-and-c-extracto deploys=impl.scc.extract.cfamily
+tree-sitter-c = "0.23.4"
+# trace:exempt reason=internal-detail
+tree-sitter-cpp = "0.23"
 
 [dev-dependencies]
 proptest = "1"

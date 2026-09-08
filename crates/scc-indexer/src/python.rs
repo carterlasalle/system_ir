@@ -5,8 +5,8 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, Retry, Route,
-    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, Retry, Route,
+    SemanticFact, SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, Test, TestKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -490,6 +490,109 @@ fn is_deserialize_side(name: &str) -> bool {
     matches!(name, "from_dict" | "from_json" | "deserialize" | "from_serializable")
 }
 
+// trace:exempt reason=internal-detail
+fn simple_type_ident(text: &str) -> Option<String> {
+    let t = text.trim();
+    if is_simple_ident(t) {
+        return Some(t.to_string());
+    }
+    for wrap in ["Optional[", "list[", "List[", "Sequence["] {
+        if let Some(rest) = t.strip_prefix(wrap) {
+            if let Some(inner) = rest.strip_suffix(']') {
+                let inner = inner.trim();
+                if is_simple_ident(inner) {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+// trace:exempt reason=internal-detail
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Simple-ident bases for Rule 2c CHA (`IERS_B(IERS)` → `["IERS"]`).
+// trace:v1 id=impl.scc.extract.python.class-bases work=WORK-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba satisfies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth implements=PLAN-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-method-on-type-or-ba
+fn python_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    crate::model::normalize_class_bases(raw)
+}
+
+// trace:exempt reason=internal-detail
+fn constructor_type_name(right: Node, src: &[u8]) -> Option<String> {
+    if right.kind() != "call" {
+        return None;
+    }
+    let fn_node = right.child_by_field_name("function")?;
+    if fn_node.kind() != "identifier" {
+        return None;
+    }
+    let n = clean(node_text(Some(fn_node), src));
+    if n.is_empty() {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// `f = helper` / `f = lambda` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.python.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn python_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = python_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        python_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn python_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    while n.kind() == "parenthesized_expression" {
+        let Some(inner) = n.named_child(0) else {
+            return FnRhs::Other;
+        };
+        n = inner;
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "lambda" => FnRhs::Lambda,
+        _ => FnRhs::Other,
+    }
+}
+
+/// `Order()` / uniquely typed ident (`x = y`).
+// trace:v1 id=impl.scc.extract.python.ident-copy work=WORK-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co satisfies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident implements=PLAN-phase-17-of-scc-x-ripwire-lessons-python-extract-time-identifier-rhs-co
+fn python_rhs_type_name(n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    if let Some(ty) = constructor_type_name(n, src) {
+        return Some(ty);
+    }
+    if n.kind() == "identifier" {
+        return ctx.unique_local_type(&clean(node_text(Some(n), src)));
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Extraction context
 // ---------------------------------------------------------------------------
@@ -536,6 +639,10 @@ struct Ctx {
     factory_returns: BTreeMap<String, String>,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Local constructor / annotation / parameter type binds.
+    type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`f = helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -555,6 +662,104 @@ impl Ctx {
     }
     fn top_name(&self) -> String {
         self.scopes.last().map(|s| s.name.clone()).unwrap_or_default()
+    }
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() || name == "self" || name == "cls" {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    /// Untyped local/param of `name` — veto fuel for class-name receivers.
+    // trace:v1 id=impl.scc.extract.python.param-shadow work=WORK-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p satisfies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name implements=PLAN-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name-receiver-p
+    fn push_local_shadow(&mut self, name: String, line: u32) {
+        let scope = self.caller().unwrap_or_default();
+        if name.is_empty() || name == "self" || name == "cls" {
+            return;
+        }
+        if self
+            .type_binds
+            .iter()
+            .any(|b| b.scope == scope && b.name == name)
+        {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name: String::new(),
+            line,
+        });
+    }
+
+    /// Class name for `Class.method` scopes; `None` at module level.
+    // trace:exempt reason=internal-detail
+    fn enclosing_class_name(&self) -> Option<String> {
+        if self.top_is_class() {
+            let n = self.top_name();
+            return (!n.is_empty()).then_some(n);
+        }
+        let top = self.top_name();
+        let (class, rest) = top.split_once('.')?;
+        if rest.is_empty() || class.is_empty() {
+            None
+        } else {
+            Some(class.to_string())
+        }
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
+
+    /// Class-scoped field type from annotation, constructor call, or unique RHS ident.
+    // trace:v1 id=impl.scc.extract.python.field-type work=WORK-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowing-unique-c satisfies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi
+    fn bind_field_type(
+        &mut self,
+        class: String,
+        field: String,
+        right: Option<Node>,
+        type_node: Option<Node>,
+        line: u32,
+        src: &[u8],
+    ) {
+        if let Some(ty_node) = type_node {
+            if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src))) {
+                self.push_type_bind_in(class.clone(), field.clone(), ty, line);
+            }
+        }
+        if let Some(r) = right {
+            if let Some(ty) = constructor_type_name(r, src) {
+                self.push_type_bind_in(class, field, ty, line);
+            } else if r.kind() == "identifier" {
+                let rhs = clean(node_text(Some(r), src));
+                if let Some(ty) = self.unique_local_type(&rhs) {
+                    self.push_type_bind_in(class, field, ty, line);
+                }
+            }
+        }
     }
 // trace:exempt reason=internal-detail
     fn into_extracted(self) -> ExtractedFile {
@@ -727,6 +932,32 @@ impl Ctx {
         }
         facts.sort_by_key(fact_sort_key);
         facts.dedup_by(|a, b| a == b);
+        let known: BTreeSet<String> = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Type
+                )
+            })
+            .map(|s| s.name.clone())
+            .chain(
+                self.imports
+                    .iter()
+                    .flat_map(|i| i.names.iter().map(|(local, _)| local.clone())),
+            )
+            .collect();
+        let mut type_binds = self.type_binds;
+        type_binds.retain(|b| b.type_name.is_empty() || known.contains(&b.type_name));
+        type_binds.sort_by(|a, b| {
+            (&a.scope, &a.name, a.line, &a.type_name).cmp(&(
+                &b.scope,
+                &b.name,
+                b.line,
+                &b.type_name,
+            ))
+        });
+        let class_bases = python_class_bases(&self.class_bases);
         ExtractedFile {
             symbols,
             imports: self.imports,
@@ -738,6 +969,9 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
+            class_bases,
         }
         }
 }
@@ -897,6 +1131,9 @@ impl PythonExtractor {
             name: sym_name,
             is_class: false,
         });
+        if let Some(params) = node.child_by_field_name("parameters") {
+            self.record_param_types(params, ctx, src);
+        }
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -1186,19 +1423,23 @@ impl PythonExtractor {
                 let (conditional, control_block, inside_loop, inside_try) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
                 self.record_wave11_call(node, fn_node, &callee, ctx, src);
-                ctx.calls.push(Call {
-                    caller,
-                    callee,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver,
-                    conditional,
-                    lexical_order,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try,
-                    awaited: call_is_awaited(node),
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver,
+                        conditional,
+                        lexical_order,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try,
+                        awaited: call_is_awaited(node),
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
                 self.record_store_ref(node, fn_node, &root, ctx, src);
                 self.record_config_call(node, fn_node, ctx, src);
                 self.record_framework_registration(node, fn_node, ctx, src);
@@ -1303,6 +1544,7 @@ impl PythonExtractor {
 
     /// Class fields (class-level assignments, `self.x` in `__init__`) and
     /// module-level `__all__` public surface.
+    // trace:exempt reason=internal-detail
     fn record_assignment(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         let left = node.child_by_field_name("left");
         let right = node.child_by_field_name("right");
@@ -1314,9 +1556,18 @@ impl PythonExtractor {
                     if !name.is_empty() {
                         let mutable = value_is_mutable(right);
                         ctx.fields
-                            .entry((owner, name))
+                            .entry((owner.clone(), name.clone()))
                             .and_modify(|m| *m = *m || mutable)
                             .or_insert(mutable);
+                        let line = node.start_position().row as u32 + 1;
+                        ctx.bind_field_type(
+                            owner,
+                            name,
+                            right,
+                            node.child_by_field_name("type"),
+                            line,
+                            src,
+                        );
                     }
                 }
             }
@@ -1332,6 +1583,27 @@ impl PythonExtractor {
                             .entry((owner, segs[1].clone()))
                             .and_modify(|m| *m = *m || mutable)
                             .or_insert(mutable);
+                    }
+                }
+            }
+        }
+        if !ctx.top_is_class() {
+            if let Some(l) = left {
+                if l.kind() == "attribute" {
+                    let mut segs: Vec<String> = Vec::new();
+                    attribute_segments(l, &mut segs, src);
+                    if segs.len() == 2 && segs[0] == "self" {
+                        if let Some(class) = ctx.enclosing_class_name() {
+                            let line = node.start_position().row as u32 + 1;
+                            ctx.bind_field_type(
+                                class,
+                                segs[1].clone(),
+                                right,
+                                node.child_by_field_name("type"),
+                                line,
+                                src,
+                            );
+                        }
                     }
                 }
             }
@@ -1375,6 +1647,69 @@ impl PythonExtractor {
                             .or_insert(true);
                     }
                 }
+            }
+        }
+        if !ctx.top_is_class() {
+            if let Some(l) = left {
+                if l.kind() == "identifier" {
+                    let name = clean(node_text(Some(l), src));
+                    let line = node.start_position().row as u32 + 1;
+                    if let Some(ty_node) = node.child_by_field_name("type") {
+                        if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src)))
+                        {
+                            ctx.push_type_bind(name.clone(), ty, line);
+                        }
+                    }
+                    if let Some(r) = right {
+                        python_record_fn_alias(ctx, name.clone(), r, src, line);
+                        if let Some(ty) = python_rhs_type_name(r, src, ctx) {
+                            ctx.push_type_bind(name, ty, line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn record_param_types(&self, params: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            let line = p.start_position().row as u32 + 1;
+            match p.kind() {
+                "typed_parameter" | "typed_default_parameter" => {
+                    let Some(n) = p.named_child(0) else {
+                        continue;
+                    };
+                    if n.kind() != "identifier" {
+                        continue;
+                    }
+                    let name = clean(node_text(Some(n), src));
+                    if name.is_empty() || name == "self" || name == "cls" {
+                        continue;
+                    }
+                    if let Some(ty_node) = p.child_by_field_name("type") {
+                        if let Some(ty) = simple_type_ident(&collapse(node_text(Some(ty_node), src)))
+                        {
+                            ctx.push_type_bind(name, ty, line);
+                            continue;
+                        }
+                    }
+                    ctx.push_local_shadow(name, line);
+                }
+                "identifier" => {
+                    ctx.push_local_shadow(clean(node_text(Some(p), src)), line);
+                }
+                "default_parameter" => {
+                    let Some(n) = p.named_child(0) else {
+                        continue;
+                    };
+                    if n.kind() != "identifier" {
+                        continue;
+                    }
+                    ctx.push_local_shadow(clean(node_text(Some(n), src)), line);
+                }
+                _ => {}
             }
         }
     }
@@ -3397,5 +3732,208 @@ class QueryBuilder:
         );
         let c = find_symbol(&ef, "QueryBuilder");
         assert_eq!(c.decl_header.as_deref(), Some("class QueryBuilder"));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.type-binds verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing exercises=impl.scc.resolve.type-narrow
+    fn constructor_and_param_type_binds_are_captured() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\ndef handle(x: Order):\n    y = Order()\n    y.process()\n    x.process()\n\ndef mixed():\n    z = Order()\n    z = Invoice()\n    z.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "constructor bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(mixed.contains(&"Order") && mixed.contains(&"Invoice"));
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.type_name == "process" || b.name == "self"),
+            "must not bind methods or self: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.param-shadow verifies=REQ-implement-phase-21-of-scc-x-ripwire-lessons-absorb-rule-2c-class-name exercises=impl.scc.extract.python.param-shadow
+    fn untyped_params_are_empty_shadow_binds() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\ndef handle(Order, x: Order, y=1):\n    Order.process()\n    x.process()\n",
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "Order"
+                && b.type_name.is_empty()),
+            "untyped param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "typed param must still bind: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds.iter().any(|b| b.scope == "handle"
+                && b.name == "y"
+                && b.type_name.is_empty()),
+            "default param must shadow: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds.iter().any(|b| b.name == "self"),
+            "must not shadow self: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.ident-copy verifies=REQ-implement-phase-17-of-scc-x-ripwire-lessons-python-extract-time-ident exercises=impl.scc.extract.python.ident-copy
+    fn identifier_rhs_copy_binds_from_unique_source() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\ndef handle(x: Order):\n    y = x\n    y.process()\n\ndef mixed():\n    z = Order()\n    w = z\n    w = Invoice()\n    w.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "ident copy bind missing: {:?}",
+            ef.type_binds
+        );
+        let w: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "w")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            w.contains(&"Order") && w.contains(&"Invoice"),
+            "conflicting copy/ctor must tombstone fuel: {w:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.python.fn-alias
+    fn function_alias_binds_from_ident_lambda_and_clobber() {
+        let ef = extract(
+            "def helper():\n    return 1\ndef other():\n    return 2\nclass Order:\n    def process(self):\n        pass\ndef run():\n    f = helper\n    f()\ndef mixed():\n    g = helper\n    g = other\n    g()\ndef lam():\n    h = lambda: 1\n    h()\ndef typed(x: Order):\n    y = x\n    y()\n",
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "lambda must tombstone: {:?}",
+            ef.fn_binds
+        );
+        assert!(
+            !ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "typed" && b.name == "y"),
+            "type-copy ident must not mint a fn bind: {:?}",
+            ef.fn_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.field-type verifies=REQ-implement-phase-8-of-scc-x-ripwire-lessons-one-hop-field-type-narrowi exercises=impl.scc.extract.python.field-type
+    fn field_type_binds_from_init_annotation_and_param() {
+        let ef = extract(
+            "class Order:\n    def process(self):\n        pass\n\nclass Invoice:\n    def process(self):\n        pass\n\nclass Svc:\n    repo: Order\n    def __init__(self, other: Invoice):\n        self.owned = Order()\n        self.other = other\n    def run(self):\n        return self.owned.process()\n",
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "class annotation bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "self.owned = Order() bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "other" && b.type_name == "Invoice"),
+            "self.other = param bind missing: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            "class Order:\n    def process(self):\n        pass\nclass Invoice:\n    def process(self):\n        pass\nclass Svc:\n    def __init__(self):\n        self.x = Order()\n        self.x = Invoice()\n",
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "x")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "tombstone fuel missing: {types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.python.class-bases verifies=REQ-implement-phase-22-of-scc-x-ripwire-lessons-absorb-rule-2c-cha-meth exercises=impl.scc.extract.python.class-bases
+    fn class_bases_are_simple_idents() {
+        let ef = extract(
+            "class IERS:\n    def open(self):\n        pass\nclass IERS_B(IERS):\n    pass\nclass Mix(pkg.Base, Generic[T]):\n    pass\n",
+        );
+        assert!(
+            ef.class_bases
+                .iter()
+                .any(|(c, b)| c == "IERS_B" && b == &["IERS"]),
+            "IERS_B bases missing: {:?}",
+            ef.class_bases
+        );
+        assert!(
+            ef.class_bases.iter().any(|(c, b)| {
+                c == "Mix" && b.contains(&"Base".to_string()) && b.contains(&"Generic".to_string())
+            }),
+            "dotted/generic bases must keep last ident: {:?}",
+            ef.class_bases
+        );
+        assert!(
+            !ef.class_bases.iter().any(|(c, _)| c == "IERS"),
+            "class with no bases must be omitted: {:?}",
+            ef.class_bases
+        );
     }
 }

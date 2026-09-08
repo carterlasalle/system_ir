@@ -4,17 +4,17 @@
 //! task`. Uses the cli-service fixture (python argparse + rust clap + go
 //! cobra + package.json surfaces).
 
-mod golden;
+mod common;
 
 #[test]
 // trace:exempt reason=unit-test
 // trace:v1 id=test.scc.surface-startup work=WORK-SCC-014 verifies=REQ-SCC-IR exercises=impl.scc.surface,impl.scc.context.startup
 fn startup_artifact_has_all_sections_and_is_deterministic() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let first = golden::run_ok(&dir, &["context", "startup"]);
+    let first = common::run_ok(&dir, &["context", "startup"]);
     for header in [
         "# SCC SYSTEM CONTEXT",
         "## SYSTEM ATLAS",
@@ -30,18 +30,18 @@ fn startup_artifact_has_all_sections_and_is_deterministic() {
     );
 
     // prompt-cache stability: a second run is byte-identical
-    let second = golden::run_ok(&dir, &["context", "startup"]);
+    let second = common::run_ok(&dir, &["context", "startup"]);
     assert_eq!(first, second, "startup must be byte-identical across runs");
 }
 
 #[test]
 // trace:exempt reason=unit-test
 fn surface_shows_component_grouped_api_map() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let out = golden::run_ok(&dir, &["surface"]);
+    let out = common::run_ok(&dir, &["surface"]);
     // known fixture callable APIs surface in the map
     assert!(out.contains("serve"), "surface must mention serve: {out}");
     assert!(out.contains("deploy"), "surface must mention deploy: {out}");
@@ -51,11 +51,11 @@ fn surface_shows_component_grouped_api_map() {
 #[test]
 // trace:exempt reason=unit-test
 fn surface_task_personalizes_the_map() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let out = golden::run_ok(&dir, &["surface", "--task", "serve"]);
+    let out = common::run_ok(&dir, &["surface", "--task", "serve"]);
     assert!(
         out.contains("task-personalized"),
         "task surface must carry the personalized header: {out}"
@@ -70,12 +70,12 @@ fn surface_explain_appends_rank_reasons() {
     // (request.explain) and renders the FULL per-entry score
     // decomposition — all eight components + total + reasons, never a
     // bare `importance:`.
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let plain = golden::run_ok(&dir, &["surface"]);
-    let explained = golden::run_ok(&dir, &["surface", "--explain"]);
+    let plain = common::run_ok(&dir, &["surface"]);
+    let explained = common::run_ok(&dir, &["surface", "--explain"]);
     assert!(
         explained.contains("importance:"),
         "--explain must append per-entry importance: {explained}"
@@ -105,11 +105,11 @@ fn surface_explain_appends_rank_reasons() {
 #[test]
 // trace:exempt reason=unit-test
 fn context_task_appends_task_delta_when_goal_matches() {
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let out = golden::run_ok(&dir, &["context", "task", "serve"]);
+    let out = common::run_ok(&dir, &["context", "task", "serve"]);
     assert!(out.contains("# SCC TASK DELTA"), "missing TASK DELTA: {out}");
     assert!(out.contains("TASK-FOCUS: serve"), "missing TASK-FOCUS: {out}");
 }
@@ -134,12 +134,12 @@ fn startup_rank_cache_persists_and_is_reused_across_runs() {
     // Wave 15.2: the per-ModelEpoch global rank cache. Two consecutive
     // `scc context startup` runs: the first stores the entry (miss), the
     // second reuses it (the deterministic `hits` marker increments).
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    golden::run_ok(&dir, &["context", "startup"]);
-    golden::run_ok(&dir, &["context", "startup"]);
+    common::run_ok(&dir, &["context", "startup"]);
+    common::run_ok(&dir, &["context", "startup"]);
 
     with_cli_compiler(&dir, |store, comp| {
         let ctx = comp.ctx();
@@ -173,11 +173,11 @@ fn startup_ledger_records_the_same_render_it_printed() {
     // once, never rebuilt for recording. The CLI's startup output is
     // byte-identical to a library rebuild (deterministic), and the
     // recorded ledger equals the visible ids derived from that render.
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let out = golden::run_ok(&dir, &["context", "startup"]);
+    let out = common::run_ok(&dir, &["context", "startup"]);
     with_cli_compiler(&dir, |store, comp| {
         let ctx = comp.ctx();
 
@@ -244,11 +244,11 @@ fn startup_budget_adapts_to_repo_complexity() {
     // complexity tiers. The tiny cli-service fixture with `--budget
     // 20000` must get the tiny 55/45 split — a 9000-token surface slice
     // (vs the old 7000-token fixed share), visible in the coverage line.
-    let repo = golden::copy_fixture("cli-service");
-    let dir = golden::workdir(repo.path());
-    golden::run_ok(&dir, &["index", "--quiet"]);
+    let repo = common::copy_fixture("cli-service");
+    let dir = common::workdir(repo.path());
+    common::run_ok(&dir, &["index", "--quiet"]);
 
-    let out = golden::run_ok(&dir, &["context", "startup", "--budget", "20000"]);
+    let out = common::run_ok(&dir, &["context", "startup", "--budget", "20000"]);
     assert!(
         out.contains("(budget 9000)"),
         "tiny repo must get the 45% surface share (budget 9000): {out}"

@@ -1,8 +1,8 @@
 //! Monorepo acceptance-scenario tests (docs/PRD.md §10) and intent/drift
 //! behavior (EPIC-180).
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 const INTENT: &str = r#"
 components:

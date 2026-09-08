@@ -1,8 +1,8 @@
 //! Export validation against `docs/system-ir.schema.json` and MCP end-to-end
 //! tests (docs/TEST_PLAN.md §14, docs/API_AND_INTEGRATIONS.md §1).
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 // trace:v1 id=test.scc.interfaces verifies=REQ-SCC-API exercises=impl.scc.mcp,impl.scc.http,impl.scc.cli
@@ -287,8 +287,7 @@ fn context_parity_across_cli_http_mcp() {
     // endpoint that fails closed to lexical ranking — parity must hold
     // through the same ranker decision on every transport). The config is
     // written FIRST so every transport sees hindsight enabled.
-    let port = 20000 + (std::process::id() % 20000) as u16;
-    let addr = format!("127.0.0.1:{port}");
+    let addr = test_listen_addr();
     std::fs::create_dir_all(dir.join(".scc")).unwrap();
     std::fs::create_dir_all(dir.join(".beads")).unwrap();
     std::fs::write(
@@ -449,14 +448,62 @@ fn structural_source_cli_renders_file_units() {
 }
 
 #[test]
+// trace:v1 id=test.scc.cli.handle-refused verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.structural.resolve-handle
+fn structural_stale_handle_is_refused_on_cli() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let stale = "scc://repo/epoch/file/main.py@aaaaaaaaaaaaaaaa";
+    let out = run_ok(&dir, &["context", "structural", "--files", stale]);
+    assert!(
+        out.contains("HANDLE REFUSED"),
+        "CLI must refuse a stale handle: {out}"
+    );
+    assert!(out.contains("stale"), "refusal must name staleness: {out}");
+    assert!(
+        !out.contains("handle_transcripts"),
+        "must not guess and serve the file: {out}"
+    );
+}
+
+#[test]
+// trace:v1 id=test.scc.cli.corrupt-db-refuses verifies=REQ-implement-phase-12-of-scc-x-ripwire-lessons-java-unprefixed-field-as exercises=impl.scc.store.refuse-corrupt
+fn corrupt_index_cache_refuses_instead_of_empty_atlas() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let db = dir.join(".scc/scc.db");
+    let _ = std::fs::remove_file(dir.join(".scc/scc.db-wal"));
+    let _ = std::fs::remove_file(dir.join(".scc/scc.db-shm"));
+    std::fs::write(&db, b"not a sqlite database").unwrap();
+    let out = run(&dir, &["status"]);
+    assert!(
+        !out.status.success(),
+        "corrupt cache must fail, not print an empty index"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        err.contains("corrupt") || err.contains("not a SQLite"),
+        "must disclose corruption: {err}"
+    );
+    assert!(
+        !err.contains("components: 0") && !err.to_lowercase().contains("not indexed yet"),
+        "must not fabricate a fresh empty index: {err}"
+    );
+}
+
+#[test]
 // trace:v1 id=test.crates-scc-cli-tests-interfaces.http-daemon-endpoints work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn http_daemon_endpoints() {
     let repo = copy_fixture("http-service-python");
     run_ok(&workdir(repo.path()), &["index", "--quiet"]);
-    // override the listen address via config for this repo; the port is
-    // derived from the process id so parallel/leaked daemons cannot collide
-    let port = 20000 + (std::process::id() % 20000) as u16;
-    let addr = format!("127.0.0.1:{port}");
+    // override the listen address via config for this repo; ephemeral so
+    // this test cannot collide with context_parity in the same binary
+    let addr = test_listen_addr();
     std::fs::write(
         workdir(repo.path()).join(".scc/config.yaml"),
         format!("schema: 1\nindex:\n  watch: false\nsecurity:\n  listen: {addr}\n"),
@@ -540,4 +587,14 @@ fn http_daemon_endpoints() {
 
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// Bind an ephemeral port so two HTTP tests in this binary cannot share a
+/// listen address. `20000 + pid` collided when cargo ran
+/// `context_parity_across_cli_http_mcp` and `http_daemon_endpoints` in
+/// parallel: the parity POST hit the other daemon (no beads/hindsight).
+// trace:exempt reason=internal-helper
+fn test_listen_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    listener.local_addr().expect("local_addr").to_string()
 }

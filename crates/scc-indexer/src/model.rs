@@ -5,6 +5,7 @@
 //! perform syntax-level extraction only. Cross-file resolution happens later
 //! in `resolve.rs`.
 
+use scc_core::{RecvKind, ReferenceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -130,6 +131,20 @@ pub struct Call {
     /// Whether the callee root is a local/imported binding or something
     /// unknown (e.g. an arbitrary member on a parameter).
     pub known_receiver: bool,
+    /// Receiver shape recovered from the callee expression (or stamped by
+    /// the extractor). Default `Unknown` is filled by [`Call::finish`].
+    #[serde(default)]
+    pub recv: RecvKind,
+    /// Last identifier in a `root.field.method` chain when classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_name: Option<String>,
+    /// CALL by default. Imports/types/macros must not use this.
+    #[serde(default)]
+    pub role: ReferenceKind,
     /// Whether the call sits inside a conditional/loop/try body (if/else/
     /// for/while/try/with/match) within its enclosing function — the ONLY
     /// evidence that turns call fanout into control-flow branching.
@@ -163,6 +178,30 @@ pub struct Call {
     /// rather than discarded as a bare expression statement.
     #[serde(default)]
     pub returns_value: bool,
+}
+
+impl Call {
+    /// Fill receiver classification from the callee string when the
+    /// extractor did not stamp a more precise `recv`.
+    pub fn finish(mut self) -> Self {
+        let fact = crate::recv::classify_callee(&self.callee);
+        if self.recv == RecvKind::Unknown {
+            self.recv = fact.recv;
+        }
+        if self.qualifier.is_none() {
+            self.qualifier = fact.qualifier;
+        }
+        if self.recv_var.is_none() {
+            self.recv_var = fact.recv_var;
+        }
+        if self.field_name.is_none() {
+            self.field_name = fact.field_name;
+        }
+        if self.role == ReferenceKind::Call && fact.role != ReferenceKind::Call {
+            self.role = fact.role;
+        }
+        self
+    }
 }
 
 /// An HTTP route declaration.
@@ -255,9 +294,6 @@ pub struct Entrypoint {
     pub line: u32,
 }
 
-
-
-
 /// One semantic fact (Wave 9): a first-class representation beyond
 /// symbols/calls/routes. Every fact carries its owning symbol so the
 /// writer can attach store evidence.
@@ -270,10 +306,18 @@ pub enum SemanticFact {
     /// @Controller, #[derive(...)]).
     Annotation { name: String, target: String },
     /// A class/struct field (state surface).
-    Field { owner: String, name: String, mutable: bool },
+    Field {
+        owner: String,
+        name: String,
+        mutable: bool,
+    },
     /// A framework registration: route/middleware/plugin/DI/event
     /// registration performed by `owner` naming `target` with a `kind`.
-    Registration { owner: String, kind: String, target: String },
+    Registration {
+        owner: String,
+        kind: String,
+        target: String,
+    },
     /// Configuration ownership: `owner` reads/writes config `key`.
     Configuration { owner: String, key: String },
     /// A callback/hook handled by `owner` (framework invokes it).
@@ -283,7 +327,11 @@ pub enum SemanticFact {
     /// validation annotations): `owner` defines schema `name`.
     /// `expr` is the defining source expression when available
     /// (e.g. `z.object({ name: z.string() })`), else empty.
-    SchemaDefinition { owner: String, name: String, expr: String },
+    SchemaDefinition {
+        owner: String,
+        name: String,
+        expr: String,
+    },
     /// Schema composition: `owner` composes schema `name` from `parent`
     /// (zod .extend/.merge, pydantic inheritance, serde flatten).
     SchemaComposition {
@@ -331,6 +379,155 @@ pub struct ExtractedFile {
     /// configuration, callbacks) — additive to the classic extraction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<SemanticFact>,
+    /// Per-scope local and class-field type binds (`x = Order()`, `x: Foo`,
+    /// typed params, `self.x = Order()`, class `x: Foo`). Extract-time only;
+    /// never stamped onto FILE entity attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_binds: Vec<TypeBind>,
+    /// Per-scope function-alias binds (`f = helper`). Extract-time only;
+    /// never stamped onto FILE entity attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fn_binds: Vec<FnBind>,
+    /// Simple-ident bases for class-like symbols in this file
+    /// (`IERS_B` → `["IERS"]`). Persisted on CLASS entity attributes, never
+    /// on FILE entities (incremental≡cold).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_bases: Vec<(String, Vec<String>)>,
+}
+
+/// One local / field → type name fact used by one-hop NamedVariable and
+/// one-hop `self`/`this` field-type narrowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeBind {
+    /// Enclosing function/method name, or class name for field binds;
+    /// empty at module scope.
+    #[serde(default)]
+    pub scope: String,
+    /// Local variable, parameter, or class field name.
+    pub name: String,
+    /// Type name as written (import alias or local class).
+    pub type_name: String,
+    pub line: u32,
+}
+
+/// One local / file-scope var → function ident used by bare `f()` pinning.
+/// Empty `target` is a lambda/clobber tombstone (binding exists; no pin).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FnBind {
+    /// Enclosing function/method name; empty at module / file scope.
+    #[serde(default)]
+    pub scope: String,
+    /// Local or file-scope variable name.
+    pub name: String,
+    /// Bound function ident; empty = lambda/clobber tombstone.
+    #[serde(default)]
+    pub target: String,
+    pub line: u32,
+}
+
+/// RHS shape for extract-time function-alias binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnRhs {
+    Ident(String),
+    Lambda,
+    Other,
+}
+
+fn fn_bind_name_ok(name: &str) -> bool {
+    !name.is_empty() && !matches!(name, "_" | "self" | "cls" | "this")
+}
+
+/// Record a function-alias bind. Ident copies a unique function name;
+/// lambda always tombstones; other RHS clobbers only when a bind already
+/// exists. Type-copy ident RHS is not a fn bind but clobbers a prior one.
+pub fn record_fn_rhs(
+    binds: &mut Vec<FnBind>,
+    scope: String,
+    name: String,
+    rhs: FnRhs,
+    typed_copy: bool,
+    line: u32,
+) {
+    if !fn_bind_name_ok(&name) {
+        return;
+    }
+    match rhs {
+        FnRhs::Ident(target) if !target.is_empty() && !typed_copy => {
+            binds.push(FnBind {
+                scope,
+                name,
+                target,
+                line,
+            });
+        }
+        FnRhs::Lambda => {
+            binds.push(FnBind {
+                scope,
+                name,
+                target: String::new(),
+                line,
+            });
+        }
+        FnRhs::Ident(_) | FnRhs::Other => {
+            if binds.iter().any(|b| b.scope == scope && b.name == name) {
+                binds.push(FnBind {
+                    scope,
+                    name,
+                    target: String::new(),
+                    line,
+                });
+            }
+        }
+    }
+}
+
+/// Sort function-alias binds for deterministic extract output.
+pub fn normalize_fn_binds(mut binds: Vec<FnBind>) -> Vec<FnBind> {
+    binds.sort_by(|a, b| {
+        (&a.scope, &a.name, a.line, &a.target).cmp(&(&b.scope, &b.name, b.line, &b.target))
+    });
+    binds
+}
+
+/// Last simple ident of a heritage clause (`pkg.IERS[T]` → `IERS`).
+pub fn simple_heritage_ident(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let t = t.split(['<', '[']).next().unwrap_or(t).trim();
+    let t = t.rsplit('.').next().unwrap_or(t).trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Sort, dedup, and keep only simple-ident bases for CHA persistence.
+pub fn normalize_class_bases(raw: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = raw
+        .iter()
+        .filter_map(|(class, bases)| {
+            let mut b: Vec<String> = bases
+                .iter()
+                .filter_map(|s| simple_heritage_ident(s))
+                .collect();
+            b.sort();
+            b.dedup();
+            (!class.is_empty() && !b.is_empty()).then(|| (class.clone(), b))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// A language extractor. Must be deterministic and side-effect free.

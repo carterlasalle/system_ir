@@ -59,7 +59,67 @@ SCOPED_TASKS = canonical_writable_tasks()
 BUDGET = h.DEFAULT_BUDGET
 
 
+def infer_agent_name(agent_cmd):
+    """Basename of argv[0]. A claude command must never be recorded as Codex."""
+    if not agent_cmd or not str(agent_cmd).strip():
+        return "unknown"
+    first = str(agent_cmd).split()[0]
+    return Path(first).name or first
+
+
 NATIVE_SCC_VARIANTS = ("scc-full", "scc-atlas", "scc-surface", "scc-atlas-surface")
+
+INFRA_STATUSES = (
+    "ARTIFACT_FAILED",
+    "SKIPPED-UNINSTALLED",
+    "PIN-MISMATCH",
+    "PIN-UNVERIFIED",
+    "SKIPPED",
+    "INFRA_FAILED",
+)
+
+_ARTIFACT_EXC = (
+    RuntimeError,
+    AssertionError,
+    ValueError,
+    OSError,
+    subprocess.TimeoutExpired,
+    json.JSONDecodeError,
+)
+
+
+def _infra_cell(error, status="ARTIFACT_FAILED"):
+    """Infrastructure-only row: never a coding-task failure (task_success=None)."""
+    return {
+        "task_success": None,
+        "task_success_defined": False,
+        "run_completion": False,
+        "context_tokens": 0,
+        "wall_sec": 0.0,
+        "error": error,
+        "error_type": "infrastructure",
+        "status": status,
+    }
+
+
+def is_infra_cell(cell):
+    """True when the cell is missing, skipped, or an infrastructure failure."""
+    if cell is None:
+        return True
+    if cell.get("error"):
+        return True
+    if cell.get("status") in INFRA_STATUSES:
+        return True
+    if cell.get("error_type") in ("infrastructure", "evaluator-infrastructure"):
+        return True
+    if cell.get("task_success") is None:
+        return True
+    return False
+
+
+def outcome_defined(cell):
+    """True when the cell has a real coding success/fail (not skip/infra)."""
+    return not is_infra_cell(cell) and cell.get("task_success") is not None
 
 
 def scc_artifact(repo, goal, workdir, scc_bin, budget=None, variant="scc-full"):
@@ -144,35 +204,46 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
     Error typing (§32): `error` is set ONLY for infrastructure failures
     (artifact generation, missing tool); an agent that completed the task
     incorrectly has task_success=False and error=None. Infra-failed cells
-    are excluded from success-rate numerators AND from the paired sets
-    (reported separately, never masquerading as a coding failure).
+    use task_success=None so they never enter success-rate numerators or
+    paired sets (reported separately, never masquerading as a coding failure).
     """
-    cell_dir = Path(workdir) / f"{variant}--{task['id']}"
+    budget_label = "native" if budget is None else str(budget)
+    cell_dir = (
+        Path(workdir) / "writable" / str(variant) / budget_label / task["repo"] / task["id"]
+    )
+    if cell_dir.exists():
+        shutil.rmtree(cell_dir)
     cell_dir.mkdir(parents=True, exist_ok=True)
     root = cell_dir / "repo"
     h.copy_tree(h.FIXTURES / task["repo"], root)
 
     artifact = None
     ctx_tokens = 0
-    error = None
     if variant in NATIVE_SCC_VARIANTS:
         try:
             artifact, ctx_tokens = scc_artifact(
                 task["repo"], task["goal"], cell_dir, scc_bin, budget=budget,
                 variant=variant)
-        except (RuntimeError, AssertionError, ValueError) as exc:
-            return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0,
-                    "error": f"scc-artifact-generation-failed: {str(exc)[:200]}",
-                    "error_type": "infrastructure"}
+        except _ARTIFACT_EXC as exc:
+            return _infra_cell(
+                f"scc-artifact-generation-failed: {type(exc).__name__}: {str(exc)[:200]}")
     elif variant in EXTERNAL_VARIANTS:
-        artifact, ctx_tokens, err = external_artifact(
-            variant, task["repo"], task["goal"], cell_dir,
-            budget if budget is not None else BUDGET)
+        try:
+            artifact, ctx_tokens, err = external_artifact(
+                variant, task["repo"], task["goal"], cell_dir,
+                budget if budget is not None else BUDGET)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return _infra_cell(f"{type(exc).__name__}: {str(exc)[:200]}")
         if artifact is None:
-            return {"task_success": False, "run_completion": False,
-                    "context_tokens": 0, "wall_sec": 0.0,
-                    "error": err, "error_type": "infrastructure"}
+            status = "ARTIFACT_FAILED"
+            err_s = err or ""
+            if err_s.startswith("SKIPPED-UNINSTALLED"):
+                status = "SKIPPED-UNINSTALLED"
+            elif err_s.startswith("PIN-MISMATCH"):
+                status = "PIN-MISMATCH"
+            elif err_s.startswith("PIN-UNVERIFIED"):
+                status = "PIN-UNVERIFIED"
+            return _infra_cell(err, status=status)
 
     started = time.monotonic()
     result = h.run_write_task(
@@ -189,17 +260,29 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
         task_success = _ev.evaluate(task["id"], root)
         eval_err = None
     except Exception as exc:  # evaluator crashed = infra failure, not a coding failure
-        task_success, eval_err = False, f"evaluator-crash: {type(exc).__name__}: {exc}"[:300]
+        cell = _infra_cell(
+            f"evaluator-crash: {type(exc).__name__}: {exc}"[:300],
+            status="INFRA_FAILED",
+        )
+        cell.update({
+            "error_type": "evaluator-infrastructure",
+            "wall_sec": wall,
+            "run_completion": result.get("run_completion"),
+            "patch_produced": result.get("patch_produced"),
+            "modified_files": len(result.get("modified_files") or []),
+            "evaluator_structural": task.get("structural", False),
+        })
+        return cell
     return {
         "task_success": task_success,
+        "task_success_defined": True,
         "run_completion": result["run_completion"],
         "context_tokens": ctx_tokens,
         "patch_produced": result["patch_produced"],
         "modified_files": len(result["modified_files"]),
         "wall_sec": wall,
         "error": eval_err or result.get("eval_output_error") or None,
-        "error_type": ("evaluator-infrastructure" if eval_err else
-                       ("agent-infrastructure" if not result["run_completion"] else None)),
+        "error_type": ("agent-infrastructure" if not result["run_completion"] else None),
         "evaluator_structural": task.get("structural", False),
     }
 
@@ -232,7 +315,7 @@ def main(argv):
         tasks = [t for t in SCOPED_TASKS if t["id"] in wanted]
     variants = tuple(v.strip() for v in args.variants.split(",") if v.strip())
     agent_cmd = args.agent_cmd or WRITABLE_AGENT_CMD
-    agent_label = args.agent_label or agent_cmd.split()[0]
+    agent_label = args.agent_label or infer_agent_name(agent_cmd)
 
     # Reproducibility metadata (§33).
     def _git(cwd, *a):
@@ -252,6 +335,7 @@ def main(argv):
         "model_label": args.model_label,
         "scc_commit": _git(scc_root, "rev-parse", "HEAD"),
         "scc_dirty": bool(_git(scc_root, "status", "--porcelain")),
+        "harness_revision": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
         "benchmark_harness_commit": _git(HERE, "rev-parse", "HEAD") if (HERE / ".git").exists() else _git(scc_root, "rev-parse", "HEAD"),
         "tasks_corpus_hash": tasks_hash,
         "evaluators_hash": evaluators_hash,
@@ -266,6 +350,7 @@ def main(argv):
     # removed when the run finishes writing — including on failure, after
     # the partial results are persisted.
     results = {"meta": meta, "cells": {}}
+    complete = False
     try:
         for variant in variants:
             for task in tasks:
@@ -278,9 +363,25 @@ def main(argv):
                                    budget=args.budget)
                 cell["requested_budget"] = args.budget if args.budget is not None else None
                 results["cells"][key] = cell
-                print(f"          success={cell['task_success']} "
-                      f"completion={cell['run_completion']} wall={cell['wall_sec']}s", flush=True)
+                print(f"          success={cell.get('task_success')} "
+                      f"completion={cell.get('run_completion')} wall={cell.get('wall_sec')}s",
+                      flush=True)
+        complete = True
+        if any(is_infra_cell(c) for c in results["cells"].values()):
+            results["meta"]["valid"] = False
+            results["meta"]["invalid_reason"] = (
+                "infrastructure or undefined-outcome cells in an otherwise complete matrix"
+            )
+    except Exception as exc:
+        results["meta"]["valid"] = False
+        results["meta"]["invalid_reason"] = (
+            f"incomplete matrix run: {type(exc).__name__}: {exc}"
+        )
+        raise
     finally:
+        if not complete:
+            results["meta"].setdefault("valid", False)
+            results["meta"].setdefault("invalid_reason", "incomplete matrix run")
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
@@ -300,13 +401,18 @@ def main(argv):
 
 def compute_summary(cells, ids, variants):
     """Paired statistics (§31) over a cells dict. Shared by main() and
-    the cell-merge tooling so refills recompute identical summaries."""
+    the cell-merge tooling so refills recompute identical summaries.
+
+    Undefined (`task_success is None`) and infrastructure/skipped cells
+    are excluded from series, macro, and paired comparisons; they appear
+    only in `skipped_cells`.
+    """
     def paired_ids(*variant_names):
         ok = set(ids)
         for v in variant_names:
             for i in ids:
                 cell = cells.get(f"{v}/{i}")
-                if cell is None or cell.get("error"):
+                if not outcome_defined(cell):
                     ok.discard(i)
         return sorted(ok)
 
@@ -320,27 +426,50 @@ def compute_summary(cells, ids, variants):
         summary[f"{v}_task_success"] = rate
         summary[f"{v}_n"] = n
     summary["skipped_cells"] = {
-        v: {i: cells.get(f"{v}/{i}", {}).get("error")
-            for i in ids if cells.get(f"{v}/{i}", {}).get("error")}
+        v: {
+            i: (
+                cells.get(f"{v}/{i}", {}).get("error")
+                or cells.get(f"{v}/{i}", {}).get("status")
+                or "undefined-outcome"
+            )
+            for i in ids if not outcome_defined(cells.get(f"{v}/{i}"))
+        }
         for v in variants}
 
-    for other in variants:
-        if other == "raw":
-            continue
-        pair = paired_ids("raw", other)
+    def paired_ci(left, right):
+        pair = paired_ids(left, right)
         if not pair:
-            summary[f"paired_{other}_minus_raw"] = None
-            continue
-        a = [1.0 if cells[f"{other}/{i}"]["task_success"] else 0.0 for i in pair]
-        b = [1.0 if cells[f"raw/{i}"]["task_success"] else 0.0 for i in pair]
+            return None
+        a = [1.0 if cells[f"{left}/{i}"]["task_success"] else 0.0 for i in pair]
+        b = [1.0 if cells[f"{right}/{i}"]["task_success"] else 0.0 for i in pair]
         mean_diff, lo, hi = h.paired_bootstrap_ci(a, b)
-        summary[f"paired_{other}_minus_raw"] = {
+        return {
             "n_paired": len(pair),
             "mean_diff": mean_diff,
             "ci95": [lo, hi],
             "ci_note": ("CI crosses zero — no superiority claim" if lo <= 0 <= hi
                         else "CI excludes zero"),
         }
+
+    for other in variants:
+        if other == "raw":
+            continue
+        summary[f"paired_{other}_minus_raw"] = paired_ci(other, "raw")
+
+    # Write-protocol contract names (SCC minus baseline / aider / repomix).
+    summary["paired_ci_scc_minus_raw"] = paired_ci("scc-full", "raw")
+    summary["paired_ci_scc_minus_aider"] = paired_ci("scc-full", "aider-repomap")
+    summary["paired_ci_scc_minus_repomix"] = paired_ci("scc-full", "repomix-compress")
+
+    micro_vals = []
+    for v in variants:
+        for i in ids:
+            cell = cells.get(f"{v}/{i}")
+            if cell is None or cell.get("error"):
+                continue
+            micro_vals.append(1.0 if cell.get("task_success") else 0.0)
+    summary["micro_task_success"] = (
+        (sum(micro_vals) / len(micro_vals)) if micro_vals else None)
     return summary
 
 

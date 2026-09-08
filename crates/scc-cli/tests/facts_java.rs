@@ -3,8 +3,8 @@
 //! EXPORTS/ANNOTATES/REGISTERS/CONTAINS/HANDLES_CALLBACK relationships that
 //! the extractor's facts produce.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 const CONFIG: &str = "languages:\n  java: true\n";
 // trace:v1 id=test.scc.facts.java verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.java

@@ -395,8 +395,10 @@ fn huge_beads_title_trimmed() {
         "the trim must be recorded in warnings: {:?}", artifact.pack.warnings);
 }
 
-/// Huge Hindsight lesson over a tiny cap: Hindsight is trimmed FIRST (it
-/// is lower authority than Beads), Beads survives.
+/// Huge Hindsight lesson over a cap that still fits pack+Beads: Hindsight
+/// is trimmed FIRST (it is lower authority than Beads), Beads survives.
+/// The cap is above the System IR pack so the test measures enrichment
+/// trim order, not last-resort pack truncation.
 #[test]
 // trace:v1 id=test.scc-cli-task-parity.huge-hindsight-trimmed-first
 fn huge_hindsight_lesson_trimmed_first() {
@@ -412,9 +414,9 @@ fn huge_hindsight_lesson_trimmed_first() {
     );
     store.insert_entity(&entity, &[]).unwrap();
     let artifact =
-        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(500), false)
+        scc_cli::commands::build_task_context(&root, "rename the transcript field", &[], &[], Some(800), false)
             .unwrap();
-    assert!(artifact.token_count <= 500);
+    assert!(artifact.token_count <= 800);
     // Hindsight trimmed first; Beads survives.
     assert!(!artifact.pack.content.contains("HINDSIGHT LESSONS"),
         "hindsight must be trimmed first");

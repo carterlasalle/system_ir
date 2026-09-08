@@ -46,6 +46,9 @@ enum Commands {
     /// Show index status, stats, and freshness
     Status,
 
+    /// Print the generated language-support matrix (from the registry)
+    Languages,
+
     /// Watch the filesystem and re-index changed files
     Watch,
 
@@ -269,6 +272,47 @@ enum BenchSub {
         /// Minimum mean recall gate
         #[arg(long, default_value_t = 0.6)]
         min_recall: f64,
+    },
+    /// Retrieval Recall@k / MRR over fixture gold (lexical vs production arms).
+    /// Does not change the production fused ranker.
+    Retrieval {
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Comma-separated ranking arms
+        #[arg(long, default_value = "lexical-then-graph,query-routed,production-blended")]
+        arms: String,
+        /// Optional fixture repo filter (e.g. http-service-python)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Minimum mean recall@10 across printed arms (0 = measure only)
+        #[arg(long, default_value_t = 0.0)]
+        min_recall: f64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Locator loop vs baseline and Ripwire (clustered localization).
+    /// Does not change production ranking. Missing Ripwire is skipped.
+    Loop {
+        /// Comma-separated arms: baseline,scc,ripwire
+        #[arg(long, default_value = "baseline,scc,ripwire")]
+        arms: String,
+        /// Files opened per task
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Optional fixture repo filter
+        #[arg(long)]
+        repo: Option<String>,
+        /// Ripwire binary (else RIPWIRE_BIN / PATH / vendored build)
+        #[arg(long)]
+        ripwire_bin: Option<PathBuf>,
+        /// Fail when SCC clustered localization is below baseline by more than this
+        #[arg(long, default_value_t = 0.0)]
+        min_delta: f64,
+        #[arg(long)]
+        json: bool,
+        /// JSONL pack-consumer protocol (search/read events) instead of locator
+        #[arg(long)]
+        explore: bool,
     },
     /// Agent-run recorder (SCC-002): run the corpus through an external
     /// agent command and record outcome metrics
@@ -577,6 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Status => commands::cmd_status(&root),
+        Commands::Languages => commands::cmd_languages(),
         Commands::Watch => commands::cmd_watch(&root),
         Commands::Overview { json } => commands::cmd_overview(&root, json),
         Commands::Context { sub } => match sub {
@@ -751,6 +796,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
+            BenchSub::Loop {
+                arms,
+                k,
+                repo,
+                ripwire_bin,
+                min_delta,
+                json,
+                explore,
+            } => {
+                let parsed: Vec<scc_cli::benchloop::LoopArm> = arms
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        scc_cli::benchloop::LoopArm::parse(s).ok_or_else(|| {
+                            scc_cli::CliError::Other(format!("unknown loop arm {s}"))
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let opts = scc_cli::benchloop::LoopOptions {
+                    k,
+                    repo_filter: repo,
+                    ripwire_bin,
+                    explore,
+                    agent_cmd: std::env::var("SCC_EXPLORE_AGENT_CMD").ok().filter(|s| !s.is_empty()),
+                };
+                match scc_cli::benchloop::run_agent_loop(&parsed, &opts) {
+                    Ok(summary) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&summary)?);
+                        } else {
+                            scc_cli::benchloop::print_loop_summary(&summary);
+                        }
+                        let gate_fail = {
+                            let base = summary.arms.iter().find(|a| a.arm == "baseline");
+                            let scc = summary.arms.iter().find(|a| a.arm == "scc");
+                            match (base, scc) {
+                                (Some(b), Some(s))
+                                    if s.clustered_localization + min_delta
+                                        < b.clustered_localization =>
+                                {
+                                    Some(format!(
+                                        "agent-loop gate failed: SCC clustered {:.3} < baseline {:.3} + {min_delta}",
+                                        s.clustered_localization, b.clustered_localization
+                                    ))
+                                }
+                                _ => None,
+                            }
+                        };
+                        match gate_fail {
+                            Some(msg) => Err(scc_cli::CliError::Other(msg)),
+                            None => Ok(()),
+                        }
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
+                }
+            },
             BenchSub::Context { min_recall } => match scc_cli::benchctx::run_context_benchmark(min_recall)
             {
                 Ok(summary) => {
@@ -758,6 +860,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(())
                 }
                 Err(e) => Err(scc_cli::CliError::Other(e)),
+            },
+            BenchSub::Retrieval {
+                k,
+                arms,
+                repo,
+                min_recall,
+                json,
+            } => {
+                let parsed: Vec<scc_core::RankingArm> = arms
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        scc_core::RankingArm::parse(s).ok_or_else(|| {
+                            scc_cli::CliError::Other(format!("unknown ranking arm {s}"))
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                match scc_cli::benchret::run_retrieval_benchmark(
+                    k,
+                    &parsed,
+                    min_recall,
+                    repo.as_deref(),
+                ) {
+                    Ok(summary) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&summary)?);
+                        } else {
+                            scc_cli::benchret::print_summary(&summary);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(scc_cli::CliError::Other(e)),
+                }
             },
             BenchSub::Index { files, lines } => {
                 let dir = std::env::temp_dir().join(format!("scc-bench-{}", std::process::id()));

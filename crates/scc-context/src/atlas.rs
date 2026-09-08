@@ -10,16 +10,16 @@
 //! excluded unless `include_low_confidence_inference` is set.
 
 use crate::packs::{entity_name, finish, Section};
-use scc_graph::TrustedGraphView;
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
-    Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode, AtlasInvariant,
-    AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
+    language_by_id, Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode,
+    AtlasInvariant, AtlasOwnershipClaim, ContractSubclass, FlowKind, SystemAtlas,
 };
+use scc_graph::TrustedGraphView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Structured atlas compilation — pure data, no rendering.
-// trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-SCC-CTX
+// trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-state-function-access,REQ-SCC-CTX
 pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     let view = &ctx.view;
     let store = ctx.store;
@@ -89,7 +89,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             failure_behavior.extend(rs.iter().filter_map(|x| x.as_str().map(String::from)));
         }
         for r in view.out_pred(&c.id, scc_core::predicates::CROSSES_BOUNDARY) {
-            failure_behavior.push(format!("crosses boundary -> {}", entity_name(view, &r.object)));
+            failure_behavior.push(format!(
+                "crosses boundary -> {}",
+                entity_name(view, &r.object)
+            ));
         }
 
         let mut consumes: BTreeSet<String> = BTreeSet::new();
@@ -226,10 +229,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         // extractor contract: entrypoint kinds are strings ("main-guard",
         // "cli-subcommand", ...); cli-subcommand entrypoints render as
         // `name [cli-subcommand]` instead of the generic kind
-        let kind = if kinds
-            .iter()
-            .any(|k| k.as_str() == Some("cli-subcommand"))
-        {
+        let kind = if kinds.iter().any(|k| k.as_str() == Some("cli-subcommand")) {
             "cli-subcommand"
         } else {
             "entrypoint"
@@ -336,7 +336,11 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             &mut contracts,
             &mut contract_seen,
             scc_core::Contract {
-                id: scc_core::entity_id(&store.repo_id, scc_core::kinds::CONTRACT, &format!("cli:{}", e.name)),
+                id: scc_core::entity_id(
+                    &store.repo_id,
+                    scc_core::kinds::CONTRACT,
+                    &format!("cli:{}", e.name),
+                ),
                 kind: "cli".into(),
                 subclass: ContractSubclass::Cli,
                 producer: e.id.clone(),
@@ -390,10 +394,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .collect();
         owners.sort();
         owners.dedup();
-        let producer = owners
-            .first()
-            .cloned()
-            .unwrap_or_else(|| c.id.clone());
+        let producer = owners.first().cloned().unwrap_or_else(|| c.id.clone());
         let mut consumers: BTreeSet<String> = BTreeSet::new();
         for pred in [
             scc_core::predicates::READS,
@@ -730,8 +731,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         .map(|e| e.name.clone())
         .collect();
     let trust_boundaries: Vec<String> =
-        scc_graph::boundaries::boundary_crossings(view.graph, store)
-            .unwrap_or_default();
+        scc_graph::boundaries::boundary_crossings(view.graph, store).unwrap_or_default();
 
     // ---- implementation map ----
     let mut implementation_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -816,16 +816,18 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // text. Provenance preserved; deduped by (target, provenance).
     let state_claims = scc_graph::state::compile_state_claims(view.graph, &symbol_comp);
     for claim in state_claims {
-        let Some(c) = components
-            .iter_mut()
-            .find(|c| c.name == claim.component)
-        else {
+        let Some(c) = components.iter_mut().find(|c| c.name == claim.component) else {
             continue;
         };
         let seen_claim = (claim.target.clone(), claim.provenance.clone());
-        if !c.owns.iter().any(|o| {
-            o.target == seen_claim.0 && o.provenance == seen_claim.1
-        }) {
+        if claim.verb == "reads" {
+            continue;
+        }
+        if !c
+            .owns
+            .iter()
+            .any(|o| o.target == seen_claim.0 && o.provenance == seen_claim.1)
+        {
             c.owns.push(AtlasOwnershipClaim {
                 target: claim.target,
                 provenance: claim.provenance,
@@ -833,7 +835,11 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         }
     }
     for c in &mut components {
-        c.owns.sort_by(|a, b| a.target.cmp(&b.target).then(a.provenance.cmp(&b.provenance)));
+        c.owns.sort_by(|a, b| {
+            a.target
+                .cmp(&b.target)
+                .then(a.provenance.cmp(&b.provenance))
+        });
     }
 
     // ---- PUBLIC API (Wave 10): exports grouped by component ----
@@ -847,7 +853,9 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         if r.predicate != scc_core::predicates::EXPORTS {
             continue;
         }
-        let Some(comp) = symbol_comp.get(&r.subject) else { continue };
+        let Some(comp) = symbol_comp.get(&r.subject) else {
+            continue;
+        };
         if let Some(name) = view.entity(&r.object).map(|e| e.name.clone()) {
             if !name.is_empty() {
                 public_api.entry(comp.clone()).or_default().insert(name);
@@ -862,8 +870,13 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         if e.attributes.get("exported").and_then(|v| v.as_bool()) != Some(true) {
             continue;
         }
-        let Some(comp) = symbol_comp.get(&e.id) else { continue };
-        public_api.entry(comp.clone()).or_default().insert(e.name.clone());
+        let Some(comp) = symbol_comp.get(&e.id) else {
+            continue;
+        };
+        public_api
+            .entry(comp.clone())
+            .or_default()
+            .insert(e.name.clone());
     }
     let public_api: BTreeMap<String, Vec<String>> = public_api
         .into_iter()
@@ -903,14 +916,19 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             if r.predicate != pred {
                 continue;
             }
-            let Some(comp) = symbol_comp.get(&r.subject) else { continue };
+            let Some(comp) = symbol_comp.get(&r.subject) else {
+                continue;
+            };
             let target = entity_name(view, &r.object);
             let line = if pred == scc_core::predicates::REGISTERS {
                 format!("registers {target}")
             } else {
                 format!("handles callback {target}")
             };
-            framework_semantics.entry(comp.clone()).or_default().insert(line);
+            framework_semantics
+                .entry(comp.clone())
+                .or_default()
+                .insert(line);
         }
     }
     let framework_semantics: BTreeMap<String, Vec<String>> = framework_semantics
@@ -934,9 +952,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .as_ref()
             .map(|s| s.revision.clone())
             .unwrap_or_else(|| "not-indexed".to_string()),
-        indexed_at: snapshot
-            .map(|s| s.indexed_at)
-            .unwrap_or_default(),
+        indexed_at: snapshot.map(|s| s.indexed_at).unwrap_or_default(),
         freshness,
         purpose,
         components,
@@ -966,17 +982,38 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
 /// Phase-stage verbs for the PIPELINE section (CompilerLanguageTool
 /// archetype): a symbol whose name contains a stage verb is a phase symbol.
 const PIPELINE_STAGES: [(&str, &[&str]); 5] = [
-    ("parse", &["parse", "parser", "lexer", "lex", "tokenize", "tokeniser", "ast"]),
+    (
+        "parse",
+        &[
+            "parse",
+            "parser",
+            "lexer",
+            "lex",
+            "tokenize",
+            "tokeniser",
+            "ast",
+        ],
+    ),
     ("analyze", &["analyze", "analyse", "analysis"]),
-    ("transform", &["transform", "lower", "resolve", "resolveconfig"]),
-    ("generate", &["generate", "generator", "codegen", "compile", "compiler"]),
-    ("emit", &["emit", "print", "format", "formatdoc", "serialize"]),
+    (
+        "transform",
+        &["transform", "lower", "resolve", "resolveconfig"],
+    ),
+    (
+        "generate",
+        &["generate", "generator", "codegen", "compile", "compiler"],
+    ),
+    (
+        "emit",
+        &["emit", "print", "format", "formatdoc", "serialize"],
+    ),
 ];
 
 /// PIPELINE (Wave 10): phase-named symbols grouped by stage, plus
 /// phase-named file paths (`1-parse`-style stage dirs). Only rendered for
 /// the CompilerLanguageTool archetype. Deterministic: sorted by
 /// (stage-rank, name); bounded to keep the section compact.
+// trace:exempt reason=internal-detail
 fn build_pipeline(view: &TrustedGraphView, archetype: Option<scc_core::Archetype>) -> Vec<String> {
     if archetype != Some(scc_core::Archetype::CompilerLanguageTool) {
         return Vec::new();
@@ -994,7 +1031,9 @@ fn build_pipeline(view: &TrustedGraphView, archetype: Option<scc_core::Archetype
         if e.name.is_empty() {
             continue;
         }
-        let Some(rank) = stage_of(&e.name) else { continue };
+        let Some(rank) = stage_of(&e.name) else {
+            continue;
+        };
         if !seen.insert(e.name.clone()) {
             continue;
         }
@@ -1010,12 +1049,10 @@ fn build_pipeline(view: &TrustedGraphView, archetype: Option<scc_core::Archetype
             // digit-prefixed stage dirs: `1-parse`, `2-analyze`, `3-transform`
             let numbered = verbs.iter().any(|v| {
                 lower.contains(&format!("/{v}"))
-                    || lower
-                        .split('/')
-                        .any(|seg| {
-                            let seg = seg.trim_start_matches(|c: char| c.is_ascii_digit());
-                            seg.trim_start_matches(['-', '_']).starts_with(v)
-                        })
+                    || lower.split('/').any(|seg| {
+                        let seg = seg.trim_start_matches(|c: char| c.is_ascii_digit());
+                        seg.trim_start_matches(['-', '_']).starts_with(v)
+                    })
             });
             if numbered {
                 rank = Some(i);
@@ -1141,22 +1178,19 @@ fn push_contract(
     contracts.push(c);
 }
 
-/// Languages with a real extractor (the indexer's language map). Files in
+/// Languages with a real extractor come from `LANGUAGE_REGISTRY`. Files in
 /// any other language are scanned but never parsed — the honest `unparsed`
 /// remainder of the coverage map.
-const EXTRACTOR_LANGUAGES: [&str; 6] = [
-    "python",
-    "typescript",
-    "javascript",
-    "go",
-    "java",
-    "rust",
-];
+// trace:exempt reason=internal-detail
+fn is_extractor_language(lang: &str) -> bool {
+    language_by_id(lang).is_some_and(|c| c.extractor)
+}
 
 /// Deterministic model-coverage facts (Wave 9): what the model knows AND
 /// what it does not. Every line is computed from the trusted view + store —
 /// no heuristics, no fabrication; when a quantity is unobservable the line
 /// says so explicitly.
+// trace:exempt reason=internal-detail
 fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     let view = &ctx.view;
     let store = ctx.store;
@@ -1167,9 +1201,12 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     let total = files.len();
     let parsed = files
         .iter()
-        .filter(|(_, _, lang, _, _)| EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .filter(|(_, _, lang, _, _)| is_extractor_language(lang))
         .count();
-    let pct = parsed.checked_mul(100).map(|n| n / total.max(1)).unwrap_or(0);
+    let pct = parsed
+        .checked_mul(100)
+        .map(|n| n / total.max(1))
+        .unwrap_or(0);
     out.insert(
         "parsed_source_files".to_string(),
         format!("{pct}% ({parsed}/{total})"),
@@ -1187,7 +1224,12 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
         if exports.is_empty() {
             "none (no EXPORTS evidence)".to_string()
         } else {
-            format!("{} export entit{} ({} EXPORTS edges)", exports.len(), if exports.len() == 1 { "y" } else { "ies" }, export_edges)
+            format!(
+                "{} export entit{} ({} EXPORTS edges)",
+                exports.len(),
+                if exports.len() == 1 { "y" } else { "ies" },
+                export_edges
+            )
         },
     );
 
@@ -1216,7 +1258,10 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
             ) && view.entity(&r.object).is_some()
         })
         .count();
-    let pct = with_target.checked_mul(100).map(|n| n / total_calls.max(1)).unwrap_or(0);
+    let pct = with_target
+        .checked_mul(100)
+        .map(|n| n / total_calls.max(1))
+        .unwrap_or(0);
     out.insert(
         "call_targets_resolved".to_string(),
         if pct >= 100 {
@@ -1253,10 +1298,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     for s in &surfaces {
         *by_kind.entry(s.kind.as_str()).or_insert(0) += 1;
     }
-    let summary: Vec<String> = by_kind
-        .iter()
-        .map(|(k, v)| format!("{k} {v}"))
-        .collect();
+    let summary: Vec<String> = by_kind.iter().map(|(k, v)| format!("{k} {v}")).collect();
     out.insert(
         "invocation_surfaces".to_string(),
         format!("{} ({})", surfaces.len(), summary.join(", ")),
@@ -1287,7 +1329,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
     // ---- unparsed files ----
     let unparsed = files
         .iter()
-        .filter(|(_, _, lang, _, _)| !EXTRACTOR_LANGUAGES.contains(&lang.as_str()))
+        .filter(|(_, _, lang, _, _)| !is_extractor_language(lang))
         .count();
     out.insert(
         "unparsed_files".to_string(),
@@ -1306,7 +1348,12 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
         "model_epoch_generations".to_string(),
         format!(
             "{gens} (source {}, semantic {}, evidence {}, intent {}, runtime {}, derived {})",
-            epoch.source, epoch.semantic, epoch.evidence, epoch.intent, epoch.runtime, epoch.derived
+            epoch.source,
+            epoch.semantic,
+            epoch.evidence,
+            epoch.intent,
+            epoch.runtime,
+            epoch.derived
         ),
     );
 
@@ -1314,7 +1361,7 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
 }
 
 /// Render the atlas as compact structured text (agent-facing).
-// trace:v1 id=impl.scc.atlas.render work=WORK-SCC-001 satisfies=REQ-SCC-CTX
+// trace:v1 id=impl.scc.atlas.render work=WORK-SCC-001 satisfies=REQ-state-function-access,REQ-SCC-CTX
 pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -> ContextPack {
     let mut pack = ContextPack::new("atlas", &atlas.revision);
     let mut sections: Vec<Section> = Vec::new();
@@ -1409,7 +1456,11 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
             out.push_str(&format!("\n{}Upstream: {}", indent, c.upstream.join(", ")));
         }
         if !c.downstream.is_empty() {
-            out.push_str(&format!("\n{}Downstream: {}", indent, c.downstream.join(", ")));
+            out.push_str(&format!(
+                "\n{}Downstream: {}",
+                indent,
+                c.downstream.join(", ")
+            ));
         }
         if !c.owns.is_empty() {
             let owned: Vec<String> = c
@@ -1422,11 +1473,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         out.push('\n');
         out
     };
-    let name_of = |id: &str| -> Option<String> {
-        ctx.view
-            .entity(id)
-            .map(|e| e.name.clone())
-    };
+    let name_of = |id: &str| -> Option<String> { ctx.view.entity(id).map(|e| e.name.clone()) };
     // services first: nested subsystems, then directly-contained components
     for svc in atlas.hierarchy.iter().filter(|n| n.kind == "service") {
         arch.push_str(&format!("\nSERVICE {}\n", svc.name.to_uppercase()));
@@ -1509,18 +1556,9 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         .iter()
         .filter(|f| f.kind != FlowKind::Architecture)
         .collect();
-    render_flows.sort_by(|a, b| {
-        b.steps
-            .len()
-            .cmp(&a.steps.len())
-            .then(a.name.cmp(&b.name))
-    });
+    render_flows.sort_by(|a, b| b.steps.len().cmp(&a.steps.len()).then(a.name.cmp(&b.name)));
     for f in render_flows.into_iter().take(FLOW_RENDER_CAP) {
-        flows.push_str(&format!(
-            "\n{} [{}]",
-            f.name,
-            flow_kind_str(f.kind)
-        ));
+        flows.push_str(&format!("\n{} [{}]", f.name, flow_kind_str(f.kind)));
         if let Some(t) = &f.trigger {
             flows.push_str(&format!("\nTrigger: {t}"));
         }
@@ -1543,10 +1581,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     // CONFIGURATION, CACHES, DERIVED / REGISTRIES. Falls back to the
     // legacy DATA OWNERSHIP title when the state compiler found no state
     // at all.
-    let has_state = atlas
-        .state_authority
-        .values()
-        .any(|v| !v.is_empty());
+    let has_state = atlas.state_authority.values().any(|v| !v.is_empty());
     let mut state_body = String::new();
     if has_state {
         state_body.push_str("DATA OWNERSHIP\n");
@@ -1557,6 +1592,13 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
                 "{} owns {} ({})\n",
                 c.name, o.target, o.provenance
             ));
+        }
+    }
+    if let Some(lines) = atlas.state_authority.get(scc_graph::state::S_PERSISTENT) {
+        for l in lines {
+            if l.contains("::") {
+                state_body.push_str(&format!("{l}\n"));
+            }
         }
     }
     if !atlas.data_stores.is_empty() {
@@ -1574,10 +1616,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     ] {
         if let Some(lines) = atlas.state_authority.get(section) {
             if !lines.is_empty() {
-                state_body.push_str(&format!(
-                    "\n{}\n",
-                    scc_graph::state::section_label(section)
-                ));
+                state_body.push_str(&format!("\n{}\n", scc_graph::state::section_label(section)));
                 for l in lines {
                     state_body.push_str(&format!("  {l}\n"));
                 }
@@ -1633,7 +1672,11 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
                 if exports.is_empty() {
                     continue;
                 }
-                let shown: Vec<&str> = exports.iter().take(API_RENDER_CAP).map(|s| s.as_str()).collect();
+                let shown: Vec<&str> = exports
+                    .iter()
+                    .take(API_RENDER_CAP)
+                    .map(|s| s.as_str())
+                    .collect();
                 let mut line = format!("{}: exports {}", comp, shown.join(", "));
                 if exports.len() > API_RENDER_CAP {
                     line.push_str(&format!(" (+{} more)", exports.len() - API_RENDER_CAP));
@@ -1660,10 +1703,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
                     lines.push(format!("{comp}: {f}"));
                 }
                 if facts.len() > SEM_RENDER_CAP {
-                    lines.push(format!(
-                        "{comp}: (+{} more)",
-                        facts.len() - SEM_RENDER_CAP
-                    ));
+                    lines.push(format!("{comp}: (+{} more)", facts.len() - SEM_RENDER_CAP));
                 }
             }
             lines.join("\n")
@@ -1700,7 +1740,11 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     // CRITICAL INVARIANTS (never cut)
     let mut inv = String::new();
     for i in &atlas.invariants {
-        inv.push_str(&format!("- [{}] {}\n", severity_str(i.severity), i.statement));
+        inv.push_str(&format!(
+            "- [{}] {}\n",
+            severity_str(i.severity),
+            i.statement
+        ));
     }
     sections.push(Section::new("CRITICAL INVARIANTS", inv, 10));
 
@@ -1774,7 +1818,11 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
         .collect();
     sections.push(Section::new(
         "EVIDENCE STATUS",
-        if ev.is_empty() { "(none)".into() } else { ev.join(", ") },
+        if ev.is_empty() {
+            "(none)".into()
+        } else {
+            ev.join(", ")
+        },
         8,
     ));
 
@@ -1842,6 +1890,7 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
 /// provenance policy applies to derived edges too), marking edge kinds:
 /// branch / retry / error / async / publish / consume / join. Never
 /// flattens alternate paths into false sequential causality.
+// trace:exempt reason=internal-detail
 fn project_flow_graph(
     view: &TrustedGraphView,
     g: &scc_core::FlowGraph,
@@ -1856,22 +1905,33 @@ fn project_flow_graph(
     };
     let mut lines: Vec<String> = Vec::new();
     let mut visited: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut queue: std::collections::VecDeque<u32> =
-        g.entrypoints.iter().copied().collect();
+    let mut queue: std::collections::VecDeque<u32> = g.entrypoints.iter().copied().collect();
     while let Some(n) = queue.pop_front() {
         if !visited.insert(n) {
             continue;
         }
-        let Some(node) = g.nodes.get(n as usize) else { continue };
-        lines.push(format!("{}: {}", entity_name(view, &node.actor), node.operation));
+        let Some(node) = g.nodes.get(n as usize) else {
+            continue;
+        };
+        lines.push(format!(
+            "{}: {}",
+            entity_name(view, &node.actor),
+            node.operation
+        ));
         let mut outs: Vec<&scc_core::FlowEdge> = g
             .edges
             .iter()
             .filter(|e| e.from == n && edge_ok(e))
             .collect();
-        outs.sort_by(|a, b| edge_rank(a.kind).cmp(&edge_rank(b.kind)).then(a.to.cmp(&b.to)));
+        outs.sort_by(|a, b| {
+            edge_rank(a.kind)
+                .cmp(&edge_rank(b.kind))
+                .then(a.to.cmp(&b.to))
+        });
         for e in outs {
-            let Some(target) = g.nodes.get(e.to as usize) else { continue };
+            let Some(target) = g.nodes.get(e.to as usize) else {
+                continue;
+            };
             let mut line = format!(
                 "  -> {}: {}",
                 entity_name(view, &target.actor),
@@ -1888,6 +1948,13 @@ fn project_flow_graph(
                 scc_core::FlowEdgeKind::Fallback => line.push_str(" [fallback]"),
                 scc_core::FlowEdgeKind::Timeout => line.push_str(" [timeout]"),
                 scc_core::FlowEdgeKind::Compensation => line.push_str(" [compensate]"),
+                scc_core::FlowEdgeKind::Read => line.push_str(" [read]"),
+                scc_core::FlowEdgeKind::Write => line.push_str(" [write]"),
+                scc_core::FlowEdgeKind::Transform => line.push_str(" [transform]"),
+                scc_core::FlowEdgeKind::Validate => line.push_str(" [validate]"),
+                scc_core::FlowEdgeKind::Authorize => line.push_str(" [authorize]"),
+                scc_core::FlowEdgeKind::Cache => line.push_str(" [cache]"),
+                scc_core::FlowEdgeKind::Invalidate => line.push_str(" [invalidate]"),
                 _ => {}
             }
             if let Some(c) = &e.condition {
@@ -1921,11 +1988,23 @@ fn edge_rank(k: scc_core::FlowEdgeKind) -> u8 {
         scc_core::FlowEdgeKind::Return => 9,
         scc_core::FlowEdgeKind::Timeout => 10,
         scc_core::FlowEdgeKind::Compensation => 11,
+        scc_core::FlowEdgeKind::Read => 12,
+        scc_core::FlowEdgeKind::Write => 13,
+        scc_core::FlowEdgeKind::Transform => 14,
+        scc_core::FlowEdgeKind::Validate => 15,
+        scc_core::FlowEdgeKind::Authorize => 16,
+        scc_core::FlowEdgeKind::Cache => 17,
+        scc_core::FlowEdgeKind::Invalidate => 18,
     }
 }
 
+// trace:exempt reason=internal-detail
 fn comp_ids(ctx: &ContextCompiler) -> Vec<String> {
-    ctx.view.components().into_iter().map(|c| c.id.clone()).collect()
+    ctx.view
+        .components()
+        .into_iter()
+        .map(|c| c.id.clone())
+        .collect()
 }
 
 fn flow_kind_str(k: FlowKind) -> &'static str {
@@ -1952,11 +2031,11 @@ fn severity_str(s: scc_core::Severity) -> &'static str {
 mod tests {
     use super::*;
     use scc_core::{
-        entity_id, kinds, predicates, relationship_id, symbol_id, Entity, Provenance,
-        Relationship,
+        entity_id, kinds, predicates, relationship_id, symbol_id, Entity, Provenance, Relationship,
     };
     use scc_store::Store;
 
+    // trace:exempt reason=internal-detail
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -1965,9 +2044,15 @@ mod tests {
         let repo = "repo";
 
         // files: 2 parsed python + 1 unparsed json
-        store.upsert_file("app.py", "h1", "python", "source", 10).unwrap();
-        store.upsert_file("lib.py", "h2", "python", "source", 10).unwrap();
-        store.upsert_file("config.json", "h3", "json", "config", 10).unwrap();
+        store
+            .upsert_file("app.py", "h1", "python", "source", 10)
+            .unwrap();
+        store
+            .upsert_file("lib.py", "h2", "python", "source", 10)
+            .unwrap();
+        store
+            .upsert_file("config.json", "h3", "json", "config", 10)
+            .unwrap();
 
         // symbols
         let mk = |n: &str| symbol_id(repo, "app.py", n);
@@ -1978,8 +2063,10 @@ mod tests {
         }
         // cli flags on worker
         let mut w = store.get_entity(&mk("worker")).unwrap().unwrap();
-        w.attributes
-            .insert("cli_flags".into(), serde_json::json!(["--queue", "--verbose"]));
+        w.attributes.insert(
+            "cli_flags".into(),
+            serde_json::json!(["--queue", "--verbose"]),
+        );
         store.insert_entity(&w, &["app.py".to_string()]).unwrap();
 
         // route with handler
@@ -2113,17 +2200,23 @@ mod tests {
     }
 
     #[test]
-    // # trace:exempt — unit test (tests are not trace-worthy behavior)
+    // trace:exempt reason=internal-detail
     fn contracts_and_coverage_from_fact_layer() {
         let (_dir, store) = test_store();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let ctx = ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
         let atlas = build_atlas(&ctx);
 
         // contract subclasses: http (route), cli (flags), config (DEBUG),
         // event (topic jobs), public-api (exported function signature) —
         // no annotations in this fixture
-        let kinds_found: BTreeSet<String> = atlas.contracts.iter().map(|c| c.kind.clone()).collect();
+        let kinds_found: BTreeSet<String> =
+            atlas.contracts.iter().map(|c| c.kind.clone()).collect();
         assert_eq!(
             kinds_found,
             BTreeSet::from([
@@ -2139,7 +2232,11 @@ mod tests {
         // every contract carries the typed subclass, and the machine-model
         // kind agrees with the subclass render prefix
         for c in &atlas.contracts {
-            assert_eq!(c.kind, c.subclass.as_str(), "kind agrees with subclass: {c:?}");
+            assert_eq!(
+                c.kind,
+                c.subclass.as_str(),
+                "kind agrees with subclass: {c:?}"
+            );
         }
         let http = atlas.contracts.iter().find(|c| c.kind == "http").unwrap();
         assert_eq!(http.operations, vec!["GET /api/x"]);
@@ -2160,7 +2257,11 @@ mod tests {
             "reader consumes DEBUG: {:?}",
             cfg.consumers
         );
-        let api = atlas.contracts.iter().find(|c| c.kind == "public-api").unwrap();
+        let api = atlas
+            .contracts
+            .iter()
+            .find(|c| c.kind == "public-api")
+            .unwrap();
         assert_eq!(api.operations, vec!["handler"]);
         assert_eq!(api.subclass, scc_core::ContractSubclass::PublicApi);
 
@@ -2181,7 +2282,10 @@ mod tests {
             "event: jobs",
             "public-api: handler",
         ] {
-            assert!(lines.contains(&want.to_string()), "missing {want}: {lines:?}");
+            assert!(
+                lines.contains(&want.to_string()),
+                "missing {want}: {lines:?}"
+            );
         }
 
         // coverage map: honest, deterministic numbers from the store
@@ -2194,7 +2298,11 @@ mod tests {
             "1 (config/docs/infra — scanned but not source-parsed)"
         );
         assert!(
-            atlas.coverage.get("exported_api").unwrap().starts_with("1 export entity"),
+            atlas
+                .coverage
+                .get("exported_api")
+                .unwrap()
+                .starts_with("1 export entity"),
             "{:?}",
             atlas.coverage.get("exported_api")
         );
@@ -2216,9 +2324,14 @@ mod tests {
             "{:?}",
             atlas.coverage.get("invocation_surfaces")
         );
-        assert_eq!(atlas.coverage.get("stale_evidence").unwrap(), "0 (model FRESH)");
+        assert_eq!(
+            atlas.coverage.get("stale_evidence").unwrap(),
+            "0 (model FRESH)"
+        );
         assert!(atlas.coverage.contains_key("model_epoch_generations"));
-        assert!(atlas.coverage.contains_key("framework_registrations_unknown"));
+        assert!(atlas
+            .coverage
+            .contains_key("framework_registrations_unknown"));
 
         // atlas entrypoints carry the surface kinds
         let ep_kinds: BTreeSet<&str> = atlas.entrypoints.iter().map(|e| e.kind.as_str()).collect();
@@ -2228,7 +2341,7 @@ mod tests {
         assert!(ep_kinds.contains("cli"), "cli surface: {ep_kinds:?}");
     }
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
 
     /// Wave 11: schema contracts (SCHEMA entities + DEFINES/COMPOSES/
     /// VALIDATES edges) render under CONTRACTS with the `schema:` prefix,
@@ -2237,7 +2350,7 @@ mod tests {
     /// the owning symbol's component.
     #[test]
 
-// trace:exempt reason=internal-detail
+    // trace:exempt reason=internal-detail
     fn schema_and_reactive_render_in_atlas() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2250,7 +2363,11 @@ mod tests {
         // store.components())
         let comp_id = entity_id(&repo, kinds::COMPONENT, "api");
         store
-            .replace_components(&[scc_core::Entity::new(comp_id.clone(), kinds::COMPONENT, "api")])
+            .replace_components(&[scc_core::Entity::new(
+                comp_id.clone(),
+                kinds::COMPONENT,
+                "api",
+            )])
             .unwrap();
         let fid = entity_id(&repo, kinds::FILE, "api/app.py");
         store
@@ -2423,7 +2540,12 @@ mod tests {
             .unwrap();
 
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let ctx = ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
         let atlas = build_atlas(&ctx);
 
         // schema contract: name + composition + validation operations
@@ -2432,7 +2554,10 @@ mod tests {
         let schema = atlas
             .contracts
             .iter()
-            .find(|c| c.subclass == scc_core::ContractSubclass::Schema && c.operations.first() == Some(&"User".to_string()))
+            .find(|c| {
+                c.subclass == scc_core::ContractSubclass::Schema
+                    && c.operations.first() == Some(&"User".to_string())
+            })
             .expect("schema contract for User");
         assert_eq!(schema.kind, "schema");
         assert_eq!(
@@ -2446,14 +2571,19 @@ mod tests {
         );
         // Wave 13 (e): the producer is the occurrence owner symbol — never
         // the concept/expr itself
-        assert_eq!(schema.producer, "User", "producer = owner symbol: {schema:?}");
+        assert_eq!(
+            schema.producer, "User",
+            "producer = owner symbol: {schema:?}"
+        );
 
         // reactive state attributed to the owning symbol's component
         assert!(
             atlas
                 .state_authority
                 .get(scc_graph::state::S_REACTIVE)
-                .map(|lines| lines.iter().any(|l| l == "api owns reactive: count [state] (EXTRACTED)"))
+                .map(|lines| lines
+                    .iter()
+                    .any(|l| l == "api owns reactive: count [state] (EXTRACTED)"))
                 .unwrap_or(false),
             "{:?}",
             atlas.state_authority
@@ -2468,13 +2598,18 @@ mod tests {
             "REACTIVE STATE",
             "api owns reactive: count [state] (EXTRACTED)",
         ] {
-            assert!(pack.content.contains(want), "missing {want:?} in:\n{}", pack.content);
+            assert!(
+                pack.content.contains(want),
+                "missing {want:?} in:\n{}",
+                pack.content
+            );
         }
     }
 
     /// A repo with component-attributed symbols exercising the Wave 10
     /// fact-layer sections: exported classes/methods, module exports,
     /// annotations, registrations, callbacks, and state facts.
+    // trace:exempt reason=internal-detail
     fn fact_layer_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("repo");
@@ -2539,13 +2674,21 @@ mod tests {
         store.replace_components(&[api_comp, web_comp]).unwrap();
         store
             .insert_entity(
-                &Entity::new(entity_id(&repo, kinds::FILE, "api/app.py"), kinds::FILE, "api/app.py"),
+                &Entity::new(
+                    entity_id(&repo, kinds::FILE, "api/app.py"),
+                    kinds::FILE,
+                    "api/app.py",
+                ),
                 &["api/app.py".into()],
             )
             .unwrap();
         store
             .insert_entity(
-                &Entity::new(entity_id(&repo, kinds::FILE, "web/app.py"), kinds::FILE, "web/app.py"),
+                &Entity::new(
+                    entity_id(&repo, kinds::FILE, "web/app.py"),
+                    kinds::FILE,
+                    "web/app.py",
+                ),
                 &["web/app.py".into()],
             )
             .unwrap();
@@ -2734,10 +2877,16 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn fact_layer_sections_grouped_by_component() {
         let (_dir, store) = fact_layer_store();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let ctx = ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
         let atlas = build_atlas(&ctx);
 
         // PUBLIC API grouped by component: api has App (exported class) +
@@ -2745,32 +2894,59 @@ mod tests {
         // handle_page. `_secret` is excluded (leading underscore).
         let api_exports = atlas.public_api.get("api").expect("api exports");
         assert!(api_exports.contains(&"App".to_string()), "{api_exports:?}");
-        assert!(api_exports.contains(&"include_router".to_string()), "{api_exports:?}");
-        assert!(!api_exports.iter().any(|e| e == "_secret"), "{api_exports:?}");
+        assert!(
+            api_exports.contains(&"include_router".to_string()),
+            "{api_exports:?}"
+        );
+        assert!(
+            !api_exports.iter().any(|e| e == "_secret"),
+            "{api_exports:?}"
+        );
         let web_exports = atlas.public_api.get("web").expect("web exports");
-        assert!(web_exports.contains(&"handle_page".to_string()), "{web_exports:?}");
+        assert!(
+            web_exports.contains(&"handle_page".to_string()),
+            "{web_exports:?}"
+        );
 
         // FRAMEWORK SEMANTICS: annotation, registration, callback per comp
         let api_facts = atlas.framework_semantics.get("api").expect("api facts");
         assert!(
-            api_facts.iter().any(|f| f.contains("annotates App.get (Get)")),
+            api_facts
+                .iter()
+                .any(|f| f.contains("annotates App.get (Get)")),
             "{api_facts:?}"
         );
         assert!(
-            api_facts.iter().any(|f| f.contains("registers RequestLogger")),
+            api_facts
+                .iter()
+                .any(|f| f.contains("registers RequestLogger")),
             "{api_facts:?}"
         );
         let web_facts = atlas.framework_semantics.get("web").expect("web facts");
         assert!(
-            web_facts.iter().any(|f| f.contains("handles callback on_message")),
+            web_facts
+                .iter()
+                .any(|f| f.contains("handles callback on_message")),
             "{web_facts:?}"
         );
 
         // component implementation carries member symbols; paths stay pure
         let api = atlas.components.iter().find(|c| c.name == "api").unwrap();
-        assert!(api.symbols.contains(&"App".to_string()), "{:?}", api.symbols);
-        assert!(api.symbols.contains(&"App.get".to_string()), "{:?}", api.symbols);
-        assert!(api.implementation.contains(&"App".to_string()), "{:?}", api.implementation);
+        assert!(
+            api.symbols.contains(&"App".to_string()),
+            "{:?}",
+            api.symbols
+        );
+        assert!(
+            api.symbols.contains(&"App.get".to_string()),
+            "{:?}",
+            api.symbols
+        );
+        assert!(
+            api.implementation.contains(&"App".to_string()),
+            "{:?}",
+            api.implementation
+        );
         assert_eq!(api.implementation_paths, vec!["api".to_string()]);
         // paths-only in the implementation map (compact render)
         assert_eq!(
@@ -2785,25 +2961,50 @@ mod tests {
             api_owns.contains(&"App.cache"),
             "mutable field owns claim: {api_owns:?}"
         );
-        assert!(api_owns.contains(&"DEBUG"), "config owns claim: {api_owns:?}");
+        assert!(
+            api_owns.contains(&"DEBUG"),
+            "config owns claim: {api_owns:?}"
+        );
 
         // LANDMARKS bounded: exports (App, include_router, handle_page)
-        assert!(atlas.landmarks.len() <= 40, "landmarks bounded: {:?}", atlas.landmarks.len());
-        assert!(atlas.landmarks.iter().any(|l| l.contains("App")), "{:?}", atlas.landmarks);
+        assert!(
+            atlas.landmarks.len() <= 40,
+            "landmarks bounded: {:?}",
+            atlas.landmarks.len()
+        );
+        assert!(
+            atlas.landmarks.iter().any(|l| l.contains("App")),
+            "{:?}",
+            atlas.landmarks
+        );
 
         // rendered atlas carries the new section headers
         let pack = render_atlas(&ctx, &atlas, usize::MAX);
         assert!(pack.content.contains("# PUBLIC API"), "{}", pack.content);
-        assert!(pack.content.contains("# FRAMEWORK SEMANTICS"), "{}", pack.content);
+        assert!(
+            pack.content.contains("# FRAMEWORK SEMANTICS"),
+            "{}",
+            pack.content
+        );
         assert!(pack.content.contains("# LANDMARKS"), "{}", pack.content);
-        assert!(pack.content.contains("api: exports App, include_router"), "{}", pack.content);
+        assert!(
+            pack.content.contains("api: exports App, include_router"),
+            "{}",
+            pack.content
+        );
     }
 
     #[test]
+    // trace:exempt reason=internal-detail
     fn pipeline_only_for_compiler_language_tool() {
         let (_dir, store) = fact_layer_store();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let ctx = ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
         let atlas = build_atlas(&ctx);
         // not a compiler repo → no pipeline lines
         assert!(atlas.pipeline.is_empty(), "{:?}", atlas.pipeline);
@@ -2822,7 +3023,12 @@ mod tests {
         e.attr("exported", serde_json::json!(true));
         store.insert_entity(&e, &["api/app.py".into()]).unwrap();
         let graph = scc_graph::RealityGraph::load(&store).unwrap();
-        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let ctx = ContextCompiler::new(
+            &store,
+            &graph,
+            crate::ContextSettings::default(),
+            Vec::new(),
+        );
         let pipeline = build_pipeline(&ctx.view, Some(scc_core::Archetype::CompilerLanguageTool));
         assert!(
             pipeline.iter().any(|l| l.trim() == "parse"),

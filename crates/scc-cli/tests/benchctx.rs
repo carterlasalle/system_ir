@@ -1,6 +1,6 @@
 //! Context benchmark integration tests (docs/TEST_PLAN.md §84–87).
 
-mod golden;
+mod common;
 // trace:v1 id=test.scc.bench.context verifies=REQ-SCC-TEST exercises=impl.scc.bench.context
 
 #[test]

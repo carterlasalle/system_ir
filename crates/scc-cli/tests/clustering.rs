@@ -10,9 +10,9 @@
 //!   graph, LibrarySdk archetype doubling);
 //! - clustering is deterministic across identical recompiles.
 
-mod golden;
+mod common;
 
-use golden::run_ok;
+use common::run_ok;
 use std::path::Path;
 
 

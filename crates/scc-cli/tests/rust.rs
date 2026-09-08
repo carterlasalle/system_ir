@@ -2,9 +2,9 @@
 //! must produce a main flow, a service component in the atlas, exported
 //! symbols, and a task pack that surfaces the retry decoration.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 
 #[test]
 fn rust_service_indexes_and_atlas() {

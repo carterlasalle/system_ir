@@ -7,8 +7,8 @@
 
 use crate::facts;
 use crate::model::{
-    Call, Entrypoint, ExtractedFile, Import, ImportType, LanguageExtractor, SemanticFact,
-    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind,
+    Call, Entrypoint, ExtractedFile, FnRhs, Import, ImportType, LanguageExtractor, SemanticFact,
+    SourceFile, StoreOp, StoreRef, Symbol, SymbolKind, TypeBind,
 };
 use tree_sitter::{Node, Parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -467,6 +467,10 @@ struct Ctx {
     module_name: String,
     /// Per-caller call-site counter (source order) — CFG lexical evidence.
     call_seq: BTreeMap<Option<String>, u32>,
+    /// Struct-field and method-receiver type binds. Extract-time only.
+    type_binds: Vec<TypeBind>,
+    /// Function-alias binds (`f := helper`). Extract-time only.
+    fn_binds: Vec<crate::model::FnBind>,
 }
 
 // trace:exempt reason=internal-detail
@@ -573,9 +577,56 @@ impl Ctx {
             entrypoints: self.entrypoints,
             cli_flags,
             facts,
+            type_binds: self.type_binds,
+            fn_binds: crate::model::normalize_fn_binds(self.fn_binds),
             ..ExtractedFile::default()
         }
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind(&mut self, name: String, type_name: String, line: u32) {
+        self.push_type_bind_in(self.caller().unwrap_or_default(), name, type_name, line);
+    }
+
+    // trace:exempt reason=internal-detail
+    fn push_type_bind_in(&mut self, scope: String, name: String, type_name: String, line: u32) {
+        if name.is_empty() || type_name.is_empty() {
+            return;
         }
+        if name == "_" {
+            return;
+        }
+        self.type_binds.push(TypeBind {
+            scope,
+            name,
+            type_name,
+            line,
+        });
+    }
+
+    /// Unique type bound to `name` in the current callable scope.
+    // trace:exempt reason=internal-detail
+    fn unique_local_type(&self, name: &str) -> Option<String> {
+        let scope = self.caller().unwrap_or_default();
+        let mut types: Vec<&str> = self
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == scope && b.name == name)
+            .map(|b| b.type_name.as_str())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        (types.len() == 1).then(|| types[0].to_string())
+    }
+
+    /// Same-file type_spec already recorded — used to treat `Order(v)` as
+    /// conversion fuel when tree-sitter parses it as a call.
+    // trace:exempt reason=internal-detail
+    fn has_type(&self, name: &str) -> bool {
+        self.symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Type && s.name == name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +635,7 @@ impl Ctx {
 
 // trace:exempt reason=internal-detail
 impl GoExtractor {
+    // trace:exempt reason=internal-detail
     fn walk(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
         match node.kind() {
             "function_declaration" => self.walk_function(node, ctx, src),
@@ -600,8 +652,11 @@ impl GoExtractor {
                 self.walk_value_decl(node, ctx, src, SymbolKind::Const);
                 self.walk_children(node, ctx, src);
             }
+            "var_spec" => self.record_var_spec(node, ctx, src),
+            "short_var_declaration" => self.record_short_var(node, ctx, src),
             "import_declaration" => self.record_import(node, ctx, src),
             "call_expression" => self.record_call(node, ctx, src),
+            "assignment_statement" => self.record_field_assign(node, ctx, src),
             _ => self.walk_children(node, ctx, src),
         }
     }
@@ -658,6 +713,7 @@ impl GoExtractor {
             });
         }
         ctx.scopes.push(name);
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -712,6 +768,11 @@ impl GoExtractor {
             }
         }
         ctx.scopes.push(sym_name);
+        if let Some((rname, rty)) = receiver_name_and_type(node.child_by_field_name("receiver"), src)
+        {
+            ctx.push_type_bind(rname, rty, start_line);
+        }
+        self.bind_params(node, ctx, src);
         self.walk_children(node, ctx, src);
         ctx.scopes.pop();
     }
@@ -810,12 +871,21 @@ impl GoExtractor {
                                     }
                                 }
                             }
+                            let field_ty = go_simple_type_name(fd.child_by_field_name("type"), src);
+                            let fline = fd.start_position().row as u32 + 1;
                             for fname in field_names {
                                 ctx.facts.push(SemanticFact::Field {
                                     owner: name.clone(),
-                                    name: fname,
+                                    name: fname.clone(),
                                     mutable: true,
                                 });
+                                self.bind_field_type(
+                                    ctx,
+                                    name.clone(),
+                                    fname,
+                                    field_ty.clone(),
+                                    fline,
+                                );
                             }
                         }
                     }
@@ -836,6 +906,121 @@ impl GoExtractor {
                             target: name.clone(), expr: String::new() });
                     }
                 }
+            }
+        }
+    }
+
+    /// Struct-scoped field type from the declared (pointer-stripped) type.
+    // trace:v1 id=impl.scc.extract.go.field-type work=WORK-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow satisfies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field implements=PLAN-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field-type-narrow
+    fn bind_field_type(
+        &self,
+        ctx: &mut Ctx,
+        owner: String,
+        field: String,
+        declared_ty: Option<String>,
+        line: u32,
+    ) {
+        if let Some(ty) = declared_ty {
+            ctx.push_type_bind_in(owner, field, ty, line);
+        }
+    }
+
+    /// `s.owned = &Invoice{}` — class-scoped field bind from a one-hop
+    /// assignment whose root is uniquely typed as the owner. A different
+    /// type than the struct declaration tombstones at resolve time.
+    // trace:v1 id=impl.scc.extract.go.field-assign work=WORK-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as satisfies=REQ-implement-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-recei implements=PLAN-phase-13-of-scc-x-ripwire-lessons-1-go-extract-time-receiver-field-as
+    fn record_field_assign(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let lefts = expr_nodes(node.child_by_field_name("left"));
+        let rights = expr_nodes(node.child_by_field_name("right"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, left) in lefts.iter().enumerate() {
+            let rhs = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx));
+            if let Some((root, field)) = one_hop_selector(*left, src) {
+                if let Some(owner) = ctx.unique_local_type(&root) {
+                    if let Some(ty) = rhs {
+                        ctx.push_type_bind_in(owner, field, ty, line);
+                    }
+                }
+            } else if left.kind() == "identifier" {
+                let name = clean(node_text(Some(*left), src));
+                if let Some(rhs) = rights.get(i).copied() {
+                    go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+                }
+                if let Some(ty) = rhs {
+                    ctx.push_type_bind(name, ty, line);
+                }
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `x := &Order{}` — caller-scoped local type bind (Ripwire Rule 2).
+    // trace:v1 id=impl.scc.extract.go.local-type work=WORK-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa satisfies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time implements=PLAN-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time-local-and-pa
+    fn record_short_var(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let lefts = expr_nodes(node.child_by_field_name("left"));
+        let rights = expr_nodes(node.child_by_field_name("right"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, left) in lefts.iter().enumerate() {
+            if left.kind() != "identifier" {
+                continue;
+            }
+            let name = clean(node_text(Some(*left), src));
+            if let Some(rhs) = rights.get(i).copied() {
+                go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+            }
+            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
+                ctx.push_type_bind(name, ty, line);
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// `var x *Order` / `var x = &Order{}` — declared type and RHS both bind.
+    // trace:exempt reason=internal-detail
+    fn record_var_spec(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let mut names: Vec<String> = Vec::new();
+        let mut nc = node.walk();
+        for n in node.children_by_field_name("name", &mut nc) {
+            let name = clean(node_text(Some(n), src));
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        let declared = go_simple_type_name(node.child_by_field_name("type"), src);
+        let rights = expr_nodes(node.child_by_field_name("value"));
+        let line = node.start_position().row as u32 + 1;
+        for (i, name) in names.into_iter().enumerate() {
+            if let Some(rhs) = rights.get(i).copied() {
+                go_record_fn_alias(ctx, name.clone(), rhs, src, line);
+            }
+            if let Some(ty) = declared.clone() {
+                ctx.push_type_bind(name.clone(), ty, line);
+            }
+            if let Some(ty) = rights.get(i).and_then(|n| go_rhs_type_name(*n, src, ctx)) {
+                ctx.push_type_bind(name, ty, line);
+            }
+        }
+        self.walk_children(node, ctx, src);
+    }
+
+    /// Typed parameters (`func handle(x *Order)`) bind in the current callable.
+    // trace:exempt reason=internal-detail
+    fn bind_params(&self, node: Node, ctx: &mut Ctx, src: &[u8]) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() != "parameter_declaration" {
+                continue;
+            }
+            let Some(ty) = go_simple_type_name(p.child_by_field_name("type"), src) else {
+                continue;
+            };
+            let line = p.start_position().row as u32 + 1;
+            let mut nc = p.walk();
+            for n in p.children_by_field_name("name", &mut nc) {
+                ctx.push_type_bind(clean(node_text(Some(n), src)), ty.clone(), line);
             }
         }
     }
@@ -978,19 +1163,23 @@ impl GoExtractor {
                 };
                 let (conditional, control_block, inside_loop) = call_cfg(node);
                 self.record_cli_surface(node, &callee, ctx, src);
-                ctx.calls.push(Call {
-                    caller,
-                    callee,
-                    line: node.start_position().row as u32 + 1,
-                    known_receiver,
-                    conditional,
-                    lexical_order,
-                    control_block: control_block.map(str::to_string),
-                    inside_loop,
-                    inside_try: false,
-                    awaited: call_is_awaited(node),
-                    returns_value: call_returns_value(node),
-                });
+                ctx.calls.push(
+                    Call {
+                        caller,
+                        callee,
+                        line: node.start_position().row as u32 + 1,
+                        known_receiver,
+                        conditional,
+                        lexical_order,
+                        control_block: control_block.map(str::to_string),
+                        inside_loop,
+                        inside_try: false,
+                        awaited: call_is_awaited(node),
+                        returns_value: call_returns_value(node),
+                        ..Default::default()
+                    }
+                    .finish(),
+                );
                 self.record_store_ref(node, &fn_node, &root, ctx, src);
                 self.record_framework_facts(node, ctx, src);
             }
@@ -2046,12 +2235,198 @@ fn method_has_own_type_param(method: Node, ty: &str, src: &[u8]) -> bool {
     false
 }
 
+// trace:exempt reason=internal-detail
 fn receiver_type(receiver: Option<Node>, src: &[u8]) -> Option<String> {
+    go_simple_type_name(
+        receiver.and_then(|plist| {
+            let mut cursor = plist.walk();
+            let pd = plist.named_children(&mut cursor).next()?;
+            pd.child_by_field_name("type")
+        }),
+        src,
+    )
+}
+
+// trace:exempt reason=internal-detail
+fn receiver_name_and_type(receiver: Option<Node>, src: &[u8]) -> Option<(String, String)> {
     let plist = receiver?;
     let mut cursor = plist.walk();
     let pd = plist.named_children(&mut cursor).next()?;
-    let t = pd.child_by_field_name("type")?;
-    let mut n = t;
+    let name = clean(node_text(pd.child_by_field_name("name"), src));
+    let ty = go_simple_type_name(pd.child_by_field_name("type"), src)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some((name, ty))
+    }
+}
+
+// trace:exempt reason=internal-detail
+fn go_is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            s,
+            "bool"
+                | "byte"
+                | "complex64"
+                | "complex128"
+                | "error"
+                | "float32"
+                | "float64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "rune"
+                | "string"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+                | "any"
+                | "comparable"
+                | "true"
+                | "false"
+                | "nil"
+        )
+}
+
+/// `left`/`right` of an assignment is an `expression_list` or a single expr.
+// trace:exempt reason=internal-detail
+fn expr_nodes(node: Option<Node>) -> Vec<Node> {
+    let Some(n) = node else {
+        return Vec::new();
+    };
+    if n.kind() == "expression_list" {
+        let mut c = n.walk();
+        n.named_children(&mut c).collect()
+    } else {
+        vec![n]
+    }
+}
+
+/// One-hop `root.field` selector; longer chains and non-identifiers are skipped.
+// trace:exempt reason=internal-detail
+fn one_hop_selector(node: Node, src: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "selector_expression" {
+        return None;
+    }
+    let field = clean(node_text(node.child_by_field_name("field"), src));
+    let op = node.child_by_field_name("operand")?;
+    if op.kind() != "identifier" {
+        return None;
+    }
+    let root = clean(node_text(Some(op), src));
+    if root.is_empty() || field.is_empty() {
+        None
+    } else {
+        Some((root, field))
+    }
+}
+
+/// `f := helper` / `f := func() {}` — function-alias fuel for bare `f()`.
+// trace:v1 id=impl.scc.extract.go.fn-alias work=WORK-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi satisfies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct implements=PLAN-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-function-alias-bi
+fn go_record_fn_alias(ctx: &mut Ctx, name: String, rhs: Node, src: &[u8], line: u32) {
+    let typed = go_rhs_type_name(rhs, src, ctx).is_some();
+    let scope = ctx.caller().unwrap_or_default();
+    crate::model::record_fn_rhs(
+        &mut ctx.fn_binds,
+        scope,
+        name,
+        go_fn_rhs(rhs, src),
+        typed,
+        line,
+    );
+}
+
+// trace:exempt reason=internal-detail
+fn go_fn_rhs(mut n: Node, src: &[u8]) -> FnRhs {
+    loop {
+        match n.kind() {
+            "parenthesized_expression" => {
+                let Some(inner) = n.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                n = inner;
+            }
+            "unary_expression" => {
+                let op = clean(node_text(n.child(0), src));
+                if op != "&" {
+                    return FnRhs::Other;
+                }
+                let Some(inner) = n.named_child(0) else {
+                    return FnRhs::Other;
+                };
+                n = inner;
+            }
+            _ => break,
+        }
+    }
+    match n.kind() {
+        "identifier" => {
+            let name = clean(node_text(Some(n), src));
+            if name.is_empty() {
+                FnRhs::Other
+            } else {
+                FnRhs::Ident(name)
+            }
+        }
+        "func_literal" => FnRhs::Lambda,
+        _ => FnRhs::Other,
+    }
+}
+
+/// Type name from `&T{}` / `T{}` / `new(T)` / assertion / conversion / typed ident.
+// trace:exempt reason=internal-detail
+fn go_rhs_type_name(mut n: Node, src: &[u8], ctx: &Ctx) -> Option<String> {
+    while matches!(n.kind(), "unary_expression" | "parenthesized_expression") {
+        n = n.named_child(0)?;
+    }
+    match n.kind() {
+        "composite_literal" => go_simple_type_name(n.child_by_field_name("type"), src),
+        "identifier" => ctx.unique_local_type(&clean(node_text(Some(n), src))),
+        "type_assertion_expression" | "type_conversion_expression" => go_cast_type_name(n, src),
+        "call_expression" => {
+            let fn_n = n.child_by_field_name("function")?;
+            let name = clean(node_text(Some(fn_n), src));
+            if name == "new" {
+                let args = n.child_by_field_name("arguments")?;
+                return go_simple_type_name(args.named_child(0), src);
+            }
+            if fn_n.kind() == "identifier" && ctx.has_type(&name) {
+                return go_is_simple_ident(&name).then_some(name);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `v.(*Order)` / `Order(v)` — simple types only. Generic conversions are
+/// skipped because tree-sitter-go also parses `fs[i](3)` that way.
+// trace:v1 id=impl.scc.extract.go.type-assert work=WORK-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi satisfies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti implements=PLAN-phase-16-of-scc-x-ripwire-lessons-extract-time-type-assertion-conversi
+fn go_cast_type_name(n: Node, src: &[u8]) -> Option<String> {
+    let ty = n.child_by_field_name("type")?;
+    if ty.kind() == "generic_type" {
+        return None;
+    }
+    go_simple_type_name(Some(ty), src)
+}
+
+/// Pointer-stripped simple type name. Slices, maps, and channels stay unbound.
+// trace:exempt reason=internal-detail
+fn go_simple_type_name(node: Option<Node>, src: &[u8]) -> Option<String> {
+    let mut n = node?;
     loop {
         match n.kind() {
             "pointer_type" | "parenthesized_type" => {
@@ -2066,15 +2441,17 @@ fn receiver_type(receiver: Option<Node>, src: &[u8]) -> Option<String> {
                 };
                 n = name;
             }
+            "slice_type" | "array_type" | "map_type" | "channel_type" | "function_type"
+            | "interface_type" => return None,
             _ => break,
         }
     }
     let text = clean(node_text(Some(n), src));
-    let text = text.split('[').next().unwrap_or("").trim().to_string();
-    if text.is_empty() {
-        None
+    let text = text.split('[').next().unwrap_or("").trim();
+    if go_is_simple_ident(text) {
+        Some(text.to_string())
     } else {
-        Some(text)
+        None
     }
 }
 
@@ -2781,6 +3158,276 @@ mod tests {
         assert_eq!(
             v.decl_header.as_deref(),
             Some("func (r *Reporter) Merge(values ...string) string")
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.field-type verifies=REQ-implement-phase-10-of-scc-x-ripwire-lessons-go-one-hop-receiver-field exercises=impl.scc.extract.go.field-type
+    fn field_type_binds_from_struct_and_receiver() {
+        let ef = extract(
+            r#"
+package app
+
+type Order struct{}
+
+func (o *Order) Process() {}
+
+type Invoice struct{}
+
+func (i *Invoice) Process() {}
+
+type Svc struct {
+	repo  *Order
+	owned *Order
+}
+
+func (s *Svc) Run() {
+	s.owned.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "repo" && b.type_name == "Order"),
+            "struct field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc" && b.name == "owned" && b.type_name == "Order"),
+            "owned field bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "Svc.Run" && b.name == "s" && b.type_name == "Svc"),
+            "receiver bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.type_name == "Process" || b.name == "s" && b.scope == "Svc"),
+            "must not bind methods as fields: {:?}",
+            ef.type_binds
+        );
+        let mixed = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Invoice{}
+	s.owned.Process()
+}
+"#,
+        );
+        let types: Vec<_> = mixed
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            types.contains(&"Order") && types.contains(&"Invoice"),
+            "assignment tombstone fuel missing: {types:?}"
+        );
+        let same = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Svc struct { owned *Order }
+func (s *Svc) Run() {
+	s.owned = &Order{}
+	s.owned.Process()
+}
+"#,
+        );
+        let same_types: Vec<_> = same
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "Svc" && b.name == "owned")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            same_types.iter().all(|t| *t == "Order") && !same_types.is_empty(),
+            "same-type assignment must stay unique Order: {same_types:?}"
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.local-type verifies=REQ-implement-phase-15-of-scc-x-ripwire-lessons-go-and-rust-extract-time exercises=impl.scc.extract.go.local-type
+    fn local_type_binds_from_short_var_and_params() {
+        let ef = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(x *Order) {
+	y := &Order{}
+	y.Process()
+	x.Process()
+	y.inner.Process()
+}
+func mixed() {
+	z := &Order{}
+	z = &Invoice{}
+	z.Process()
+}
+func factory() {
+	x := MakeOrder()
+	x.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "param bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "short-var bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting local assignment must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "factory" && b.name == "x"),
+            "opaque factory call must not mint a type bind: {:?}",
+            ef.type_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.fn-alias verifies=REQ-implement-phase-25-of-scc-x-ripwire-lessons-absorb-extract-time-funct exercises=impl.scc.extract.go.fn-alias
+    fn function_alias_binds_from_ident_literal_and_clobber() {
+        let ef = extract(
+            r#"
+package app
+func helper() {}
+func other() {}
+func run() {
+	f := helper
+	f()
+}
+func mixed() {
+	g := helper
+	g = other
+	g()
+}
+func lam() {
+	h := func() {}
+	h()
+}
+"#,
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "run" && b.name == "f" && b.target == "helper"),
+            "ident alias missing: {:?}",
+            ef.fn_binds
+        );
+        let g: Vec<_> = ef
+            .fn_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "g")
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(
+            g.contains(&"helper") && g.contains(&"other"),
+            "two function idents must tombstone fuel: {g:?}"
+        );
+        assert!(
+            ef.fn_binds
+                .iter()
+                .any(|b| b.scope == "lam" && b.name == "h" && b.target.is_empty()),
+            "func literal must tombstone: {:?}",
+            ef.fn_binds
+        );
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.extract.go.type-assert verifies=REQ-implement-phase-16-of-scc-x-ripwire-lessons-extract-time-type-asserti exercises=impl.scc.extract.go.type-assert
+    fn type_assert_and_conversion_binds() {
+        let ef = extract(
+            r#"
+package app
+type Order struct{}
+func (o *Order) Process() {}
+type Invoice struct{}
+func (i *Invoice) Process() {}
+func handle(v any) {
+	x := v.(*Order)
+	x.Process()
+	y := Order(v)
+	y.Process()
+}
+func mixed(v any) {
+	z := v.(*Order)
+	z = v.(*Invoice)
+	z.Process()
+}
+func indexed(fs []func(int), i int) {
+	w := fs[i](3)
+	w.Process()
+}
+"#,
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "x" && b.type_name == "Order"),
+            "type assertion bind missing: {:?}",
+            ef.type_binds
+        );
+        assert!(
+            ef.type_binds
+                .iter()
+                .any(|b| b.scope == "handle" && b.name == "y" && b.type_name == "Order"),
+            "type conversion bind missing: {:?}",
+            ef.type_binds
+        );
+        let z: Vec<_> = ef
+            .type_binds
+            .iter()
+            .filter(|b| b.scope == "mixed" && b.name == "z")
+            .map(|b| b.type_name.as_str())
+            .collect();
+        assert!(
+            z.contains(&"Order") && z.contains(&"Invoice"),
+            "conflicting assertion must tombstone fuel: {z:?}"
+        );
+        assert!(
+            !ef.type_binds
+                .iter()
+                .any(|b| b.scope == "indexed" && b.name == "w"),
+            "index-then-call must not mint a type bind: {:?}",
+            ef.type_binds
         );
     }
 }

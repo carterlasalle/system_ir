@@ -6,9 +6,9 @@
 //! and symbol→state authority (module-level globals + class statics as
 //! mutable FIELD entities owned by their module/class symbol).
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 // trace:v1 id=test.scc.fact-generalize verifies=REQ-SCC-IR exercises=impl.scc.facts,impl.scc.extract.python
 
 fn builder_factory_service() -> tempfile::TempDir {

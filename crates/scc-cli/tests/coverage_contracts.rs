@@ -4,9 +4,9 @@
 //! public_api + framework_callback entrypoints, and a MODEL COVERAGE
 //! section that states what the model knows AND what it does not.
 
-mod golden;
+mod common;
 
-use golden::{copy_fixture, run_ok, workdir};
+use common::{copy_fixture, run_ok, workdir};
 // trace:v1 id=test.scc.coverage verifies=REQ-SCC-CTX exercises=impl.scc.atlas
 
 #[test]

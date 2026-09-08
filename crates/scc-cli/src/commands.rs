@@ -42,6 +42,7 @@ pub fn cmd_index(root: &Path, quiet: bool) -> crate::Result<()> {
             report.failed,
             report.duration_ms as f64 / 1000.0
         );
+        println!("analysis_quality: {}", report.analysis_quality.compact_line());
     }
     Ok(())
 }
@@ -87,13 +88,27 @@ pub fn cmd_status(root: &Path) -> crate::Result<()> {
                     "freshness: STALE — {} file(s) changed since index (run `scc index`)",
                     stale.len()
                 );
-                for p in stale.iter().take(10) {
-                    println!("  {p}");
+            for p in stale.iter().take(10) {
+                println!("  {p}");
+            }
+            }
+            if let Some(raw) = store.meta_get("analysis_quality")? {
+                match serde_json::from_str::<scc_core::AnalysisQuality>(&raw) {
+                    Ok(q) => println!("analysis_quality: {}", q.compact_line()),
+                    Err(_) => println!("analysis_quality: {raw}"),
                 }
             }
         }
         None => println!("not indexed yet — run `scc index`"),
     }
+    Ok(())
+}
+
+/// `scc languages` — generated support matrix. Never hand-maintain a
+/// second list in CLI copy.
+// trace:v1 id=impl.scc.cli.languages work=WORK-ripwire-lessons-phase1 satisfies=REQ-language-support-matrix
+pub fn cmd_languages() -> crate::Result<()> {
+    print!("{}", scc_core::support_matrix_markdown());
     Ok(())
 }
 
@@ -295,6 +310,9 @@ pub(crate) fn truncate_to(content: &str, cap: usize) -> String {
     }
     const FOOTER: &str = "\n\n… [task hard cap: content truncated to fit budget]\n";
     let footer_tokens = scc_core::estimate_tokens(FOOTER);
+    if footer_tokens > cap {
+        return String::new();
+    }
     let target = cap.saturating_sub(footer_tokens);
     let mut lo = 0usize;
     let mut hi = content.len();
@@ -401,7 +419,16 @@ pub fn cmd_context_structural(
     let max_units = (tokens / 1000).clamp(1, 64);
 
     let paths: Vec<String> = if !files.is_empty() {
-        files.to_vec()
+        let mut resolved = Vec::new();
+        for f in files {
+            match scc_context::structural_source::resolve_handle_to_path(&store.root, f) {
+                Ok(p) => resolved.push(p),
+                Err(e) => {
+                    return Ok(format!("# HANDLE REFUSED\n{e}\n"));
+                }
+            }
+        }
+        resolved
     } else if let Some(goal) = task {
         let goal = goal.trim();
         if goal.is_empty() {
@@ -1484,6 +1511,18 @@ mod tests {
     fn truncate_to_returns_original_when_under_cap() {
         let content = "short\n";
         assert_eq!(truncate_to(content, 1000), content);
+    }
+
+    #[test]
+    // trace:v1 id=test.scc-cli-commands.truncate-to-footer-exceeds-cap work=WORK-task-context-transport-parity verifies=REQ-complete-task-context-identical-across-transports,REQ-implement-p0-omp-integration-correctness-and-writable-benchmark-scient exercises=impl.crates-scc-cli-src-commands.truncate-to
+    fn truncate_to_returns_empty_when_footer_exceeds_cap() {
+        let content = "HEADER\nbody that does not fit\n";
+        let out = truncate_to(content, 1);
+        assert!(
+            out.is_empty(),
+            "footer larger than the cap must not be returned: {out:?} tokens={}",
+            scc_core::estimate_tokens(&out)
+        );
     }
 
     #[test]

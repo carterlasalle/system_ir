@@ -2,8 +2,8 @@
 //! reproduce exact OBSERVED aggregates (counts, latency, errors) and feed
 //! reconciliation.
 
-mod golden;
-use golden::*;
+mod common;
+use common::*;
 
 const OTLP_TRACE: &str = r#"{
   "resourceSpans": [
