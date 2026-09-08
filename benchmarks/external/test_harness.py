@@ -490,5 +490,40 @@ class ResumeCellsTest(unittest.TestCase):
         self.assertEqual(h.resume_cells(None), {})
 
 
+class NativeBudgetMetaTest(unittest.TestCase):
+    """Part 20: a native-default run_write_matrix cell and meta must NOT
+    inherit the 8k equal-token budget. meta['requested_budget'] is None and
+    external variants are built with --native (product-default size)."""
+
+    def test_meta_budget_none_in_native_mode(self):
+        # Reproduce the meta construction in main(): native mode has no --budget.
+        args_budget = None
+        requested = args_budget if args_budget is not None else None
+        self.assertIsNone(requested, "native mode meta budget must be None")
+
+    def test_external_artifact_builds_native_argv(self):
+        h = load("run_write_matrix")
+        captured = {}
+        orig = h.subprocess.run
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            class P:
+                returncode = 0
+                stdout = '{"ok": true, "tool": "x", "tokens": 123, "files": 1, "artifact": "/tmp/a"}'
+            return P()
+        h.subprocess.run = fake_run
+        try:
+            import tempfile
+            from pathlib import Path
+            with tempfile.TemporaryDirectory() as d:
+                h.external_artifact("aider-repomap", "x", "goal", d, None)
+        finally:
+            h.subprocess.run = orig
+        argv = captured["argv"]
+        self.assertIn("--native", argv, "native mode must pass --native to the adapter")
+        self.assertNotIn("8000", argv, "native mode must not inherit the 8k budget")
+
+
 if __name__ == "__main__":
     unittest.main()

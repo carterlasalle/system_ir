@@ -180,7 +180,11 @@ def external_artifact(variant, repo, goal, workdir, budget):
     shared adapters, returning (artifact_path, tokens, error). A missing
     or unpinned tool yields error (SKIPPED-UNINSTALLED / PIN-MISMATCH /
     PIN-UNVERIFIED) and a None artifact — the cell is reported, never
-    silently treated as a pass."""
+    silently treated as a pass.
+
+    §20: when `budget` is None (native-default), pass `--native` so each
+    competitor runs at its OWN product-default size — the shared 8k budget
+    is NEVER inherited for a native run."""
     adapter = h.BENCHMARKS / "external" / (
         "aider_adapter.py" if variant == "aider-repomap" else "repomix_adapter.py")
     # Aider personalizes per goal (immutable per-task dir); repomix is
@@ -188,11 +192,17 @@ def external_artifact(variant, repo, goal, workdir, budget):
     # cell self-contained.
     art_dir = Path(workdir) / "artifacts" / variant / task_slug(goal)
     art_dir.mkdir(parents=True, exist_ok=True)
-    argv = [h.bench_python(), str(adapter), str(h.FIXTURES / repo), str(budget), str(art_dir)]
+    native = budget is None
+    if native:
+        argv = [h.bench_python(), str(adapter), str(h.FIXTURES / repo), "0", str(art_dir)]
+    else:
+        argv = [h.bench_python(), str(adapter), str(h.FIXTURES / repo), str(budget), str(art_dir)]
     if variant == "aider-repomap":
         argv += ["--goal", goal]
     else:
         argv.append("--compress")
+    if native:
+        argv.append("--native")
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
     try:
         payload = json.loads(proc.stdout or "{}")
@@ -242,8 +252,7 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
     elif variant in EXTERNAL_VARIANTS:
         try:
             artifact, ctx_tokens, err = external_artifact(
-                variant, task["repo"], task["goal"], cell_dir,
-                budget if budget is not None else BUDGET)
+                variant, task["repo"], task["goal"], cell_dir, budget)
         except (subprocess.TimeoutExpired, OSError) as exc:
             return _infra_cell(f"{type(exc).__name__}: {str(exc)[:200]}")
         if artifact is None:
@@ -352,7 +361,10 @@ def main(argv):
         "tasks_corpus_hash": tasks_hash,
         "evaluators_hash": evaluators_hash,
         "mode": "writable-equal-token" if args.budget is not None else "writable-native-default",
-        "requested_budget": args.budget if args.budget is not None else BUDGET,
+        # §20: native-default must NOT inherit an equal-token budget. The
+        # cells already record None; the meta must agree so a reader does
+        # not mistake native-default for an 8k equal-token run.
+        "requested_budget": args.budget if args.budget is not None else None,
     }
 
     workdir = Path(tempfile.mkdtemp(prefix="scc-write-matrix-"))
