@@ -122,6 +122,18 @@ def outcome_defined(cell):
     return not is_infra_cell(cell) and cell.get("task_success") is not None
 
 
+def resume_cells(prev_cells):
+    """Cells from a prior partial run that are safe to reuse: completed AND
+    not an infrastructure/skipped outcome. A quota-interrupted refill should
+    only re-run genuinely missing or failed cells (§42/§43)."""
+    if not prev_cells:
+        return {}
+    return {
+        k: v for k, v in prev_cells.items()
+        if v.get("run_completion") and not is_infra_cell(v)
+    }
+
+
 def scc_artifact(repo, goal, workdir, scc_bin, budget=None, variant="scc-full"):
     """Build an SCC artifact through the AUTHORITATIVE CLI builder
     (`scc bench external --artifact-only`, mission §18/§40). `scc-full` is
@@ -350,11 +362,27 @@ def main(argv):
     # removed when the run finishes writing — including on failure, after
     # the partial results are persisted.
     results = {"meta": meta, "cells": {}}
+    # Resume (§42/§43): if the output file already exists, reuse completed
+    # cells and only re-run missing/incomplete/infra cells. This makes a
+    # quota-interrupted refill cheap instead of re-burning the whole matrix.
+    prev_path = Path(args.out)
+    if prev_path.exists():
+        try:
+            prev = json.loads(prev_path.read_text())
+            prev_cells = prev.get("cells", {})
+            reuse = resume_cells(prev_cells)
+            if reuse:
+                print(f"[resume] reusing {len(reuse)} already-complete cells", flush=True)
+                results["cells"].update(reuse)
+        except Exception as exc:
+            print(f"[resume] could not read existing results ({exc}); starting fresh", flush=True)
     complete = False
     try:
         for variant in variants:
             for task in tasks:
                 key = f"{variant}/{task['id']}"
+                if key in results["cells"]:
+                    continue
                 print(f"[matrix] {key} ...", flush=True)
                 cell = run_variant(variant, task, workdir, args.scc_bin,
                                    agent_cmd=agent_cmd,

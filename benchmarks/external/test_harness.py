@@ -467,5 +467,28 @@ class AggregateShapeTest(unittest.TestCase):
         self.assertIn("aider", buf.getvalue())
 
 
+class ResumeCellsTest(unittest.TestCase):
+    """Part 42/43: resume_cells reuses only completed, non-infra cells so a
+    quota-interrupted refill re-runs just the missing/failed cells."""
+
+    def test_reuse_only_complete_non_infra(self):
+        h = load("run_write_matrix")
+        cells = {
+            "raw/t1": {"run_completion": True, "task_success": True},
+            "scc-full/t2": {"run_completion": True, "task_success": False},
+            "aider-repomap/t3": {"run_completion": True, "task_success": None,
+                                 "error": "agent crashed"},  # infra -> not reused
+            "repomix-compress/t4": {"run_completion": False, "task_success": True},  # incomplete
+            "raw/t5": {"run_completion": True, "task_success": None, "status": "skipped"},
+        }
+        reuse = h.resume_cells(cells)
+        self.assertEqual(sorted(reuse), ["raw/t1", "scc-full/t2"])
+
+    def test_empty_and_none_cells(self):
+        h = load("run_write_matrix")
+        self.assertEqual(h.resume_cells({}), {})
+        self.assertEqual(h.resume_cells(None), {})
+
+
 if __name__ == "__main__":
     unittest.main()

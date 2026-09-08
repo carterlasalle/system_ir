@@ -12,7 +12,7 @@ MODEL="gpt-5.2-codex"
 
 run_one () {
   local budget="$1"; local out="$2"; shift 2
-  if [ -f "$out" ] && python3 -c "import json,sys; sys.exit(0 if 'summary' in json.load(open('$out')) else 1)" 2>/dev/null; then
+  if [ -f "$out" ] && python3 -c "import json,sys; d=json.load(open('$out')); sys.exit(0 if ('summary' in d and sum(1 for c in d.get('cells',{}).values() if not c.get('run_completion'))==0) else 1)" 2>/dev/null; then
     echo "[driver] $out already complete — skipping"
     return 0
   fi
@@ -26,7 +26,7 @@ run_one 8000 "$OUT/write-matrix-8k.json"
 run_one 16000 "$OUT/write-matrix-16k.json"
 run_one 24000 "$OUT/write-matrix-24k.json"
 # Native-default (§20): no budget — each system at its product-native size.
-if [ -f "$OUT/write-matrix-native-default.json" ] && python3 -c "import json,sys; sys.exit(0 if 'summary' in json.load(open('$OUT/write-matrix-native-default.json')) else 1)" 2>/dev/null; then
+if [ -f "$OUT/write-matrix-native-default.json" ] && python3 -c "import json,sys; d=json.load(open('$OUT/write-matrix-native-default.json')); sys.exit(0 if ('summary' in d and sum(1 for c in d.get('cells',{}).values() if not c.get('run_completion'))==0) else 1)" 2>/dev/null; then
   echo "[driver] native-default already complete — skipping"
 else
   echo "[driver] running native-default"
