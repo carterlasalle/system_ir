@@ -490,5 +490,10 @@
       "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
     "n_tasks": 9
+  },
+  "validity": {
+    "valid": false,
+    "validity": "PROVISIONAL",
+    "invalid_reason": "quota-interrupted at start (0/36 cells); the claude watchdog refills on quota recovery"
   }
 }

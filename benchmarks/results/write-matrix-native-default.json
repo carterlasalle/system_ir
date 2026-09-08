@@ -555,5 +555,10 @@
     },
     "micro_task_success": 0.1388888888888889,
     "n_tasks": 9
+  },
+  "validity": {
+    "valid": false,
+    "validity": "PROVISIONAL",
+    "invalid_reason": "partial run (16/36 cells complete); the codex watchdog refills the remaining 20 cells on quota recovery"
   }
 }
