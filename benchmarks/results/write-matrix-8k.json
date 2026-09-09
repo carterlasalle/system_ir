@@ -1,14 +1,15 @@
 {
   "meta": {
     "schema": 2,
-    "timestamp": "2026-09-01T14:04:13Z",
+    "timestamp": "2026-09-09T02:06:17Z",
     "agent_label": "codex",
     "agent_cmd": "codex exec --json --sandbox workspace-write --skip-git-repo-check --ephemeral --color never -C . -",
     "model_label": "gpt-5.2-codex",
-    "scc_commit": "713c766340293833ed3f6ae3279198f3636ea459",
+    "scc_commit": "6f8918c78871ae7a2998350a8536dcbe087ad03e",
     "scc_dirty": true,
-    "benchmark_harness_commit": "713c766340293833ed3f6ae3279198f3636ea459",
-    "tasks_corpus_hash": "741107fb533987ad",
+    "harness_revision": "6f8918c78871ae7a2998350a8536dcbe087ad03e",
+    "benchmark_harness_commit": "6f8918c78871ae7a2998350a8536dcbe087ad03e",
+    "tasks_corpus_hash": "29eaac2e6747a53d",
     "evaluators_hash": "96729e9e61f267e4",
     "mode": "writable-equal-token",
     "requested_budget": 8000
@@ -436,19 +437,19 @@
     },
     "repomix-compress/ts-api-web.pagination": {
       "task_success": true,
-      "run_completion": false,
+      "task_success_defined": true,
+      "run_completion": true,
       "context_tokens": 339,
       "patch_produced": true,
-      "modified_files": 4,
-      "wall_sec": 158.0,
+      "modified_files": 3,
+      "wall_sec": 88.8,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": true,
       "requested_budget": 8000
     }
   },
   "summary": {
-    "n_tasks": 9,
     "raw_task_success": 0.4444444444444444,
     "raw_n": 9,
     "scc-full_task_success": 0.3333333333333333,
@@ -489,6 +490,39 @@
         0.3333333333333333
       ],
       "ci_note": "CI crosses zero \u2014 no superiority claim"
-    }
+    },
+    "paired_ci_scc_minus_raw": {
+      "n_paired": 9,
+      "mean_diff": -0.1111111111111111,
+      "ci95": [
+        -0.4444444444444444,
+        0.2222222222222222
+      ],
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
+    },
+    "paired_ci_scc_minus_aider": {
+      "n_paired": 9,
+      "mean_diff": -0.1111111111111111,
+      "ci95": [
+        -0.4444444444444444,
+        0.2222222222222222
+      ],
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
+    },
+    "paired_ci_scc_minus_repomix": {
+      "n_paired": 9,
+      "mean_diff": -0.1111111111111111,
+      "ci95": [
+        -0.3333333333333333,
+        0.0
+      ],
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
+    },
+    "micro_task_success": 0.4166666666666667,
+    "n_tasks": 9
+  },
+  "validity": {
+    "valid": true,
+    "note": "COMPLETE 36/36; 2026-09-08 codex gpt-5.2-codex, budget 8000 (refilled repomix 1 cell)"
   }
 }
