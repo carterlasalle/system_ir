@@ -383,7 +383,7 @@ def run_repomix(argv):
             "actual_shared_tokens": total,
             "native_tool_budget_parameter": None,
         }))
-        return None
+        return None, 0
     packed = "\n\n".join(f"## File: {path}\n{content}" for path, content in kept)
     artifact = os.path.join(out_dir, "repomix.txt")
     with open(artifact, "w") as fh:
@@ -405,25 +405,30 @@ def run_repomix(argv):
 
 
 def main(argv):
-    if len(argv) not in (4, 5):
+    # `--native` (Part I) appends one flag, so argv may be 4, 5, or 6 long.
+    # The native path runs the FULL pack at product-default size; it needs
+    # no positive budget. Rejecting it here was a latent bug that blocked
+    # every native-default repomix cell with a usage error.
+    if len(argv) not in (4, 5, 6):
         print(
             json.dumps(
                 {
                     "ok": False,
                     "error": (
-                        f"usage: {argv[0]} <repo> <token_budget> <out_dir> [--compress] "
+                        f"usage: {argv[0]} <repo> <token_budget> <out_dir> [--compress] [--native] "
                         f"(pinned repomix commit {LOCKED_REPOMIX_COMMIT})"
                     ),
                 }
             )
         )
         return 1
-    try:
-        int(argv[2])
-    except ValueError:
-        print(json.dumps({"ok": False, "error": f"invalid token budget: {argv[2]}"}))
-        return 1
-
+    native = "--native" in argv[4:]
+    if not native:
+        try:
+            int(argv[2])
+        except ValueError:
+            print(json.dumps({"ok": False, "error": f"invalid token budget: {argv[2]}"}))
+            return 1
     payload, code = run_repomix(argv)
     if payload is not None:  # native mode already printed its own payload
         print(json.dumps(payload))

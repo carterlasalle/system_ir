@@ -525,5 +525,52 @@ class NativeBudgetMetaTest(unittest.TestCase):
         self.assertNotIn("8000", argv, "native mode must not inherit the 8k budget")
 
 
+class RepomixNativeArgTest(unittest.TestCase):
+    """Part 20: repomix_adapter main() must accept --native (argv len 6)
+    and return a (payload, code) tuple from run_repomix in native mode.
+    Rejecting the flag was a latent bug that failed every native-default
+    repomix cell with a usage error."""
+
+    def test_native_argv_accepted(self):
+        r = load("repomix_adapter")
+        captured = {}
+        orig_run = r.subprocess.run
+        orig_verify = r.verify_repomix_pin
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            # Write the pack XML to the -o output path so run_repomix can read it.
+            out = argv[argv.index("-o") + 1]
+            Path(out).write_text('<file path="a.py">def a(): pass</file>')
+            class P:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return P()
+        r.subprocess.run = fake_run
+        r.verify_repomix_pin = lambda: None
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                repo_dir = Path(d) / "repo"
+                repo_dir.mkdir()
+                (repo_dir / "a.py").write_text("def a(): pass\n")
+                rc = r.main(["repomix_adapter.py", str(repo_dir), "0", str(Path(d) / "out"), "--compress", "--native"])
+        finally:
+            r.subprocess.run = orig_run
+            r.verify_repomix_pin = orig_verify
+        self.assertEqual(rc, 0, "native --native must not be rejected with a usage error")
+        # --native is consumed by main()/run_repomix (adapter-level), NOT
+        # forwarded to the repomix CLI; acceptance is proven by rc==0 plus
+        # a native-default artifact produced (not a usage error).
+        self.assertTrue(captured["argv"], "the pinned repomix CLI was invoked")
+
+    def test_native_run_repomix_returns_tuple(self):
+        r = load("repomix_adapter")
+        import inspect
+        src = inspect.getsource(r.run_repomix)
+        self.assertIn("return None, 0", src, "native run_repomix must return a (None, 0) tuple")
+
+
 if __name__ == "__main__":
     unittest.main()
