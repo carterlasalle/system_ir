@@ -1,14 +1,14 @@
 {
   "meta": {
     "schema": 2,
-    "timestamp": "2026-09-09T07:20:06Z",
+    "timestamp": "2026-09-09T12:33:05Z",
     "agent_label": "codex",
     "agent_cmd": "codex exec --json --sandbox workspace-write --skip-git-repo-check --ephemeral --color never -C . -",
     "model_label": "gpt-5.2-codex",
-    "scc_commit": "a6dd0163176c98270a4c33952245f5e269dad34c",
+    "scc_commit": "baf7ca48821db95c7a80416206a3c7fbe433f7e5",
     "scc_dirty": true,
-    "harness_revision": "a6dd0163176c98270a4c33952245f5e269dad34c",
-    "benchmark_harness_commit": "a6dd0163176c98270a4c33952245f5e269dad34c",
+    "harness_revision": "baf7ca48821db95c7a80416206a3c7fbe433f7e5",
+    "benchmark_harness_commit": "baf7ca48821db95c7a80416206a3c7fbe433f7e5",
     "tasks_corpus_hash": "29eaac2e6747a53d",
     "evaluators_hash": "96729e9e61f267e4",
     "mode": "writable-native-default",
@@ -434,52 +434,52 @@
     "repomix-compress/py-queue.classification-fallback": {
       "task_success": false,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 411,
       "patch_produced": false,
-      "modified_files": 4,
-      "wall_sec": 65.3,
+      "modified_files": 1,
+      "wall_sec": 137.3,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": false,
       "requested_budget": null
     },
     "repomix-compress/py-queue.store-changes": {
       "task_success": false,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 411,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 7.4,
+      "wall_sec": 19.0,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": false,
       "requested_budget": null
     },
     "repomix-compress/py-queue.empty-messages": {
-      "task_success": false,
+      "task_success": true,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 411,
-      "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 7.1,
+      "patch_produced": true,
+      "modified_files": 2,
+      "wall_sec": 151.1,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": false,
       "requested_budget": null
     },
     "repomix-compress/ts-api-web.pagination": {
-      "task_success": false,
+      "task_success": true,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 346,
-      "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 8.2,
+      "patch_produced": true,
+      "modified_files": 4,
+      "wall_sec": 149.7,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": true,
       "requested_budget": null
     }
@@ -491,7 +491,7 @@
     "scc-full_n": 9,
     "aider-repomap_task_success": 0.4444444444444444,
     "aider-repomap_n": 9,
-    "repomix-compress_task_success": 0.3333333333333333,
+    "repomix-compress_task_success": 0.5555555555555556,
     "repomix-compress_n": 9,
     "skipped_cells": {
       "raw": {},
@@ -519,10 +519,10 @@
     },
     "paired_repomix-compress_minus_raw": {
       "n_paired": 9,
-      "mean_diff": -0.1111111111111111,
+      "mean_diff": 0.1111111111111111,
       "ci95": [
-        -0.4444444444444444,
-        0.2222222222222222
+        0.0,
+        0.3333333333333333
       ],
       "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
@@ -546,19 +546,18 @@
     },
     "paired_ci_scc_minus_repomix": {
       "n_paired": 9,
-      "mean_diff": 0.0,
+      "mean_diff": -0.2222222222222222,
       "ci95": [
-        -0.4444444444444444,
-        0.4444444444444444
+        -0.5555555555555556,
+        0.0
       ],
       "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
-    "micro_task_success": 0.3888888888888889,
+    "micro_task_success": 0.4444444444444444,
     "n_tasks": 9
   },
   "validity": {
-    "valid": false,
-    "validity": "PROVISIONAL",
-    "invalid_reason": "partial run (quota-interrupted); watchdog resumes remaining cells on next quota recovery"
+    "valid": true,
+    "note": "COMPLETE 36/36; 2026-09-09 codex gpt-5.2-codex native-default"
   }
 }
