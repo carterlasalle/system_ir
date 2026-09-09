@@ -1,14 +1,14 @@
 {
   "meta": {
     "schema": 2,
-    "timestamp": "2026-09-09T16:52:29Z",
+    "timestamp": "2026-09-09T21:52:25Z",
     "agent_label": "claude",
     "agent_cmd": "claude -p --model claude-sonnet-4-5 --dangerously-skip-permissions",
     "model_label": "claude-sonnet-4-5",
-    "scc_commit": "c56a8d9d48567fcba0fdedb9623872e406c71fe5",
+    "scc_commit": "779b4068293be153ce2500777938cc06e31e509f",
     "scc_dirty": true,
-    "harness_revision": "c56a8d9d48567fcba0fdedb9623872e406c71fe5",
-    "benchmark_harness_commit": "c56a8d9d48567fcba0fdedb9623872e406c71fe5",
+    "harness_revision": "779b4068293be153ce2500777938cc06e31e509f",
+    "benchmark_harness_commit": "779b4068293be153ce2500777938cc06e31e509f",
     "tasks_corpus_hash": "29eaac2e6747a53d",
     "evaluators_hash": "96729e9e61f267e4",
     "mode": "writable-native-default",
@@ -447,39 +447,39 @@
     "repomix-compress/py-queue.store-changes": {
       "task_success": false,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 411,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 24.8,
+      "wall_sec": 72.1,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": false,
       "requested_budget": null
     },
     "repomix-compress/py-queue.empty-messages": {
-      "task_success": false,
+      "task_success": true,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 411,
-      "patch_produced": false,
-      "modified_files": 1,
-      "wall_sec": 4.2,
+      "patch_produced": true,
+      "modified_files": 7,
+      "wall_sec": 225.3,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": false,
       "requested_budget": null
     },
     "repomix-compress/ts-api-web.pagination": {
       "task_success": false,
       "task_success_defined": true,
-      "run_completion": false,
+      "run_completion": true,
       "context_tokens": 346,
       "patch_produced": false,
       "modified_files": 1,
-      "wall_sec": 4.2,
+      "wall_sec": 48.1,
       "error": null,
-      "error_type": "agent-infrastructure",
+      "error_type": null,
       "evaluator_structural": true,
       "requested_budget": null
     }
@@ -491,7 +491,7 @@
     "scc-full_n": 9,
     "aider-repomap_task_success": 0.3333333333333333,
     "aider-repomap_n": 9,
-    "repomix-compress_task_success": 0.0,
+    "repomix-compress_task_success": 0.1111111111111111,
     "repomix-compress_n": 9,
     "skipped_cells": {
       "raw": {},
@@ -519,12 +519,12 @@
     },
     "paired_repomix-compress_minus_raw": {
       "n_paired": 9,
-      "mean_diff": -0.4444444444444444,
+      "mean_diff": -0.3333333333333333,
       "ci95": [
-        -0.7777777777777778,
-        -0.1111111111111111
+        -0.6666666666666666,
+        0.0
       ],
-      "ci_note": "CI excludes zero"
+      "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
     "paired_ci_scc_minus_raw": {
       "n_paired": 9,
@@ -546,19 +546,18 @@
     },
     "paired_ci_scc_minus_repomix": {
       "n_paired": 9,
-      "mean_diff": 0.3333333333333333,
+      "mean_diff": 0.2222222222222222,
       "ci95": [
         0.0,
-        0.6666666666666666
+        0.5555555555555556
       ],
       "ci_note": "CI crosses zero \u2014 no superiority claim"
     },
-    "micro_task_success": 0.2777777777777778,
+    "micro_task_success": 0.3055555555555556,
     "n_tasks": 9
   },
   "validity": {
-    "valid": false,
-    "validity": "PROVISIONAL",
-    "invalid_reason": "partial run (33/36; claude quota-interrupted; watchdog resumes 3 remaining cells on next recovery)"
+    "valid": true,
+    "note": "COMPLETE 36/36; 2026-09-09 claude claude-sonnet-4-5 native-default"
   }
 }
