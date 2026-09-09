@@ -145,12 +145,13 @@ Native-default is genuinely native after the fixes: `meta['requested_budget']`
 is `None`, and external variants build at product-default size (no inherited 8k
 cap).
 
-- **codex native-default**: 27/36 complete (raw 0.444, scc 0.333, aider 0.444);
-  repomix 9 cells remain. PROVISIONAL.
-- **claude native-default**: 11/36 complete; 25 cells remain. PROVISIONAL.
+- **codex native-default**: COMPLETE 36/36 (raw 0.444, scc 0.333, aider 0.444,
+  repomix 0.556, micro 0.444). valid=true.
+- **claude native-default**: COMPLETE 36/36 (raw 0.444, scc 0.333, aider 0.333,
+  repomix 0.111, micro 0.306). valid=true.
 
-Both are quota-gated; the watchdogs resume them on provider quota recovery
-(resume logic reuses completed cells).
+Both completed on provider quota recovery via the resume logic (completed cells
+reused, only missing cells re-run).
 
 ## 12. Codex Results
 
@@ -172,20 +173,18 @@ aider mean 0.222, repomix mean 0.250.
 - Paired bootstrap 95% CIs, deterministic seed.
 - One comparison excludes zero (claude 8k scc−raw). The rest cross zero and are
   reported as no-superiority.
-- Native-default matrices are not yet complete, so no native vs equal-token
-  comparison is asserted.
+- Native-default matrices are complete; they are reported separately from
+  equal-token (different context budgets), so no cross-mode comparison is
+  asserted.
 
 ## 15. Remaining Limitations
 
-- **Native-default matrices incomplete** (codex 9 repomix cells, claude 25
-  cells) — quota-gated, watchdogs armed and resuming on recovery.
-- The 9 codex native-default cells carry the pre-fix `usage:` error in the
-  result file; the repomix fix is committed, so the resume will regenerate them
-  correctly.
+- All equal-token and native-default matrices are complete and valid; the
+  remaining work was quota-gated and is now done.
 - OMP live interactive smoke test requires a human `omp` session; the harness
   is committed.
-- Cost/quota limits prevent a fully continuous run; results were staged across
-  multiple refill batches.
+- Cost/quota limits prevented a fully continuous run; results were staged across
+  multiple refill batches, but every matrix is now complete.
 
 ## 16. Definition-of-Done Checklist
 
@@ -199,7 +198,7 @@ aider mean 0.222, repomix mean 0.250.
 | Evaluator meta-contract | PASS |
 | TraceLayer verification | PASS |
 | Equal-token matrices 4k/8k/16k/24k | PASS (codex + claude, all valid) |
-| Native-default matrices | **BLOCKED** (quota) |
+| Native-default matrices | **PASS** (codex + claude, both 36/36 valid) |
 | Paired CIs / no unsupported superiority | PASS |
 | Historical result validity classified | PASS |
 | Blind remains aggregate-only | PASS |
