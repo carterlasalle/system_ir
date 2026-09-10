@@ -34,8 +34,20 @@ BOOT_ITERS = 10000
 VARIANTS = ("raw", "scc-full", "aider-repomap", "repomix-compress")
 
 
+def is_valid(d):
+    """The file's own validity model: filename twin OR validity.valid=false
+    both mean INVALID. Analysis sections must use valid_matrices(), never
+    load_matrices() directly."""
+    return d.get("validity", {}).get("valid", True) is not False
+
+
 def load_matrices():
-    """(name, payload) for every non-invalid matrix file, sorted."""
+    """(name, payload) for every parseable matrix file, sorted.
+
+    INVALID files (`.invalid.json` twins AND `validity.valid == false`)
+    are LOADED so the manifest records them, but every analysis section
+    (§2 cap utilization, §3 CIs, §4 floor/ceiling) consumes only
+    valid_matrices()."""
     out = []
     for p in sorted(RESULTS.glob("write-matrix-*.json")):
         if p.name.endswith(".invalid.json"):
@@ -48,6 +60,12 @@ def load_matrices():
             continue
         out.append((p.name, d))
     return out
+
+
+def valid_matrices(matrices):
+    """Subset of load_matrices() output the file's own validity model
+    accepts. Pooling anything else violates the manifest's verdicts."""
+    return [(n, d) for n, d in matrices if is_valid(d)]
 
 
 def valid_cells(d):
@@ -171,22 +189,27 @@ def verdict(lo, hi):
 
 
 def floor_ceiling(matrices):
-    """Per-task attempts/success pooled over valid matrices."""
-    agg: dict[str, dict] = {}
+    """Per-(task, corpus) attempts/success pooled over VALID matrices only.
+
+    Never pool across tasks_corpus_hash values: task definitions may have
+    changed between corpora, so each corpus gets its own rows. Callers must
+    pass valid_matrices()."""
+    agg: dict[tuple[str, str], dict] = {}
     for name, d in matrices:
         agent = d["meta"].get("agent_label", "?")
+        corpus = d["meta"].get("tasks_corpus_hash") or "unknown"
         for k, c in valid_cells(d).items():
             _, tid = k.split("/", 1)
-            e = agg.setdefault(tid, {"n": 0, "ok": 0, "agents": set(), "files": set()})
+            e = agg.setdefault((corpus, tid), {"n": 0, "ok": 0, "agents": set(), "files": set()})
             e["n"] += 1
             e["ok"] += int(bool(c["task_success"]))
             e["agents"].add(str(agent))
             e["files"].add(name)
     rows = []
-    for tid, e in sorted(agg.items()):
+    for (corpus, tid), e in sorted(agg.items()):
         rate = e["ok"] / e["n"]
         cls = "floor" if rate == 0.0 else ("ceiling" if rate == 1.0 else "informative")
-        rows.append((tid, e["n"], e["ok"], round(rate, 3), cls, len(e["agents"]), len(e["files"])))
+        rows.append((corpus, tid, e["n"], e["ok"], round(rate, 3), cls, len(e["agents"]), len(e["files"])))
     return rows
 
 
@@ -218,10 +241,20 @@ def main() -> int:
             f"{m['requested_budget']} | {m['valid_cells']} | {m['repos']} ({m['repo_list']}) | {m['verdict']} |"
         )
     L.append("")
-    L.append("Supersession: `.invalid.json` twins are excluded from every claim. Files whose")
-    L.append("validity note records a refill (e.g. repomix/aider cell refills) supersede the")
-    L.append("provisional partials they completed; the manifest lists each surviving file once.")
-    L.append("Native-default files (budget None) are not budget conditions at all.")
+    L.append("Supersession: `.invalid.json` twins AND files with `validity.valid == false`")
+    L.append("are listed here but excluded from every claim below (§2–§4 consume valid files")
+    L.append("only). Files whose validity note records a refill (e.g. repomix/aider cell refills)")
+    L.append("supersede the provisional partials they completed; the manifest lists each surviving")
+    L.append("file once. Native-default files (budget None) are not budget conditions at all.")
+    valid = valid_matrices(matrices)
+    L.append("")
+    L.append(f"Corpus lineage: {len(valid)}/{len(matrices)} files valid, grouped by tasks_corpus_hash")
+    L.append("(pooled claims never cross corpus boundaries):")
+    lineage: dict[str, list[str]] = {}
+    for name, d in valid:
+        lineage.setdefault(d["meta"].get("tasks_corpus_hash") or "unknown", []).append(name)
+    for corpus, names in sorted(lineage.items()):
+        L.append(f"- corpus {corpus}: {len(names)} files ({', '.join(names)})")
     L.append("")
 
     L.append("## 2. Cap utilization (binding iff max realized >= 95% of cap)")
@@ -230,7 +263,7 @@ def main() -> int:
     L.append("|---|---|---|---|---|---|---|")
     binding_files = 0
     total_budgeted = 0
-    for name, d in matrices:
+    for name, d in valid:
         for v, cap, mean, mx, util, binding in cap_table(name, d):
             if cap is not None:
                 total_budgeted += 1
@@ -247,7 +280,7 @@ def main() -> int:
     L.append("")
     L.append(f"Seed {BOOT_SEED}, {BOOT_ITERS} iterations, resampling unit = repository.")
     L.append("")
-    for name, d in matrices:
+    for name, d in valid:
         mean, lo, hi, n_tasks, n_repos, sizes = clustered_ci(d)
         L.append(
             f"- {name}: diff={mean:+.3f} CI95=[{lo:+.3f}, {hi:+.3f}] "
@@ -255,12 +288,12 @@ def main() -> int:
         )
     L.append("")
 
-    L.append("## 4. Task floor / ceiling (pooled over valid matrices)")
+    L.append("## 4. Task floor / ceiling (valid matrices only, per corpus)")
     L.append("")
-    L.append("| task | attempts | success | rate | class | agents | files |")
-    L.append("|---|---|---|---|---|---|---|")
-    for tid, n, ok, rate, cls, na, nf in floor_ceiling(matrices):
-        L.append(f"| {tid} | {n} | {ok} | {rate} | {cls} | {na} | {nf} |")
+    L.append("| corpus | task | attempts | success | rate | class | agents | files |")
+    L.append("|---|---|---|---|---|---|---|---|")
+    for corpus, tid, n, ok, rate, cls, na, nf in floor_ceiling(valid):
+        L.append(f"| {corpus} | {tid} | {n} | {ok} | {rate} | {cls} | {na} | {nf} |")
     L.append("")
     L.append("Floor tasks (0% everywhere) should not consume future paid quota unless")
     L.append("extreme difficulty is the explicit experimental question.")
@@ -295,7 +328,7 @@ def main() -> int:
     L.append("")
 
     OUT.write_text("\n".join(L))
-    print(f"wrote {OUT} ({len(matrices)} matrices)")
+    print(f"wrote {OUT} ({len(valid)}/{len(matrices)} valid matrices)")
     return 0
 
 

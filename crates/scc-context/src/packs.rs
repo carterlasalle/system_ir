@@ -36,9 +36,11 @@ impl Section {
 }
 
 /// What the renderer actually did to fit the budget — honest accounting
-/// (P0): the pack is never silently cut; if the minimum safe result still
-/// exceeds the budget, `exceeded_soft_budget` is set and the content stays
-/// complete.
+/// (P0): the pack is never silently cut. Dropped and line-truncated
+/// sections are recorded; the delivered text ALWAYS fits the budget
+/// (`estimated_tokens <= budget`, guaranteed by the hard phase below).
+/// `exceeded_soft_budget` survives only as a safety signal and is false
+/// on every successful render.
 #[derive(Debug, Clone, Default)]
 struct RenderOutcome {
     original_tokens: usize,
@@ -54,15 +56,40 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
         original_tokens: estimate_tokens(&assemble(&sections)),
         ..Default::default()
     };
-    // assemble; then drop lowest-priority sections while over budget.
+    // Warnings are reserved up front: sections fit whatever the warnings
+    // leave. A warnings block that alone exceeds the budget collapses to
+    // a one-line receipt (the count is never silent).
+    let mut warn_block = String::new();
+    for w in &warnings {
+        warn_block.push_str(&format!("\n⚠ WARNING: {w}\n"));
+    }
+    if estimate_tokens(&warn_block) > budget {
+        warn_block = format!(
+            "\n⚠ WARNINGS: {} warning(s) omitted over {}-token budget\n",
+            warnings.len(),
+            budget
+        );
+    }
+    let content_budget = budget.saturating_sub(estimate_tokens(&warn_block));
+    // Pathological floor: below ~16 tokens even a section title cannot
+    // fit. Deliver the honest receipt instead of an unbounded artifact.
+    if content_budget < 16 {
+        let receipt = format!("# PACK OMITTED\npack omitted: budget {budget} below the 16-token floor\n");
+        outcome.hard_truncated = true;
+        if estimate_tokens(&receipt) + estimate_tokens(&warn_block) > budget {
+            return (format!("# PACK OMITTED\nbudget {budget}\n"), outcome);
+        }
+        return (receipt + &warn_block, outcome);
+    }
+    // Phase 1 (soft): drop lowest-priority sections while over budget.
     // Sections with priority >= 9 (invariants, ownership, contracts,
-    // failure behavior) are never dropped and never hard-truncated.
+    // failure behavior) survive this phase.
     let mut content = assemble(&sections);
     let mut tokens = estimate_tokens(&content);
-    while tokens > budget {
+    while tokens > content_budget {
         let min_priority = sections.iter().map(|s| s.priority).min().unwrap_or(10);
         if min_priority >= 9 {
-            break; // cannot drop anything else
+            break; // soft phase cannot drop anything else
         }
         let idx = sections
             .iter()
@@ -78,11 +105,95 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
             break;
         }
     }
-    // warnings always appended (never cut): they are short
-    for w in warnings {
-        content.push_str(&format!("\n⚠ WARNING: {w}\n"));
+    // Phase 2 (hard invariant): the delivered pack ALWAYS fits its
+    // budget. Lowest-priority multi-line bodies halve first (line
+    // granularity, explicit marker), then whole sections drop
+    // (recorded) except the highest-priority one, then that last body
+    // truncates to fit exactly. Deterministic: priority, then order.
+    if tokens > content_budget && !sections.is_empty() {
+        outcome.hard_truncated = true;
+        loop {
+            let cur = estimate_tokens(&assemble(&sections));
+            if cur <= content_budget {
+                break;
+            }
+            let mut cand: Option<usize> = None;
+            for (i, s) in sections.iter().enumerate() {
+                // A body already carrying the marker halves to itself —
+                // never pick it twice (termination: each section halves
+                // at most once; the drop phase finishes the job).
+                if s.body.lines().count() > 1
+                    && !s.body.contains("[section truncated to fit")
+                    && cand.map(|j| s.priority < sections[j].priority).unwrap_or(true)
+                {
+                    cand = Some(i);
+                }
+            }
+            let Some(i) = cand else { break };
+            let n = sections[i].body.lines().count();
+            let keep = (n / 2).max(1);
+            let kept: Vec<&str> = sections[i].body.lines().take(keep).collect();
+            sections[i].body = format!(
+                "{}\n… [section truncated to fit {content_budget}-token budget]",
+                kept.join("\n")
+            );
+            let tag = format!("truncated:{}", sections[i].title);
+            if !outcome.dropped_sections.contains(&tag) {
+                outcome.dropped_sections.push(tag);
+            }
+        }
+        while sections.len() > 1 && estimate_tokens(&assemble(&sections)) > content_budget {
+            let min_priority = sections.iter().map(|s| s.priority).min().unwrap_or(10);
+            let idx = sections
+                .iter()
+                .position(|s| s.priority == min_priority)
+                .unwrap();
+            let dropped = sections.remove(idx).title;
+            if !outcome.dropped_sections.contains(&dropped) {
+                outcome.dropped_sections.push(dropped);
+            }
+        }
+        if estimate_tokens(&assemble(&sections)) > content_budget {
+            // Single section left, still over: binary-search the largest
+            // fitting line prefix (marker included in the probe, so the
+            // result fits by measurement, not by hope).
+            let title = sections[0].title.clone();
+            let prio = sections[0].priority;
+            let total_lines = sections[0].body.lines().count();
+            let marker = format!(
+                "\n… [pack hard cap: {title} truncated to fit {budget}-token budget]"
+            );
+            let mut lo = 0usize;
+            let mut hi = total_lines;
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                let body: String = sections[0].body.lines().take(mid).collect::<Vec<_>>().join("\n") + &marker;
+                let probe = vec![Section::new(&title, body, prio)];
+                if estimate_tokens(&assemble(&probe)) <= content_budget {
+                    lo = mid;
+                } else {
+                    hi = mid.saturating_sub(1);
+                }
+            }
+            let body: String = sections[0].body.lines().take(lo).collect::<Vec<_>>().join("\n") + &marker;
+            sections[0].body = body;
+            content = assemble(&sections);
+            let tag = format!("truncated:{}", title);
+            if !outcome.dropped_sections.contains(&tag) {
+                outcome.dropped_sections.push(tag);
+            }
+            if estimate_tokens(&content) > content_budget {
+                // Even title + marker exceeds (absurd budget): receipt.
+                // Return directly — the reassemble below must not clobber it.
+                content = format!("# PACK OMITTED\npack omitted: single section exceeds {budget}-token budget\n");
+                content.push_str(&warn_block);
+                outcome.exceeded_soft_budget = estimate_tokens(&content) > budget;
+                return (content, outcome);
+            }
+        }
     }
-    outcome.hard_truncated = false;
+    content = assemble(&sections);
+    content.push_str(&warn_block);
     outcome.exceeded_soft_budget = estimate_tokens(&content) > budget;
     (content, outcome)
 }
@@ -1111,7 +1222,7 @@ fn compression_policy(goal: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 // trace:exempt reason=internal-detail
-pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
+pub fn component(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> ContextPack {
     let mut pack = ContextPack::new("component", &ctx.revision());
     let comp = ctx
         .store
@@ -1284,7 +1395,7 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         5,
     ));
 
-    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
+    finish(&mut pack, sections, budget, ctx_warnings(ctx));
     pack
 }
 
@@ -1349,7 +1460,8 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
     body
 }
 
-pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
+// trace:exempt reason=internal-detail
+pub fn flow(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> ContextPack {
     let mut pack = ContextPack::new("flow", &ctx.revision());
     let f = ctx
         .view
@@ -1376,7 +1488,7 @@ pub fn flow(ctx: &ContextCompiler, id_or_name: &str) -> ContextPack {
         sections.push(Section::new("ATTRIBUTES", attrs, 6));
     }
 
-    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
+    finish(&mut pack, sections, budget, ctx_warnings(ctx));
     pack
 }
 
@@ -1390,6 +1502,7 @@ pub fn impact(
     files: &[String],
     symbols: &[String],
     diff_base: Option<&str>,
+    budget: usize,
 ) -> ContextPack {
     let mut pack = ContextPack::new("impact", &ctx.revision());
     let mut files = files.to_vec();
@@ -1573,7 +1686,7 @@ pub fn impact(
     }
 
     pack.entity_ids = imp.components.clone();
-    finish(&mut pack, sections, usize::MAX, ctx_warnings(ctx));
+    finish(&mut pack, sections, budget, ctx_warnings(ctx));
     pack
 }
 
@@ -1582,7 +1695,7 @@ pub fn impact(
 // ---------------------------------------------------------------------------
 
 // trace:exempt reason=internal-detail
-pub fn verify(ctx: &ContextCompiler) -> ContextPack {
+pub fn verify(ctx: &ContextCompiler, budget: usize) -> ContextPack {
     let mut pack = ContextPack::new("verify", &ctx.revision());
     let mut sections: Vec<Section> = Vec::new();
 
@@ -1800,7 +1913,7 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
     }
     sections.push(Section::new("VERDICT", verdict, 10));
 
-    finish(&mut pack, sections, usize::MAX, Vec::new());
+    finish(&mut pack, sections, budget, Vec::new());
     pack
 }
 
@@ -2514,7 +2627,7 @@ mod tests {
             crate::ContextSettings::default(),
             Vec::new(),
         );
-        let pack = impact(&ctx, &["src/a.py".into()], &[], None);
+        let pack = impact(&ctx, &["src/a.py".into()], &[], None, 50_000);
         assert!(
             pack.content.contains("FORGOTTEN PARTNERS"),
             "missing section: {}",
@@ -2619,5 +2732,45 @@ mod tests {
         );
         let err = crate::structural_source::resolve_handle_to_path(&root, &stale).unwrap_err();
         assert!(err.contains("stale"), "{err}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.render-hard-cap verifies=REQ-SCC-CTX exercises=impl.scc.packs
+    fn render_hard_cap_always_fits() {
+        // Even priority-9/10 material cannot escape the budget: the hard
+        // phase truncates and drops (recorded) until the text fits.
+        let sections = vec![
+            Section::new("IDENTITY", "repo: x\n".into(), 10),
+            Section::new("COMPONENTS", "line\n".repeat(2000), 9),
+            Section::new("FLOWS", "flow\n".repeat(2000), 5),
+            Section::new("INDEX STATUS", "ok\n".into(), 5),
+        ];
+        let (content, outcome) = render(sections, 300, vec!["fresh".into()]);
+        assert!(
+            scc_core::estimate_tokens(&content) <= 300,
+            "hard cap violated: {}",
+            scc_core::estimate_tokens(&content)
+        );
+        assert!(outcome.hard_truncated, "hard path must engage");
+        assert!(!outcome.dropped_sections.is_empty(), "drops must be recorded");
+        assert!(!outcome.exceeded_soft_budget, "fit must hold");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.render-single-section-fit verifies=REQ-SCC-CTX exercises=impl.scc.packs
+    fn render_single_priority_ten_section_fits() {
+        // One huge priority-10 body: never dropped, line-truncated to fit.
+        let sections = vec![Section::new("IDENTITY", "datum\n".repeat(5000), 10)];
+        let (content, outcome) = render(sections, 200, Vec::new());
+        assert!(
+            scc_core::estimate_tokens(&content) <= 200,
+            "hard cap violated: {}",
+            scc_core::estimate_tokens(&content)
+        );
+        assert!(
+            outcome.dropped_sections.iter().any(|d| d == "truncated:IDENTITY"),
+            "{:?}",
+            outcome.dropped_sections
+        );
     }
 }

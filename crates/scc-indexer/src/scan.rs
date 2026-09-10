@@ -350,6 +350,9 @@ pub fn scan_repo_with_stats(
         .follow_links(false)
         .require_git(false);
 
+    // One canonical root for the whole walk: canonicalization is a
+    // syscall per file when left inside the loop below.
+    let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     for entry in builder.build() {
         let entry = match entry {
             Ok(e) => e,
@@ -370,7 +373,7 @@ pub fn scan_repo_with_stats(
                 continue;
             }
         };
-        if !canon.starts_with(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())) {
+        if !canon.starts_with(&root_c) {
             stats.symlink_escape += 1;
             continue; // symlink escape: ignore
         }

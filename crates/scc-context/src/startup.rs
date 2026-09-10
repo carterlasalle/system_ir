@@ -24,6 +24,11 @@ pub const RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // trace:exempt reason=internal-detail
 pub struct StartupContext {
     pub atlas: String,
+    /// Atlas budget the DELIVERED atlas text was rendered under (normally
+    /// the loop's final `atlas_budget`, or the 256-token essentials budget
+    /// on the emergency floor). The ledger rebuilds the same pack, so
+    /// recorded atlas ids never describe undelivered text (§53 coupling).
+    pub atlas_budget_used: usize,
     /// Deterministic physical-layout evidence (repository skeleton),
     /// built from the indexed file inventory under its own hard budget.
     pub skeleton: String,
@@ -117,8 +122,17 @@ fn coverage_lines(
     let mut stale: Vec<String> = compiler.stale_paths.clone();
     stale.sort();
     stale.dedup();
-    for p in &stale {
+    // Bounded: per-path lines aid small repos; a 10k-stale repo reports
+    // counts, never 10k lines (the emergency floor omits paths entirely).
+    const MAX_STALE_LINES: usize = 10;
+    for p in stale.iter().take(MAX_STALE_LINES) {
         coverage.push(format!("stale: {p}"));
+    }
+    if stale.len() > MAX_STALE_LINES {
+        coverage.push(format!(
+            "stale: …and {} more changed file(s) not yet re-indexed",
+            stale.len() - MAX_STALE_LINES
+        ));
     }
     coverage.push(format!(
         "surface map: {} of {} entries rendered, {} tokens (budget {})",
@@ -191,16 +205,15 @@ pub fn build_startup(
     // inventory, under its own hard budget. Pre-bounded (never rebalanced
     // by the corrective loop below), deterministic per epoch, and counted
     // in every fused hard-max probe.
-    let skeleton = {
-        let paths: Vec<String> = compiler
-            .store
-            .all_files()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(p, _, _, _, _)| p)
-            .collect();
-        crate::skeleton::build_skeleton(&paths, crate::skeleton::skeleton_budget(budget.total)).text
-    };
+    let paths: Vec<String> = compiler
+        .store
+        .all_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(p, _, _, _, _)| p)
+        .collect();
+    let mut skeleton =
+        crate::skeleton::build_skeleton(&paths, crate::skeleton::skeleton_budget(budget.total)).text;
 
     // Surface: the FULL production pipeline — the one authoritative
     // [`build_surface`] service in Global mode (heterogeneous global PPR,
@@ -340,18 +353,101 @@ pub fn build_startup(
         }
         store_global_rank_cache(compiler, c);
     }
-    let surface = render.text.clone();
+    let mut surface = render.text.clone();
+    let mut atlas_budget_used = atlas_budget;
+
+    // Emergency floor (Part 4): the corrective loop guarantees fit
+    // whenever the Surface/Atlas floors leave room. When even the floors
+    // overflow (a tiny budget on a large repository), degrade
+    // structurally instead of escaping the cap: atlas essentials at a
+    // fixed 256-token budget, surface omitted (ledger ids cleared so §53
+    // coupling holds), skeleton shrunk until the fused receipt fits. The
+    // delivered text ALWAYS satisfies the hard max — there is no overflow
+    // escape hatch. `atlas_budget_used` tracks the delivered atlas so the
+    // ledger rebuilds the same pack it describes.
+    let emergency_omissions: Option<Vec<String>>;
+    {
+        let omissions_probe0 = omission_lines(
+            &render.omissions,
+            render.omitted_ids.len(),
+            &atlas_pack.dropped_sections,
+            atlas_pack.hard_truncated,
+            atlas_pack.exceeded_soft_budget,
+        );
+        if BLOCK_HEADER_OVERHEAD
+            + estimate_tokens(&assemble_body(
+                &atlas,
+                &skeleton,
+                &surface,
+                &coverage,
+                &omissions_probe0,
+            ))
+            <= startup_hard_max
+        {
+            emergency_omissions = None;
+        } else {
+
+        atlas_budget_used = 256;
+        atlas_pack = compiler.system_atlas(Some(atlas_budget_used));
+        atlas = atlas_pack.content.clone();
+        render.rendered_ids.clear();
+        render.omitted_ids.clear();
+        render.omissions.clear();
+        render.text = String::new();
+        render.token_count = 0;
+        surface = String::new();
+        // Minimal emergency coverage: warnings + counts, never per-path
+        // lines (a 10k-stale repo must still fit a tiny budget).
+        coverage = compiler_warnings(compiler);
+        if compiler.stale_paths.is_empty() {
+            coverage.push("model: current".into());
+        } else {
+            coverage.push(format!(
+                "model stale: {} changed file(s) not yet re-indexed (paths omitted over hard max)",
+                compiler.stale_paths.len()
+            ));
+        }
+        coverage.push("surface map: omitted over hard max (0 rendered)".into());
+        let mut skel_budget = crate::skeleton::skeleton_budget(budget.total);
+        loop {
+            let probe = crate::skeleton::build_skeleton(&paths, skel_budget);
+            let omissions_probe = {
+            let mut o = omission_lines(
+                &[],
+                0,
+                &atlas_pack.dropped_sections,
+                atlas_pack.hard_truncated,
+                atlas_pack.exceeded_soft_budget,
+            );
+            o.push(
+                "startup emergency compression: atlas essentials + skeleton only (surface omitted over hard max)".into(),
+            );
+            o };
+            let fused = assemble_body(&atlas, &probe.text, "", &coverage, &omissions_probe);
+            if BLOCK_HEADER_OVERHEAD + estimate_tokens(&fused) <= startup_hard_max
+                || skel_budget == 0
+            {
+                skeleton = probe.text;
+                emergency_omissions = Some(omissions_probe);
+                break;
+            }
+            skel_budget /= 2;
+        }
+    }
+    }
 
     // OMISSIONS (final render — after the corrective loop): the render
     // result's per-kind cuts + omitted-id count + the atlas's dropped
     // sections (honest: omitted ids are never silent).
-    let omissions = omission_lines(
-        &render.omissions,
-        render.omitted_ids.len(),
-        &atlas_pack.dropped_sections,
-        atlas_pack.hard_truncated,
-        atlas_pack.exceeded_soft_budget,
-    );
+    let omissions = emergency_omissions.unwrap_or_else(|| {
+        omission_lines(
+            &render.omissions,
+            render.omitted_ids.len(),
+            &atlas_pack.dropped_sections,
+            atlas_pack.hard_truncated,
+            atlas_pack.exceeded_soft_budget,
+        )
+    });
 
     let trust_policy = trust_policy_str(compiler.view.policy());
 
@@ -400,24 +496,9 @@ pub fn build_startup(
     };
     artifact.text = assemble_block(&atlas, &skeleton, &surface, &coverage, &omissions, &artifact);
 
-    // Final invariant (Part 4): the COMPLETE startup text never exceeds the
-    // hard maximum. The corrective loop guarantees it by construction when
-    // the Surface/Atlas floors leave enough room. When a requested budget
-    // is below the atlas floor (a tiny budget on a large repository), the
-    // loop exhausts both floors and the artifact legitimately cannot fit:
-    // instead of panicking (which would crash agent integrations), the
-    // over-budget state is recorded as an honest, actionable OMISSIONS
-    // line — the model and the caller both see the artifact exceeded the
-    // requested budget (§56: surfaced, never swallowed).
-    if estimate_tokens(&artifact.text) > startup_hard_max {
-        let overflow = estimate_tokens(&artifact.text) - startup_hard_max;
-        artifact.text.push_str(&format!(
-            "\n## BUDGET OVERFLOW\nstartup artifact exceeds the hard max by ~{overflow} tokens (atlas/surface floors reached); request a larger --budget\n"
-        ));
-    }
-
     StartupContext {
         atlas,
+        atlas_budget_used,
         skeleton,
         surface,
         surface_render: render,
@@ -601,8 +682,10 @@ pub fn visible_ids_from_startup(
     let mut components = BTreeSet::new();
     let mut flows = BTreeSet::new();
 
-    // Cache-hit in the CLI flow (build_startup already ran system_atlas).
-    let atlas_pack = compiler.system_atlas(Some(startup.artifact.budget.atlas));
+    // Cache-hit in the CLI flow (build_startup already ran system_atlas
+    // at this budget). The DELIVERED budget — not the requested one — so
+    // emergency-floor artifacts record only delivered atlas ids (§53).
+    let atlas_pack = compiler.system_atlas(Some(startup.atlas_budget_used));
 
     // Surface: rendered entries ONLY — the SAME render the artifact
     // printed, so the ledger exactly matches the artifact text. Entry
@@ -796,6 +879,7 @@ mod tests {
     fn render_startup_emits_spec_headers() {
         let sc = StartupContext {
             atlas: "ATLAS-BODY".into(),
+            atlas_budget_used: 6000,
             skeleton: "SKELETON-BODY".into(),
             surface: "SURFACE-BODY".into(),
             surface_render: scc_core::SurfaceRenderResult {

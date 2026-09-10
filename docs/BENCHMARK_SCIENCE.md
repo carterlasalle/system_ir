@@ -25,10 +25,16 @@
 | write-matrix-native-default.json | 2 | 2026-09-09T12:33:05Z | baf7ca48821d | 29eaac2e6747a53d | codex | gpt-5.2-codex | writable-native-default | None | 36 | 4 (http-service,py-queue,queue-worker,ts-api-web) | VALID |
 | write-matrix-v2.json | None | None |  | None | None | None | writable | None | 12 | 4 (http-service,py-queue,queue-worker,ts-api-web) | INVALID: historical: pre-evaluator-contract (grep validators, Python-reconstructed scc-fu |
 
-Supersession: `.invalid.json` twins are excluded from every claim. Files whose
-validity note records a refill (e.g. repomix/aider cell refills) supersede the
-provisional partials they completed; the manifest lists each surviving file once.
-Native-default files (budget None) are not budget conditions at all.
+Supersession: `.invalid.json` twins AND files with `validity.valid == false`
+are listed here but excluded from every claim below (§2–§4 consume valid files
+only). Files whose validity note records a refill (e.g. repomix/aider cell refills)
+supersede the provisional partials they completed; the manifest lists each surviving
+file once. Native-default files (budget None) are not budget conditions at all.
+
+Corpus lineage: 10/13 files valid, grouped by tasks_corpus_hash
+(pooled claims never cross corpus boundaries):
+- corpus 29eaac2e6747a53d: 7 files (write-matrix-16k-claude.json, write-matrix-16k.json, write-matrix-24k-claude.json, write-matrix-24k.json, write-matrix-8k.json, write-matrix-native-default-claude.json, write-matrix-native-default.json)
+- corpus 741107fb533987ad: 3 files (write-matrix-4k-claude.json, write-matrix-4k.json, write-matrix-8k-claude.json)
 
 ## 2. Cap utilization (binding iff max realized >= 95% of cap)
 
@@ -66,14 +72,6 @@ Native-default files (budget None) are not budget conditions at all.
 | write-matrix-8k.json | scc-full | 8000 | 552.1 | 575 | 0.072 | non-binding |
 | write-matrix-8k.json | aider-repomap | 8000 | 203.6 | 333 | 0.042 | non-binding |
 | write-matrix-8k.json | repomix-compress | 8000 | 454.2 | 516 | 0.065 | non-binding |
-| write-matrix-claude.json | raw | None | 0.0 | 0 | None | n/a-native |
-| write-matrix-claude.json | scc-full | None | 2262.3 | 2465 | None | n/a-native |
-| write-matrix-claude.json | aider-repomap | None | None | None | None | no-data |
-| write-matrix-claude.json | repomix-compress | None | None | None | None | no-data |
-| write-matrix-full.json | raw | None | 0.0 | 0 | None | n/a-native |
-| write-matrix-full.json | scc-full | None | 2256.8 | 2465 | None | n/a-native |
-| write-matrix-full.json | aider-repomap | None | 223.0 | 333 | None | n/a-native |
-| write-matrix-full.json | repomix-compress | None | 459.7 | 516 | None | n/a-native |
 | write-matrix-native-default-claude.json | raw | None | 0.0 | 0 | None | n/a-native |
 | write-matrix-native-default-claude.json | scc-full | None | 552.1 | 575 | None | n/a-native |
 | write-matrix-native-default-claude.json | aider-repomap | None | 205.9 | 333 | None | n/a-native |
@@ -82,10 +80,6 @@ Native-default files (budget None) are not budget conditions at all.
 | write-matrix-native-default.json | scc-full | None | 552.1 | 575 | None | n/a-native |
 | write-matrix-native-default.json | aider-repomap | None | 203.6 | 333 | None | n/a-native |
 | write-matrix-native-default.json | repomix-compress | None | 458.4 | 521 | None | n/a-native |
-| write-matrix-v2.json | raw | None | 0.0 | 0 | None | n/a-native |
-| write-matrix-v2.json | scc-full | None | 2262.3 | 2465 | None | n/a-native |
-| write-matrix-v2.json | aider-repomap | None | None | None | None | no-data |
-| write-matrix-v2.json | repomix-compress | None | None | None | None | no-data |
 
 Binding files: 0/32 budgeted (variant, file) rows bind.
 Non-binding rows are COMMON-CAP REPLICATES, not context-dose experiments:
@@ -103,25 +97,31 @@ Seed 1234, 10000 iterations, resampling unit = repository.
 - write-matrix-4k.json: diff=+0.111 CI95=[+0.000, +0.273] n_tasks=9 n_repos=4 clusters={'http-service': 3, 'py-queue': 3, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
 - write-matrix-8k-claude.json: diff=+0.333 CI95=[+0.000, +0.600] n_tasks=9 n_repos=4 clusters={'http-service': 3, 'py-queue': 3, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
 - write-matrix-8k.json: diff=-0.111 CI95=[-0.667, +0.200] n_tasks=9 n_repos=4 clusters={'http-service': 3, 'py-queue': 3, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
-- write-matrix-claude.json: diff=+0.000 CI95=[+0.000, +0.000] n_tasks=6 n_repos=4 clusters={'http-service': 2, 'py-queue': 1, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
-- write-matrix-full.json: diff=+0.167 CI95=[+0.000, +0.600] n_tasks=6 n_repos=4 clusters={'http-service': 2, 'py-queue': 1, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
 - write-matrix-native-default-claude.json: diff=-0.111 CI95=[-0.667, +0.200] n_tasks=9 n_repos=4 clusters={'http-service': 3, 'py-queue': 3, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
 - write-matrix-native-default.json: diff=-0.111 CI95=[-0.273, +0.000] n_tasks=9 n_repos=4 clusters={'http-service': 3, 'py-queue': 3, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
-- write-matrix-v2.json: diff=-0.167 CI95=[-0.600, +0.000] n_tasks=6 n_repos=4 clusters={'http-service': 2, 'py-queue': 1, 'queue-worker': 2, 'ts-api-web': 1} → CROSSES ZERO — no superiority claim
 
-## 4. Task floor / ceiling (pooled over valid matrices)
+## 4. Task floor / ceiling (valid matrices only, per corpus)
 
-| task | attempts | success | rate | class | agents | files |
-|---|---|---|---|---|---|---|
-| http-service.health-check | 48 | 7 | 0.146 | informative | 3 | 13 |
-| http-service.rename-transcript-field | 48 | 7 | 0.146 | informative | 3 | 13 |
-| http-service.transcript-normalization | 40 | 34 | 0.85 | informative | 2 | 10 |
-| py-queue.classification-fallback | 40 | 0 | 0.0 | floor | 2 | 10 |
-| py-queue.empty-messages | 48 | 45 | 0.938 | informative | 3 | 13 |
-| py-queue.store-changes | 40 | 0 | 0.0 | floor | 2 | 10 |
-| queue-worker.asr-retry | 48 | 0 | 0.0 | floor | 3 | 13 |
-| queue-worker.street-vocabulary | 48 | 14 | 0.292 | informative | 3 | 13 |
-| ts-api-web.pagination | 48 | 26 | 0.542 | informative | 3 | 13 |
+| corpus | task | attempts | success | rate | class | agents | files |
+|---|---|---|---|---|---|---|---|
+| 29eaac2e6747a53d | http-service.health-check | 28 | 6 | 0.214 | informative | 2 | 7 |
+| 29eaac2e6747a53d | http-service.rename-transcript-field | 28 | 5 | 0.179 | informative | 2 | 7 |
+| 29eaac2e6747a53d | http-service.transcript-normalization | 28 | 25 | 0.893 | informative | 2 | 7 |
+| 29eaac2e6747a53d | py-queue.classification-fallback | 28 | 0 | 0.0 | floor | 2 | 7 |
+| 29eaac2e6747a53d | py-queue.empty-messages | 28 | 26 | 0.929 | informative | 2 | 7 |
+| 29eaac2e6747a53d | py-queue.store-changes | 28 | 0 | 0.0 | floor | 2 | 7 |
+| 29eaac2e6747a53d | queue-worker.asr-retry | 28 | 0 | 0.0 | floor | 2 | 7 |
+| 29eaac2e6747a53d | queue-worker.street-vocabulary | 28 | 11 | 0.393 | informative | 2 | 7 |
+| 29eaac2e6747a53d | ts-api-web.pagination | 28 | 16 | 0.571 | informative | 2 | 7 |
+| 741107fb533987ad | http-service.health-check | 12 | 1 | 0.083 | informative | 2 | 3 |
+| 741107fb533987ad | http-service.rename-transcript-field | 12 | 2 | 0.167 | informative | 2 | 3 |
+| 741107fb533987ad | http-service.transcript-normalization | 12 | 9 | 0.75 | informative | 2 | 3 |
+| 741107fb533987ad | py-queue.classification-fallback | 12 | 0 | 0.0 | floor | 2 | 3 |
+| 741107fb533987ad | py-queue.empty-messages | 12 | 11 | 0.917 | informative | 2 | 3 |
+| 741107fb533987ad | py-queue.store-changes | 12 | 0 | 0.0 | floor | 2 | 3 |
+| 741107fb533987ad | queue-worker.asr-retry | 12 | 0 | 0.0 | floor | 2 | 3 |
+| 741107fb533987ad | queue-worker.street-vocabulary | 12 | 3 | 0.25 | informative | 2 | 3 |
+| 741107fb533987ad | ts-api-web.pagination | 12 | 6 | 0.5 | informative | 2 | 3 |
 
 Floor tasks (0% everywhere) should not consume future paid quota unless
 extreme difficulty is the explicit experimental question.

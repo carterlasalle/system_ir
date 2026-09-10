@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// trace:exempt reason=internal-detail
 pub struct Checkpoint {
     pub task: TaskRef,
     pub system_ir_revision: String,
@@ -17,6 +18,10 @@ pub struct Checkpoint {
     pub next_actions: Vec<String>,
     #[serde(default)]
     pub created_at: String,
+    /// Durable ContextSnapshot id pinned at capture (semantic rehydration:
+    /// `checkpoint load` diffs it so compaction sees what survived).
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,10 +61,10 @@ pub struct Tests {
     #[serde(default)]
     pub not_run: Vec<String>,
 }
-// trace:v1 id=impl.scc.checkpoint work=WORK-SCC-001 satisfies=REQ-SCC-API
 
 /// Capture the current checkpoint: git-modified files + current system IR
 /// revision + affected system entities derived from the working tree.
+// trace:v1 id=impl.scc.checkpoint work=WORK-SCC-001 satisfies=REQ-SCC-API
 pub fn capture(root: &Path) -> crate::Result<Checkpoint> {
     let store = crate::open_store(root)?;
     let revision = store
@@ -99,6 +104,43 @@ pub fn capture(root: &Path) -> crate::Result<Checkpoint> {
     }
     cp.files.modified = modified;
 
+    // Durable snapshot link: pin affected ids + checkpoint text so
+    // `checkpoint load` (OMP PreCompact rehydration) reports still-valid
+    // vs invalidated vs modified facts, not just task state. Impact
+    // fields are already entity ids (components/flows/routes/invariants).
+    {
+        let mut entity_ids: Vec<String> = Vec::new();
+        entity_ids.extend(cp.affected.components.iter().cloned());
+        entity_ids.extend(cp.affected.flows.iter().cloned());
+        entity_ids.extend(cp.affected.contracts.iter().cloned());
+        entity_ids.extend(cp.affected.invariants.iter().cloned());
+        entity_ids.sort();
+        entity_ids.dedup();
+        let epoch = store.cache_epoch().unwrap_or_else(|_| "no-epoch".into());
+        let head = store
+            .revisions()
+            .map(|rs| rs.into_iter().last().map(|r| r.rev).unwrap_or(0))
+            .unwrap_or(0);
+        let task = if cp.task.goal.is_empty() {
+            cp.task.bead.clone().unwrap_or_else(|| "checkpoint".into())
+        } else {
+            cp.task.goal.clone()
+        };
+        if let Ok(artifact) = serde_json::to_string_pretty(&cp) {
+            if let Ok(snap) = store.save_snapshot(scc_store::snapshot::SnapshotSave {
+                task: &task,
+                epoch: &epoch,
+                revision: head,
+                artifact: &artifact,
+                entity_ids: &entity_ids,
+                budget: 0,
+                warnings: &[],
+            }) {
+                cp.snapshot_id = Some(snap.id);
+            }
+        }
+    }
+
     let path = crate::checkpoint_path(root);
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
     std::fs::write(&path, serde_json::to_string_pretty(&cp)?)?;
@@ -106,6 +148,7 @@ pub fn capture(root: &Path) -> crate::Result<Checkpoint> {
 }
 
 /// Load and render the checkpoint as markdown for session rehydration.
+// trace:v1 id=impl.scc.checkpoint.load work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub fn load(root: &Path) -> crate::Result<Option<String>> {
     let path = crate::checkpoint_path(root);
     if !path.exists() {
@@ -161,6 +204,45 @@ pub fn load(root: &Path) -> crate::Result<Option<String>> {
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
+    }
+    // Semantic rehydration verdict: what the pinned snapshot says about
+    // model drift since capture (still-valid vs invalidated vs modified).
+    if let Some(sid) = cp.snapshot_id.as_deref() {
+        match crate::open_store(root).and_then(|store| {
+            store
+                .diff_snapshot(sid)
+                .map_err(crate::CliError::from)
+        }) {
+            Ok(Some(d)) => {
+                out.push_str(&format!(
+                    "## Snapshot validity (model drift since checkpoint)\n{} still valid, {} invalidated, {} modified{}\n\n",
+                    d.still_valid.len(),
+                    d.invalidated.len(),
+                    d.modified_entities.len(),
+                    if d.artifact_changed {
+                        " — context would re-render differently"
+                    } else {
+                        ""
+                    },
+                ));
+                for f in d.invalidated.iter().chain(d.modified_entities.iter()).take(10) {
+                    out.push_str(&format!("- {f}\n"));
+                }
+                if d.invalidated.len() + d.modified_entities.len() > 10 {
+                    out.push_str(&format!(
+                        "- … ({} more)\n",
+                        d.invalidated.len() + d.modified_entities.len() - 10
+                    ));
+                }
+                out.push('\n');
+            }
+            Ok(None) => {
+                out.push_str("## Snapshot validity\ncheckpoint snapshot no longer stored\n\n");
+            }
+            Err(e) => {
+                out.push_str(&format!("## Snapshot validity\nsnapshot unreadable: {e}\n\n"));
+            }
+        }
     }
     Ok(Some(out))
 }

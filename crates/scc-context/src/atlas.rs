@@ -18,9 +18,171 @@ use scc_core::{
 use scc_graph::TrustedGraphView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Structured atlas compilation — pure data, no rendering.
+/// Semantic compilation scope: which repository roles feed the
+/// architecture sections (entrypoints, contracts, state authority,
+/// flows, boundaries, deployment). Components and files ALWAYS list
+/// every role (labeled) — structure stays visible; only the inferred
+/// architecture is scoped, so a fixture route never becomes a global
+/// entrypoint and a benchmark DB writer never owns production state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// trace:v1 id=impl.scc.atlas-scope work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub enum AtlasScope {
+    /// Default: production-role evidence only, plus test relationships
+    /// that explain production (TESTED_BY). Counts of scoped-out facts
+    /// land in the coverage map under `scope`.
+    Production,
+    /// Everything: benchmark/fixture archaeology, benchmark tasks.
+    Full,
+}
+
+/// Repository role of one entity: its `file` attribute (routes, symbols,
+/// contracts carry it), else its handler symbol's file, else a manifest
+/// pointer (`dockerfile`). Entities without any placement evidence are
+/// production — never drop facts we cannot place.
+// trace:exempt reason=internal-detail
+fn entity_role(view: &TrustedGraphView, e: &scc_core::Entity) -> &'static str {
+    let file: Option<String> = e
+        .attributes
+        .get("file")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            e.attributes
+                .get("handler")
+                .and_then(|v| v.as_str())
+                .and_then(|h| view.entity(h))
+                .and_then(|s| {
+                    s.attributes
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+        })
+        .or_else(|| {
+            e.attributes
+                .get("dockerfile")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+    file.as_deref()
+        .and_then(scc_graph::components::path_role)
+        .unwrap_or("production")
+}
+
+/// Role of an entity id (`production` when unknown — see [`entity_role`]).
+// trace:exempt reason=internal-detail
+fn entity_id_role(view: &TrustedGraphView, id: &str) -> &'static str {
+    view.entity(id)
+        .map(|e| entity_role(view, e))
+        .unwrap_or("production")
+}
+
+/// Scope-filtered entity iteration: architecture sections use this
+/// instead of `view.entities_of_kind`. Structural kinds are never
+/// filtered by callers (components/files list every role, labeled).
+/// Dropped counts accumulate per section for the honesty receipt.
+/// Participant verdict for unattributed hubs (topics, configurations):
+/// `None` when no participant carries placement evidence (kept — never
+/// drop facts we cannot place), else whether ANY participant is production.
+/// A topic whose publishers/subscribers are ALL fixture files is fixture
+/// chatter, not architecture — even though the topic entity itself has no
+/// file attribute.
+// trace:exempt reason=internal-detail
+fn participants_production(view: &TrustedGraphView, ids: &[String]) -> Option<bool> {
+    let mut decided = false;
+    let mut prod = false;
+    for id in ids {
+        if let Some(e) = view.entity(id) {
+            if e.attributes.get("file").and_then(|v| v.as_str()).is_some() {
+                decided = true;
+                if entity_role(view, e) == "production" {
+                    prod = true;
+                }
+            }
+        }
+    }
+    if decided {
+        Some(prod)
+    } else {
+        None
+    }
+}
+
+/// Actor placement: component actors resolve through the component
+/// role map, symbol actors through entity file evidence. `None` means
+/// unplaceable (kept — never drop flows we cannot place).
+// trace:exempt reason=internal-detail
+fn actor_production(
+    view: &TrustedGraphView,
+    comp_role_by_id: &HashMap<String, String>,
+    actor: &str,
+) -> Option<bool> {
+    if let Some(r) = comp_role_by_id.get(actor) {
+        return Some(r == "production");
+    }
+    view.entity(actor).map(|e| entity_role(view, e) == "production")
+}
+
+/// Flow keep rule: a flow with at least one production actor is
+/// architecture; a flow whose actors are ALL placed outside production
+/// is fixture/test choreography. Unplaceable flows are kept.
+// trace:exempt reason=internal-detail
+fn keep_flow(
+    view: &TrustedGraphView,
+    comp_role_by_id: &HashMap<String, String>,
+    scope: AtlasScope,
+    actors: &[String],
+) -> bool {
+    if scope == AtlasScope::Full {
+        return true;
+    }
+    let mut decided = false;
+    for a in actors {
+        match actor_production(view, comp_role_by_id, a) {
+            Some(true) => return true,
+            Some(false) => decided = true,
+            None => {}
+        }
+    }
+    !decided
+}
+
+// trace:exempt reason=internal-detail
+fn scoped_entities<'a>(
+    view: &'a TrustedGraphView,
+    kind: &str,
+    scope: AtlasScope,
+    section: &str,
+    scoped_out: &mut BTreeMap<String, usize>,
+) -> Vec<&'a scc_core::Entity> {
+    let all = view.entities_of_kind(kind);
+    if scope == AtlasScope::Full {
+        return all;
+    }
+    let total = all.len();
+    let kept: Vec<&'a scc_core::Entity> = all
+        .into_iter()
+        .filter(|e| entity_role(view, e) == "production")
+        .collect();
+    let dropped = total - kept.len();
+    if dropped > 0 {
+        *scoped_out.entry(section.to_string()).or_default() += dropped;
+    }
+    kept
+}
+
+/// Structured atlas compilation — pure data, no rendering. Default
+/// scope is [`AtlasScope::Production`]: fixture/test/benchmark evidence
+/// labels components but never feeds architecture sections.
 // trace:v1 id=impl.scc.atlas work=WORK-SCC-001 satisfies=REQ-state-function-access,REQ-SCC-CTX
 pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
+    build_atlas_scoped(ctx, AtlasScope::Production)
+}
+
+/// [`build_atlas`] with an explicit scope. `Full` restores the unfiltered
+/// compilation for benchmark/fixture archaeology (`scc atlas --full`).
+// trace:v1 id=impl.scc.atlas-scoped work=WORK-SI-MMMJA4G6 satisfies=REQ-SCC-CTX
+pub fn build_atlas_scoped(ctx: &ContextCompiler, scope: AtlasScope) -> SystemAtlas {
     let view = &ctx.view;
     let store = ctx.store;
     let snapshot = store.latest_snapshot().ok().flatten();
@@ -30,8 +192,13 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
 
     // ---- components ----
     let mut components: Vec<AtlasComponent> = Vec::new();
-    // data stores / data entities written by component symbols (WRITES-derived)
+    // data stores / data entities written by component symbols (WRITES-derived).
+    // Collected per component so the global DATA STORES list can scope to
+    // production components: a benchmark DB writer never owns production state.
     let mut data_stores: BTreeSet<String> = BTreeSet::new();
+    let mut comp_store_targets: Vec<(String, Vec<String>)> = Vec::new();
+    // Honesty receipt: per-section counts of architecture facts scoped out.
+    let mut scoped_out: BTreeMap<String, usize> = BTreeMap::new();
     for c in view.components() {
         // Purpose prefers evidence-backed claims (Declared, then Resolved)
         // over bare inference; the trust view already strips low-confidence
@@ -76,6 +243,14 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         // names (the component compiler attributes every contained symbol).
         // The structured model carries both; the render shows only the
         // paths (`implementation_paths`) to stay compact.
+        // Role first: owns/data-stores scoping below needs it before the
+        // AtlasComponent literal is built.
+        let role = c
+            .attributes
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| scc_graph::components::component_role(&implementation_paths).into());
         let mut implementation: Vec<String> = implementation_paths.clone();
         let mut symbols: Vec<String> = implementation_attr
             .get("symbols")
@@ -138,6 +313,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         // reference (`db.users`) so data entities stay attributed to their
         // store.
         let mut owns: Vec<AtlasOwnershipClaim> = Vec::new();
+        let mut my_store_targets: Vec<String> = Vec::new();
         if let Some(oa) = c.attributes.get("owns").and_then(|v| v.as_array()) {
             for o in oa {
                 let Some(t) = o.get("target").and_then(|v| v.as_str()) else {
@@ -163,6 +339,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
                 };
                 if is_store_target {
                     data_stores.insert(target_name.clone());
+                    my_store_targets.push(target_name.clone());
                 }
                 owns.push(AtlasOwnershipClaim {
                     target: target_name,
@@ -189,12 +366,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .get("parent")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let role = c
-            .attributes
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| scc_graph::components::component_role(&implementation_paths).into());
+        comp_store_targets.push((c.name.clone(), my_store_targets));
 
         components.push(AtlasComponent {
             name: c.name.clone(),
@@ -215,12 +387,57 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     }
     components.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // ---- scope: production component set ----
+    // Component roles are presentation AND scope: every component lists
+    // (structure stays visible), but owns/data-stores/public-api/framework
+    // sections only admit production components by default. Unknown
+    // components are kept — never drop facts we cannot place.
+    let comp_role: HashMap<String, String> = components
+        .iter()
+        .map(|c| (c.name.clone(), c.role.clone()))
+        .collect();
+    let comp_role_by_id: HashMap<String, String> = view
+        .components()
+        .into_iter()
+        .map(|c| {
+            let paths: Vec<String> = c
+                .attributes
+                .get("implementation")
+                .and_then(|v| v.get("paths"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let role = c
+                .attributes
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| scc_graph::components::component_role(&paths).into());
+            (c.id.clone(), role)
+        })
+        .collect();
+    let prod_comp = |name: &str| -> bool {
+        scope == AtlasScope::Full
+            || comp_role.get(name).map(|r| r == "production").unwrap_or(true)
+    };
+    if scope == AtlasScope::Production {
+        data_stores = comp_store_targets
+            .into_iter()
+            .filter(|(name, _)| prod_comp(name))
+            .flat_map(|(_, tgts)| tgts)
+            .collect();
+    }
+
     let mut entrypoints: Vec<AtlasEntrypoint> = Vec::new();
     // Exact duplicates (same method+path+handler from overlapping evidence)
     // collapse to one line; distinct handlers stay visible so genuinely
     // ambiguous routes are never hidden.
     let mut seen_routes: BTreeSet<(String, String, String)> = BTreeSet::new();
-    for r in view.entities_of_kind(scc_core::kinds::ROUTE) {
+    for r in scoped_entities(view, scc_core::kinds::ROUTE, scope, "entrypoints", &mut scoped_out) {
         let method = r
             .attributes
             .get("method")
@@ -247,7 +464,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             symbol: handler,
         });
     }
-    for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
+    for e in scoped_entities(view, scc_core::kinds::SYMBOL, scope, "entrypoints", &mut scoped_out) {
         let Some(kinds) = e.attributes.get("entrypoints").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -281,6 +498,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         .map(|e| (e.name.clone(), e.kind.clone()))
         .collect();
     for s in scc_graph::flows::invocation_surfaces(view.graph) {
+        if scope == AtlasScope::Production && entity_id_role(view, &s.symbol) != "production" {
+            *scoped_out.entry("entrypoints".into()).or_default() += 1;
+            continue;
+        }
         let name = view.name_of(&s.symbol);
         let kind = s.kind.as_str().to_string();
         if !surface_names.insert((name.clone(), kind.clone())) {
@@ -300,7 +521,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     let mut contract_seen: BTreeMap<(String, String), usize> = BTreeMap::new();
 
     // http: ROUTE entities (producer = handler symbol)
-    for r in view.entities_of_kind(scc_core::kinds::ROUTE) {
+    for r in scoped_entities(view, scc_core::kinds::ROUTE, scope, "contracts", &mut scoped_out) {
         let method = r
             .attributes
             .get("method")
@@ -347,7 +568,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
 
     // cli: SYMBOL entities carrying `cli_flags: ["--flag", ...]` attrs
     // (producer = the owning symbol)
-    for e in view.entities_of_kind(scc_core::kinds::SYMBOL) {
+    for e in scoped_entities(view, scc_core::kinds::SYMBOL, scope, "contracts", &mut scoped_out) {
         let Some(flags) = e.attributes.get("cli_flags").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -380,9 +601,12 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     }
 
     // event: TOPIC entities with PUBLISHES/SUBSCRIBES edges (producer = the
-    // topic; consumers = the publishing/subscribing symbols)
+    // topic; consumers = the publishing/subscribing symbols). Participant-
+    // scoped: an unattributed topic is judged by its publishers, not kept
+    // by default — fixture topics never reach the architecture sections.
     for t in view.entities_of_kind(scc_core::kinds::TOPIC) {
         let mut consumers: BTreeSet<String> = BTreeSet::new();
+        let mut participant_ids: Vec<String> = Vec::new();
         let mut any = false;
         for pred in [
             scc_core::predicates::PUBLISHES,
@@ -391,11 +615,26 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         ] {
             for rel in view.in_pred(&t.id, pred) {
                 consumers.insert(entity_name(view, &rel.subject));
+                participant_ids.push(rel.subject.clone());
                 any = true;
             }
         }
         if !any {
             continue;
+        }
+        if scope == AtlasScope::Production {
+            let self_prod = t
+                .attributes
+                .get("file")
+                .and_then(|v| v.as_str())
+                .and_then(scc_graph::components::path_role)
+                .map(|r| r == "production")
+                .unwrap_or(false);
+            let parts_prod = participants_production(view, &participant_ids).unwrap_or(true);
+            if !self_prod && !parts_prod {
+                *scoped_out.entry("contracts".into()).or_default() += 1;
+                continue;
+            }
         }
         push_contract(
             &mut contracts,
@@ -415,6 +654,35 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // config: CONFIGURATION entities (producer = the owning symbol via
     // CONFIGURED_BY; consumers = READS edges + the configured-by symbols)
     for c in view.entities_of_kind(scc_core::kinds::CONFIGURATION) {
+        if scope == AtlasScope::Production {
+            let self_prod = c
+                .attributes
+                .get("file")
+                .and_then(|v| v.as_str())
+                .and_then(scc_graph::components::path_role)
+                .map(|r| r == "production")
+                .unwrap_or(false);
+            if !self_prod {
+                let mut party: Vec<String> = view
+                    .out_pred(&c.id, scc_core::predicates::CONFIGURED_BY)
+                    .into_iter()
+                    .map(|r| r.object.clone())
+                    .collect();
+                for pred in [
+                    scc_core::predicates::READS,
+                    scc_core::predicates::CONSUMES,
+                    scc_core::predicates::HANDLES,
+                ] {
+                    for rel in view.in_pred(&c.id, pred) {
+                        party.push(rel.subject.clone());
+                    }
+                }
+                if participants_production(view, &party) == Some(false) {
+                    *scoped_out.entry("contracts".into()).or_default() += 1;
+                    continue;
+                }
+            }
+        }
         let mut owners: Vec<String> = view
             .out_pred(&c.id, scc_core::predicates::CONFIGURED_BY)
             .into_iter()
@@ -460,6 +728,18 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // The EXPORT entity's symbol is the EXPORTS edge subject; consumers are
     // the symbols that call it.
     for e in view.entities_of_kind(scc_core::kinds::EXPORT) {
+        if scope == AtlasScope::Production && entity_role(view, e) != "production" {
+            let sym_prod = view
+                .in_pred(&e.id, scc_core::predicates::EXPORTS)
+                .into_iter()
+                .next()
+                .map(|r| entity_id_role(view, &r.subject) == "production")
+                .unwrap_or(true);
+            if !sym_prod {
+                *scoped_out.entry("contracts".into()).or_default() += 1;
+                continue;
+            }
+        }
         let kind_attr = e
             .attributes
             .get("kind")
@@ -508,7 +788,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // render under FRAMEWORK SEMANTICS, not here. Producer = the
     // registering symbol (REGISTERS subject); consumers = symbols consuming
     // the surface.
-    for ce in view.entities_of_kind(scc_core::kinds::CONTRACT) {
+    for ce in scoped_entities(view, scc_core::kinds::CONTRACT, scope, "contracts", &mut scoped_out) {
         let Some(kind_attr) = ce
             .attributes
             .get("kind")
@@ -564,7 +844,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // count is DERIVED from the live OCCURRENCE entities — never a stored,
     // write-time-mutated counter.
     let mut inline: Vec<(usize, String)> = Vec::new();
-    for s in view.entities_of_kind(scc_core::kinds::SCHEMA) {
+    for s in scoped_entities(view, scc_core::kinds::SCHEMA, scope, "contracts", &mut scoped_out) {
         let count = scc_graph::state::occurrence_count(view.graph, &s.id);
         let expr = s
             .attributes
@@ -667,6 +947,15 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         if g.kind != scc_core::FlowKind::Sequence {
             continue;
         }
+        if !keep_flow(
+            view,
+            &comp_role_by_id,
+            scope,
+            &g.nodes.iter().map(|n| n.actor.clone()).collect::<Vec<_>>(),
+        ) {
+            *scoped_out.entry("flows".into()).or_default() += 1;
+            continue;
+        }
         let steps = project_flow_graph(view, &g, &mut async_boundaries);
         if steps.is_empty() {
             continue;
@@ -683,6 +972,15 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     for f in view.flows() {
         if f.kind == scc_core::FlowKind::Sequence {
             continue; // sequences come from the canonical graphs
+        }
+        if !keep_flow(
+            view,
+            &comp_role_by_id,
+            scope,
+            &f.steps.iter().map(|s| s.actor.clone()).collect::<Vec<_>>(),
+        ) {
+            *scoped_out.entry("flows".into()).or_default() += 1;
+            continue;
         }
         let mut steps: Vec<String> = Vec::new();
         let mut prev_actor: Option<String> = None;
@@ -737,9 +1035,14 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         .collect();
 
     // ---- deployment / externals / trust boundaries ----
-    let deployment_units: Vec<String> = view
-        .entities_of_kind(scc_core::kinds::DEPLOYMENT_UNIT)
-        .into_iter()
+    let deployment_units: Vec<String> = scoped_entities(
+        view,
+        scc_core::kinds::DEPLOYMENT_UNIT,
+        scope,
+        "deployment",
+        &mut scoped_out,
+    )
+    .into_iter()
         .map(|e| {
             let img = e
                 .attributes
@@ -753,13 +1056,21 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             }
         })
         .collect();
-    let external_systems: Vec<String> = view
-        .entities_of_kind(scc_core::kinds::EXTERNAL_API)
-        .into_iter()
+    let external_systems: Vec<String> = scoped_entities(
+        view,
+        scc_core::kinds::EXTERNAL_API,
+        scope,
+        "external-systems",
+        &mut scoped_out,
+    )
+    .into_iter()
         .map(|e| e.name.clone())
         .collect();
-    let trust_boundaries: Vec<String> =
-        scc_graph::boundaries::boundary_crossings(view.graph, store).unwrap_or_default();
+    let trust_boundaries: Vec<String> = if scope == AtlasScope::Full {
+        scc_graph::boundaries::boundary_crossings(view.graph, store).unwrap_or_default()
+    } else {
+        scc_graph::boundaries::production_crossings(view.graph, store).unwrap_or_default()
+    };
 
     // ---- implementation map ----
     let mut implementation_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -812,7 +1123,23 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             }
         }
     }
-    let state_authority = scc_graph::state::compile_state_authority(view.graph, &symbol_comp);
+    let mut state_authority = scc_graph::state::compile_state_authority(view.graph, &symbol_comp);
+    // State lines read `{comp} owns/reads …` / `{comp}::{sym} …`: the
+    // leading component attributes the claim. Non-production components
+    // never own production state in the default scope.
+    if scope == AtlasScope::Production {
+        for lines in state_authority.values_mut() {
+            let before = lines.len();
+            lines.retain(|l| {
+                let head = l.split([' ', ':']).next().unwrap_or("");
+                prod_comp(head)
+            });
+            let dropped = before - lines.len();
+            if dropped > 0 {
+                *scoped_out.entry("state-authority".into()).or_default() += dropped;
+            }
+        }
+    }
 
     // hierarchical containers: services first, then subsystems; members are
     // direct member entity ids (component ids or nested subsystem ids)
@@ -844,6 +1171,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // text. Provenance preserved; deduped by (target, provenance).
     let state_claims = scc_graph::state::compile_state_claims(view.graph, &symbol_comp);
     for claim in state_claims {
+        if !prod_comp(&claim.component) {
+            *scoped_out.entry("state-authority".into()).or_default() += 1;
+            continue;
+        }
         let Some(c) = components.iter_mut().find(|c| c.name == claim.component) else {
             continue;
         };
@@ -863,6 +1194,15 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         }
     }
     for c in &mut components {
+        if scope == AtlasScope::Production
+            && comp_role.get(&c.name).map(|r| r != "production").unwrap_or(false)
+        {
+            let n = c.owns.len();
+            c.owns.clear();
+            if n > 0 {
+                *scoped_out.entry("state-authority".into()).or_default() += n;
+            }
+        }
         c.owns.sort_by(|a, b| {
             a.target
                 .cmp(&b.target)
@@ -884,6 +1224,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         let Some(comp) = symbol_comp.get(&r.subject) else {
             continue;
         };
+        if !prod_comp(comp) {
+            *scoped_out.entry("public-api".into()).or_default() += 1;
+            continue;
+        }
         if let Some(name) = view.entity(&r.object).map(|e| e.name.clone()) {
             if !name.is_empty() {
                 public_api.entry(comp.clone()).or_default().insert(name);
@@ -901,6 +1245,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         let Some(comp) = symbol_comp.get(&e.id) else {
             continue;
         };
+        if !prod_comp(comp) {
+            *scoped_out.entry("public-api".into()).or_default() += 1;
+            continue;
+        }
         public_api
             .entry(comp.clone())
             .or_default()
@@ -920,6 +1268,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         rels.sort_by(|x, y| x.object.cmp(&y.object));
         for r in rels {
             if let Some(comp) = symbol_comp.get(&r.object) {
+                if !prod_comp(comp) {
+                    *scoped_out.entry("framework".into()).or_default() += 1;
+                    continue;
+                }
                 let target = entity_name(view, &r.object);
                 framework_semantics
                     .entry(comp.clone())
@@ -947,6 +1299,10 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             let Some(comp) = symbol_comp.get(&r.subject) else {
                 continue;
             };
+            if !prod_comp(comp) {
+                *scoped_out.entry("framework".into()).or_default() += 1;
+                continue;
+            }
             let target = entity_name(view, &r.object);
             let line = if pred == scc_core::predicates::REGISTERS {
                 format!("registers {target}")
@@ -972,7 +1328,7 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
 
     // ---- LANDMARKS (Wave 10): notable exports + annotated targets,
     // bounded (~40) ----
-    let landmarks = build_landmarks(view, &public_api, &symbol_comp);
+    let landmarks = build_landmarks(view, &public_api, &symbol_comp, scope, &comp_role, &mut scoped_out);
 
     SystemAtlas {
         repository: repo.name,
@@ -986,7 +1342,27 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
         components,
         entrypoints,
         contracts,
-        coverage: compute_coverage(ctx),
+        coverage: {
+            let mut coverage = compute_coverage(ctx);
+            let scoped_total: usize = scoped_out.values().sum();
+            let scope_line = if scope == AtlasScope::Full {
+                "full (every repository role feeds the architecture sections)".to_string()
+            } else if scoped_total == 0 {
+                "production (no non-production architecture facts found)".to_string()
+            } else {
+                let parts: Vec<String> = scoped_out
+                    .iter()
+                    .map(|(k, v)| format!("{k}:{v}"))
+                    .collect();
+                format!(
+                    "production ({} non-production facts scoped out of architecture sections: {}; components/files still list all roles)",
+                    scoped_total,
+                    parts.join(", ")
+                )
+            };
+            coverage.insert("scope".to_string(), scope_line);
+            coverage
+        },
         flows,
         invariants,
         deployment_units,
@@ -1114,10 +1490,14 @@ fn build_pipeline(view: &TrustedGraphView, archetype: Option<scc_core::Archetype
 /// Exports: the component-sorted public API, preferring classes then
 /// functions, capped. Annotated targets: symbols an ANNOTATION/REGISTERS
 /// fact targets (framework-decorated code). Deterministic: sorted.
+// trace:exempt reason=internal-detail
 fn build_landmarks(
     view: &TrustedGraphView,
     public_api: &BTreeMap<String, Vec<String>>,
     symbol_comp: &HashMap<String, String>,
+    scope: AtlasScope,
+    comp_role: &HashMap<String, String>,
+    scoped_out: &mut BTreeMap<String, usize>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -1153,11 +1533,18 @@ fn build_landmarks(
             out.push(format!("export {}", n));
         }
     }
-    // annotated targets (framework-decorated symbols), capped
+    // annotated targets (framework-decorated symbols), capped.
+    // Component-scoped: a test-only decorator target is not a landmark.
     let mut targets: Vec<String> = Vec::new();
     for a in view.entities_of_kind(scc_core::kinds::ANNOTATION) {
         for r in view.out_pred(&a.id, scc_core::predicates::ANNOTATES) {
             if let Some(comp) = symbol_comp.get(&r.object) {
+                if scope == AtlasScope::Production
+                    && comp_role.get(comp).map(|r| r != "production").unwrap_or(false)
+                {
+                    *scoped_out.entry("landmarks".into()).or_default() += 1;
+                    continue;
+                }
                 let name = entity_name(view, &r.object);
                 if !name.is_empty() && !name.starts_with('_') {
                     targets.push(format!("{name} (@{})", a.name));
@@ -2231,6 +2618,95 @@ mod tests {
     fn kinds_stringify() {
         assert_eq!(flow_kind_str(FlowKind::Sequence), "sequence");
         assert_eq!(severity_str(scc_core::Severity::Critical), "CRITICAL");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.context.atlas-production-scope verifies=REQ-SCC-CTX exercises=impl.scc.atlas-scoped
+    fn atlas_production_scope_keeps_fixture_routes_out() {
+        // The pollution case: fixtures/foo/app.py exposes GET /admin. The
+        // default atlas must not list it as an entrypoint or contract, the
+        // fixture component must still list (labeled), and --full restores it.
+        let (_dir, store) = fact_layer_store();
+        let repo = store.repo_id.clone();
+        let mk_route = |store: &Store, method: &str, path: &str, file: &str| {
+            let name = format!("{method} {path}");
+            let mut e = Entity::new(entity_id(&repo, kinds::ROUTE, &name), kinds::ROUTE, &name);
+            e.attr("method", serde_json::json!(method));
+            e.attr("path", serde_json::json!(path));
+            e.attr("handler", serde_json::json!("handler"));
+            e.attr("file", serde_json::json!(file));
+            store.insert_entity(&e, &[file.to_string()]).unwrap();
+        };
+        mk_route(&store, "GET", "/api/ok", "api/app.py");
+        mk_route(&store, "GET", "/admin", "fixtures/foo/app.py");
+        let mut fx_comp = scc_core::Entity::new(
+            entity_id(&repo, kinds::COMPONENT, "fx"),
+            kinds::COMPONENT,
+            "fx",
+        );
+        fx_comp.attr(
+            "implementation",
+            serde_json::json!({"paths": ["fixtures/foo"], "symbols": []}),
+        );
+        // Re-list components: fact_layer_store set [api, web]; rebuild the
+        // same two plus fx (replace_components takes the full list).
+        let mut api_comp = scc_core::Entity::new(
+            entity_id(&repo, kinds::COMPONENT, "api"),
+            kinds::COMPONENT,
+            "api",
+        );
+        api_comp.attr(
+            "implementation",
+            serde_json::json!({"paths": ["api"], "symbols": []}),
+        );
+        let mut web_comp = scc_core::Entity::new(
+            entity_id(&repo, kinds::COMPONENT, "web"),
+            kinds::COMPONENT,
+            "web",
+        );
+        web_comp.attr(
+            "implementation",
+            serde_json::json!({"paths": ["web"], "symbols": []}),
+        );
+        store.replace_components(&[api_comp, web_comp, fx_comp]).unwrap();
+
+        let graph = scc_graph::RealityGraph::load(&store).unwrap();
+        let ctx = ContextCompiler::new(&store, &graph, crate::ContextSettings::default(), Vec::new());
+        let atlas = build_atlas(&ctx);
+        assert!(
+            atlas.entrypoints.iter().any(|e| e.trigger == "GET /api/ok"),
+            "production route listed: {:?}",
+            atlas.entrypoints
+        );
+        assert!(
+            !atlas.entrypoints.iter().any(|e| e.trigger == "GET /admin"),
+            "fixture route must not be a global entrypoint: {:?}",
+            atlas.entrypoints
+        );
+        assert!(
+            !atlas.contracts.iter().any(|c| c
+                .operations
+                .iter()
+                .any(|o| o == "GET /admin")),
+            "fixture route must not be a contract: {:?}",
+            atlas.contracts
+        );
+        assert!(
+            atlas.components.iter().any(|c| c.name == "fx" && c.role == "fixture"),
+            "fixture component stays visible, labeled: {:?}",
+            atlas.components.iter().map(|c| (&c.name, &c.role)).collect::<Vec<_>>()
+        );
+        assert!(
+            atlas.coverage.get("scope").map(|s| s.contains("production")).unwrap_or(false),
+            "scope honesty receipt: {:?}",
+            atlas.coverage.get("scope")
+        );
+        let full = build_atlas_scoped(&ctx, AtlasScope::Full);
+        assert!(
+            full.entrypoints.iter().any(|e| e.trigger == "GET /admin"),
+            "full scope restores the fixture route: {:?}",
+            full.entrypoints
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ Inferred claims are labeled with confidence and evidence and never silently prom
 | Resolution | Cross-file call resolution with conventional source-root fallbacks (`src/`/`svc`/`lib`/`app`), LSP definition resolution (pyright + typescript-language-server), SCIP import, and a resolution-conflict model — disagreements are surfaced, never merged |
 | System IR | Component compiler (workspaces, deployment units, directories, intent), responsibilities, ownership, contracts, invariants, trust boundaries, Git co-change |
 | Atlas | Machine-readable architecture, sequence, dataflow, lifecycle, and workflow views — no colors, no coordinates, semantics only |
-| Context | Six agent-facing operations with hard token budgets that never cut invariants, ownership, or failure behavior; optional semantic ranking via any OpenAI-compatible embedding endpoint plus a separate `/rerank` model |
+| Context | Agent-facing operations with hard token budgets (rendered output always fits; over-budget sections drop or line-truncate with every cut recorded); default production-scope atlas (`scc atlas --full` for all roles); optional semantic ranking via any OpenAI-compatible embedding endpoint plus a separate `/rerank` model |
 | Freshness | Content-hash invalidation, incremental indexing with full↔incremental equivalence guarantees, staleness detection, intent↔reality drift, CI gates |
 | Runtime | OpenTelemetry trace ingestion, static-vs-observed edge reconciliation, replay-verified aggregates |
 | Integrations | Claude Code hooks, Codex AGENTS.md, Oh My Pi native extension, OpenCode MCP config, Hermes plugin, MCP server, HTTP API, TypeScript and Python SDKs, Beads/CBM/Hindsight/Context7 adapters |

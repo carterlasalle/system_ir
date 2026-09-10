@@ -98,6 +98,10 @@ enum Commands {
         budget: Option<usize>,
         #[arg(long)]
         json: bool,
+        /// Full scope: include test/fixture/benchmark evidence in the
+        /// architecture sections (default is the production scope)
+        #[arg(long)]
+        full: bool,
         /// Resolve unresolved call edges through the language backends first
         #[arg(long)]
         resolve: bool,
@@ -734,7 +738,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Surface { task, budget, explain } => {
             commands::cmd_surface(&root, task.as_deref(), budget, explain)
         }
-        Commands::Atlas { budget, json, resolve } => {
+        Commands::Atlas { budget, json, full, resolve } => {
             if resolve {
                 let rep = scc_cli::resolve_and_recompile(&root)?;
                 eprintln!(
@@ -742,7 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rep.upgraded, rep.unresolved, rep.errors
                 );
             }
-            commands::cmd_atlas(&root, budget, json)
+            commands::cmd_atlas(&root, budget, json, full)
         }
         Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
         Commands::Drift { json } => commands::cmd_drift(&root, json),

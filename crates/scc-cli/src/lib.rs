@@ -112,32 +112,40 @@ pub fn recompile(store: &Store) -> Result<scc_graph::RecompileReport> {
 }
 
 /// Compute repository-relative paths whose indexed snapshot no longer matches
-/// the working tree: modified, deleted, AND added files. Added files are
-/// found by diffing the authoritative scan against the indexed inventory —
-/// a newly created relevant file must make the model non-current.
+/// the working tree: modified, deleted, AND added files, from ONE
+/// authoritative scan diffed against the indexed inventory — a newly
+/// created relevant file must make the model non-current, and indexed
+/// files are never re-read when the scan already hashed them (one
+/// read+hash per file per freshness check, not two). Same scan the
+/// indexer uses, so both sides share one notion of "repository file"
+/// (git-ignored and configured-ignored paths excluded).
+///
+/// Scaling note: the authoritative scan still reads every candidate file
+/// (correctness first — no mtime cache exists yet, so content hashing is
+/// the only proof of sameness). The scan walk itself is the periodic
+/// reconciliation; a watcher dirty-set + metadata fast path stays
+/// deferred until a daemon owns it.
 // trace:v1 id=impl.crates-scc-cli-src-lib.stale-paths work=WORK-SI-MMMJA4G6 implements=PLAN-SI-SYKFPBEC
 pub fn stale_paths(store: &Store) -> Result<Vec<String>> {
+    let config = load_config(&store.root)?;
+    let scanned = scc_indexer::scan::scan_repo(&store.root, &config.index).map_err(scc_indexer::IndexError::from)?;
+    let mut fresh: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for f in &scanned {
+        fresh.insert(f.path.as_str(), f.hash.as_str());
+    }
     let mut out = Vec::new();
     let mut indexed = std::collections::HashSet::new();
     for (path, hash, _lang, _kind, _size) in store.all_files()? {
         indexed.insert(path.clone());
-        let full = store.root.join(&path);
-        let current = match std::fs::read(&full) {
-            Ok(b) => scc_indexer::scan::hash_bytes(&b),
-            Err(_) => String::new(), // deleted
-        };
-        if current != hash {
-            out.push(path);
+        match fresh.get(path.as_str()) {
+            Some(current) if *current == hash.as_str() => {} // fresh — no re-read
+            Some(_) => out.push(path),   // modified
+            None => out.push(path),      // deleted (or newly ignored)
         }
     }
-    // Added since indexing: in the scan but absent from the inventory.
-    // Same scan the indexer uses, so both sides share one notion of
-    // "repository file" (git-ignored and configured-ignored paths excluded).
-    let config = load_config(&store.root)?;
-    let scanned = scc_indexer::scan::scan_repo(&store.root, &config.index).map_err(scc_indexer::IndexError::from)?;
     for f in scanned {
         if !indexed.contains(&f.path) {
-            out.push(f.path);
+            out.push(f.path); // added since indexing
         }
     }
     out.sort();
@@ -165,6 +173,7 @@ pub fn compiler<'a>(
         startup_tokens: config.context.startup_tokens,
         task_tokens: config.context.task_tokens,
         atlas_tokens: config.context.atlas_tokens,
+        detail_tokens: config.context.detail_tokens,
         include_low_confidence_inference: config.context.include_low_confidence_inference,
         rank_salt: format!(
             "{}:{}:{}",
@@ -194,6 +203,7 @@ impl Compiler<'_> {
     }
 }
 
+// trace:exempt reason=internal-detail
 pub fn index_and_recompile(root: &Path, config: &Config) -> Result<scc_indexer::IndexReport> {
     let indexer = scc_indexer::Indexer::new(open_store(root)?, config.clone());
     let report = indexer.index()?;
@@ -209,6 +219,13 @@ pub fn index_and_recompile(root: &Path, config: &Config) -> Result<scc_indexer::
         );
     }
     recompile(&store)?;
+    // Revision AFTER recompile (never inside the indexer): history must
+    // include derived facts (components, boundaries, flows). Recording
+    // before recompile leaves history one recompile behind — V2 content
+    // dedup exposed this ordering bug.
+    let _ = store.record_current_revision_with_config(
+        &scc_indexer::semantic_config_hash(config),
+    )?;
     Ok(report)
 }
 

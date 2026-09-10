@@ -1,3 +1,9 @@
+> **HISTORICAL — superseded.** September 9 benchmark-mission report describing the tree at `f042395`.
+> Current behavior is recorded in `docs/CAPABILITY_LEDGER.md`. Claims below about components,
+> freshness, budgets, benchmark interpretation, and mission completeness predate the product-truth
+> and hardening passes and **do not describe the current code**. Kept for archaeology only.
+
+---
 # System IR / SCC — Final Mission Report
 
 <!-- trace:v1 id=doc.mission-final-report work=WORK-mission-final-report-document satisfies=REQ-report-document -->

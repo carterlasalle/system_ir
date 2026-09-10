@@ -199,6 +199,13 @@ fn run_external(command: &str, input: &str) -> crate::Result<String> {
 
 /// `scc export capsule.md` — portable startup capsule for any harness
 /// (Claude Code, Codex, Hermes, OpenCode...).
+///
+/// A durable committed file cannot BE the live 20k-token startup artifact,
+/// so the capsule is a deliberately defined derivative: the compact
+/// overview PLUS the bounded repository skeleton. Every SCC-supported
+/// agent therefore receives the physical layout before its first
+/// reasoning turn; the skeleton also tells it to run `scc context
+/// startup` for the fused live architecture.
 // trace:v1 id=impl.crates-scc-cli-src-compress.capsule-markdown
 pub fn capsule_markdown(root: &Path) -> crate::Result<String> {
     let store = crate::open_store(root)?;
@@ -208,12 +215,23 @@ pub fn capsule_markdown(root: &Path) -> crate::Result<String> {
     let overview = comp.ctx().system_overview();
     let revision = overview.repository_revision.clone();
     let repo = store.repository();
+    let paths: Vec<String> = store
+        .all_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(p, _, _, _, _)| p)
+        .collect();
+    let skeleton = scc_context::skeleton::build_skeleton(
+        &paths,
+        scc_context::skeleton::skeleton_budget(config.context.startup_tokens),
+    );
     Ok(format!(
-        "<!-- SCC-CAPSULE v1 repo={} revision={} generated={} -->\n# SYSTEM CAPSULE\n\n{}\n",
+        "<!-- SCC-CAPSULE v1 repo={} revision={} generated={} -->\n# SYSTEM CAPSULE\n\n{}\n## REPOSITORY SKELETON\n\n{}\n\n(Physical layout above; run `scc context startup` for the fused live architecture.)\n",
         repo.id,
         revision,
         scc_core::now_rfc3339(),
-        overview.content
+        overview.content,
+        skeleton.text
     ))
 }
 

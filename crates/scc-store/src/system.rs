@@ -39,10 +39,19 @@ pub struct System {
 }
 
 /// How a stitch was evidenced. Never stronger than the keys behind it.
+///
+/// Direction rule: a shared SHAPE (server+server routes, pub+pub topics)
+/// is a [`MatchKind::MatchingContract`], never [`MatchKind::Exact`].
+/// Exact requires evidenced direction across members (publisher in one,
+/// subscriber in another; a declared repo binding) — two servers exposing
+/// the same route may never have called each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 // trace:v1 id=impl.crates-scc-store-src-system.match-kind work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub enum MatchKind {
-    /// Strong key, every side evidenced (verb+route, shared topic name).
+    /// Direction evidenced across members (publisher↔subscriber,
+    /// declared repo binding). Reachable for routes once HTTP client-call
+    /// evidence exists (HTTP_CLIENT_CALL entities — extractor deferred,
+    /// like deferred FlowEdgeKind detection: documented, not faked).
     Exact,
     /// Importer names the member repo AND the imported symbol.
     Declared,
@@ -50,6 +59,10 @@ pub enum MatchKind {
     Inferred,
     /// Same key claimed incompatibly — recorded, never joined.
     Ambiguous,
+    /// Same contract shape in ≥2 members with no evidenced direction
+    /// (server+server routes, pub+pub or bare topics). A shared
+    /// contract, NOT a proven cross-repo dependency.
+    MatchingContract,
 }
 
 /// What kind of cross-repo binding a stitch represents.
@@ -64,6 +77,29 @@ pub enum StitchKind {
     PackageExport,
 }
 
+/// Directional role of one stitch end. Package stitches carry no role:
+/// their direction already reads from ends order (importer first) and the
+/// Declared/Inferred verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// trace:v1 id=impl.crates-scc-store-src-system.end-role work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub enum EndRole {
+    /// A server route declaration (stitch_routes ends are always this:
+    /// ROUTE entities are server-side evidence).
+    Server,
+    /// Reserved: an HTTP client call (fetch/axios/client-stub evidence).
+    /// No extractor emits this yet — present so the upgrade path needs no
+    /// schema change when client-call detection lands.
+    Client,
+    /// A topic publisher in this member.
+    Publisher,
+    /// A topic subscriber in this member.
+    Subscriber,
+    /// Both publishes and subscribes in this member.
+    PublisherSubscriber,
+    /// Topic claimed with no pub/sub edges: direction unknown.
+    Unknown,
+}
+
 /// One end of a stitch: the member entity plus where it was observed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // trace:v1 id=impl.crates-scc-store-src-system.stitch-end work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
@@ -74,6 +110,8 @@ pub struct StitchEnd {
     pub entity_id: String,
     /// Files observing this entity (provenance survives stitching).
     pub sources: Vec<String>,
+    /// Directional role, if this stitch kind has a direction vocabulary.
+    pub role: Option<EndRole>,
 }
 
 /// A cross-repo semantic edge. Ambiguous stitches carry all claimants and
@@ -89,6 +127,25 @@ pub struct Stitch {
     pub match_kind: MatchKind,
     /// One end per claiming member, ordered by (repo_id, entity_id).
     pub ends: Vec<StitchEnd>,
+}
+
+/// Publish/subscribe sides of one topic entity inside one member,
+/// from its PUBLISHES/SUBSCRIBES relationship edges.
+// trace:exempt reason=internal-detail
+fn topic_sides(store: &Store, topic_id: &str) -> Result<(bool, bool), StoreError> {
+    let mut publishes = false;
+    let mut subscribes = false;
+    for r in store.all_relationships()? {
+        if r.object != topic_id {
+            continue;
+        }
+        if r.predicate == scc_core::predicates::PUBLISHES {
+            publishes = true;
+        } else if r.predicate == scc_core::predicates::SUBSCRIBES {
+            subscribes = true;
+        }
+    }
+    Ok((publishes, subscribes))
 }
 
 // trace:exempt reason=internal-detail
@@ -137,17 +194,20 @@ impl System {
     }
 
     // trace:v1 id=impl.crates-scc-store-src-system-system.end work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
-    fn end(&self, m: &Member, e: &Entity) -> Result<StitchEnd, StoreError> {
+    fn end(&self, m: &Member, e: &Entity, role: Option<EndRole>) -> Result<StitchEnd, StoreError> {
         Ok(StitchEnd {
             repo_id: m.repo_id.clone(),
             entity_id: e.id.clone(),
             sources: m.store.entity_sources(&e.id)?,
+            role,
         })
     }
 
-    /// Stitch HTTP contracts: same `VERB /path` route name in ≥2 members
-    /// is an exact cross-repo contract (strong key: verb + normalized
-    /// route). Same path with different verbs across members is ambiguous:
+    /// Stitch HTTP contracts: same `VERB /path` in ≥2 members is a
+    /// contract-SHAPE match. ROUTE entities are server declarations, so two
+    /// members exposing the same route are two servers that may never have
+    /// called each other: [`MatchKind::MatchingContract`], never Exact.
+    /// Same path with different verbs across members is ambiguous:
     /// recorded with all claimants, never joined.
     // trace:v1 id=impl.scc.store.system.stitch-routes work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     pub fn stitch_routes(&self) -> Result<Vec<Stitch>, StoreError> {
@@ -177,7 +237,7 @@ impl System {
             verbs.dedup();
             let mut stitch_ends = Vec::new();
             for (i, _, e) in claims {
-                stitch_ends.push(self.end(&self.members[*i], e)?);
+                stitch_ends.push(self.end(&self.members[*i], e, Some(EndRole::Server))?);
             }
             stitch_ends.sort_by(|a, b| {
                 (a.repo_id.clone(), a.entity_id.clone())
@@ -188,7 +248,7 @@ impl System {
                 out.push(Stitch {
                     kind: StitchKind::Route,
                     key: format!("{} {path}", verbs[0]),
-                    match_kind: MatchKind::Exact,
+                    match_kind: MatchKind::MatchingContract,
                     ends: stitch_ends,
                 });
             } else {
@@ -206,10 +266,12 @@ impl System {
         Ok(out)
     }
 
-    /// Stitch event topics: same topic name evidenced in ≥2 members is an
-    /// exact semantic stitch (brokers namespace globally). Publish and
-    /// subscribe sides are distinguished by each end's relationships, not
-    /// by the stitch itself.
+    /// Stitch event topics: same topic name in ≥2 members. Direction
+    /// decides the verdict from each member's PUBLISHES/SUBSCRIBES edges:
+    /// a publisher in one member and a subscriber in another is an
+    /// [`MatchKind::Exact`] dependency; pub+pub, sub+sub, or unevidenced
+    /// sides are a [`MatchKind::MatchingContract`] shape match. Each end
+    /// carries its side ([`EndRole`]).
     // trace:v1 id=impl.scc.store.system.stitch-topics work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     pub fn stitch_topics(&self) -> Result<Vec<Stitch>, StoreError> {
         let mut by_name: BTreeMap<String, Vec<(usize, Entity)>> = BTreeMap::new();
@@ -221,8 +283,24 @@ impl System {
         let mut out = Vec::new();
         for (name, ends) in &by_name {
             let mut stitch_ends = Vec::new();
+            let mut pub_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let mut sub_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
             for (i, e) in ends {
-                stitch_ends.push(self.end(&self.members[*i], e)?);
+                let m = &self.members[*i];
+                let (publishes, subscribes) = topic_sides(&m.store, &e.id)?;
+                let role = match (publishes, subscribes) {
+                    (true, true) => EndRole::PublisherSubscriber,
+                    (true, false) => EndRole::Publisher,
+                    (false, true) => EndRole::Subscriber,
+                    (false, false) => EndRole::Unknown,
+                };
+                if publishes {
+                    pub_repos.insert(m.repo_id.as_str());
+                }
+                if subscribes {
+                    sub_repos.insert(m.repo_id.as_str());
+                }
+                stitch_ends.push(self.end(m, e, Some(role))?);
             }
             let repos: std::collections::BTreeSet<&str> =
                 stitch_ends.iter().map(|e| e.repo_id.as_str()).collect();
@@ -233,10 +311,21 @@ impl System {
                 (a.repo_id.clone(), a.entity_id.clone())
                     .cmp(&(b.repo_id.clone(), b.entity_id.clone()))
             });
+            // Exact only across members: a publisher in one member and a
+            // subscriber in a DIFFERENT one. Same-member pub+sub proves
+            // nothing about the other member.
+            let directed = !pub_repos.is_empty()
+                && !sub_repos.is_empty()
+                && !(pub_repos == sub_repos && pub_repos.len() == 1);
+            let match_kind = if directed {
+                MatchKind::Exact
+            } else {
+                MatchKind::MatchingContract
+            };
             out.push(Stitch {
                 kind: StitchKind::Topic,
                 key: name.clone(),
-                match_kind: MatchKind::Exact,
+                match_kind,
                 ends: stitch_ends,
             });
         }
@@ -313,13 +402,14 @@ impl System {
                                     am.repo_id, module
                                 ),
                                 sources: vec![file.clone()],
+                                role: None,
                             });
                             break;
                         }
                     }
                 }
                 for (bi, e) in &ends_src {
-                    stitch_ends.push(self.end(&self.members[*bi], e)?);
+                    stitch_ends.push(self.end(&self.members[*bi], e, None)?);
                 }
                 stitch_ends.sort_by(|a, b| {
                     (a.repo_id.clone(), a.entity_id.clone())
@@ -349,7 +439,8 @@ fn norm_export(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scc_core::Entity;
+    use crate::Relationship;
+    use scc_core::{predicates, Entity, Provenance};
     use tempfile::TempDir;
 
     // trace:exempt reason=internal-detail
@@ -405,9 +496,51 @@ mod tests {
         root
     }
 
+    // trace:exempt reason=internal-detail
+    fn add_topic_side(root: &std::path::Path, topic: &str, publishes: bool, subscribes: bool) {
+        let store = Store::open(&root.join(".scc").join("scc.db"), root).unwrap();
+        let tid = format!("repo://{}/topic/{topic}", store.repo_id);
+        let sym = Entity::new(
+            format!("repo://{}/symbol/side.py/fn", store.repo_id),
+            "symbol",
+            "fn",
+        );
+        store.insert_entity(&sym, &["side.py".into()]).unwrap();
+        if publishes {
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        "rel:pub".to_string(),
+                        sym.id.clone(),
+                        predicates::PUBLISHES,
+                        tid.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "side.py",
+                )
+                .unwrap();
+        }
+        if subscribes {
+            store
+                .insert_relationship(
+                    &Relationship::new(
+                        "rel:sub".to_string(),
+                        sym.id.clone(),
+                        predicates::SUBSCRIBES,
+                        tid.clone(),
+                        Provenance::Extracted,
+                    ),
+                    "side.py",
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
-    // trace:v1 id=test.scc.store.system-route-exact verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-routes
-    fn shared_verb_and_path_is_an_exact_contract() {
+    // trace:v1 id=test.scc.store.system-route-shape verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-routes
+    fn shared_verb_and_path_is_a_matching_contract() {
+        // Two servers exposing GET /health may never have called each
+        // other: a MatchingContract shape match, never Exact.
         let dir = TempDir::new().unwrap();
         let a = member_with(&dir, "svc-a", &["GET /health"], &[], &[], &[]);
         let b = member_with(&dir, "svc-b", &["GET /health", "POST /users"], &[], &[], &[]);
@@ -415,12 +548,13 @@ mod tests {
         let routes = sys.stitch_routes().unwrap();
         assert_eq!(routes.len(), 1, "{routes:?}");
         assert_eq!(routes[0].key, "GET /health");
-        assert_eq!(routes[0].match_kind, MatchKind::Exact);
+        assert_eq!(routes[0].match_kind, MatchKind::MatchingContract);
         assert_eq!(routes[0].ends.len(), 2);
-        // canonical ids untouched by stitching
+        // canonical ids untouched by stitching; ends are server-declared
         for e in &routes[0].ends {
             assert!(e.entity_id.starts_with("repo://"), "{}", e.entity_id);
             assert!(!e.sources.is_empty());
+            assert_eq!(e.role, Some(EndRole::Server), "{e:?}");
         }
     }
 
@@ -450,16 +584,62 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=test.scc.store.system-topic-exact verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-topics
-    fn shared_topic_is_an_exact_stitch() {
+    // trace:v1 id=test.scc.store.system-topic-bare verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-topics
+    fn bare_shared_topic_is_a_matching_contract() {
+        // Same name, no pub/sub edges: direction unknown, not Exact.
         let dir = TempDir::new().unwrap();
         let a = member_with(&dir, "prod", &[], &["orders.created"], &[], &[]);
         let b = member_with(&dir, "cons", &[], &["orders.created"], &[], &[]);
         let sys = System::open(&[a.as_path(), b.as_path()]).unwrap();
         let topics = sys.stitch_topics().unwrap();
         assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].match_kind, MatchKind::MatchingContract);
+        assert_eq!(topics[0].ends.len(), 2);
+        for e in &topics[0].ends {
+            assert_eq!(e.role, Some(EndRole::Unknown), "{e:?}");
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.store.system-topic-directed verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-topics
+    fn publisher_to_subscriber_is_an_exact_stitch() {
+        // Publisher in one member, subscriber in another: evidenced
+        // direction, with per-end roles.
+        let dir = TempDir::new().unwrap();
+        let a = member_with(&dir, "prod", &[], &["orders.created"], &[], &[]);
+        let b = member_with(&dir, "cons", &[], &["orders.created"], &[], &[]);
+        add_topic_side(a.as_path(), "orders.created", true, false);
+        add_topic_side(b.as_path(), "orders.created", false, true);
+        let sys = System::open(&[a.as_path(), b.as_path()]).unwrap();
+        let topics = sys.stitch_topics().unwrap();
+        assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].match_kind, MatchKind::Exact);
         assert_eq!(topics[0].ends.len(), 2);
+        let role_of = |repo: &str| {
+            topics[0]
+                .ends
+                .iter()
+                .find(|e| e.repo_id.contains(repo))
+                .unwrap()
+                .role
+        };
+        assert_eq!(role_of("prod"), Some(EndRole::Publisher));
+        assert_eq!(role_of("cons"), Some(EndRole::Subscriber));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.store.system-topic-undirected verifies=REQ-SI-503JSBGP exercises=impl.scc.store.system.stitch-topics
+    fn publisher_to_publisher_is_a_matching_contract() {
+        // Both sides publish: no cross-member direction evidenced.
+        let dir = TempDir::new().unwrap();
+        let a = member_with(&dir, "prod-a", &[], &["orders.created"], &[], &[]);
+        let b = member_with(&dir, "prod-b", &[], &["orders.created"], &[], &[]);
+        add_topic_side(a.as_path(), "orders.created", true, false);
+        add_topic_side(b.as_path(), "orders.created", true, false);
+        let sys = System::open(&[a.as_path(), b.as_path()]).unwrap();
+        let topics = sys.stitch_topics().unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].match_kind, MatchKind::MatchingContract);
     }
 
     #[test]

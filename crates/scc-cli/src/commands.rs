@@ -60,6 +60,10 @@ pub fn cmd_index_paths(root: &Path, paths: &[String], quiet: bool) -> crate::Res
     let report = indexer.refresh_paths(paths)?;
     drop(indexer);
     recompile(&store)?;
+    // Same ordering contract as full index: revision after recompile.
+    let _ = store.record_current_revision_with_config(
+        &scc_indexer::semantic_config_hash(&config),
+    )?;
     if !quiet && report.indexed > 0 {
         println!("refreshed {} file(s)", report.indexed);
     }
@@ -154,12 +158,16 @@ pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
 
 /// `scc atlas [--budget N] [--json]` — the full System Atlas.
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-atlas work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool) -> crate::Result<()> {
+pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool, full: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().system_atlas(budget);
+    let pack = if full {
+        comp.ctx().system_atlas_scoped(budget, scc_context::atlas::AtlasScope::Full)
+    } else {
+        comp.ctx().system_atlas(budget)
+    };
     if json {
         println!("{}", serde_json::to_string(&pack)?);
     } else {
@@ -1077,7 +1085,10 @@ pub fn cmd_system(_root: &Path, members: &[std::path::PathBuf], json: bool) -> c
             s.ends.len()
         );
         for e in &s.ends {
-            println!("  {} {}", e.repo_id, e.entity_id);
+            match e.role {
+                Some(role) => println!("  {} {} ({role:?})", e.repo_id, e.entity_id),
+                None => println!("  {} {}", e.repo_id, e.entity_id),
+            }
         }
     }
     Ok(())
@@ -1124,8 +1135,10 @@ pub fn cmd_diff(root: &Path, from: i64, to: i64, json: bool) -> crate::Result<()
     for (label, ids) in [
         ("added entities", &d.added_entities),
         ("removed entities", &d.removed_entities),
+        ("modified entities", &d.modified_entities),
         ("added relationships", &d.added_relationships),
         ("removed relationships", &d.removed_relationships),
+        ("modified relationships", &d.modified_relationships),
     ] {
         println!("  {label}: {}", ids.len());
         for id in ids.iter().take(20) {
@@ -1134,6 +1147,14 @@ pub fn cmd_diff(root: &Path, from: i64, to: i64, json: bool) -> crate::Result<()
         if ids.len() > 20 {
             println!("    … ({} more)", ids.len() - 20);
         }
+    }
+    if !d.modified_kinds.is_empty() {
+        let kinds: Vec<String> = d
+            .modified_kinds
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        println!("  modified kinds: {}", kinds.join(", "));
     }
     Ok(())
 }
@@ -1189,17 +1210,32 @@ pub fn cmd_snapshot_diff(root: &Path, id: &str, json: bool) -> crate::Result<()>
                 println!("{}", serde_json::to_string_pretty(&d)?);
             } else {
                 println!(
-                    "snapshot rev {} vs current rev {}: {} still valid, {} invalidated",
+                    "snapshot rev {} vs current rev {}: {} still valid, {} invalidated, {} modified{}",
                     d.snapshot_revision,
                     d.current_revision,
                     d.still_valid.len(),
-                    d.invalidated.len()
+                    d.invalidated.len(),
+                    d.modified_entities.len(),
+                    if d.artifact_changed { " (artifact would re-render differently)" } else { "" },
                 );
-                for f in d.invalidated.iter().take(20) {
-                    println!("  - {f}");
-                }
-                if d.invalidated.len() > 20 {
-                    println!("  … ({} more)", d.invalidated.len() - 20);
+                for (label, ids) in [
+                    ("invalidated", &d.invalidated),
+                    ("modified entities", &d.modified_entities),
+                    ("changed relationships", &d.changed_relationships),
+                    ("changed contracts", &d.changed_contracts),
+                    ("changed state", &d.changed_state),
+                    ("changed flows", &d.changed_flows),
+                ] {
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    println!("  {label} ({}):", ids.len());
+                    for f in ids.iter().take(20) {
+                        println!("    - {f}");
+                    }
+                    if ids.len() > 20 {
+                        println!("    … ({} more)", ids.len() - 20);
+                    }
                 }
             }
         }

@@ -108,10 +108,19 @@ fn startup_ledger_omits_budget_dropped_entries() {
     let dir = setup_fixture();
     let root = dir.path();
 
-    // A below-floor startup budget must NOT panic (§56): the corrective
-    // loop exhausts the surface/atlas floors and the artifact surfaces an
-    // honest BUDGET OVERFLOW marker instead of crashing the CLI.
+    // A below-floor startup budget must NOT panic (§56) and must NOT
+    // escape the cap: the emergency floor (atlas essentials + skeleton +
+    // receipt) always fits the hard max (200 + max(200/5, 500) = 700).
     let out = run(root, &["context", "startup", "--budget", "200"]);
+    assert!(
+        !out.contains("BUDGET OVERFLOW"),
+        "no overflow escape hatch: the artifact must fit the hard max"
+    );
+    let est = out.chars().count().div_ceil(4);
+    assert!(
+        est <= 700,
+        "startup artifact must fit the hard max: ~{est} > 700"
+    );
     let blob = ledger_visible_blob(root);
 
     // Ledger-vs-artifact coupling (§53): any recorded symbol id is in the

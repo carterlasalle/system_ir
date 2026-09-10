@@ -187,9 +187,16 @@ fn checkpoint_captures_goal_from_active_bead() {
     let cp: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(cp["task"]["goal"], "Fix transcript normalization retry", "{out}");
     assert_eq!(cp["task"]["bead"], "b7", "{out}");
-    // rehydration renders the goal
+    // capture pins a durable snapshot for semantic rehydration
+    assert!(
+        cp["snapshot_id"].as_str().map(|s| s.starts_with("snap-")).unwrap_or(false),
+        "capture must pin a snapshot id: {out}"
+    );
+    // rehydration renders the goal plus the snapshot validity verdict
     let loaded = run_ok(&dir, &["checkpoint", "load", "--inject"]);
     assert!(loaded.contains("Fix transcript normalization retry"), "{loaded}");
+    assert!(loaded.contains("Snapshot validity"), "{loaded}");
+    assert!(loaded.contains("still valid"), "{loaded}");
 }
 
 #[test]
@@ -285,17 +292,25 @@ fn atlas_budget_accounting_is_honest() {
     let repo = copy_fixture("http-service-python");
     let dir = workdir(repo.path());
     run_ok(&dir, &["index", "--quiet"]);
-    // tight budget: the renderer drops low-priority sections and reports it
-    // — it never silently cuts critical content
+    // tight budget: the hard renderer fits the budget exactly — sections
+    // may drop or line-truncate (even critical ones at 200 tokens), but
+    // every cut is recorded in dropped_sections, never silent
     let out = run_ok(&dir, &["atlas", "--budget", "200", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["budget"], 200);
     assert!(
-        v["truncated"].as_bool().unwrap()
-            || v["exceeded_soft_budget"].as_bool().unwrap(),
-        "tight budget must be reported: {out}"
+        v["truncated"].as_bool().unwrap(),
+        "tight budget must report truncation: {out}"
     );
-    // critical sections never dropped
+    assert!(
+        v["tokens"].as_u64().unwrap() <= 200,
+        "hard cap violated: {}",
+        v["tokens"]
+    );
+    assert!(
+        !v["exceeded_soft_budget"].as_bool().unwrap(),
+        "fit must hold, no soft excess: {out}"
+    );
     let dropped: Vec<&str> = v["dropped_sections"]
         .as_array()
         .map(|a| {
@@ -304,9 +319,10 @@ fn atlas_budget_accounting_is_honest() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for critical in ["CRITICAL INVARIANTS", "DATA OWNERSHIP", "CONTRACTS"] {
-        assert!(!dropped.contains(&critical), "dropped critical: {dropped:?}");
-    }
+    assert!(
+        !dropped.is_empty(),
+        "cuts must be recorded: {out}"
+    );
 }
 
 #[test]
@@ -568,7 +584,8 @@ fn multi_repo_system_stitches_contracts_topics_and_packages() {
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("system parse failed: {e}; raw={raw:?}"))
     };
 
-    // contract stitch: same verb + path in two languages
+    // contract stitch: same verb + path in two languages, both servers.
+    // Same shape, no evidenced direction: MatchingContract, never Exact.
     let routes = sys(&[svc_a.clone(), web_b.clone()]);
     let health: Vec<&serde_json::Value> = routes
         .as_array()
@@ -577,11 +594,12 @@ fn multi_repo_system_stitches_contracts_topics_and_packages() {
         .filter(|s| s["key"] == "GET /health")
         .collect();
     assert_eq!(health.len(), 1, "{routes}");
-    assert_eq!(health[0]["match_kind"], "Exact");
+    assert_eq!(health[0]["match_kind"], "MatchingContract");
     assert_eq!(health[0]["ends"].as_array().unwrap().len(), 2);
     // provenance survives stitching: every end names its file
     for e in health[0]["ends"].as_array().unwrap() {
         assert!(!e["sources"].as_array().unwrap().is_empty(), "{e}");
+        assert_eq!(e["role"], "Server", "{e}");
     }
 
     // standalone-vs-system stability: svc-a ends identical in both systems
@@ -639,6 +657,19 @@ fn multi_repo_system_stitches_contracts_topics_and_packages() {
         .collect();
     assert_eq!(orders.len(), 1, "{topics}");
     assert_eq!(orders[0]["match_kind"], "Exact");
+    // direction evidenced per end: producer publishes, consumer subscribes
+    let role_of = |ends: &serde_json::Value, repo: &str| {
+        ends.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["repo_id"] == repo)
+            .unwrap()["role"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(role_of(&orders[0]["ends"], "prod"), "Publisher", "{topics}");
+    assert_eq!(role_of(&orders[0]["ends"], "cons"), "Subscriber", "{topics}");
 
     // package stitch: declared repo + symbol binding
     let pkgs = sys(&[hub.clone(), spoke.clone()]);

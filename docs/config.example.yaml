@@ -15,6 +15,7 @@ languages:
 context:
   startup_tokens: 6000
   task_tokens: 10000
+  detail_tokens: 6000
   include_low_confidence_inference: false
 inference:
   enabled: false

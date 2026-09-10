@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // trace:exempt reason=internal-detail
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 // trace:exempt reason=internal-detail
 pub const FTS_ESCAPE: &str = "\"";
 // trace:exempt reason=internal-detail
@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
 ];
 
 /// v4: model epoch. `context_cache.revision` becomes `epoch` — the cache is
@@ -98,6 +99,25 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
   budget INTEGER NOT NULL DEFAULT 0,
   warnings TEXT NOT NULL DEFAULT '[]'
 );
+"#;
+
+/// v8: versioned-graph V2 + snapshot V2 (§XIX/§XXII hardening). Revisions
+/// gain the semantic-config and graph-content hashes so extractor, config,
+/// confidence, or provenance changes produce a revision even when source
+/// files did not move. Snapshots gain entity/relationship/contract/state
+/// fingerprints plus the artifact hash so diffs detect modification, not
+/// just presence.
+/// Version-gated (runs once per database), so plain ADD COLUMN is safe.
+// trace:exempt reason=internal-detail
+const MIGRATION_8: &str = r#"
+ALTER TABLE graph_revisions ADD COLUMN semantic_config_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE graph_revisions ADD COLUMN graph_content_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE context_snapshots ADD COLUMN entity_fp TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE context_snapshots ADD COLUMN rel_fp TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE context_snapshots ADD COLUMN contract_fp TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE context_snapshots ADD COLUMN state_fp TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE context_snapshots ADD COLUMN flow_names TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE context_snapshots ADD COLUMN artifact_hash TEXT NOT NULL DEFAULT '';
 "#;
 
 /// v6: observed trace-path signatures (Wave 6) — canonical root-to-leaf

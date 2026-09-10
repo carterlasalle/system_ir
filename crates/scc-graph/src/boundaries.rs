@@ -158,12 +158,34 @@ pub fn compile_boundaries(graph: &RealityGraph, store: &Store) -> Result<Vec<(Re
 /// never mutates the database — context generation must be side-effect free.
 /// An atlas/verify run on an un-recompiled store shows the last compiled
 /// crossings; run `scc index` (or the pipeline) to refresh them.
+// trace:exempt reason=internal-detail
 pub fn boundary_crossings(graph: &RealityGraph, store: &Store) -> Result<Vec<String>> {
+    crossing_lines(graph, store, false)
+}
+
+/// [`boundary_crossings`] restricted to production-side crossings: a
+/// crossing whose subject (component or calling symbol) lives under a
+/// test/fixture/benchmark/example tree is fixture chatter, not
+/// architecture. Used by atlas scope filtering; `verify`/CLI keep the
+/// unfiltered diagnostic view.
+// trace:exempt reason=internal-detail
+pub fn production_crossings(graph: &RealityGraph, store: &Store) -> Result<Vec<String>> {
+    crossing_lines(graph, store, true)
+}
+
+/// Shared crossing renderer. `prod_only` keeps a crossing only when its
+/// subject side is production-placed; unplaceable subjects are kept
+/// (never drop facts we cannot place).
+// trace:exempt reason=internal-detail
+fn crossing_lines(graph: &RealityGraph, store: &Store, prod_only: bool) -> Result<Vec<String>> {
     let units = unit_dirs(graph);
     let comps = store.components()?;
     let mut lines: Vec<String> = Vec::new();
     for rel in store.all_relationships()? {
         if rel.predicate != scc_core::predicates::CROSSES_BOUNDARY {
+            continue;
+        }
+        if prod_only && !crossing_subject_production(graph, &rel.subject) {
             continue;
         }
         let Some(subj) = graph.entity(&rel.subject) else {
@@ -196,6 +218,38 @@ pub fn boundary_crossings(graph: &RealityGraph, store: &Store) -> Result<Vec<Str
     lines.sort();
     lines.dedup();
     Ok(lines)
+}
+
+/// True when a crossing's subject side is production-placed (or
+/// unplaceable — kept, never dropped).
+// trace:exempt reason=internal-detail
+fn crossing_subject_production(graph: &RealityGraph, subject: &str) -> bool {
+    let Some(subj) = graph.entity(subject) else {
+        return true;
+    };
+    match subj.kind.as_str() {
+        kinds::COMPONENT => {
+            let paths: Vec<String> = subj
+                .attributes
+                .get("implementation")
+                .and_then(|v| v.get("paths"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::components::component_role(&paths) == "production"
+        }
+        _ => subj
+            .attributes
+            .get("file")
+            .and_then(|v| v.as_str())
+            .and_then(crate::components::path_role)
+            .map(|r| r == "production")
+            .unwrap_or(true),
+    }
 }
 
 /// The component whose `implementation.paths` best match the file attribute

@@ -91,14 +91,20 @@ fn atlas_renders_typed_contracts_surfaces_and_coverage() {
 
 #[test]
 fn model_coverage_is_droppable_but_contracts_never() {
-    // The MODEL COVERAGE section is priority 7 (droppable before critical),
-    // while CONTRACTS (priority 9) is never dropped — a tight budget hides
-    // the coverage map but never the contracts.
+    // Tight budget: MODEL COVERAGE (priority 7) drops before CONTRACTS
+    // (priority 9) — drop ORDER still favors critical sections — but the
+    // hard invariant wins over any section: the pack fits 250 tokens and
+    // every cut is recorded, never silent.
     let repo = copy_fixture("python-facts-service");
     let dir = workdir(repo.path());
     run_ok(&dir, &["index", "--quiet"]);
     let out = run_ok(&dir, &["atlas", "--budget", "250", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["tokens"].as_u64().unwrap() <= 250,
+        "hard cap violated: {}",
+        v["tokens"]
+    );
     let dropped: Vec<&str> = v["dropped_sections"]
         .as_array()
         .map(|a| {
@@ -107,21 +113,14 @@ fn model_coverage_is_droppable_but_contracts_never() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let content = v["content"].as_str().unwrap_or("");
-    if content.contains("# MODEL COVERAGE") {
+    assert!(!dropped.is_empty(), "cuts must be recorded: {out}");
+    // drop order: coverage goes before contracts
+    let cov_idx = dropped.iter().position(|d| d.contains("MODEL COVERAGE"));
+    let con_idx = dropped.iter().position(|d| d.contains("CONTRACTS"));
+    if let (Some(cov), Some(con)) = (cov_idx, con_idx) {
         assert!(
-            dropped.contains(&"MODEL COVERAGE") || !dropped.contains(&"CONTRACTS"),
-            "CONTRACTS must never drop; MODEL COVERAGE may: dropped={dropped:?}"
+            cov < con,
+            "coverage must drop before contracts: {dropped:?}"
         );
-    } else {
-        assert!(
-            dropped.contains(&"MODEL COVERAGE"),
-            "MODEL COVERAGE must be the dropped section: {dropped:?}"
-        );
-        assert!(
-            !dropped.contains(&"CONTRACTS"),
-            "CONTRACTS must never drop: {dropped:?}"
-        );
-        assert!(content.contains("# CONTRACTS"), "contracts survive budget: {content}");
     }
 }

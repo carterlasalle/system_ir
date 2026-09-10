@@ -40,6 +40,11 @@ pub struct ContextSettings {
     pub startup_tokens: usize,
     pub task_tokens: usize,
     pub atlas_tokens: usize,
+    /// Hard budget for the on-demand detail packs (component/flow/impact/
+    /// verify): standalone agent calls, not fused, so a fixed share of a
+    /// default startup total keeps them rich but bounded. Receipt: 6000
+    /// ≈ 30% of the 20k default total; every pack render guarantees fit.
+    pub detail_tokens: usize,
     pub include_low_confidence_inference: bool,
     /// Salt for the task-pack cache: derived from the active ranker
     /// configuration so enabling/disabling embeddings invalidates cached
@@ -68,6 +73,7 @@ impl Default for ContextSettings {
             startup_tokens: 6000,
             task_tokens: 10000,
             atlas_tokens: 15000,
+            detail_tokens: 6000,
             include_low_confidence_inference: false,
             rank_salt: String::new(),
             pack_allocator: PackAllocator::AdaptivePriority,
@@ -281,16 +287,28 @@ impl<'a> ContextCompiler<'a> {
 
     /// Full System Atlas (Wave 2): the startup architecture artifact.
     /// Cached under the model epoch + stale set like task packs — a stale
-    /// atlas is never served. Budgets are honored honestly: if the minimum
-    /// safe atlas exceeds the budget, `exceeded_soft_budget` is set instead
-    /// of silently cutting critical content.
+    /// atlas is never served. The pack render guarantees fit: dropped and
+    /// line-truncated sections are recorded, never silent.
+    // trace:exempt reason=internal-detail
     pub fn system_atlas(&self, budget: Option<usize>) -> ContextPack {
+        self.system_atlas_scoped(budget, atlas::AtlasScope::Production)
+    }
+
+    /// [`system_atlas`] with an explicit scope. The scope is part of the
+    /// cache key: production and full compilations never share entries.
+    // trace:v1 id=impl.scc.context.system-atlas-scoped work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+    pub fn system_atlas_scoped(
+        &self,
+        budget: Option<usize>,
+        scope: atlas::AtlasScope,
+    ) -> ContextPack {
         let budget = budget.unwrap_or(self.settings.atlas_tokens);
         let epoch = self.store.cache_epoch().unwrap_or_else(|_| "no-epoch".into());
         let key = {
             let mut h = blake3::Hasher::new();
             h.update(b"atlas");
             h.update(budget.to_string().as_bytes());
+            h.update(format!("{scope:?}").as_bytes());
             h.update(self.settings.rank_salt.as_bytes());
             h.update(epoch.as_bytes());
             let mut stale: Vec<&String> = self.stale_paths.iter().collect();
@@ -306,7 +324,7 @@ impl<'a> ContextCompiler<'a> {
                 return pack;
             }
         }
-        let atlas = atlas::build_atlas(self);
+        let atlas = atlas::build_atlas_scoped(self, scope);
         let pack = atlas::render_atlas(self, &atlas, budget);
         if let Ok(json) = serde_json::to_string(&pack) {
             let _ = self.store.cache_put(&key, &json, &epoch);
@@ -379,24 +397,28 @@ impl<'a> ContextCompiler<'a> {
         pack
     }
 
+    // trace:exempt reason=internal-detail
     pub fn component_context(&self, id: &str) -> ContextPack {
-        packs::component(self, id)
+        packs::component(self, id, self.settings.detail_tokens)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn flow_context(&self, id: &str) -> ContextPack {
-        packs::flow(self, id)
+        packs::flow(self, id, self.settings.detail_tokens)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn impact_context(
         &self,
         files: &[String],
         symbols: &[String],
         diff_base: Option<&str>,
     ) -> ContextPack {
-        packs::impact(self, files, symbols, diff_base)
+        packs::impact(self, files, symbols, diff_base, self.settings.detail_tokens)
     }
 
+    // trace:exempt reason=internal-detail
     pub fn verify_context(&self) -> ContextPack {
-        packs::verify(self)
+        packs::verify(self, self.settings.detail_tokens)
     }
 }

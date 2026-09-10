@@ -90,24 +90,54 @@ pub fn prov_rank(p: Provenance) -> u8 {
 /// example, and docs trees are structure, not production architecture.
 /// A single non-production role when every path shares it, `mixed` when
 /// production and non-production mix, `production` otherwise. Deterministic.
+/// Repository role of ONE path by generic directory convention (never
+/// repository names). `None` means no non-production segment matched — the
+/// caller maps that to `production`. Shared by component aggregation,
+/// skeleton labeling, and atlas scope filtering so all three agree on
+/// what "fixture" (etc.) means.
+// trace:exempt reason=internal-detail
+pub fn path_role(path: &str) -> Option<&'static str> {
+    // Depth guard for the examples family: generic English words are only
+    // reliable as LEADING layout signals (`examples/`, `crate/examples/`).
+    // Deeper occurrences are overwhelmingly package namespaces — notably
+    // Java's conventional `com.example` / `org.example` placeholder
+    // packages (RFC 2606), which must never classify production sources as
+    // examples. Technical markers (test, fixture, benchmark, docs, …) match
+    // at any depth: they rarely appear as namespace words, and `src/test`
+    // style nesting must keep matching.
+    for (depth, seg) in path.split('/').enumerate() {
+        match seg.to_ascii_lowercase().as_str() {
+            "tests" | "test" | "testing" | "__tests__" | "spec" | "specs" | "e2e" => {
+                return Some("test")
+            }
+            "fixtures" | "fixture" | "testdata" | "test-data" => return Some("fixture"),
+            "benchmarks" | "benchmark" | "benches" | "bench" => return Some("benchmark"),
+            "examples" | "example" | "samples" | "demo" => {
+                if depth <= 1 {
+                    return Some("example");
+                }
+            }
+            "docs" | "doc" => return Some("docs"),
+            "config" | "conf" | "configuration" | "workflows" => return Some("config"),
+            "generated" | "__generated__" => return Some("generated"),
+            "vendor" | "third_party" | "third-party" | "node_modules" => return Some("vendor"),
+            "target" | "dist" | "build" | "out" | "coverage" => return Some("build"),
+            "tools" | "tooling" | "devtools" => return Some("tooling"),
+            "sdk" => return Some("sdk"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when no path segment places the path outside production.
+// trace:exempt reason=internal-detail
+pub fn is_production_path(path: &str) -> bool {
+    path_role(path).is_none()
+}
+
 // trace:v1 id=impl.scc.components.role work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
 pub fn component_role(paths: &[String]) -> &'static str {
-    fn path_role(path: &str) -> Option<&'static str> {
-        for seg in path.split('/') {
-            match seg.to_ascii_lowercase().as_str() {
-                "tests" | "test" | "testing" | "__tests__" | "spec" | "specs" | "e2e" => {
-                    return Some("test")
-                }
-                "fixtures" | "fixture" | "testdata" | "test-data" => return Some("fixture"),
-                "benchmarks" | "benchmark" | "benches" | "bench" => return Some("benchmark"),
-                "examples" | "example" | "samples" | "docs" | "doc" | "demo" => {
-                    return Some("example")
-                }
-                _ => {}
-            }
-        }
-        None
-    }
     let mut roles = std::collections::BTreeSet::new();
     for p in paths {
         if let Some(r) = path_role(p) {
@@ -731,6 +761,15 @@ pub fn compile_components(
             }
         }
     }
+    // owns/depends per component (sorted for determinism — aggregation
+    // iterates a HashMap; vec order feeds owns/depends_on attrs and rel
+    // evidence, so unsorted order is visible run-to-run nondeterminism)
+    for v in owns.values_mut() {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    for v in depends.values_mut() {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+    }
     // symbols/evidence/retries per component (sorted for determinism —
     // aggregation iterates a HashMap)
     for (sym_id, comp) in &symbol_component {
@@ -1113,6 +1152,8 @@ pub fn compile_components(
         for r in graph.in_pred(&store_target, scc_core::predicates::WRITES) {
             ev.extend(r.evidence.clone());
         }
+        ev.sort();
+        ev.dedup();
         ev
     };
     let call_evidence_between = |from_comp: &str, to_comp: &str| -> Vec<String> {
@@ -1129,6 +1170,9 @@ pub fn compile_components(
                 }
             }
         }
+        // sorted: symbol_component is a HashMap, iteration order is random
+        ev.sort();
+        ev.dedup();
         ev
     };
 
@@ -1285,6 +1329,22 @@ mod tests {
         assert_eq!(component_role(&v(&["src/api", "tests/api"])), "mixed");
         assert_eq!(component_role(&v(&["fixtures/a", "benchmarks/b"])), "mixed");
         assert_eq!(component_role(&[]), "production");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.graph.path-role-namespace verifies=REQ-SI-NX53P4B7 exercises=impl.scc.components.role
+    fn path_role_ignores_namespace_example_segments() {
+        // Java's conventional com.example placeholder package is a
+        // namespace, not an examples tree.
+        assert_eq!(
+            path_role("java_service/src/main/java/com/example/greet/GreetingImpl.java"),
+            None
+        );
+        // Genuine example trees still classify (top level or one down).
+        assert_eq!(path_role("examples/foo/main.py"), Some("example"));
+        assert_eq!(path_role("mycrate/examples/foo.rs"), Some("example"));
+        assert_eq!(path_role("fixtures/foo/app.py"), Some("fixture"));
+        assert_eq!(path_role("src/test/foo.py"), Some("test"));
     }
 
     #[test]

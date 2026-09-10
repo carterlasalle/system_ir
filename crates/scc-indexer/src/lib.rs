@@ -103,7 +103,26 @@ type ExtractedEntry = (
 );
 
 // trace:exempt reason=internal-detail
+/// Hash of the semantic-relevant configuration (language backends,
+/// resolver switches): part of revision identity, so enabling a backend
+/// without touching files still advances graph history. Computed by index
+/// callers, which record the revision after recompile.
+pub fn semantic_config_hash(config: &Config) -> String {
+    let l = &config.languages;
+    let v = serde_json::json!({
+        "typescript": l.typescript,
+        "python": l.python,
+        "go": l.go,
+        "rust": l.rust,
+        "java": l.java,
+        "c": l.c,
+        "cpp": l.cpp,
+        "auto_resolve": config.index.auto_resolve,
+    });
+    scc_core::fnv1a64_hex(v.to_string().as_bytes())
+}
 impl Indexer {
+
         // trace:v1 id=impl.scc.index.stable-identity work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     pub fn new(mut store: Store, config: Config) -> Self {
         // Stable identity (§XIV): explicit config id or git remote wins on
@@ -393,7 +412,10 @@ impl Indexer {
 
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
-        let _ = self.store.record_current_revision()?;
+        // Revision recording happens in the caller AFTER recompile: the
+        // revision must include derived facts (components, boundaries,
+        // flows), which only exist post-recompile. Recording here would
+        // leave history systematically one recompile behind.
         report.analysis_quality = persist_analysis_quality(&self.store)?;
         persist_bm25_corpus(&self.store)?;
         report.duration_ms = started.elapsed().as_millis() as u64;
@@ -565,7 +587,10 @@ impl Indexer {
         let mut report = self.index_paths(&changed_paths, &scanned, &git_info.revision)?;
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
-        let _ = self.store.record_current_revision()?;
+        // Revision recording happens in the caller AFTER recompile: the
+        // revision must include derived facts (components, boundaries,
+        // flows), which only exist post-recompile. Recording here would
+        // leave history systematically one recompile behind.
         report.revision = git_info.revision;
         report.duration_ms = started.elapsed().as_millis() as u64;
         report.scan_stats = scan_stats;
