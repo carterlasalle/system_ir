@@ -85,6 +85,45 @@ pub fn prov_rank(p: Provenance) -> u8 {
     }
 }
 
+/// Repository role of a component from its implementation paths, by generic
+/// directory convention (never repository names): test, fixture, benchmark,
+/// example, and docs trees are structure, not production architecture.
+/// A single non-production role when every path shares it, `mixed` when
+/// production and non-production mix, `production` otherwise. Deterministic.
+// trace:v1 id=impl.scc.components.role work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
+pub fn component_role(paths: &[String]) -> &'static str {
+    fn path_role(path: &str) -> Option<&'static str> {
+        for seg in path.split('/') {
+            match seg.to_ascii_lowercase().as_str() {
+                "tests" | "test" | "testing" | "__tests__" | "spec" | "specs" | "e2e" => {
+                    return Some("test")
+                }
+                "fixtures" | "fixture" | "testdata" | "test-data" => return Some("fixture"),
+                "benchmarks" | "benchmark" | "benches" | "bench" => return Some("benchmark"),
+                "examples" | "example" | "samples" | "docs" | "doc" | "demo" => {
+                    return Some("example")
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let mut roles = std::collections::BTreeSet::new();
+    for p in paths {
+        if let Some(r) = path_role(p) {
+            roles.insert(r);
+        }
+    }
+    if roles.is_empty() {
+        return "production";
+    }
+    let all_covered = paths.iter().all(|p| path_role(p).is_some());
+    if roles.len() == 1 && all_covered {
+        return roles.into_iter().next().unwrap_or("production");
+    }
+    "mixed"
+}
+
 #[derive(Debug, Clone)]
 // trace:exempt reason=internal-detail
 pub struct ComponentCandidate {
@@ -909,13 +948,10 @@ pub fn compile_components(
                 push_resp(text, prov, conf, &mut resp, &mut seen);
             }
         }
-        if resp.is_empty() {
-            resp.push(json!({
-                "text": format!("Hosts the {} code module", name),
-                "provenance": Provenance::Inferred.as_str(),
-                "confidence": 0.5,
-            }));
-        }
+        // No evidence → no responsibility claim. Silence beats the old
+        // content-free fallback ("Hosts the X code module"), which readers
+        // mistook for knowledge. An empty array renders as unknown;
+        // consumers (`purpose_text`, packs, trust filter) already handle it.
         e.attr("responsibility", json!(resp));
 
         let cluster = clustering
@@ -931,6 +967,10 @@ pub fn compile_components(
                 "symbols": symbols_per_comp.get(&name).cloned().unwrap_or_default(),
             }),
         );
+
+        // Repository role travels with the component so renders can scope
+        // test/fixture/benchmark trees as structure, never production.
+        e.attr("role", json!(component_role(&dirs)));
 
         // ---- Wave 5: boundary kind + weighted clustering score ----
         let mut score: f64 = match cluster.boundary_kind.as_str() {
@@ -1233,6 +1273,19 @@ fn clear_component_relationships(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // trace:v1 id=test.scc.graph.component-role verifies=REQ-SI-NX53P4B7 exercises=impl.scc.components.role
+    fn component_role_scopes_non_production_trees() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(component_role(&v(&["src/api", "src/db"])), "production");
+        assert_eq!(component_role(&v(&["fixtures/http-service-python"])), "fixture");
+        assert_eq!(component_role(&v(&["tests", "spec/e2e"])), "test");
+        assert_eq!(component_role(&v(&["benchmarks/external"])), "benchmark");
+        assert_eq!(component_role(&v(&["src/api", "tests/api"])), "mixed");
+        assert_eq!(component_role(&v(&["fixtures/a", "benchmarks/b"])), "mixed");
+        assert_eq!(component_role(&[]), "production");
+    }
 
     #[test]
     fn intent_ownership_stays_declared() {

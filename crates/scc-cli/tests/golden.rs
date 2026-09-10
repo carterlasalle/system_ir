@@ -408,6 +408,35 @@ fn stale_detection_and_verify() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.added-file-makes-verify-stale verifies=REQ-SI-NX53P4B7 exercises=impl.crates-scc-cli-src-lib.stale-paths
+fn added_file_makes_verify_stale() {
+    let repo = copy_fixture("http-service-python");
+    run_ok(&workdir(repo.path()), &["index", "--quiet"]);
+    let verify = run_ok(&workdir(repo.path()), &["verify"]);
+    assert!(verify.contains("Fresh"), "{verify}");
+    // skip accounting: counts recorded at index time, visible in verify
+    assert!(verify.contains("discovered="), "{verify}");
+    assert!(verify.contains("indexed="), "{verify}");
+    let status = run_ok(&workdir(repo.path()), &["status"]);
+    assert!(status.contains("discovered="), "{status}");
+    // add without re-indexing: the scan sees it, the inventory does not
+    std::fs::write(workdir(repo.path()).join("services/new_endpoint.py"), "def new_endpoint():\n    return 'new'\n").unwrap();
+    let verify = run_ok(&workdir(repo.path()), &["verify"]);
+    assert!(verify.contains("STALE"), "{verify}");
+    assert!(verify.contains("new_endpoint.py"), "{verify}");
+
+    // re-index restores freshness
+    run_ok(&workdir(repo.path()), &["index", "--quiet"]);
+    let verify = run_ok(&workdir(repo.path()), &["verify"]);
+    assert!(verify.contains("Fresh"), "{verify}");
+
+    // delete without re-indexing
+    std::fs::remove_file(workdir(repo.path()).join("services/new_endpoint.py")).unwrap();
+    let verify = run_ok(&workdir(repo.path()), &["verify"]);
+    assert!(verify.contains("STALE"), "{verify}");
+}
+
+#[test]
 // trace:v1 id=test.crates-scc-cli-tests-golden.secret-redaction-end-to-end
 fn secret_redaction_end_to_end() {
     let repo = tempfile::TempDir::new().unwrap();
@@ -442,6 +471,19 @@ fn check_invariants_fails_on_dangling_refs() {
     drop(db);
     let out = run(&workdir(repo.path()), &["check-invariants"]);
     assert!(!out.status.success(), "dangling refs must fail CI check");
+}
+
+#[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.cold-index-verifies-clean verifies=REQ-SI-NX53P4B7 exercises=impl.crates-scc-cli-src-commands.cmd-verify
+fn cold_index_verifies_clean() {
+    // A fresh cold index must not report SCC-created graph corruption:
+    // zero dangling internal references, fresh files, VERIFIED verdict.
+    let repo = copy_fixture("http-service-python");
+    run_ok(&workdir(repo.path()), &["index", "--quiet"]);
+    let verify = run_ok(&workdir(repo.path()), &["verify"]);
+    assert!(verify.contains("Dangling references: 0"), "{verify}");
+    assert!(verify.contains("Fresh:"), "{verify}");
+    assert!(verify.contains("VERIFIED"), "{verify}");
 }
 
 #[test]
@@ -485,5 +527,258 @@ fn other_integration_binaries_do_not_mod_golden() {
     assert!(
         offenders.is_empty(),
         "mod golden re-runs the golden suite in each binary: {offenders:?}"
+    );
+}
+
+#[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.multi-repo-system-stitches verifies=REQ-SI-503JSBGP exercises=impl.crates-scc-cli-src-commands.cmd-system
+fn multi_repo_system_stitches_contracts_topics_and_packages() {
+    use std::path::PathBuf;
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fixtures");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let member = |fixture: &str, name: &str| -> PathBuf {
+        let dst = tmp.path().join(name);
+        std::fs::create_dir_all(&dst).unwrap();
+        copy_tree(&fixtures.join(fixture), &dst);
+        dst
+    };
+    let svc_a = member("http-service-python", "svc-a");
+    let web_b = member("ts-api-web", "web-b");
+    let hub = member("stitch_hub", "stitch_hub");
+    let spoke = member("stitch_spoke", "spoke");
+    let prod = member("event_producer", "prod");
+    let cons = member("event_consumer", "cons");
+    let amb = member("stitch_ambiguous", "amb");
+    for m in [&svc_a, &web_b, &hub, &spoke, &prod, &cons, &amb] {
+        run_ok(m, &["index", "--quiet"]);
+    }
+    let sys = |ms: &[PathBuf]| -> serde_json::Value {
+        let mut args = vec!["system".to_string(), "--json".to_string()];
+        for m in ms {
+            args.push("--member".to_string());
+            args.push(m.display().to_string());
+        }
+        let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let raw = run_ok(tmp.path(), &argrefs);
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("system parse failed: {e}; raw={raw:?}"))
+    };
+
+    // contract stitch: same verb + path in two languages
+    let routes = sys(&[svc_a.clone(), web_b.clone()]);
+    let health: Vec<&serde_json::Value> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["key"] == "GET /health")
+        .collect();
+    assert_eq!(health.len(), 1, "{routes}");
+    assert_eq!(health[0]["match_kind"], "Exact");
+    assert_eq!(health[0]["ends"].as_array().unwrap().len(), 2);
+    // provenance survives stitching: every end names its file
+    for e in health[0]["ends"].as_array().unwrap() {
+        assert!(!e["sources"].as_array().unwrap().is_empty(), "{e}");
+    }
+
+    // standalone-vs-system stability: svc-a ends identical in both systems
+    let routes2 = sys(&[svc_a.clone(), amb.clone()]);
+    let ids = |v: &serde_json::Value, key: &str| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == key)
+            .unwrap()["ends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["entity_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // same svc-a end id in the exact and the ambiguous view: system context
+    // never rewrites member identity
+    let amb_svc: Vec<String> = routes2
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "/health")
+        .unwrap()["ends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["repo_id"] == "svc-a")
+        .map(|e| e["entity_id"].as_str().unwrap().to_string())
+        .collect();
+    let exact_svc: Vec<String> = ids(&routes, "GET /health")
+        .into_iter()
+        .filter(|id| id.starts_with("repo://svc-a/"))
+        .collect();
+    assert_eq!(exact_svc, amb_svc);
+
+    // ambiguity stays ambiguous, never joined
+    let amb_routes: Vec<&serde_json::Value> = routes2
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["key"] == "/health")
+        .collect();
+    assert_eq!(amb_routes.len(), 1, "{routes2}");
+    assert_eq!(amb_routes[0]["match_kind"], "Ambiguous");
+    assert_eq!(amb_routes[0]["ends"].as_array().unwrap().len(), 2);
+
+    // event stitch across producer/consumer
+    let topics = sys(&[prod.clone(), cons.clone()]);
+    let orders: Vec<&serde_json::Value> = topics
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["key"] == "orders.created")
+        .collect();
+    assert_eq!(orders.len(), 1, "{topics}");
+    assert_eq!(orders[0]["match_kind"], "Exact");
+
+    // package stitch: declared repo + symbol binding
+    let pkgs = sys(&[hub.clone(), spoke.clone()]);
+    assert_eq!(pkgs.as_array().unwrap().len(), 1, "{pkgs}");
+    assert_eq!(pkgs[0]["match_kind"], "Declared");
+    assert_eq!(pkgs[0]["ends"].as_array().unwrap().len(), 2);
+
+    // checkout move keeps identity: rename svc-a, stitches unchanged
+    let moved = tmp.path().join("svc-a-moved");
+    std::fs::rename(&svc_a, &moved).unwrap();
+    let routes3 = sys(&[moved, web_b]);
+    assert_eq!(ids(&routes3, "GET /health"), ids(&routes, "GET /health"));
+
+    // incremental == cold for stitches: unrelated file addition changes nothing
+    std::fs::write(tmp.path().join("svc-a-moved").join("notes.txt"), "hello").unwrap();
+    run_ok(&tmp.path().join("svc-a-moved"), &["index", "--quiet"]);
+    let routes4 = sys(&[tmp.path().join("svc-a-moved"), tmp.path().join("web-b")]);
+    assert_eq!(routes4, routes3);
+}
+
+#[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.graph-history-and-snapshot verifies=REQ-SI-503JSBGP exercises=impl.crates-scc-cli-src-commands.cmd-history
+fn graph_history_records_and_snapshots_diff() {
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+
+    // durable revision with source-hash/extractor provenance
+    let hist: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["history", "--json"])).unwrap();
+    assert_eq!(hist.as_array().unwrap().len(), 1, "{hist}");
+    assert_eq!(hist[0]["rev"], 1);
+    assert!(!hist[0]["source_hash"].as_str().unwrap().is_empty());
+    assert!(!hist[0]["extractor_version"].as_str().unwrap().is_empty());
+
+    // content-identical re-index: no duplicate revision
+    run_ok(&dir, &["index", "--quiet"]);
+    let hist2: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["history", "--json"])).unwrap();
+    assert_eq!(hist2.as_array().unwrap().len(), 1);
+
+    // change the model: new field entity appears in the delta
+    std::fs::write(dir.join("main.py"), "x = 1\n").unwrap();
+    run_ok(&dir, &["index", "--quiet"]);
+    let diff: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["diff", "--from", "1", "--to", "2", "--json"])).unwrap();
+    assert!(
+        !diff["added_entities"].as_array().unwrap().is_empty(),
+        "{diff}"
+    );
+
+    // snapshot persists the render with epoch + revision
+    let snap: serde_json::Value = serde_json::from_str(&run_ok(
+        &dir,
+        &["snapshot", "save", "--task", "change transcript normalization", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(snap["revision"], 2);
+    assert!(!snap["epoch"].as_str().unwrap().is_empty());
+    assert!(!snap["entity_ids"].as_array().unwrap().is_empty());
+    let id = snap["id"].as_str().unwrap().to_string();
+
+    // resume works: the stored render comes back intact
+    let shown = run_ok(&dir, &["snapshot", "show", &id]);
+    assert!(shown.contains("transcript") || shown.contains("Transcript"), "{shown}");
+
+    // clean diff while the model is unchanged
+    let d0: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["snapshot", "diff", &id, "--json"])).unwrap();
+    assert_eq!(d0["current_revision"], 2);
+    assert!(d0["invalidated"].as_array().unwrap().is_empty(), "{d0}");
+
+    // remove a rendered symbol: diff names the invalidated fact
+    let main = std::fs::read_to_string(dir.join("main.py")).unwrap();
+    std::fs::write(dir.join("main.py"), main.replace("x = 1\n", "")).unwrap();
+    run_ok(&dir, &["index", "--quiet"]);
+    let d1: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["snapshot", "diff", &id, "--json"])).unwrap();
+    assert_eq!(d1["current_revision"], 3);
+    assert!(
+        !d1["invalidated"].as_array().unwrap().is_empty(),
+        "{d1}"
+    );
+    assert!(
+        !d1["still_valid"].as_array().unwrap().is_empty(),
+        "{d1}"
+    );
+}
+
+#[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.state-flow-write-edge verifies=REQ-SI-503JSBGP exercises=impl.scc.graph.state-flow-read-write
+fn state_authority_write_surfaces_as_flow_edge() {
+    let repo = copy_fixture("http-service-python");
+    run_ok(&workdir(repo.path()), &["index", "--quiet"]);
+    let out = run_ok(&workdir(repo.path()), &["export", "flow-graphs.json"]);
+    let graphs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let kinds: Vec<String> = graphs
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["edges"].as_array().unwrap().iter())
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "write"),
+        "state WRITES must compile to a flow Write edge: {kinds:?}"
+    );
+}
+
+#[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.deleted-symbol-never-haunts-packs verifies=REQ-SI-503JSBGP exercises=impl.crates-scc-cli-src-commands.build-task-context
+fn deleted_symbol_never_haunts_task_packs() {
+    // Falsifiable hallucination probe (§41): a symbol whose file is gone
+    // must not appear in a task pack — neither via the stale path (before
+    // re-index) nor after re-indexing. A resolver/retriever that sprays
+    // same-name edges or ignores freshness fails this test.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let before = run_ok(&dir, &["context", "task", "change transcript normalization"]);
+    assert!(before.contains("Normalizer"), "{before}");
+
+    // delete the file WITHOUT re-indexing: its exact source must vanish
+    // (live files may still reference the name — those are honest).
+    // NOTE: flow/surface entries still name stale symbols (known gap, see
+    // mission report); exact-source exclusion is the load-bearing invariant.
+    std::fs::remove_file(dir.join("services").join("transcripts.py")).unwrap();
+    let stale = run_ok(&dir, &["context", "task", "change transcript normalization"]);
+    assert!(
+        !stale.contains("services%2Ftranscripts.py")
+            && !stale.contains("# services/transcripts.py"),
+        "deleted file served as exact source: {stale}"
+    );
+
+    // re-index: the fact is invalidated, still absent
+    run_ok(&dir, &["index", "--quiet"]);
+    let after = run_ok(&dir, &["context", "task", "change transcript normalization"]);
+    assert!(
+        !after.contains("services%2Ftranscripts.py")
+            && !after.contains("# services/transcripts.py"),
+        "deleted file served as exact source: {after}"
     );
 }

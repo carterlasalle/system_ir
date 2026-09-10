@@ -477,6 +477,7 @@ mod tests {
         assert!(!term_match("run", "running"));
     }
 
+    // trace:v1 id=impl.crates-scc-context-src-rank.boost-scorer work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     struct BoostScorer;
     impl SemanticScorer for BoostScorer {
         fn score(&self, _goal: &str, e: &scc_core::Entity) -> f64 {
@@ -526,6 +527,7 @@ mod tests {
 
     // ---- Wave 11: startup-atlas confidence ranking ----
 
+    // trace:exempt reason=test-helper
     fn component(name: &str) -> AtlasComponent {
         AtlasComponent {
             name: name.to_string(),
@@ -541,6 +543,7 @@ mod tests {
             owns: Vec::new(),
             layer: "component".into(),
             parent: None,
+            role: String::new(),
         }
     }
 

@@ -611,8 +611,10 @@ class TestFullSCCContainsStructural(unittest.TestCase):
                           "Full SCC artifact missing the Atlas section")
             self.assertIn("SURFACE", text.upper(),
                           "Full SCC artifact missing the Surface section")
-            # §19: equal-token postcondition on the FINAL artifact.
-            actual = max(1, len(text) // 4)
+            # §19: equal-token postcondition on the FINAL artifact, using
+            # the shared chars/4-ceiling estimator (mirrors scc_core).
+            from run_context_bench import estimate_shared_tokens
+            actual = estimate_shared_tokens(text)
             self.assertLessEqual(actual, 4000,
                                   f"final artifact {actual} tokens > budget 4000")
 

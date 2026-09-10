@@ -165,9 +165,23 @@ fn harness_help_exits_zero() {
 //     fixture produces the expected metric-row format
 // ---------------------------------------------------------------------------
 
+// trace:exempt reason=internal-detail
+fn paid_or_skip() -> bool {
+    // `scc bench external` launches paid coding agents: the suite stays
+    // green without quota and runs these only under explicit opt-in.
+    if std::env::var("SCC_ALLOW_PAID_BENCHMARKS").as_deref() != Ok("1") {
+        eprintln!("skip: needs SCC_ALLOW_PAID_BENCHMARKS=1 (paid agent path)");
+        return false;
+    }
+    true
+}
+
 #[test]
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn external_variant_emits_metric_row() {
+    if !paid_or_skip() {
+        return;
+    }
     let workdir = tempfile::TempDir::new().unwrap();
     let out = run_in(
         workdir.path(),
@@ -237,6 +251,9 @@ fn external_variant_emits_metric_row() {
 #[test]
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn scc_surface_variant_generates_artifact() {
+    if !paid_or_skip() {
+        return;
+    }
     let workdir = tempfile::TempDir::new().unwrap();
     let out = run_in(
         workdir.path(),
@@ -345,6 +362,9 @@ fn repomix_adapter_skips_cleanly_when_tool_missing() {
 #[test]
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn external_variant_delegation_reports_skipped_status() {
+    if !paid_or_skip() {
+        return;
+    }
     // `scc bench external --variant aider-repomap` delegates to the python
     // harness; with the tool missing it reports SKIPPED-UNINSTALLED and the
     // arm succeeds (exit 0).
@@ -382,6 +402,9 @@ fn external_variant_delegation_reports_skipped_status() {
 #[test]
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn ablation_variants_emit_metric_rows() {
+    if !paid_or_skip() {
+        return;
+    }
     // Representative modes from each pipeline stage: lexical (no PPR),
     // task-ppr (the CLI-mapped production ranking), ppr-quotas (+MMR +
     // quota caps). Each must emit a §72 row with a non-empty artifact.
@@ -439,6 +462,9 @@ fn ablation_variants_emit_metric_rows() {
 #[test]
 // trace:exempt reason=unit-test  # external-bench suite test/helper
 fn scc_full_structural_section_is_goal_selected_not_ground_truth() {
+    if !paid_or_skip() {
+        return;
+    }
     // The critical audit fix: `scc-full` must NOT use ground-truth
     // task.files for context construction. The structural section's unit
     // paths must be a subset of what `scc surface --task "<goal>"` renders
@@ -472,8 +498,8 @@ fn scc_full_structural_section_is_goal_selected_not_ground_truth() {
     let text = std::fs::read_to_string(&artifact).expect("artifact exists");
 
     // FINAL-artifact budget enforcement: the concatenated startup +
-    // task-delta + structural context fits the budget (chars/4 rule).
-    let estimate = |s: &str| if s.is_empty() { 0 } else { (s.len() / 4).max(1) };
+    // task-delta + structural context fits the budget (canonical chars/4).
+    let estimate = scc_core::estimate_tokens;
     assert!(
         estimate(&text) <= 8000,
         "concatenated artifact fits the budget ({} tokens)",

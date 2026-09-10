@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use scc_cli::commands;
+use scc_core::estimate_tokens;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -117,6 +118,15 @@ enum Commands {
         json: bool,
     },
 
+    /// Multi-repo system: semantic stitches across member checkouts
+    System {
+        /// Member checkout roots (each already indexed)
+        #[arg(long, required = true)]
+        member: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export the System IR
     Export {
         /// system-ir.json | system-ir.jsonl | ccg | flow-graphs.json
@@ -148,6 +158,28 @@ enum Commands {
     Checkpoint {
         #[command(subcommand)]
         sub: CheckpointSub,
+    },
+
+    /// Graph revision history (durable temporal log)
+    History {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Semantic diff between two graph revisions
+    Diff {
+        #[arg(long)]
+        from: i64,
+        #[arg(long)]
+        to: i64,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Durable context snapshots: save, show, diff rendered knowledge
+    Snapshot {
+        #[command(subcommand)]
+        sub: SnapshotSub,
     },
 
     /// Run graph invariant checks; exit nonzero on violation (CI)
@@ -272,6 +304,9 @@ enum BenchSub {
         /// Minimum mean recall gate
         #[arg(long, default_value_t = 0.6)]
         min_recall: f64,
+        /// Minimum mean precision gate (0.0 = recall-only, the default)
+        #[arg(long, default_value_t = 0.0)]
+        min_precision: f64,
     },
     /// Retrieval Recall@k / MRR over fixture gold (lexical vs production arms).
     /// Does not change the production fused ranker.
@@ -541,6 +576,34 @@ enum ContextSub {
 }
 
 #[derive(Subcommand)]
+// trace:v1 id=impl.crates-scc-cli-src-main.snapshot-sub work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+enum SnapshotSub {
+    /// Render a task pack and persist it as a durable snapshot
+    Save {
+        /// Task goal to render
+        #[arg(long)]
+        task: String,
+        /// Token budget for the render
+        #[arg(long)]
+        budget: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a stored snapshot render (resume)
+    Show {
+        /// Snapshot id
+        id: String,
+    },
+    /// Diff a snapshot against the current model
+    Diff {
+        /// Snapshot id
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 // trace:v1 id=impl.crates-scc-cli-src-main.checkpoint-sub work=WORK-SCC-001 satisfies=REQ-SCC-API
 enum CheckpointSub {
     /// Capture the current task state
@@ -683,6 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
         Commands::Drift { json } => commands::cmd_drift(&root, json),
+        Commands::System { member, json } => commands::cmd_system(&root, &member, json),
         Commands::Export { format } => commands::cmd_export(&root, &format),
         Commands::Query { query, limit } => commands::cmd_query(&root, &query, limit),
         Commands::Components => commands::cmd_list_components(&root),
@@ -691,6 +755,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Checkpoint { sub } => match sub {
             CheckpointSub::Save { json } => commands::cmd_checkpoint_save(&root, json),
             CheckpointSub::Load { inject } => commands::cmd_checkpoint_load(&root, inject),
+        },
+        Commands::History { json } => commands::cmd_history(&root, json),
+        Commands::Diff { from, to, json } => commands::cmd_diff(&root, from, to, json),
+        Commands::Snapshot { sub } => match sub {
+            SnapshotSub::Save { task, budget, json } => {
+                commands::cmd_snapshot_save(&root, &task, budget, json)
+            }
+            SnapshotSub::Show { id } => commands::cmd_snapshot_show(&root, &id),
+            SnapshotSub::Diff { id, json } => commands::cmd_snapshot_diff(&root, &id, json),
         },
         Commands::CheckInvariants => match commands::cmd_check_invariants(&root) {
             Ok(true) => Ok(()),
@@ -853,7 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => Err(scc_cli::CliError::Other(e)),
                 }
             },
-            BenchSub::Context { min_recall } => match scc_cli::benchctx::run_context_benchmark(min_recall)
+            BenchSub::Context { min_recall, min_precision } => match scc_cli::benchctx::run_context_benchmark(min_recall, min_precision)
             {
                 Ok(summary) => {
                     scc_cli::benchctx::print_summary(&summary);
@@ -969,6 +1042,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     return Ok(());
                 }
+                // Paid-model safety interlock: the branches below pipe prompts
+                // to a paid coding agent. --artifact-only (handled above) only
+                // generates local context and stays available without opt-in.
+                scc_cli::benchagent::require_paid_opt_in().map_err(scc_cli::CliError::Other)?;
                 if EXTERNAL_VARIANTS.contains(&v) {
                     run_external_python_delegation(v, repo.as_deref(), budget, cmd.as_deref(), json)
                 } else if NATIVE_VARIANTS.contains(&v) {
@@ -1235,17 +1312,6 @@ fn load_external_tasks(repo_filter: Option<&str>) -> Result<Vec<scc_cli::benchag
 }
 
 // --- artifact generation ----------------------------------------------------
-
-/// Deterministic chars/4 token estimate — the same rule the python harness
-/// and the adapters use, so context_tokens are comparable across variants.
-// trace:exempt reason=internal-detail  # external-bench token heuristic (impl.scc.cli.main)
-fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        (text.len() / 4).max(1)
-    }
-}
 
 /// Run the `scc` binary itself (the current executable) and capture stdout.
 /// The variant artifacts are generated through the exact production CLI so

@@ -61,10 +61,10 @@ holds).
 
 ## Fairness rules (equal-token mode)
 
-- **One shared tokenizer for ALL variants**: deterministic chars/4
-  (`len(text) / 4`, min 1). The scc native arm, both python adapters, and
-  the harness all use the same rule, so an equal token budget means the
-  same thing in every variant's artifact.
+- **One shared tokenizer for ALL variants**: deterministic chars/4 ceiling
+  (`(len(text) + 3) // 4`, mirroring Rust `scc_core::estimate_tokens`).
+  The scc native arm, both python adapters, and the harness all use the
+  same rule, so an equal token budget means the same thing in every variant's artifact.
 - **FINAL artifact budget enforcement**: for `scc-full`, the budget applies
   to the **concatenated** startup + task-delta + structural artifact, not
   per piece. Pieces are sized so the total never exceeds N: startup gets

@@ -35,6 +35,7 @@ pub enum RecvKind {
 
 // trace:exempt reason=internal-detail
 impl RecvKind {
+    // trace:exempt reason=internal-detail
     pub fn as_str(self) -> &'static str {
         match self {
             RecvKind::None => "NONE",
@@ -52,6 +53,7 @@ impl RecvKind {
     }
 
     /// Receivers whose method must be a sibling of the enclosing type.
+    // trace:exempt reason=internal-detail
     pub fn is_instance_self(self) -> bool {
         matches!(self, RecvKind::This | RecvKind::SelfRecv)
     }
@@ -60,6 +62,7 @@ impl RecvKind {
     /// `self.x.m()` / `this.x.m()` may pin via a unique field type; longer
     /// chains stay unresolved and must not pretend the intermediate name
     /// is the method.
+    // trace:exempt reason=internal-detail
     pub fn is_field_chain(self) -> bool {
         matches!(
             self,
@@ -78,18 +81,18 @@ impl RecvKind {
 // trace:v1 id=impl.scc.core.resolution-class work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
 pub enum ResolutionClass {
     ResolvedInternal,
-    AmbiguousInternal,
     UnresolvedLikelyInternal,
     ConfirmedExternal,
     #[default]
     Unknown,
 }
 
+// trace:exempt reason=internal-detail
 impl ResolutionClass {
+    // trace:exempt reason=internal-detail
     pub fn as_str(self) -> &'static str {
         match self {
             ResolutionClass::ResolvedInternal => "resolved_internal",
-            ResolutionClass::AmbiguousInternal => "ambiguous_internal",
             ResolutionClass::UnresolvedLikelyInternal => "unresolved_likely_internal",
             ResolutionClass::ConfirmedExternal => "confirmed_external",
             ResolutionClass::Unknown => "unknown",
@@ -99,31 +102,69 @@ impl ResolutionClass {
 
 /// Compact analyzer-health summary. Concise by default; counts are floors
 /// of what this index actually observed.
+/// Ordinal confidence ladder for call resolution. These are NOT calibrated
+/// probabilities — no experiment measured them. They encode a deliberate
+/// ranking (exact pins outrank typed-receiver matches outrank lexical
+/// fallbacks), and every production emit site must use these names instead
+/// of bare literals so the ranking stays reviewable in one place.
+// trace:exempt reason=const-data
+pub mod confidence {
+    /// LSP definition resolution.
+    pub const LSP_EXACT: f64 = 0.99;
+    /// SCIP definition resolution (compiler-exact, same tier as LSP).
+    pub const SCIP_EXACT: f64 = 0.99;
+    /// Unique pin through a structural rule: bare-local callable, typed
+    /// receiver, field type, Rule-1 enclosing class, Rule-3 include file,
+    /// or fn-alias binding. Same tier as definition exactness: narrowing
+    /// converged on exactly one target.
+    pub const UNIQUE_PIN: f64 = 0.99;
+    /// `self`/`this` method found on a sibling of the enclosing class.
+    pub const SIBLING_METHOD: f64 = 0.98;
+    /// Namespace-qualified member pin (`ns.member`, `pkg.Symbol`).
+    pub const NAMESPACE_PIN: f64 = 0.97;
+    /// Imported member pin (binding resolved through an import).
+    pub const IMPORTED_MEMBER: f64 = 0.95;
+    /// Typed-receiver tier: field-type and Rule-1 enclosing-class matches.
+    /// Shares its value with unique pins; kept as a name so call sites
+    /// state which rule family produced the edge.
+    pub const TYPED_RECEIVER: f64 = 0.9;
+    /// Confirmed external target (`external:` import, seeded root).
+    pub const CONFIRMED_EXTERNAL: f64 = 0.8;
+    /// Strong same-system edge below definition-exactness: bridge stitch,
+    /// state-authority write. Structural, not pinned by a resolver rule.
+    pub const STRONG_LINK: f64 = 0.8;
+    /// Seeded field-chain root (object known, method not pinned).
+    pub const SEEDED_ROOT: f64 = 0.55;
+    /// No rule fired; recorded for coverage honesty, never an edge.
+    pub const UNRESOLVED_FALLBACK: f64 = 0.5;
+    /// Likely-internal target that no rule could pin.
+    pub const UNRESOLVED_LIKELY_INTERNAL: f64 = 0.4;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 // trace:v1 id=impl.scc.core.analysis-quality work=WORK-ripwire-lessons-phase1 satisfies=REQ-resolution-honesty-gauges
 pub struct AnalysisQuality {
     pub calls: CallQuality,
     pub files: FileQuality,
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub stale_facts_dropped: u32,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub matched_doc_mentions: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unmatched_doc_mentions: u32,
 }
 
+// trace:exempt reason=internal-detail
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+// trace:v1 id=impl.scc.core.call-quality work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
 pub struct CallQuality {
     pub resolved: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub precise: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub heuristic: u32,
-    pub ambiguous: u32,
     pub likely_internal_unresolved: u32,
     pub external: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -131,16 +172,16 @@ pub struct CallQuality {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+// trace:v1 id=impl.scc.core.file-quality work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
 pub struct FileQuality {
     pub parsed: u32,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub partial: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unsupported: u32,
 }
 
 // trace:exempt reason=internal-detail
 impl AnalysisQuality {
+// trace:v1 id=impl.scc.core.analysis-quality.record-call work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
     pub fn record_call(&mut self, class: ResolutionClass, precise: bool) {
         match class {
             ResolutionClass::ResolvedInternal => {
@@ -151,7 +192,6 @@ impl AnalysisQuality {
                     self.calls.heuristic += 1;
                 }
             }
-            ResolutionClass::AmbiguousInternal => self.calls.ambiguous += 1,
             ResolutionClass::UnresolvedLikelyInternal => {
                 self.calls.likely_internal_unresolved += 1
             }
@@ -166,14 +206,11 @@ impl AnalysisQuality {
         self.calls.resolved += other.calls.resolved;
         self.calls.precise += other.calls.precise;
         self.calls.heuristic += other.calls.heuristic;
-        self.calls.ambiguous += other.calls.ambiguous;
         self.calls.likely_internal_unresolved += other.calls.likely_internal_unresolved;
         self.calls.external += other.calls.external;
         self.calls.unknown += other.calls.unknown;
         self.files.parsed += other.files.parsed;
-        self.files.partial += other.files.partial;
         self.files.unsupported += other.files.unsupported;
-        self.stale_facts_dropped += other.stale_facts_dropped;
         self.matched_doc_mentions += other.matched_doc_mentions;
         self.unmatched_doc_mentions += other.unmatched_doc_mentions;
     }
@@ -181,17 +218,14 @@ impl AnalysisQuality {
     // trace:exempt reason=internal-detail
     pub fn compact_line(&self) -> String {
         let mut line = format!(
-            "calls: resolved={} precise={} heuristic={} ambiguous={} likely_internal_unresolved={} external={} | files: parsed={} partial={} unsupported={} | stale_facts_dropped={}",
+            "calls: resolved={} precise={} heuristic={} likely_internal_unresolved={} external={} | files: parsed={} unsupported={}",
             self.calls.resolved,
             self.calls.precise,
             self.calls.heuristic,
-            self.calls.ambiguous,
             self.calls.likely_internal_unresolved,
             self.calls.external,
             self.files.parsed,
-            self.files.partial,
             self.files.unsupported,
-            self.stale_facts_dropped
         );
         if self.matched_doc_mentions > 0 || self.unmatched_doc_mentions > 0 {
             line.push_str(&format!(
@@ -207,6 +241,7 @@ impl AnalysisQuality {
 /// never spend more tokens to be clever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+// trace:v1 id=impl.scc.core.representation-kind work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub enum RepresentationKind {
     Exact,
     Structural,
@@ -214,6 +249,7 @@ pub enum RepresentationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// trace:v1 id=impl.scc.core.representation-choice work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub struct RepresentationChoice {
     pub kind: RepresentationKind,
     pub reason: String,
@@ -261,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    // trace:v1 id=test.scc.core.structural-wins verifies=REQ-exact-source-dominance exercises=impl.scc.core.choose-representation
     fn structural_wins_when_it_saves_tokens() {
         let c = choose_representation(100, 29);
         assert_eq!(c.kind, RepresentationKind::Structural);
@@ -271,16 +308,18 @@ mod tests {
     // trace:v1 id=test.scc.core.analysis-quality-buckets verifies=REQ-resolution-honesty-gauges exercises=impl.scc.core.analysis-quality
     fn record_call_buckets_are_honest() {
         let mut q = AnalysisQuality::default();
+        q.record_call(ResolutionClass::ResolvedInternal, true);
         q.record_call(ResolutionClass::ResolvedInternal, false);
         q.record_call(ResolutionClass::ConfirmedExternal, false);
         q.record_call(ResolutionClass::UnresolvedLikelyInternal, false);
-        q.record_call(ResolutionClass::AmbiguousInternal, false);
-        assert_eq!(q.calls.resolved, 1);
+        q.record_call(ResolutionClass::Unknown, false);
+        assert_eq!(q.calls.resolved, 2);
+        assert_eq!(q.calls.precise, 1);
         assert_eq!(q.calls.heuristic, 1);
-        assert_eq!(q.calls.precise, 0);
         assert_eq!(q.calls.external, 1);
         assert_eq!(q.calls.likely_internal_unresolved, 1);
-        assert_eq!(q.calls.ambiguous, 1);
+        assert_eq!(q.calls.unknown, 1);
+        assert!(q.compact_line().contains("precise=1"));
         assert!(q.compact_line().contains("external=1"));
     }
 }

@@ -37,6 +37,7 @@ fn op_of(graph: &RealityGraph, sym: &str) -> String {
 }
 
 /// Mutable edge registry for one graph build (dedup + join detection).
+// trace:exempt reason=internal-detail
 struct EdgeTable {
     edges: Vec<FlowEdge>,
     seen: BTreeSet<(u32, u32, String)>,
@@ -102,6 +103,7 @@ impl EdgeTable {
 }
 
 /// Mutable node registry for one graph build.
+// trace:exempt reason=internal-detail
 struct NodeTable {
     nodes: Vec<FlowNode>,
     by_key: HashMap<NodeKey, u32>,
@@ -140,6 +142,7 @@ impl NodeTable {
 /// `symbol_comp` maps symbol id -> component entity id (same mapping the
 /// projection compilers use, so displays agree).
 // trace:v1 id=impl.scc.flowgraph work=WORK-SCC-005 satisfies=REQ-SCC-FLOW
+// trace:v1 id=impl.scc.graph.state-flow-read-write work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub fn compile_flow_graphs(
     graph: &RealityGraph,
     store: &Store,
@@ -408,6 +411,32 @@ pub fn compile_flow_graphs(
                         r.provenance,
                         r.evidence.clone(),
                     );
+                }
+            }
+        }
+
+        // ---- read/write edges (state authority: handler READS/WRITES
+        // stores). Same mechanical pattern as publish/consume: the store
+        // relationship is the evidence, provenance rides along.
+        for (sym, comp) in symbol_comp {
+            for (pred, kind) in [
+                (
+                    scc_core::predicates::READS,
+                    FlowEdgeKind::Read,
+                ),
+                (
+                    scc_core::predicates::WRITES,
+                    FlowEdgeKind::Write,
+                ),
+            ] {
+                for r in graph.out_pred(sym, pred) {
+                    let from_key = (comp.clone(), op_of(graph, sym));
+                    if let Some(from) = table.lookup(&from_key) {
+                        let to_key =
+                            (r.object.clone(), format!("state {}", op_of(graph, &r.object)));
+                        let to = table.get(&to_key);
+                        edges.push(from, to, kind, None, r.provenance, r.evidence.clone());
+                    }
                 }
             }
         }

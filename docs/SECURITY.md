@@ -51,7 +51,11 @@ Unknown adapters should be sandboxed.
 
 ## 7. Network
 
-Loopback only in local mode. Remote mode requires TLS/auth/project scoping.
+Loopback only in local mode. The daemon (`scc serve`) refuses non-loopback
+binds unless `SCC_ALLOW_REMOTE_LISTEN=1` is set — and even then the service
+is UNAUTHENTICATED (no TLS/auth yet): bind 127.0.0.1 for local use, and treat
+any LAN bind as trusted-network-only. Remote mode with TLS/auth/project
+scoping is future work, not a current control.
 
 ## 8. Remote models
 

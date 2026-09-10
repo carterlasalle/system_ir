@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SCHEMA_VERSION: &str = "0.1.0";
 
 pub mod handles;
+pub mod identity;
 pub mod languages;
 pub mod lex;
 pub mod resolution;
@@ -507,6 +508,7 @@ pub enum FlowEdgeKind {
     /// Retry edge (back to the retried operation).
     Retry,
     /// Fallback edge to the degraded path.
+    /// DEFERRED (§25): no reliable extractor evidence; not produced.
     Fallback,
     /// Asynchronous dispatch.
     Async,
@@ -517,24 +519,32 @@ pub enum FlowEdgeKind {
     /// Convergence of concurrent paths.
     Join,
     /// Return/terminal edge.
+    /// DEFERRED: subsumed by Next topology; not produced as a kind.
     Return,
     /// Timeout edge.
+    /// DEFERRED (§25): no reliable extractor evidence; not produced.
     Timeout,
     /// Compensation/rollback edge.
+    /// DEFERRED (§25): no reliable extractor evidence; not produced.
     Compensation,
     /// State/data read.
     Read,
     /// State/data write.
     Write,
     /// Data transformation.
+    /// DEFERRED: subsumed by call-chain topology; not produced as a kind.
     Transform,
     /// Validation/schema check.
+    /// DEFERRED: no reliable extractor evidence; not produced.
     Validate,
     /// Authorization/policy gate.
+    /// DEFERRED: trust-boundary analysis covers this; not a flow kind.
     Authorize,
     /// Cache lookup.
+    /// DEFERRED: no reliable extractor evidence; not produced.
     Cache,
     /// Cache/state invalidation.
+    /// DEFERRED: no reliable extractor evidence; not produced.
     Invalidate,
 }
 
@@ -641,6 +651,11 @@ pub struct AtlasComponent {
     /// members; `None` for unmerged leaves.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Repository role from implementation paths: `production` (default),
+    /// `test`, `fixture`, `benchmark`, `example`, or `mixed`. Lets renders
+    /// scope non-production trees as structure, never production.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// One hierarchical container (service or subsystem) with its direct member
@@ -1892,6 +1907,23 @@ pub struct TaskSeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    // trace:v1 id=test.scc-core.estimate-tokens work=WORK-SI-MMMJA4G6 verifies=REQ-SI-NX53P4B7 exercises=impl.crates-scc-core-src-lib.estimate-tokens
+    fn estimate_tokens_is_chars_ceiling() {
+        // Authoritative estimator: chars/4 ceiling. All budget paths
+        // (Rust packs, CLI builders, Python harness mirrors) must agree.
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens("fn main() { println!(\"hi\"); }"), 8);
+        // Unicode counts code points (Rust chars), not bytes or graphemes.
+        assert_eq!(estimate_tokens("日本語"), 1);
+        assert_eq!(estimate_tokens("日本語テスト"), 2);
+        // Long identifier-heavy paths stay proportional.
+        let path = "crates/scc-context/src/surface/structural_source_selection_policy.rs";
+        assert_eq!(estimate_tokens(path), path.chars().count().div_ceil(4));
+    }
 
     #[test]
 // trace:v1 id=impl.crates-scc-core-src-lib-context-budget.component-encode-decode-roundtrip work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching

@@ -75,11 +75,11 @@ FILE_RE = re.compile(r'<file path="([^"]+)"[^>]*>([\s\S]*?)</file>')
 
 
 def estimate_tokens(text):
-    # The single shared tokenizer for ALL variants (chars/4; the harness,
-    # the scc side, and the aider adapter use the same rule).
+    # Mirror of run_context_bench.estimate_shared_tokens (which mirrors Rust
+    # scc_core::estimate_tokens): chars/4 ceiling. Keep in sync.
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    return (len(text) + 3) // 4
 
 
 def repomix_command(repo_abs, out_file, compress):

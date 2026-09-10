@@ -103,3 +103,34 @@ fn incremental_refresh_creates_type_narrow_calls_when_callee_gains_method() {
         "refreshing the callee must re-resolve the importer's type-narrowed CALL"
     );
 }
+
+#[test]
+// trace:v1 id=test.scc.index.non-utf8-recorded verifies=REQ-SI-NX53P4B7
+fn non_utf8_file_is_recorded_not_perpetually_added() {
+    // A file unreadable as UTF-8 extracts no facts, but its inventory row
+    // (with the scan hash) must exist — otherwise every freshness scan
+    // reports it as "added" forever.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("ok.py"), "def ok():\n    return 1\n").unwrap();
+    std::fs::write(root.join("bad.py"), b"\xff\xfe def broken():\n    pass\n").unwrap();
+    let (idx, _db) = indexer_for(root);
+    let report = idx.index().unwrap();
+    assert_eq!(report.failed, 1);
+    let inventory: std::collections::HashMap<String, String> = idx
+        .store
+        .all_files()
+        .unwrap()
+        .into_iter()
+        .map(|(p, h, _, _, _)| (p, h))
+        .collect();
+    let scanned = scc_indexer::scan::scan_repo(root, &Config::default().index).unwrap();
+    for f in &scanned {
+        assert_eq!(
+            inventory.get(&f.path),
+            Some(&f.hash),
+            "scan/inventory closure violated for {}",
+            f.path
+        );
+    }
+}

@@ -31,13 +31,34 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("rcb", HERE / "run_context_bench.py")
 h = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(h)
-
 # Writable codex: edits allowed (the harness owns isolation). NOT the
 # read-only sandbox used by the localization benchmark.
 WRITABLE_AGENT_CMD = (
     "codex exec --json --sandbox workspace-write --skip-git-repo-check "
     "--ephemeral --color never -C . -"
 )
+
+PAID_GATE_ENV = "SCC_ALLOW_PAID_BENCHMARKS"
+PAID_GATE_MESSAGE = (
+    "refusing: run_write_matrix.py launches paid coding agents (codex/claude "
+    "via --agent-cmd); paid model benchmarks are disabled by default and spend "
+    "real API quota. Re-run with --dry-run (builds local context artifacts "
+    "only, launches no model) or set SCC_ALLOW_PAID_BENCHMARKS=1 to opt in "
+    "explicitly."
+)
+
+
+def check_paid_opt_in(*, dry_run):
+    """Hard safety interlock: launching an external coding agent requires an
+    explicit opt-in. Returns True when the run may proceed (dry-run Mock or
+    env opt-in); prints the refusal and returns False otherwise — always
+    BEFORE any external process/model launch."""
+    if dry_run:
+        return True
+    if os.environ.get(PAID_GATE_ENV) == "1":
+        return True
+    print(PAID_GATE_MESSAGE, file=sys.stderr)
+    return False
 
 # Canonical corpus (§28): the writable tasks are the canonical tasks.json
 # ids that have REGISTERED evaluators. SCOPED_TASKS is derived, never a
@@ -161,7 +182,7 @@ def scc_artifact(repo, goal, workdir, scc_bin, budget=None, variant="scc-full"):
     # a regression is loud, not silent).
     if budget is not None:
         text = Path(payload["artifact"]).read_text()
-        actual = max(1, len(text) // 4)
+        actual = h.estimate_shared_tokens(text)
         assert actual <= budget, f"equal-token violation: artifact {actual} > budget {budget}"
         assert tokens == actual or tokens <= budget, (tokens, actual, budget)
     return Path(payload["artifact"]), tokens
@@ -220,7 +241,7 @@ def external_artifact(variant, repo, goal, workdir, budget):
 
 
 def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
-                agent_label=None, model_label=None, budget=None):
+                agent_label=None, model_label=None, budget=None, launch_agent=True):
     """One (variant, task) cell: isolated copy -> agent -> evaluator.
 
     Error typing (§32): `error` is set ONLY for infrastructure failures
@@ -266,6 +287,18 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
                 status = "PIN-UNVERIFIED"
             return _infra_cell(err, status=status)
 
+    if not launch_agent:
+        return {
+            "task_success": None,
+            "task_success_defined": False,
+            "run_completion": False,
+            "context_tokens": ctx_tokens,
+            "wall_sec": 0.0,
+            "error": None,
+            "error_type": None,
+            "status": "DRY-RUN",
+        }
+
     started = time.monotonic()
     result = h.run_write_task(
         agent_cmd, root, task["goal"],
@@ -308,6 +341,27 @@ def run_variant(variant, task, workdir, scc_bin=None, agent_cmd=None,
     }
 
 
+
+
+def _run_preflight(question, budget):
+    """Run preflight.py checks; returns its exit code (0 = GO). Split out
+    so tests can stub the science while asserting the gate is consulted."""
+    import subprocess as _sp
+    try:
+        _pre = _sp.run(
+            [sys.executable, str(HERE / "preflight.py"),
+             "--question", question,
+             "--budget", budget],
+            capture_output=True, text=True,
+        )
+    except OSError as e:
+        # Fail closed and clean: a preflight that cannot run is a refusal,
+        # never a traceback and never a silent pass.
+        print(f"PREFLIGHT REFUSE: cannot execute preflight.py: {e}", file=sys.stderr)
+        return 2
+    sys.stdout.write(_pre.stdout)
+    return _pre.returncode
+
 def main(argv):
     import argparse
     parser = argparse.ArgumentParser(prog="run_write_matrix.py")
@@ -324,7 +378,20 @@ def main(argv):
     parser.add_argument("--tasks", help="comma-separated canonical task ids (default: all evaluator-backed)")
     parser.add_argument("--variants", default="raw,scc-full,aider-repomap,repomix-compress",
                         help="comma-separated variants")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build local context artifacts only; never launch the external coding agent (no model quota)")
+    parser.add_argument("--question", default="",
+                        help="experimental question this run answers (required for paid runs: preflight refuses without one)")
     args = parser.parse_args(argv)
+
+    # Paid-model safety interlock: refuse BEFORE any external process/model
+    # launch unless this is a local-only dry run or the operator opted in.
+    if not check_paid_opt_in(dry_run=args.dry_run):
+        return 2
+    # Paid preflight (§44): even opted-in runs must answer the cheap gates.
+    if not args.dry_run:
+        if _run_preflight(args.question, str(args.budget or "")) != 0:
+            return 2
 
     tasks = SCOPED_TASKS
     if args.tasks:
@@ -400,7 +467,8 @@ def main(argv):
                                    agent_cmd=agent_cmd,
                                    agent_label=agent_label,
                                    model_label=args.model_label,
-                                   budget=args.budget)
+                                   budget=args.budget,
+                                   launch_agent=not args.dry_run)
                 cell["requested_budget"] = args.budget if args.budget is not None else None
                 results["cells"][key] = cell
                 print(f"          success={cell.get('task_success')} "
@@ -505,7 +573,7 @@ def compute_summary(cells, ids, variants):
     for v in variants:
         for i in ids:
             cell = cells.get(f"{v}/{i}")
-            if cell is None or cell.get("error"):
+            if cell is None or cell.get("error") or cell.get("task_success") is None:
                 continue
             micro_vals.append(1.0 if cell.get("task_success") else 0.0)
     summary["micro_task_success"] = (

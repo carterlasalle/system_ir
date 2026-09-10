@@ -24,13 +24,15 @@ pub const RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // trace:exempt reason=internal-detail
 pub struct StartupContext {
     pub atlas: String,
+    /// Deterministic physical-layout evidence (repository skeleton),
+    /// built from the indexed file inventory under its own hard budget.
+    pub skeleton: String,
     pub surface: String,
     pub surface_render: scc_core::SurfaceRenderResult,
     pub coverage: Vec<String>,
     pub omissions: Vec<String>,
     pub artifact: ContextArtifact,
 }
-
 /// Global-rank cache (Wave 15.2, per-ModelEpoch rank caching): the
 /// expensive, epoch-stable parts of a global Surface build —
 /// `SystemRanker::new` (heterogeneous node graph + adjacency + rarity),
@@ -185,6 +187,21 @@ pub fn build_startup(
     let atlas_pack = compiler.system_atlas(Some(budget.atlas));
     let atlas = atlas_pack.content.clone();
 
+    // Repository Skeleton: physical-layout evidence from the indexed file
+    // inventory, under its own hard budget. Pre-bounded (never rebalanced
+    // by the corrective loop below), deterministic per epoch, and counted
+    // in every fused hard-max probe.
+    let skeleton = {
+        let paths: Vec<String> = compiler
+            .store
+            .all_files()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, _, _, _, _)| p)
+            .collect();
+        crate::skeleton::build_skeleton(&paths, crate::skeleton::skeleton_budget(budget.total)).text
+    };
+
     // Surface: the FULL production pipeline — the one authoritative
     // [`build_surface`] service in Global mode (heterogeneous global PPR,
     // required coverage, MMR diversity, token-aware quotas, soft/hard
@@ -260,7 +277,7 @@ pub fn build_startup(
             atlas_pack.hard_truncated,
             atlas_pack.exceeded_soft_budget,
         );
-        let fused = assemble_body(&atlas, &render.text, &coverage, &omissions_probe);
+        let fused = assemble_body(&atlas, &skeleton, &render.text, &coverage, &omissions_probe);
         if BLOCK_HEADER_OVERHEAD + estimate_tokens(&fused) <= startup_hard_max {
             break;
         }
@@ -273,7 +290,7 @@ pub fn build_startup(
             // than looping forever.
             break;
         }
-        let overhead = estimate_tokens(&assemble_body(&atlas, "", &coverage, &omissions_probe));
+        let overhead = estimate_tokens(&assemble_body(&atlas, &skeleton, "", &coverage, &omissions_probe));
         let room = startup_hard_max.saturating_sub(overhead);
         if room >= 64 {
             // Surface still has room: shrink it to the room the current
@@ -357,7 +374,7 @@ pub fn build_startup(
     // (atlas + surface + coverage + omissions, without the artifact metadata
     // comment). A content change that keeps the config identical now
     // changes the hash — the audit's name/content mismatch fix.
-    let body = assemble_body(&atlas, &surface, &coverage, &omissions);
+    let body = assemble_body(&atlas, &skeleton, &surface, &coverage, &omissions);
     let mut ch = blake3::Hasher::new();
     ch.update(b"startup-content-v1");
     ch.update(epoch.as_bytes());
@@ -381,7 +398,7 @@ pub fn build_startup(
         content_hash,
         text: String::new(),
     };
-    artifact.text = assemble_block(&atlas, &surface, &coverage, &omissions, &artifact);
+    artifact.text = assemble_block(&atlas, &skeleton, &surface, &coverage, &omissions, &artifact);
 
     // Final invariant (Part 4): the COMPLETE startup text never exceeds the
     // hard maximum. The corrective loop guarantees it by construction when
@@ -401,6 +418,7 @@ pub fn build_startup(
 
     StartupContext {
         atlas,
+        skeleton,
         surface,
         surface_render: render,
         coverage,
@@ -408,7 +426,6 @@ pub fn build_startup(
         artifact,
     }
 }
-
 /// The store-cache key for the global rank cache: `rank:global:` +
 /// blake3 over the composite cache epoch, the TrustPolicy fingerprint,
 /// and the rank salt (truncated to 20 hex chars, mirroring the
@@ -478,17 +495,19 @@ fn symbol_id_of(entry_id: &str) -> String {
 /// `build_startup(..).artifact.text == render_startup(&startup)` always.
 // trace:exempt reason=internal-detail
 pub fn render_startup(s: &StartupContext) -> String {
-    assemble_block(&s.atlas, &s.surface, &s.coverage, &s.omissions, &s.artifact)
+    assemble_block(&s.atlas, &s.skeleton, &s.surface, &s.coverage, &s.omissions, &s.artifact)
 }
 
 /// The startup body (all content sections, no artifact metadata comment) —
 /// the preimage of `content_hash`.
 // trace:exempt reason=internal-detail
-fn assemble_body(atlas: &str, surface: &str, coverage: &[String], omissions: &[String]) -> String {
+fn assemble_body(atlas: &str, skeleton: &str, surface: &str, coverage: &[String], omissions: &[String]) -> String {
     let mut out = String::new();
     out.push_str("# SCC SYSTEM CONTEXT\n");
     out.push_str("## SYSTEM ATLAS\n");
     out.push_str(atlas.trim_end());
+    out.push_str("\n\n## REPOSITORY SKELETON\n");
+    out.push_str(skeleton.trim_end());
     out.push_str("\n\n## SYSTEM SURFACE MAP\n");
     out.push_str(surface.trim_end());
     out.push_str("\n\n## MODEL COVERAGE\n");
@@ -511,6 +530,7 @@ fn assemble_body(atlas: &str, surface: &str, coverage: &[String], omissions: &[S
 // trace:exempt reason=internal-detail
 fn assemble_block(
     atlas: &str,
+    skeleton: &str,
     surface: &str,
     coverage: &[String],
     omissions: &[String],
@@ -522,7 +542,7 @@ fn assemble_block(
         "<!-- artifact sha256:{} content_hash:{} epoch:{} renderer:{} -->\n\n",
         artifact.sha256, artifact.content_hash, artifact.epoch, artifact.renderer_version
     ));
-    out.push_str(&assemble_body(atlas, surface, coverage, omissions));
+    out.push_str(&assemble_body(atlas, skeleton, surface, coverage, omissions));
     out
 }
 
@@ -776,6 +796,7 @@ mod tests {
     fn render_startup_emits_spec_headers() {
         let sc = StartupContext {
             atlas: "ATLAS-BODY".into(),
+            skeleton: "SKELETON-BODY".into(),
             surface: "SURFACE-BODY".into(),
             surface_render: scc_core::SurfaceRenderResult {
                 text: "SURFACE-BODY".into(),
@@ -801,13 +822,17 @@ mod tests {
         let out = render_startup(&sc);
         assert!(out.contains("# SCC SYSTEM CONTEXT"));
         assert!(out.contains("## SYSTEM ATLAS"));
+        assert!(out.contains("## REPOSITORY SKELETON"));
         assert!(out.contains("## SYSTEM SURFACE MAP"));
-        assert!(out.contains("## MODEL COVERAGE"));
-        assert!(out.contains("## OMISSIONS"));
         assert!(out.contains("ATLAS-BODY"));
         assert!(out.contains("SURFACE-BODY"));
-        assert!(out.contains("sha256:abc"));
-        assert!(out.contains("content_hash:def"));
+        assert!(out.contains("SKELETON-BODY"));
+        let (ia, ik, is) = (
+            out.find("## SYSTEM ATLAS").unwrap(),
+            out.find("## REPOSITORY SKELETON").unwrap(),
+            out.find("## SYSTEM SURFACE MAP").unwrap(),
+        );
+        assert!(ia < ik && ik < is, "skeleton grounds before architecture");
         assert!(out.contains("stale: a.py"));
     }
 

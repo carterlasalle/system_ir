@@ -12,7 +12,8 @@
 use crate::write::{evidence_id, rel_id};
 use scc_core::kinds;
 use scc_core::{
-    entity_id, symbol_id, Entity, Evidence, EvidenceType, Provenance, Relationship,
+    entity_id, resolution::confidence, symbol_id, Entity, Evidence, EvidenceType, Provenance,
+    Relationship,
 };
 use scc_store::Store;
 use serde_json::Value;
@@ -620,7 +621,7 @@ pub fn import_scip(store: &Store, path: &Path) -> Result<ImportReport, String> {
                     ext_id,
                     Provenance::Extracted,
                 )
-                .with_confidence(0.8)
+                .with_confidence(confidence::CONFIRMED_EXTERNAL)
                 .with_evidence(vec![ev.id.clone()]);
                 store
                     .insert_relationship(&rel, &doc.file)
@@ -651,7 +652,7 @@ pub fn import_scip(store: &Store, path: &Path) -> Result<ImportReport, String> {
                 target.entity.clone(),
                 Provenance::Resolved,
             )
-            .with_confidence(0.99)
+            .with_confidence(confidence::SCIP_EXACT)
             .with_evidence(vec![ev.id.clone()]);
             store
                 .insert_relationship(&rel, &doc.file)

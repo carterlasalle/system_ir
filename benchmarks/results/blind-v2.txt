@@ -1,0 +1,50 @@
+# Blind v2 — validation vs blind (aggregates only, fresh rerun on present tree)
+# generated: 2026-09-10 by `scc bench atlas --blind` (aggregate-only, no paid models)
+# scc_commit: cc1b7892a570e497d3129506e601f35258750005 (working tree DIRTY: mission changes present)
+# supersedes: nothing (blind-v1.txt preserved untouched); compare with diff
+# result: all per-layer recall figures IDENTICAL to blind-v1; only atlas token
+#   counts moved (validation 132061 -> 139594, blind 52187 -> 56980) from
+#   startup-capsule additions. CURRENT BLIND PERFORMANCE = VERIFIED (aggregate).
+# Blind v1 — validation vs blind (aggregates only)
+blind manifest sha256: 524c463622b3fe29476a7e249cc7999018f6e9bba1fbf2d78226fa88a5d0ba57 (20 ground-truth files, 20 blind-test repos)
+validation corpus: validation: /Users/rocket/system_ir/benchmarks/holdout
+blind corpus:      blind-test: /Users/rocket/system_ir/benchmarks/blind-test
+results:           /Users/rocket/system_ir/benchmarks/results/blind-v1.txt
+# blind-test failures are never shown to tuning agents: no per-repo rows, no filenames, no missed keys
+
+layer                validation        blind        gap
+architecture              0.624        0.352     -0.273
+entrypoints               0.422        0.217     -0.205
+behavior                  0.057        0.035     -0.022
+state_authority           0.450        0.743     +0.293
+contracts                 0.060        0.015     -0.045
+landmarks                 0.910        0.980     +0.070
+tests                     0.090        0.018     -0.071
+overall (gate)            0.323        0.272     -0.050
+
+scored: validation 20 (skipped 0) | blind 20 (skipped 0)
+precision: validation 0.045 | blind 0.072
+F2: validation 0.100 | blind 0.138
+density (facts/1k tokens): validation 0.41 | blind 0.48
+atlas tokens: validation 139594 | blind 56980
+
+## blind transfer ratio (blind / validation) — how much of the validation recall transfers to the unseen blind corpus
+  architecture            0.564
+  entrypoints             0.513
+  behavior                0.611
+  state_authority         1.652
+  contracts               0.255
+  landmarks               1.077
+  tests                   0.205
+  overall                 0.844
+
+## generalization gap (blind - validation) — informational, not gating
+  architecture           -0.273
+  entrypoints            -0.205
+  behavior               -0.022
+  state_authority        +0.293
+  contracts              -0.045
+  landmarks              +0.070
+  tests                  -0.071
+  overall                -0.050
+  gate (recall >= 0.5): blind FAIL | validation FAIL

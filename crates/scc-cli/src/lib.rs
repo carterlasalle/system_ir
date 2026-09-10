@@ -111,11 +111,16 @@ pub fn recompile(store: &Store) -> Result<scc_graph::RecompileReport> {
     Ok(scc_graph::recompile(store)?)
 }
 
-/// Compute repository-relative paths whose content hash no longer matches
-/// the indexed snapshot (deleted files count as stale).
+/// Compute repository-relative paths whose indexed snapshot no longer matches
+/// the working tree: modified, deleted, AND added files. Added files are
+/// found by diffing the authoritative scan against the indexed inventory —
+/// a newly created relevant file must make the model non-current.
+// trace:v1 id=impl.crates-scc-cli-src-lib.stale-paths work=WORK-SI-MMMJA4G6 implements=PLAN-SI-SYKFPBEC
 pub fn stale_paths(store: &Store) -> Result<Vec<String>> {
     let mut out = Vec::new();
+    let mut indexed = std::collections::HashSet::new();
     for (path, hash, _lang, _kind, _size) in store.all_files()? {
+        indexed.insert(path.clone());
         let full = store.root.join(&path);
         let current = match std::fs::read(&full) {
             Ok(b) => scc_indexer::scan::hash_bytes(&b),
@@ -125,6 +130,18 @@ pub fn stale_paths(store: &Store) -> Result<Vec<String>> {
             out.push(path);
         }
     }
+    // Added since indexing: in the scan but absent from the inventory.
+    // Same scan the indexer uses, so both sides share one notion of
+    // "repository file" (git-ignored and configured-ignored paths excluded).
+    let config = load_config(&store.root)?;
+    let scanned = scc_indexer::scan::scan_repo(&store.root, &config.index).map_err(scc_indexer::IndexError::from)?;
+    for f in scanned {
+        if !indexed.contains(&f.path) {
+            out.push(f.path);
+        }
+    }
+    out.sort();
+    out.dedup();
     Ok(out)
 }
 

@@ -53,6 +53,19 @@ struct Tool {
     input_schema: serde_json::Value,
 }
 
+/// MCP tool annotations for a read-only deterministic context tool.
+/// All ten tools are non-destructive and idempotent for identical model
+/// state and input; only `task_context` takes open-world input.
+// trace:v1 id=impl.crates-scc-cli-src-mcp.tool-annotations work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+fn tool_annotations(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": name == "task_context",
+    })
+}
+
 // trace:v1 id=impl.scc.mcp work=WORK-SCC-001 satisfies=REQ-SCC-API
 // trace:v1 id=impl.crates-scc-cli-src-mcp.tools work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
 fn tools() -> Vec<Tool> {
@@ -231,6 +244,7 @@ pub fn serve_stdio(root: &Path) -> crate::Result<()> {
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema,
+                            "annotations": tool_annotations(t.name),
                         })
                     })
                     .collect();
@@ -438,6 +452,20 @@ mod tests {
             assert!(t.input_schema.get("properties").is_some());
         }
         assert_eq!(tools().len(), 10, "the ten semantic tools only");
+        // truthful annotations: read-only, non-destructive, idempotent;
+        // only task_context takes open-world input.
+        for t in tools() {
+            let a = tool_annotations(t.name);
+            assert_eq!(a["readOnlyHint"], true, "{}", t.name);
+            assert_eq!(a["destructiveHint"], false, "{}", t.name);
+            assert_eq!(a["idempotentHint"], true, "{}", t.name);
+            assert_eq!(
+                a["openWorldHint"],
+                t.name == "task_context",
+                "{}",
+                t.name
+            );
+        }
     }
 
     #[test]

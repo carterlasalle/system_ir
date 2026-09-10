@@ -7,23 +7,37 @@ Local-first, evidence-first, incremental, provenance-aware, progressively retrie
 
 ## 2. Layers
 
+<!-- trace:exempt reason=document-structure -->
 ### L0 Snapshot
 Repo ID, branch, commit, file paths/hashes, language, timestamp.
 
+<!-- trace:exempt reason=document-structure -->
 ### L1 Evidence
 Source locations, symbols, extractor metadata, trace/config sources.
 
+<!-- trace:exempt reason=document-structure -->
 ### L2 Reality Graph
 Typed entities/relations with provenance/confidence/freshness.
 
+<!-- trace:exempt reason=document-structure -->
 ### L3 System IR
 Components, responsibilities, ownership, contracts, Atlas, invariants.
 
+<!-- trace:exempt reason=document-structure -->
 ### L4 Context indexes
 Lexical, semantic, adjacency, component/flow/contract/test membership.
 
+<!-- trace:exempt reason=document-structure -->
 ### L5 Runtime/history
 Aggregated traces, Git co-change, prior snapshots, drift history.
+
+GraphRevision vs ModelEpoch (complementary, never collapsed): a
+**GraphRevision** (`graph_revisions` table) is a persistent history position
+— source hash + extractor versions + full member row sets, chained by
+base_rev. A **ModelEpoch** is the identity of the ACTIVE compiled semantic
+view across the source/semantic/evidence/intent/runtime/derived axes
+(generation counters + content hash). Revisions answer "what was true at
+position N"; the epoch answers "what is the live view right now".
 
 ## 3. MVP storage
 

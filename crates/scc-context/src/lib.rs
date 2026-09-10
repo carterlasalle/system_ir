@@ -13,6 +13,7 @@ pub mod rank;
 pub mod relevance;
 mod repo_path;
 pub mod selector;
+pub mod skeleton;
 pub mod startup;
 pub mod structural_source;
 pub mod surface;

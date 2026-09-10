@@ -18,6 +18,7 @@ fn startup_artifact_has_all_sections_and_is_deterministic() {
     for header in [
         "# SCC SYSTEM CONTEXT",
         "## SYSTEM ATLAS",
+        "## REPOSITORY SKELETON",
         "## SYSTEM SURFACE MAP",
         "## MODEL COVERAGE",
         "## OMISSIONS",

@@ -73,6 +73,8 @@ pub struct IndexReport {
     pub failed: usize,
     pub duration_ms: u64,
     pub analysis_quality: scc_core::AnalysisQuality,
+    /// Per-category scan skip counts (ignored/unsupported/oversized/…).
+    pub scan_stats: scan::ScanStats,
 }
 
 // trace:exempt reason=internal-detail
@@ -88,9 +90,29 @@ pub struct Indexer {
     pub cpp: Box<dyn LanguageExtractor>,
 }
 
+/// One indexed file's extract payload carried through a phase: scan record,
+/// extraction output, canonical text, and config/failure hits. Single-read
+/// invariant (§18): every pass below consumes THIS text, never re-reads.
+// trace:exempt reason=internal-detail
+type ExtractedEntry = (
+    ScannedFile,
+    ExtractedFile,
+    String,
+    Vec<configrefs::ConfigRefHit>,
+    Vec<failures::FailureHit>,
+);
+
 // trace:exempt reason=internal-detail
 impl Indexer {
-    pub fn new(store: Store, config: Config) -> Self {
+        // trace:v1 id=impl.scc.index.stable-identity work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+    pub fn new(mut store: Store, config: Config) -> Self {
+        // Stable identity (§XIV): explicit config id or git remote wins on
+        // fresh databases; loaded databases keep their persistent id.
+        let remote = git::resolve_git(&store.root).remote_url;
+        let _ = store.adopt_stable_identity(
+            config.repository.id.as_deref(),
+            remote.as_deref(),
+        );
         Indexer {
             store,
             config,
@@ -107,10 +129,12 @@ impl Indexer {
     pub fn config(&self) -> &Config {
         &self.config
     }
-
-    /// Full or incremental index depending on stored state.
     pub fn index(&self) -> Result<IndexReport, IndexError> {
-        let scanned = scan::scan_repo(&self.store.root, &self.config.index)?;
+        let (scanned, scan_stats) = scan::scan_repo_with_stats(&self.store.root, &self.config.index)?;
+        self.store.meta_set(
+            "scan_stats",
+            &serde_json::to_string(&scan_stats).unwrap_or_else(|_| "{}".into()),
+        )?;
         let existing: HashMap<String, String> = self
             .store
             .all_files()?
@@ -141,6 +165,7 @@ impl Indexer {
             changed: changed.len() + added.len(),
             added: added.len(),
             removed: removed.len(),
+            scan_stats: scan_stats.clone(),
             ..Default::default()
         };
 
@@ -148,7 +173,6 @@ impl Indexer {
         self.store
             .meta_set("remote_url", git_info.remote_url.as_deref().unwrap_or(""))?;
         self.store.meta_set("revision", &git_info.revision)?;
-        report.revision = git_info.revision.clone();
 
         if existing.is_empty() && removed.is_empty() && changed.is_empty() && added.is_empty() {
             // cold index path below handles empty scans
@@ -216,20 +240,27 @@ impl Indexer {
             }
         }
 
-        let mut extracted: BTreeMap<
-            String,
-            (
-                ScannedFile,
-                ExtractedFile,
-                Vec<configrefs::ConfigRefHit>,
-                Vec<failures::FailureHit>,
-            ),
-        > = BTreeMap::new();
+        // Single-read invariant (§18): each file is read ONCE per phase, in
+        // the extract loop below. `content` travels with the extraction so
+        // the write and config passes never re-read (and never hash a
+        // second, possibly newer, byte representation).
+        let mut extracted: BTreeMap<String, ExtractedEntry> = BTreeMap::new();
         for f in &to_process {
             let path = &f.path;
             let full = self.store.root.join(path);
             let Ok(content) = std::fs::read_to_string(&full) else {
+                // Unreadable as UTF-8 (or vanished mid-index): record the
+                // inventory row with the scan hash so freshness scan-diff
+                // stays closed (scan set == inventory set). No facts are
+                // extracted; the skip is counted, never silent.
                 report.failed += 1;
+                self.store.upsert_file(
+                    path,
+                    &f.hash,
+                    f.language.as_str(),
+                    f.kind.as_str(),
+                    f.size,
+                )?;
                 continue;
             };
             let ef = self.extract(f, &content);
@@ -239,7 +270,7 @@ impl Indexer {
             index.set_type_binds(path, &ef.type_binds);
             index.set_fn_binds(path, &ef.fn_binds);
             index.set_class_bases(path, &ef.class_bases);
-            extracted.insert(path.clone(), (f.clone(), ef, cfg_hits, fail_hits));
+            extracted.insert(path.clone(), (f.clone(), ef, content, cfg_hits, fail_hits));
         }
 
         // ---- resolution + writing ----
@@ -251,7 +282,9 @@ impl Indexer {
             self.store.purge_path(path)?;
         }
         let mut intent: Option<configs::Intent> = None;
-        for (path, (f, ef, cfg_hits, fail_hits)) in &extracted {
+        // Quality map: loaded once, patched per file, saved once below.
+        let mut quality_map = load_quality_files(&self.store);
+        for (path, (f, ef, content, cfg_hits, fail_hits)) in &extracted {
             let file = SourceFile::new(path.clone(), String::new()); // content re-read below
             let _ = file;
             let lang = f.language;
@@ -268,20 +301,19 @@ impl Indexer {
                     &self.store.repo_id,
                 );
             }
-            let writer = write::Writer::new(&self.store, &self.store.repo_id, &report.revision);
-            // re-read content for hash consistency
-            let full = self.store.root.join(path);
-            let content = std::fs::read_to_string(&full).unwrap_or_default();
-            let hash = scan::hash_bytes(content.as_bytes());
-            writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
-            record_file_quality(&self.store, path, f.language, &resolved_calls)?;
+            let writer = write::Writer::new(&self.store, &self.store.repo_id, &git_info.revision);
+            // Single-read invariant (§18): `content` is the extract loop's
+            // canonical text; the hash above is the scan-time blake3 over
+            // raw bytes. Never re-read here.
+            writer.write_source(path, &f.hash, ef, &resolved_imports, &resolved_calls, &index)?;
+            record_file_quality(&mut quality_map, path, f.language, &resolved_calls);
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(
                 &self.store,
                 path,
                 f.language.as_str(),
-                &content,
+                content,
                 cfg_hits.clone(),
             )
             .map_err(IndexError::ConfigRefs)?;
@@ -289,13 +321,13 @@ impl Indexer {
                 .map_err(IndexError::Failures)?;
             report.indexed += 1;
         }
-
+        save_quality_files(&self.store, &quality_map)?;
         // tested_by edges derived from changed files must be relinked
         let changed_list: Vec<String> = to_process.iter().map(|f| f.path.clone()).collect();
-        self.relink_tests_for(&changed_list, &report.revision)?;
+        self.relink_tests_for(&changed_list, &git_info.revision)?;
 
         // ---- config extraction (env, compose, package.json, intent, readme) ----
-        for (path, (f, ef, _cfg, _fail)) in &extracted {
+        for (path, (f, ef, content, _cfg, _fail)) in &extracted {
             let lang = f.language;
             if matches!(
                 lang,
@@ -308,14 +340,9 @@ impl Indexer {
                 || path == ".scc/intent.yaml"
                 || is_readme(path)
             {
-                let full = self.store.root.join(path);
-                let Ok(content) = std::fs::read_to_string(&full) else {
-                    continue;
-                };
-                let mut out = configs::extract_config_file(path, &content, &self.store.repo_id);
-                let infra = crate::infra::extract_infra_file(path, &content, &self.store.repo_id);
+                let mut out = configs::extract_config_file(path, content, &self.store.repo_id);
+                let infra = crate::infra::extract_infra_file(path, content, &self.store.repo_id);
                 out.entities.extend(infra.entities);
-                out.relationships.extend(infra.relationships);
                 if let Some(i) = out.intent {
                     intent = Some(i);
                 }
@@ -323,7 +350,7 @@ impl Indexer {
                     self.store.meta_set("purpose", &purpose)?;
                 }
                 let _writer =
-                    write::Writer::new(&self.store, &self.store.repo_id, &report.revision);
+                    write::Writer::new(&self.store, &self.store.repo_id, &git_info.revision);
                 for e in out.entities {
                     self.store.insert_entity(&e, std::slice::from_ref(path))?;
                 }
@@ -366,6 +393,7 @@ impl Indexer {
 
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
+        let _ = self.store.record_current_revision()?;
         report.analysis_quality = persist_analysis_quality(&self.store)?;
         persist_bm25_corpus(&self.store)?;
         report.duration_ms = started.elapsed().as_millis() as u64;
@@ -462,11 +490,16 @@ impl Indexer {
     /// Refresh specific paths (watch events / post-edit). Unknown paths are
     /// ignored. Returns the number of files re-indexed.
     pub fn refresh_paths(&self, paths: &[String]) -> Result<IndexReport, IndexError> {
-        let scanned: HashMap<String, ScannedFile> =
-            scan::scan_repo(&self.store.root, &self.config.index)?
-                .into_iter()
-                .map(|f| (f.path.clone(), f))
-                .collect();
+        let (scanned_vec, scan_stats) =
+            scan::scan_repo_with_stats(&self.store.root, &self.config.index)?;
+        self.store.meta_set(
+            "scan_stats",
+            &serde_json::to_string(&scan_stats).unwrap_or_else(|_| "{}".into()),
+        )?;
+        let scanned: HashMap<String, ScannedFile> = scanned_vec
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
         let git_info = git::resolve_git(&self.store.root);
         self.store.meta_set("revision", &git_info.revision)?;
         let snapshot_id = self
@@ -509,11 +542,13 @@ impl Indexer {
             }
         }
         let deleted_cascade = self.with_dependents(&deleted_paths)?;
+        let mut quality_map = load_quality_files(&self.store);
         for p in &deleted_paths {
             self.store.purge_path(p)?;
             self.store.delete_file(p)?;
-            drop_file_quality(&self.store, p)?;
+            drop_file_quality(&mut quality_map, p);
         }
+        save_quality_files(&self.store, &quality_map)?;
         for d in deleted_cascade {
             if scanned.contains_key(&d) && !changed_paths.contains(&d) {
                 changed_paths.push(d);
@@ -530,8 +565,10 @@ impl Indexer {
         let mut report = self.index_paths(&changed_paths, &scanned, &git_info.revision)?;
         self.store.finish_snapshot(snapshot_id, report.indexed)?;
         self.store.cache_clear()?;
+        let _ = self.store.record_current_revision()?;
         report.revision = git_info.revision;
         report.duration_ms = started.elapsed().as_millis() as u64;
+        report.scan_stats = scan_stats;
         Ok(report)
     }
 
@@ -567,20 +604,19 @@ impl Indexer {
             }
         }
 
-        let mut extracted: BTreeMap<
-            String,
-            (
-                ScannedFile,
-                ExtractedFile,
-                Vec<configrefs::ConfigRefHit>,
-                Vec<failures::FailureHit>,
-            ),
-        > = BTreeMap::new();
+        let mut extracted: BTreeMap<String, ExtractedEntry> = BTreeMap::new();
         for p in &paths {
             let Some(f) = scanned.get(p) else { continue };
             let full = self.store.root.join(p);
             let Ok(content) = std::fs::read_to_string(&full) else {
                 report.failed += 1;
+                self.store.upsert_file(
+                    p,
+                    &f.hash,
+                    f.language.as_str(),
+                    f.kind.as_str(),
+                    f.size,
+                )?;
                 continue;
             };
             self.store.purge_path(p)?;
@@ -590,11 +626,13 @@ impl Indexer {
             index.add_file(p, &ef.symbols);
             index.set_type_binds(p, &ef.type_binds);
             index.set_fn_binds(p, &ef.fn_binds);
-            index.set_class_bases(p, &ef.class_bases);
-            extracted.insert(p.clone(), (f.clone(), ef, cfg_hits, fail_hits));
+            extracted.insert(p.clone(), (f.clone(), ef, content, cfg_hits, fail_hits));
         }
 
-        for (path, (f, ef, cfg_hits, fail_hits)) in &extracted {
+        // Quality map: loaded once, patched per file, saved once below —
+        // never deserialize/re-serialize the metadata blob per file.
+        let mut quality_map = load_quality_files(&self.store);
+        for (path, (f, ef, content, cfg_hits, fail_hits)) in &extracted {
             let mut resolved_imports: Vec<ResolvedImport> = Vec::new();
             let mut resolved_calls = Vec::new();
             if extracts_code(f.language) {
@@ -609,18 +647,17 @@ impl Indexer {
                 );
             }
             let writer = write::Writer::new(&self.store, &self.store.repo_id, revision);
-            let full = self.store.root.join(path);
-            let content = std::fs::read_to_string(&full).unwrap_or_default();
-            let hash = scan::hash_bytes(content.as_bytes());
-            writer.write_source(path, &hash, ef, &resolved_imports, &resolved_calls, &index)?;
-            record_file_quality(&self.store, path, f.language, &resolved_calls)?;
+            // Single-read invariant (§18): `content` is the extract loop's
+            // canonical text; hash is the scan-time blake3 over raw bytes.
+            writer.write_source(path, &f.hash, ef, &resolved_imports, &resolved_calls, &index)?;
+            record_file_quality(&mut quality_map, path, f.language, &resolved_calls);
             self.store
                 .upsert_file(path, &f.hash, f.language.as_str(), f.kind.as_str(), f.size)?;
             configrefs::apply_config_refs(
                 &self.store,
                 path,
                 f.language.as_str(),
-                &content,
+                content,
                 cfg_hits.clone(),
             )
             .map_err(IndexError::ConfigRefs)?;
@@ -628,17 +665,14 @@ impl Indexer {
                 .map_err(IndexError::Failures)?;
             report.indexed += 1;
         }
+        save_quality_files(&self.store, &quality_map)?;
 
         // config extraction for changed config files
         let mut intent: Option<configs::Intent> = None;
-        for (path, (f, _ef, _cfg, _fail)) in &extracted {
+        for (path, (f, _ef, content, _cfg, _fail)) in &extracted {
             if f.language.is_config_extract() || path == ".scc/intent.yaml" || is_readme(path) {
-                let full = self.store.root.join(path);
-                let Ok(content) = std::fs::read_to_string(&full) else {
-                    continue;
-                };
-                let mut out = configs::extract_config_file(path, &content, &self.store.repo_id);
-                let infra = crate::infra::extract_infra_file(path, &content, &self.store.repo_id);
+                let mut out = configs::extract_config_file(path, content, &self.store.repo_id);
+                let infra = crate::infra::extract_infra_file(path, content, &self.store.repo_id);
                 out.entities.extend(infra.entities);
                 out.relationships.extend(infra.relationships);
                 if let Some(i) = out.intent {
@@ -815,12 +849,15 @@ fn save_quality_files(
     Ok(())
 }
 
+/// Record one file's gauges into the in-memory map. Callers load the map
+/// once per phase and save once at completion — never deserialize /
+/// re-serialize the metadata blob per file (O(n²) on large repos).
 fn record_file_quality(
-    store: &Store,
+    map: &mut BTreeMap<String, scc_core::AnalysisQuality>,
     path: &str,
     lang: Language,
     calls: &[resolve::ResolvedCall],
-) -> Result<(), IndexError> {
+) {
     let mut q = resolve::quality_from_calls(calls);
     match scc_core::language_by_id(lang.as_str()).map(|c| c.tier) {
         Some(scc_core::LanguageTier::IndexSearch) | None => {
@@ -830,17 +867,12 @@ fn record_file_quality(
             q.files.parsed = 1;
         }
     }
-    let mut map = load_quality_files(store);
     map.insert(path.to_string(), q);
-    save_quality_files(store, &map)
 }
 
-fn drop_file_quality(store: &Store, path: &str) -> Result<(), IndexError> {
-    let mut map = load_quality_files(store);
-    if map.remove(path).is_some() {
-        save_quality_files(store, &map)?;
-    }
-    Ok(())
+// trace:v1 id=impl.crates-scc-indexer-src-lib.drop-file-quality work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+fn drop_file_quality(map: &mut BTreeMap<String, scc_core::AnalysisQuality>, path: &str) {
+    map.remove(path);
 }
 
 fn apply_doc_mentions(store: &Store) -> Result<(), IndexError> {

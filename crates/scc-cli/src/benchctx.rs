@@ -332,7 +332,7 @@ fn score_task(
 
 /// Run the full context benchmark against `benchmarks/tasks.json`.
 // trace:v1 id=impl.crates-scc-cli-src-benchctx.run-context-benchmark
-pub fn run_context_benchmark(min_recall: f64) -> Result<BenchSummary, String> {
+pub fn run_context_benchmark(min_recall: f64, min_precision: f64) -> Result<BenchSummary, String> {
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let corpus_path = fixtures
         .parent()
@@ -380,6 +380,14 @@ pub fn run_context_benchmark(min_recall: f64) -> Result<BenchSummary, String> {
         return Err(format!(
             "benchmark gate failed: mean recall {:.3} < {min_recall}",
             summary.mean_recall
+        ));
+    }
+    // precision gate (§40): recall alone rewards returning everything.
+    // Default 0.0 keeps the gate recall-only unless a floor is set.
+    if summary.mean_precision < min_precision {
+        return Err(format!(
+            "benchmark gate failed: mean precision {:.3} < {min_precision}",
+            summary.mean_precision
         ));
     }
     if summary.hallucination_violations > 0 {

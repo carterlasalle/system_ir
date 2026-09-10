@@ -16,7 +16,19 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub integrations: IntegrationsConfig,
     pub security: SecurityConfig,
+    pub repository: RepositoryConfig,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+// trace:exempt reason=internal-detail
+pub struct RepositoryConfig {
+    /// Explicit stable repository id. Overrides remote-derived and
+    /// basename identity for this checkout (mission §XIV).
+    pub id: Option<String>,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -82,6 +94,7 @@ pub struct InferenceConfig {
 
 // trace:exempt reason=internal-detail
 impl Default for InferenceConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         InferenceConfig {
             enabled: false,
@@ -127,13 +140,13 @@ pub struct IntegrationsConfig {
 #[serde(default)]
 // trace:exempt reason=internal-detail
 pub struct SecurityConfig {
-    pub redact_secrets: bool,
     pub allow_remote_models: bool,
     pub listen: String,
 }
 
 // trace:exempt reason=internal-detail
 impl Default for Config {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         Config {
             schema: 1,
@@ -144,12 +157,14 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             integrations: IntegrationsConfig::default(),
             security: SecurityConfig::default(),
+            repository: RepositoryConfig::default(),
         }
     }
 }
 
 // trace:exempt reason=internal-detail
 impl Default for IndexConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         IndexConfig {
             ignore: vec![
@@ -164,6 +179,9 @@ impl Default for IndexConfig {
                 "venv/**".into(),
                 ".venv/**".into(),
                 "__pycache__/**".into(),
+                "**/.DS_Store".into(),
+                "Thumbs.db".into(),
+                "**/Thumbs.db".into(),
                 "*.lock".into(),
                 "*.min.js".into(),
                 "*.map".into(),
@@ -193,6 +211,7 @@ impl Default for LanguagesConfig {
 
 // trace:exempt reason=internal-detail
 impl Default for ContextConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         ContextConfig {
             startup_tokens: 6000,
@@ -206,6 +225,7 @@ impl Default for ContextConfig {
 
 // trace:exempt reason=internal-detail
 impl Default for RuntimeConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         RuntimeConfig { opentelemetry: OtelConfig { enabled: false } }
     }
@@ -213,6 +233,7 @@ impl Default for RuntimeConfig {
 
 // trace:exempt reason=internal-detail
 impl Default for IntegrationsConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         IntegrationsConfig {
             serena: true,
@@ -227,9 +248,9 @@ impl Default for IntegrationsConfig {
 
 // trace:exempt reason=internal-detail
 impl Default for SecurityConfig {
+    // trace:exempt reason=internal-detail
     fn default() -> Self {
         SecurityConfig {
-            redact_secrets: true,
             allow_remote_models: false,
             listen: "127.0.0.1:7777".into(),
         }
@@ -305,6 +326,7 @@ mod tests {
     }
 
     #[test]
+    // trace:exempt reason=unit-test
     fn parses_example_config() {
         let text = r#"
 schema: 1
@@ -319,7 +341,6 @@ context:
   startup_tokens: 6000
   task_tokens: 10000
 security:
-  redact_secrets: true
   listen: 127.0.0.1:7777
 "#;
         let cfg: Config = serde_yaml::from_str(text).unwrap();

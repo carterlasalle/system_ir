@@ -6,7 +6,7 @@
 
 use crate::write::rel_id;
 use scc_core::kinds;
-use scc_core::{Evidence, Provenance, Relationship};
+use scc_core::{resolution::confidence, Evidence, Provenance, Relationship};
 use scc_store::Store;
 
 /// Attach INVOKES/IMPLEMENTS from symbols onto rpc CONTRACTs.
@@ -72,7 +72,7 @@ pub fn link_rpc_bridges(store: &Store) -> Result<usize, scc_store::StoreError> {
                 cid.clone(),
                 Provenance::Extracted,
             )
-            .with_confidence(0.8)
+            .with_confidence(confidence::STRONG_LINK)
             .with_evidence(vec![ev.id.clone()]);
             store.insert_relationship(&rel, path)?;
             written += 1;

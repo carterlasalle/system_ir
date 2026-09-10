@@ -33,13 +33,28 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
     // data stores / data entities written by component symbols (WRITES-derived)
     let mut data_stores: BTreeSet<String> = BTreeSet::new();
     for c in view.components() {
-        let purpose_text = c
+        // Purpose prefers evidence-backed claims (Declared, then Resolved)
+        // over bare inference; the trust view already strips low-confidence
+        // claims, and this keeps the render honest about what remains.
+        let responsibility = c
             .attributes
             .get("responsibility")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|r| r.get("text"))
-            .and_then(|t| t.as_str())
+            .and_then(|v| v.as_array());
+        fn claim_text(r: &serde_json::Value) -> &str {
+            r.get("text").and_then(|t| t.as_str()).unwrap_or("")
+        }
+        let purpose_text = responsibility
+            .and_then(|a| {
+                a.iter()
+                    .find(|r| {
+                        matches!(
+                            r.get("provenance").and_then(|p| p.as_str()),
+                            Some("Declared") | Some("Resolved")
+                        )
+                    })
+                    .or_else(|| a.first())
+                    .map(claim_text)
+            })
             .unwrap_or("")
             .to_string();
 
@@ -174,6 +189,12 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .get("parent")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let role = c
+            .attributes
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| scc_graph::components::component_role(&implementation_paths).into());
 
         components.push(AtlasComponent {
             name: c.name.clone(),
@@ -189,12 +210,16 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             owns,
             layer,
             parent,
+            role,
         });
     }
     components.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // ---- entrypoints ----
     let mut entrypoints: Vec<AtlasEntrypoint> = Vec::new();
+    // Exact duplicates (same method+path+handler from overlapping evidence)
+    // collapse to one line; distinct handlers stay visible so genuinely
+    // ambiguous routes are never hidden.
+    let mut seen_routes: BTreeSet<(String, String, String)> = BTreeSet::new();
     for r in view.entities_of_kind(scc_core::kinds::ROUTE) {
         let method = r
             .attributes
@@ -212,6 +237,9 @@ pub fn build_atlas(ctx: &ContextCompiler) -> SystemAtlas {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if !seen_routes.insert((method.to_string(), path.to_string(), handler.clone())) {
+            continue;
+        }
         entrypoints.push(AtlasEntrypoint {
             name: r.name.clone(),
             kind: "route".into(),
@@ -1433,6 +1461,12 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     let mut rendered: BTreeSet<String> = BTreeSet::new(); // names under containers
     let comp_block = |c: &AtlasComponent, indent: &str| -> String {
         let mut out = format!("\n{}{}", indent, c.name.to_uppercase());
+        // Role scoping at the render boundary: test/fixture/benchmark
+        // trees stay visible as structure but are never mistaken for
+        // production architecture. Production renders unlabeled.
+        if !c.role.is_empty() && c.role != "production" {
+            out.push_str(&format!(" [{}]", c.role));
+        }
         if !c.purpose.is_empty() {
             out.push_str(&format!("\n{}Purpose: {}", indent, c.purpose));
         }

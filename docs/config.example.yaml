@@ -1,3 +1,4 @@
+# trace:v1 id=doc.scc-config-example work=WORK-SI-MMMJA4G6 documents=REQ-SI-503JSBGP
 schema: 1
 index:
   ignore:
@@ -33,6 +34,7 @@ integrations:
   narsil: false
   context7_command: ""  # e.g. 'npx -y @upstash/context7-mcp' — external docs
 security:
-  redact_secrets: true
+  # NOTE: values are never ingested (references only), so there is no
+  # redact-secrets knob by design; see docs/SECURITY.md.
   allow_remote_models: false
   listen: 127.0.0.1:7777

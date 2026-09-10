@@ -285,10 +285,16 @@ class NativeRoutingTest(unittest.TestCase):
             return [], None
         h.run_external_variant = fake_ext
         h.run_native_variant = fake_nat
+        old_paid = os.environ.get("SCC_ALLOW_PAID_BENCHMARKS")
+        os.environ["SCC_ALLOW_PAID_BENCHMARKS"] = "1"
         try:
             rc = h.main(["--mode", "native-default", "--repo", "x", "--single", "--json"])
             self.assertEqual(rc, 0)
         finally:
+            if old_paid is None:
+                os.environ.pop("SCC_ALLOW_PAID_BENCHMARKS", None)
+            else:
+                os.environ["SCC_ALLOW_PAID_BENCHMARKS"] = old_paid
             h.run_external_variant = orig_ext
             h.run_native_variant = orig_nat
             self._restore_tasks(h, orig_f, orig_lt, fixtures)
@@ -317,9 +323,15 @@ class NativeRoutingTest(unittest.TestCase):
             return [], None
         h.run_external_variant = fake_ext
         h.run_native_variant = fake_nat
+        old_paid = os.environ.get("SCC_ALLOW_PAID_BENCHMARKS")
+        os.environ["SCC_ALLOW_PAID_BENCHMARKS"] = "1"
         try:
             h.main(["--mode", "native-default", "--repo", "x", "--single", "--json"])
         finally:
+            if old_paid is None:
+                os.environ.pop("SCC_ALLOW_PAID_BENCHMARKS", None)
+            else:
+                os.environ["SCC_ALLOW_PAID_BENCHMARKS"] = old_paid
             h.run_external_variant = orig_ext
             h.run_native_variant = orig_nat
             self._restore_tasks(h, orig_f, orig_lt, fixtures)

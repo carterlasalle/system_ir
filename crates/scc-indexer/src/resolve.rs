@@ -37,6 +37,7 @@
 
 use crate::model::{Call, FnBind, Import, ImportType, Symbol, SymbolKind, TypeBind};
 use crate::recv::{classify_callee, split_recv_path, RecvFact};
+use scc_core::resolution::confidence;
 use scc_core::{RecvKind, ReferenceKind, ResolutionClass};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -56,6 +57,18 @@ pub struct ResolvedCall {
     pub recv: RecvKind,
     /// Number of remaining in-repo candidates after narrowing (0/1/k).
     pub candidates: u32,
+}
+
+impl ResolvedCall {
+    /// Exact binding: narrowing converged on exactly one in-repo target.
+    /// Every `ResolvedInternal` emit site pins a unique target (import,
+    /// namespace, receiver+type, or local rule) and passes `candidates = 1`,
+    /// so this is structural, not a confidence threshold.
+    pub fn is_precise(&self) -> bool {
+        self.class == ResolutionClass::ResolvedInternal
+            && self.callee_id.is_some()
+            && self.candidates <= 1
+    }
 }
 
 /// Symbol index for one file.
@@ -1030,7 +1043,7 @@ pub fn resolve_calls(
                 caller_id,
                 Some(id),
                 call.callee.clone(),
-                0.9,
+                confidence::TYPED_RECEIVER,
                 call.line,
                 ResolutionClass::ResolvedInternal,
                 recv,
@@ -1045,7 +1058,7 @@ pub fn resolve_calls(
                 caller_id,
                 Some(id),
                 call.callee.clone(),
-                0.9,
+                confidence::TYPED_RECEIVER,
                 call.line,
                 ResolutionClass::ResolvedInternal,
                 recv,
@@ -1067,10 +1080,10 @@ pub fn resolve_calls(
             };
             let (callee_id, class, conf, cand) = match seeded {
                 Some((id, ResolutionClass::ConfirmedExternal)) => {
-                    (Some(id), ResolutionClass::ConfirmedExternal, 0.8, 0)
+                    (Some(id), ResolutionClass::ConfirmedExternal, confidence::CONFIRMED_EXTERNAL, 0)
                 }
-                Some((id, class)) => (Some(id), class, 0.55, 1),
-                None => (None, ResolutionClass::UnresolvedLikelyInternal, 0.4, 0),
+                Some((id, class)) => (Some(id), class, confidence::SEEDED_ROOT, 1),
+                None => (None, ResolutionClass::UnresolvedLikelyInternal, confidence::UNRESOLVED_LIKELY_INTERNAL, 0),
             };
             out.push(emit(
                 caller_id,
@@ -1094,7 +1107,7 @@ pub fn resolve_calls(
                             caller_id,
                             Some(id),
                             call.callee.clone(),
-                            0.9,
+                            confidence::TYPED_RECEIVER,
                             call.line,
                             ResolutionClass::ResolvedInternal,
                             recv,
@@ -1108,7 +1121,7 @@ pub fn resolve_calls(
                 caller_id,
                 None,
                 call.callee.clone(),
-                0.4,
+                confidence::UNRESOLVED_LIKELY_INTERNAL,
                 call.line,
                 ResolutionClass::UnresolvedLikelyInternal,
                 recv,
@@ -1125,7 +1138,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(scc_core::symbol_id(repo_id, path, &m.name)),
                         call.callee.clone(),
-                        0.98,
+                        confidence::SIBLING_METHOD,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1138,7 +1151,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(id),
                         call.callee.clone(),
-                        0.9,
+                        confidence::TYPED_RECEIVER,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1151,7 +1164,7 @@ pub fn resolve_calls(
                 caller_id,
                 None,
                 call.callee.clone(),
-                0.5,
+                confidence::UNRESOLVED_FALLBACK,
                 call.line,
                 ResolutionClass::UnresolvedLikelyInternal,
                 recv,
@@ -1177,7 +1190,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(id),
                         call.callee.clone(),
-                        0.9,
+                        confidence::TYPED_RECEIVER,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1190,7 +1203,7 @@ pub fn resolve_calls(
                         caller_id,
                         None,
                         call.callee.clone(),
-                        0.4,
+                        confidence::UNRESOLVED_LIKELY_INTERNAL,
                         call.line,
                         ResolutionClass::UnresolvedLikelyInternal,
                         recv,
@@ -1210,7 +1223,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(scc_core::symbol_id(repo_id, path, &sym.name)),
                         call.callee.clone(),
-                        0.99,
+                        confidence::UNIQUE_PIN,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1232,7 +1245,7 @@ pub fn resolve_calls(
                         external,
                     )),
                     call.callee.clone(),
-                    0.8,
+                    confidence::CONFIRMED_EXTERNAL,
                     call.line,
                     ResolutionClass::ConfirmedExternal,
                     recv,
@@ -1270,7 +1283,7 @@ pub fn resolve_calls(
                 caller_id,
                 callee_id,
                 call.callee.clone(),
-                0.95,
+                confidence::IMPORTED_MEMBER,
                 call.line,
                 class,
                 recv,
@@ -1288,7 +1301,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(id),
                         call.callee.clone(),
-                        0.97,
+                        confidence::NAMESPACE_PIN,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1301,7 +1314,7 @@ pub fn resolve_calls(
                 caller_id,
                 None,
                 call.callee.clone(),
-                0.5,
+                confidence::UNRESOLVED_FALLBACK,
                 call.line,
                 ResolutionClass::UnresolvedLikelyInternal,
                 recv,
@@ -1317,7 +1330,7 @@ pub fn resolve_calls(
                     caller_id,
                     Some(id),
                     call.callee.clone(),
-                    0.9,
+                    confidence::TYPED_RECEIVER,
                     call.line,
                     ResolutionClass::ResolvedInternal,
                     recv,
@@ -1336,7 +1349,7 @@ pub fn resolve_calls(
                     caller_id,
                     Some(id),
                     call.callee.clone(),
-                    0.9,
+                    confidence::TYPED_RECEIVER,
                     call.line,
                     ResolutionClass::ResolvedInternal,
                     recv,
@@ -1358,7 +1371,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(mid.clone()),
                         call.callee.clone(),
-                        0.9,
+                        confidence::TYPED_RECEIVER,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1374,7 +1387,7 @@ pub fn resolve_calls(
                             caller_id,
                             Some(id),
                             call.callee.clone(),
-                            0.9,
+                            confidence::TYPED_RECEIVER,
                             call.line,
                             ResolutionClass::ResolvedInternal,
                             recv,
@@ -1390,7 +1403,7 @@ pub fn resolve_calls(
                         caller_id,
                         Some(id),
                         call.callee.clone(),
-                        0.9,
+                        confidence::TYPED_RECEIVER,
                         call.line,
                         ResolutionClass::ResolvedInternal,
                         recv,
@@ -1403,7 +1416,7 @@ pub fn resolve_calls(
                     caller_id,
                     None,
                     call.callee.clone(),
-                    0.4,
+                    confidence::UNRESOLVED_LIKELY_INTERNAL,
                     call.line,
                     ResolutionClass::UnresolvedLikelyInternal,
                     recv,
@@ -1423,7 +1436,7 @@ pub fn resolve_calls(
             caller_id,
             None,
             call.callee.clone(),
-            0.5,
+            confidence::UNRESOLVED_FALLBACK,
             call.line,
             class,
             recv,
@@ -1437,7 +1450,7 @@ pub fn resolve_calls(
 pub fn quality_from_calls(calls: &[ResolvedCall]) -> scc_core::AnalysisQuality {
     let mut q = scc_core::AnalysisQuality::default();
     for c in calls {
-        q.record_call(c.class, false);
+        q.record_call(c.class, c.is_precise());
     }
     q
 }
@@ -2757,6 +2770,40 @@ mod tests {
         let q = quality_from_calls(&resolved);
         assert_eq!(q.calls.external, 0, "unresolved must not count as external");
         assert_eq!(q.calls.likely_internal_unresolved, 1);
+    }
+
+    #[test]
+    fn unique_pin_counts_as_precise_unresolved_does_not() {
+        // Precise = narrowing converged on exactly one in-repo target.
+        // A resolved call with one candidate is exact by construction;
+        // anything else stays in its honest bucket.
+        fn call(class: ResolutionClass, callee: Option<&str>, candidates: u32) -> ResolvedCall {
+            ResolvedCall {
+                caller_id: "repo://r/file/a.py".into(),
+                callee_id: callee.map(str::to_string),
+                callee_name: "f".into(),
+                provenance: scc_core::Provenance::Extracted,
+                confidence: confidence::TYPED_RECEIVER,
+                line: 1,
+                class,
+                recv: RecvKind::Unknown,
+                candidates,
+            }
+        }
+        let calls = vec![
+            call(ResolutionClass::ResolvedInternal, Some("id"), 1),
+            call(ResolutionClass::UnresolvedLikelyInternal, None, 0),
+            call(ResolutionClass::ConfirmedExternal, Some("ext"), 0),
+        ];
+        assert!(calls[0].is_precise());
+        assert!(!calls[1].is_precise());
+        assert!(!calls[2].is_precise());
+        let q = quality_from_calls(&calls);
+        assert_eq!(q.calls.resolved, 1);
+        assert_eq!(q.calls.precise, 1);
+        assert_eq!(q.calls.heuristic, 0);
+        assert_eq!(q.calls.likely_internal_unresolved, 1);
+        assert_eq!(q.calls.external, 1);
     }
 
     #[test]

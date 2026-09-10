@@ -43,6 +43,11 @@ pub fn cmd_index(root: &Path, quiet: bool) -> crate::Result<()> {
             report.duration_ms as f64 / 1000.0
         );
         println!("analysis_quality: {}", report.analysis_quality.compact_line());
+        let s = &report.scan_stats;
+        println!(
+            "files: discovered={} indexed={} ignored={} unsupported={} oversized={} unreadable={}",
+            s.discovered, s.indexed, s.ignored, s.unsupported, s.oversized, s.unreadable
+        );
     }
     Ok(())
 }
@@ -82,7 +87,7 @@ pub fn cmd_status(root: &Path) -> crate::Result<()> {
             }
             let stale = crate::stale_paths(&store)?;
             if stale.is_empty() {
-                println!("freshness: up to date");
+                println!("freshness: CURRENT — model matches working tree");
             } else {
                 println!(
                     "freshness: STALE — {} file(s) changed since index (run `scc index`)",
@@ -96,6 +101,25 @@ pub fn cmd_status(root: &Path) -> crate::Result<()> {
                 match serde_json::from_str::<scc_core::AnalysisQuality>(&raw) {
                     Ok(q) => println!("analysis_quality: {}", q.compact_line()),
                     Err(_) => println!("analysis_quality: {raw}"),
+                }
+            }
+            if let Some(raw) = store.meta_get("scan_stats")? {
+                // Counts only, recorded at index time; live staleness is
+                // reported above from the working-tree scan.
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(v) => {
+                        let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                        println!(
+                            "files: discovered={} indexed={} ignored={} unsupported={} oversized={} unreadable={}",
+                            n("discovered"),
+                            n("indexed"),
+                            n("ignored"),
+                            n("unsupported"),
+                            n("oversized"),
+                            n("unreadable")
+                        );
+                    }
+                    Err(_) => println!("files: {raw}"),
                 }
             }
         }
@@ -1021,6 +1045,165 @@ pub fn cmd_drift(root: &Path, json: bool) -> crate::Result<()> {
         for (id, kind, sev, msg, at) in &findings {
             println!("[{sev}] {kind} (#{id}, {at}): {msg}");
         }
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-system work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_system(_root: &Path, members: &[std::path::PathBuf], json: bool) -> crate::Result<()> {
+    let roots: Vec<&Path> = members.iter().map(|p| p.as_path()).collect();
+    let sys = scc_store::system::System::open(&roots)?;
+    let mut all = sys.stitch_routes()?;
+    all.extend(sys.stitch_topics()?);
+    all.extend(sys.stitch_package_exports()?);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&all)?);
+        return Ok(());
+    }
+    println!(
+        "system: {} members, {} stitches",
+        sys.members.len(),
+        all.len()
+    );
+    for m in &sys.members {
+        println!("member {} ({})", m.repo_id, m.root.display());
+    }
+    for s in &all {
+        println!(
+            "[{:?}/{:?}] {} ({} ends)",
+            s.kind,
+            s.match_kind,
+            s.key,
+            s.ends.len()
+        );
+        for e in &s.ends {
+            println!("  {} {}", e.repo_id, e.entity_id);
+        }
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-history work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_history(root: &Path, json: bool) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let revs = store.revisions()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&revs)?);
+        return Ok(());
+    }
+    if revs.is_empty() {
+        println!("no graph revisions recorded");
+        return Ok(());
+    }
+    for r in &revs {
+        println!(
+            "rev {} (base {}): {} entities, {} rels, {} files | src={} ext={} | {}",
+            r.rev,
+            r.base_rev,
+            r.entity_count,
+            r.rel_count,
+            r.file_count,
+            &r.source_hash[..r.source_hash.len().min(12)],
+            r.extractor_version,
+            r.created_at,
+        );
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-diff work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_diff(root: &Path, from: i64, to: i64, json: bool) -> crate::Result<()> {
+    let store = open_store(root)?;
+    let d = store.semantic_diff(from, to)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+        return Ok(());
+    }
+    // Bounded human rendering: counts plus the first 20 ids per class.
+    println!("diff rev {from}..{to}:");
+    for (label, ids) in [
+        ("added entities", &d.added_entities),
+        ("removed entities", &d.removed_entities),
+        ("added relationships", &d.added_relationships),
+        ("removed relationships", &d.removed_relationships),
+    ] {
+        println!("  {label}: {}", ids.len());
+        for id in ids.iter().take(20) {
+            println!("    {id}");
+        }
+        if ids.len() > 20 {
+            println!("    … ({} more)", ids.len() - 20);
+        }
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-snapshot-save work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_snapshot_save(
+    root: &Path,
+    task: &str,
+    budget: Option<usize>,
+    json: bool,
+) -> crate::Result<()> {
+    let artifact = build_task_context(root, task, &[], &[], budget, false)?;
+    let store = open_store(root)?;
+    let head = store.revisions()?.into_iter().last().map(|r| r.rev).unwrap_or(0);
+    let epoch = store.model_epoch()?.composite(&head.to_string());
+    let mut ids = artifact.pack.entity_ids.clone();
+    ids.extend(artifact.delta_ids.iter().cloned());
+    ids.sort();
+    ids.dedup();
+    let snap = store.save_snapshot(scc_store::snapshot::SnapshotSave {
+        task,
+        epoch: &epoch,
+        revision: head,
+        artifact: &format!("{}{}", artifact.pack.content, artifact.delta),
+        entity_ids: &ids,
+        budget: artifact.token_count,
+        warnings: &artifact.pack.warnings,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+    } else {
+        println!("snapshot {} ({} visible ids)", snap.id, snap.entity_ids.len());
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-snapshot-show work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_snapshot_show(root: &Path, id: &str) -> crate::Result<()> {
+    let store = open_store(root)?;
+    match store.load_snapshot(id)? {
+        Some(s) => print!("{}", s.artifact),
+        None => println!("no snapshot {id}"),
+    }
+    Ok(())
+}
+
+// trace:v1 id=impl.crates-scc-cli-src-commands.cmd-snapshot-diff work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+pub fn cmd_snapshot_diff(root: &Path, id: &str, json: bool) -> crate::Result<()> {
+    let store = open_store(root)?;
+    match store.diff_snapshot(id)? {
+        Some(d) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                println!(
+                    "snapshot rev {} vs current rev {}: {} still valid, {} invalidated",
+                    d.snapshot_revision,
+                    d.current_revision,
+                    d.still_valid.len(),
+                    d.invalidated.len()
+                );
+                for f in d.invalidated.iter().take(20) {
+                    println!("  - {f}");
+                }
+                if d.invalidated.len() > 20 {
+                    println!("  … ({} more)", d.invalidated.len() - 20);
+                }
+            }
+        }
+        None => println!("no snapshot {id}"),
     }
     Ok(())
 }

@@ -213,11 +213,52 @@ fn load_corpus_tasks() -> Result<Vec<VariantTask>, String> {
         .collect())
 }
 
+/// Paid-model safety interlock: paid benchmark entrypoints refuse execution
+/// by default and spend no model quota unless the operator opted in with
+/// `SCC_ALLOW_PAID_BENCHMARKS=1`. The pure predicate is unit-testable
+/// without touching the process environment.
+// trace:v1 id=impl.scc.bench.paid-gate work=WORK-SCC-002 verifies=REQ-SCC-TEST
+pub fn paid_opt_in_allowed(env_val: Option<&str>) -> bool {
+    env_val == Some("1")
+}
+
+/// Read the process environment for the paid-benchmark opt-in.
+// trace:v1 id=impl.scc.bench.paid-gate-require work=WORK-SCC-002 verifies=REQ-SCC-TEST
+pub fn require_paid_opt_in() -> Result<(), String> {
+    if paid_opt_in_allowed(std::env::var("SCC_ALLOW_PAID_BENCHMARKS").ok().as_deref()) {
+        Ok(())
+    } else {
+        Err("refusing: this benchmark launches paid coding agents (codex/claude); paid model benchmarks are disabled by default and spend real API quota. Set SCC_ALLOW_PAID_BENCHMARKS=1 to opt in explicitly.".to_string())
+    }
+}
+#[cfg(test)]
+/// Serializes tests that mutate `SCC_ALLOW_PAID_BENCHMARKS` (Rust runs
+/// tests in parallel threads sharing one process environment).
+pub(crate) static PAID_TEST_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(test)]
+/// Run `f` with the paid-benchmark opt-in set, restoring the previous
+/// value afterwards. Mock-agent tests use this: mocks never spend quota,
+/// but they exercise the same gated entrypoints as paid runs.
+// trace:v1 id=impl.crates-scc-cli-src-benchagent.with-paid-opt-in work=WORK-SCC-002
+pub(crate) fn with_paid_opt_in<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = PAID_TEST_ENV_LOCK.lock();
+    let prev = std::env::var("SCC_ALLOW_PAID_BENCHMARKS").ok();
+    std::env::set_var("SCC_ALLOW_PAID_BENCHMARKS", "1");
+    let out = f();
+    match prev {
+        Some(v) => std::env::set_var("SCC_ALLOW_PAID_BENCHMARKS", v),
+        None => std::env::remove_var("SCC_ALLOW_PAID_BENCHMARKS"),
+    }
+    out
+}
+
 /// `scc bench agent --cmd "<command>"` — the command receives the task goal
 /// via the `SCC_GOAL` env var and the repo path as its working directory
 /// (like `claude -p "$SCC_GOAL"` or `codex exec -- "$SCC_GOAL"`).
 // trace:v1 id=impl.scc.bench.agent work=WORK-SCC-002 verifies=REQ-SCC-TEST
 pub fn run_agent_benchmark(cmd: &str, min_files: f64) -> Result<AgentBenchSummary, String> {
+    require_paid_opt_in()?;
     let tasks = load_corpus_tasks()?;
     run_variant_tasks("", &tasks, |_, _| Ok(cmd.to_string()), min_files)
 }
@@ -232,6 +273,7 @@ pub fn run_variant_benchmark(
     cmd: &str,
     min_files: f64,
 ) -> Result<AgentBenchSummary, String> {
+    require_paid_opt_in()?;
     let tasks = load_corpus_tasks()?;
     run_variant_tasks(variant, &tasks, |_, _| Ok(cmd.to_string()), min_files)
 }
@@ -1090,13 +1132,14 @@ mod tests {
     use crate::benchctx::GroundTruth;
     use std::path::PathBuf;
 
-// trace:v1 id=impl.crates-scc-cli-src-benchagent.fake-agent-records-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-    #[test]
 
+    #[test]
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.fake-agent-records-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.fake-agent-records-metrics-2 work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn fake_agent_records_metrics() {
         // the fake agent echoes the goal and lists the repo (shows files);
         // no JSON event stream → tool-level counters stay at their defaults
-        let summary = run_agent_benchmark("echo \"$SCC_GOAL\" && ls -R .", 0.0).unwrap();
+        let summary = with_paid_opt_in(|| run_agent_benchmark("echo \"$SCC_GOAL\" && ls -R .", 0.0).unwrap());
         assert_eq!(summary.tasks, 21);
         assert!(summary.results.iter().all(|r| r.exit_ok));
         assert!(summary.mean_duration_ms > 0.0);
@@ -1129,9 +1172,9 @@ mod tests {
         assert_eq!(m.files_surfaced, 1);
     }
 
-// trace:v1 id=impl.crates-scc-cli-src-benchagent.jsonl-event-stream-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.jsonl-event-stream-metrics work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.jsonl-event-stream-metrics-2 work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn jsonl_event_stream_metrics() {
         // Synthetic codex --json stream (task 0 ground truth: main.py +
         // services/transcripts.py): a search, a wrong-file read, then the
@@ -1141,7 +1184,7 @@ mod tests {
 '{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"/bin/zsh -lc \"sed -n 1,40p wrong_file.py\"","aggregated_output":"","exit_code":0,"status":"completed"}}' \
 '{"type":"item.completed","item":{"id":"i3","type":"mcp_tool_call","server":"files","tool":"read_file","arguments":{"file_path":"main.py"},"result":{"content":"transcript"}}}' \
 '{"type":"item.completed","item":{"id":"i4","type":"agent_message","text":"done"}}'"#;
-        let summary = run_agent_benchmark(cmd, 0.0).unwrap();
+        let summary = with_paid_opt_in(|| run_agent_benchmark(cmd, 0.0).unwrap());
         assert_eq!(summary.tasks, 21);
         assert!(summary.results.iter().all(|r| r.exit_ok));
         // task 0 = http-service.rename-transcript-field (GT: main.py, services/transcripts.py)
@@ -1161,7 +1204,6 @@ mod tests {
 
 // trace:v1 id=impl.crates-scc-cli-src-benchagent.corpus-ground-truth-parses work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-
     fn corpus_ground_truth_parses() {
         let fixtures = locate_fixtures_dir().unwrap();
         let path = fixtures.parent().unwrap().join("benchmarks/tasks.json");
@@ -1181,7 +1223,7 @@ mod tests {
 fn variant_benchmark_records_variant_name() {
         // Same protocol as run_agent_benchmark, but the summary carries the
         // variant name (Wave 15 external suite).
-        let summary = run_variant_benchmark("scc-atlas-surface", "echo \"$SCC_GOAL\"", 0.0).unwrap();
+        let summary = with_paid_opt_in(|| run_variant_benchmark("scc-atlas-surface", "echo \"$SCC_GOAL\"", 0.0).unwrap());
         assert_eq!(summary.variant, "scc-atlas-surface");
         assert_eq!(summary.tasks, 21);
         assert!(summary.results.iter().all(|r| r.exit_ok));
@@ -1235,7 +1277,6 @@ fn run_variant_tasks_filters_and_first_plan() {
 
 // trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-evaluates-all-three-clauses work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-
     fn agent_gate_evaluates_all_three_clauses() {
         let a = summary_with(2.0, 4.0, Some(1000.0));
         // E reduces searches AND files AND first-correct -> PASS
@@ -1264,13 +1305,13 @@ fn run_variant_tasks_filters_and_first_plan() {
         assert!(!g5.passed);
     }
 
-// trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-fails-closed-without-json-streams work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
     #[test]
-
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-fails-closed-without-json-streams work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
+    // trace:v1 id=impl.crates-scc-cli-src-benchagent.agent-gate-fails-closed-without-json-streams-2 work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn agent_gate_fails_closed_without_json_streams() {
         // echo produces no JSON event stream -> no first-correct means ->
         // the gate cannot verify reduction and FAILS closed.
-        let g = run_agent_gate("echo hi", "echo hi", 0.0).unwrap();
+        let g = with_paid_opt_in(|| run_agent_gate("echo hi", "echo hi", 0.0).unwrap());
         assert!(!g.passed);
         assert!(!g.first_correct_bounded);
         assert_eq!(g.baseline.tasks, 21);
@@ -1441,4 +1482,39 @@ fn run_variant_tasks_filters_and_first_plan() {
             .collect();
         assert!(!serve_lines.is_empty(), "serve symbols surface lexically: {out}");
     }
+    #[test]
+    // trace:v1 id=test.scc.bench.paid-gate-predicate verifies=REQ-SCC-TEST exercises=impl.scc.bench.paid-gate
+    fn paid_gate_predicate_allows_only_explicit_one() {
+        assert!(paid_opt_in_allowed(Some("1")));
+        assert!(!paid_opt_in_allowed(None));
+        assert!(!paid_opt_in_allowed(Some("0")));
+        assert!(!paid_opt_in_allowed(Some("")));
+        assert!(!paid_opt_in_allowed(Some("true")));
+    }
+    #[test]
+    // trace:v1 id=test.scc.bench.paid-gate-refuses verifies=REQ-SCC-TEST exercises=impl.scc.bench.paid-gate
+    fn paid_gate_refuses_benchmark_without_opt_in() {
+        let _guard = PAID_TEST_ENV_LOCK.lock();
+        let prev = std::env::var("SCC_ALLOW_PAID_BENCHMARKS").ok();
+        std::env::remove_var("SCC_ALLOW_PAID_BENCHMARKS");
+        let err = run_agent_benchmark("echo hi", 0.0).unwrap_err();
+        assert!(
+            err.contains("SCC_ALLOW_PAID_BENCHMARKS"),
+            "refusal must name the opt-in: {err}"
+        );
+        match prev {
+            Some(v) => std::env::set_var("SCC_ALLOW_PAID_BENCHMARKS", v),
+            None => std::env::remove_var("SCC_ALLOW_PAID_BENCHMARKS"),
+        }
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.bench.paid-gate-allows verifies=REQ-SCC-TEST exercises=impl.scc.bench.paid-gate
+    fn paid_gate_opt_in_allows_mock_benchmark() {
+        // A harmless mock command proves the gate opens with opt-in; no
+        // model quota is spent by `echo`.
+        let summary = with_paid_opt_in(|| run_agent_benchmark("echo hi", 0.0).unwrap());
+        assert_eq!(summary.tasks, 21);
+    }
+
 }

@@ -92,12 +92,11 @@ def src_files(directory):
 
 
 def estimate_tokens(text):
-    # Deterministic chars/4 heuristic — the single shared tokenizer for ALL
-    # variants (harness, adapters, and the scc side use the same rule), so
-    # equal-token budgets mean the same thing everywhere.
+    # Mirror of run_context_bench.estimate_shared_tokens (which mirrors Rust
+    # scc_core::estimate_tokens): chars/4 ceiling. Keep in sync.
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    return (len(text) + 3) // 4
 
 
 def installed_aider_commit(site_packages=None):

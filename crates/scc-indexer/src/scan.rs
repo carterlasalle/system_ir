@@ -154,6 +154,24 @@ pub struct ScannedFile {
     pub size: u64,
 }
 
+/// Skip accounting for one repository scan. Every met file with a resolved
+/// repo-relative path lands in exactly one bucket, so `discovered ==
+/// indexed + ignored + unsupported + oversized + unreadable`. Pre-path
+/// walker errors and symlink escapes are counted in their own buckets
+/// without a path. Counts (never paths) surface in `scc status`,
+/// `scc verify`, and analysis quality.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// trace:v1 id=impl.crates-scc-indexer-src-scan.scan-stats work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
+pub struct ScanStats {
+    pub discovered: u64,
+    pub indexed: u64,
+    pub ignored: u64,
+    pub unsupported: u64,
+    pub oversized: u64,
+    pub unreadable: u64,
+    pub symlink_escape: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
     #[error("path escapes repository root: {0}")]
@@ -309,6 +327,17 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 /// globs, and classify every file.
 // trace:exempt reason=internal-detail
 pub fn scan_repo(root: &Path, config: &IndexConfig) -> Result<Vec<ScannedFile>, ScanError> {
+    Ok(scan_repo_with_stats(root, config)?.0)
+}
+
+/// [`scan_repo`] plus per-category skip counts. Every met file lands in
+/// exactly one [`ScanStats`] bucket.
+// trace:v1 id=impl.crates-scc-indexer-src-scan.scan-repo-with-stats work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-NX53P4B7
+pub fn scan_repo_with_stats(
+    root: &Path,
+    config: &IndexConfig,
+) -> Result<(Vec<ScannedFile>, ScanStats), ScanError> {
+    let mut stats = ScanStats::default();
     let mut out = Vec::new();
     let mut builder = WalkBuilder::new(root);
     builder
@@ -324,7 +353,10 @@ pub fn scan_repo(root: &Path, config: &IndexConfig) -> Result<Vec<ScannedFile>, 
     for entry in builder.build() {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                stats.unreadable += 1;
+                continue;
+            }
         };
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
@@ -333,34 +365,49 @@ pub fn scan_repo(root: &Path, config: &IndexConfig) -> Result<Vec<ScannedFile>, 
         // Resolve symlinks defensively through the sandbox.
         let canon = match abs.canonicalize() {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => {
+                stats.unreadable += 1;
+                continue;
+            }
         };
         if !canon.starts_with(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())) {
+            stats.symlink_escape += 1;
             continue; // symlink escape: ignore
         }
         let rel = match abs.strip_prefix(root) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                stats.unreadable += 1;
+                continue;
+            }
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if rel_str.is_empty() {
             continue;
         }
+        stats.discovered += 1;
         if is_ignored(&rel_str, config) {
+            stats.ignored += 1;
             continue;
         }
         let Some((language, kind)) = classify(rel) else {
+            stats.unsupported += 1;
             continue;
         };
         let bytes = match std::fs::read(abs) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(_) => {
+                stats.unreadable += 1;
+                continue;
+            }
         };
         if bytes.len() > 5 * 1024 * 1024 {
+            stats.oversized += 1;
             continue; // skip oversized files
         }
         let size = bytes.len() as u64;
         let hash = hash_bytes(&bytes);
+        stats.indexed += 1;
         out.push(ScannedFile {
             path: rel_str,
             hash,
@@ -369,7 +416,7 @@ pub fn scan_repo(root: &Path, config: &IndexConfig) -> Result<Vec<ScannedFile>, 
             size,
         });
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 /// Check ignore globs: `**/node_modules/**` style patterns relative to the
@@ -544,6 +591,19 @@ mod tests {
         assert!(is_ignored("generated/x.ts", &cfg));
         assert!(!is_ignored("src/main.py", &cfg));
         assert!(is_ignored(".scc/data.db", &cfg));
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.scan.default-ignore-skips-os-metadata verifies=REQ-SI-NX53P4B7
+    fn default_ignore_skips_os_metadata() {
+        // macOS/Windows metadata must never enter the inventory: Finder
+        // mutates .DS_Store spontaneously, which would otherwise flake
+        // freshness (a file the user never touched reads as changed).
+        let cfg = IndexConfig::default();
+        assert!(is_ignored(".DS_Store", &cfg));
+        assert!(is_ignored("services/.DS_Store", &cfg));
+        assert!(is_ignored("Thumbs.db", &cfg));
+        assert!(!is_ignored("services/app.py", &cfg));
     }
 
     #[test]

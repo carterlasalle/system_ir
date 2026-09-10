@@ -11,6 +11,12 @@
 //! - L5 history: `intent_claims`, `drift_findings`
 
 pub use rusqlite;
+
+pub mod history;
+pub mod snapshot;
+// trace:exempt reason=module-facade  # pub mod declaration only; behavior traced per item in system.rs
+pub mod system;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use scc_core::{
     Entity, Evidence, Flow, Invariant, Provenance, Relationship, Repository, Severity, Snapshot,
@@ -21,7 +27,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // trace:exempt reason=internal-detail
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 // trace:exempt reason=internal-detail
 pub const FTS_ESCAPE: &str = "\"";
 // trace:exempt reason=internal-detail
@@ -32,6 +38,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
 ];
 
 /// v4: model epoch. `context_cache.revision` becomes `epoch` — the cache is
@@ -53,6 +60,43 @@ CREATE TABLE IF NOT EXISTS flow_graphs (
   name TEXT NOT NULL,
   trigger TEXT,
   graph TEXT NOT NULL
+);
+"#;
+
+/// v7: versioned reality graph (§XIX) — durable revision log plus full
+/// member row sets per revision for introduction/removal history and
+/// transactional historical views. Complements the model epoch (active
+/// compiled view), it does not replace it.
+// trace:exempt reason=internal-detail
+const MIGRATION_7: &str = r#"
+CREATE TABLE IF NOT EXISTS graph_revisions (
+  rev INTEGER PRIMARY KEY,
+  base_rev INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  source_hash TEXT NOT NULL DEFAULT '',
+  extractor_version TEXT NOT NULL DEFAULT '',
+  entity_count INTEGER NOT NULL DEFAULT 0,
+  rel_count INTEGER NOT NULL DEFAULT 0,
+  file_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS revision_members (
+  rev INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  id TEXT NOT NULL,
+  row_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (rev, kind, id)
+);
+CREATE INDEX IF NOT EXISTS idx_revision_members_rev ON revision_members(rev);
+CREATE TABLE IF NOT EXISTS context_snapshots (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  task TEXT NOT NULL DEFAULT '',
+  epoch TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 0,
+  artifact TEXT NOT NULL DEFAULT '',
+  entity_ids TEXT NOT NULL DEFAULT '[]',
+  budget INTEGER NOT NULL DEFAULT 0,
+  warnings TEXT NOT NULL DEFAULT '[]'
 );
 "#;
 
@@ -376,6 +420,7 @@ impl ModelEpoch {
 }
 // trace:v1 id=impl.scc.store work=WORK-SCC-001 satisfies=REQ-SCC-DATA implements=PLAN-SCC-001
 
+#[derive(Debug)]
 // trace:exempt reason=internal-detail
 pub struct Store {
     pub conn: Connection,
@@ -436,6 +481,7 @@ impl Store {
     /// rooted at `root`. `root` must exist. A truncated or garbage existing
     /// file is refused rather than migrated into a fake empty index.
     // trace:exempt reason=internal-detail
+        // trace:v1 id=impl.scc.store.stable-identity work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     pub fn open(path: &Path, root: &Path) -> Result<Store> {
         let existed_nonempty = path.is_file()
             && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
@@ -460,7 +506,23 @@ impl Store {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "repository".to_string());
-        let repo_id = scc_core::sanitize_key(&name);
+        // Stable repository identity (§XIV): explicit operator id wins,
+        // then the persistent id already stored in this database (checkout
+        // moves keep their semantic identity), then basename fallback.
+        let explicit = std::env::var("SCC_REPO_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let mut repo_id = scc_core::sanitize_key(&name);
+        let mut id_source = "basename";
+        if let Some(e) = explicit {
+            repo_id = scc_core::sanitize_key(e.trim());
+            id_source = "explicit";
+        } else if existed_nonempty {
+            if let Some(persisted) = Self::existing_repo_id(&conn)? {
+                repo_id = persisted;
+                id_source = "persistent";
+            }
+        }
 
         let mut store = Store {
             conn,
@@ -469,6 +531,10 @@ impl Store {
             repo_name: name,
         };
         store.ensure_repository()?;
+        if id_source == "persistent" {
+            store.refresh_repository_root()?;
+        }
+        store.meta_set("repo_id_source", id_source)?;
         Ok(store)
     }
 
@@ -494,6 +560,76 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+    /// The repository id already persisted in this database, if any.
+    /// A moved checkout keeps the id its entities were written under.
+    // trace:exempt reason=internal-detail
+    fn existing_repo_id(conn: &Connection) -> Result<Option<String>> {
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM repositories ORDER BY rowid LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Point the persisted repository row at the current checkout path
+    /// after a move. Identity (id) is untouched; only the provenance
+    /// path (root) follows the checkout.
+    // trace:exempt reason=internal-detail
+    fn refresh_repository_root(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE repositories SET root = ?1, name = ?2 WHERE id = ?3",
+            params![
+                self.root.to_string_lossy(),
+                self.repo_name,
+                self.repo_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Adopt a stable identity derived from explicit config or the git
+    /// remote. Only applies to a fresh database (no entities yet): once
+    /// entity ids are written under an id, that id is load-bearing and
+    /// must survive via the persistent rule in [`Store::open`] instead.
+    /// Returns true when the identity changed.
+    // trace:v1 id=impl.scc.store.adopt-stable-identity work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+    pub fn adopt_stable_identity(
+        &mut self,
+        explicit: Option<&str>,
+        remote_url: Option<&str>,
+    ) -> Result<bool> {
+        if self.meta_get("repo_id_source")?.as_deref() == Some("explicit") {
+            return Ok(false);
+        }
+        let n: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities",
+            [],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Ok(false);
+        }
+        let basename = self
+            .root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repository".to_string());
+        let id = scc_core::identity::stable_repo_id(explicit, remote_url, &basename);
+        if id == self.repo_id {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM repositories WHERE id = ?1",
+            params![self.repo_id],
+        )?;
+        self.repo_id = id;
+        self.ensure_repository()?;
+        self.meta_set("repo_id_source", "remote")?;
+        Ok(true)
     }
 
     // trace:exempt reason=internal-detail
@@ -2470,6 +2606,53 @@ mod tests {
         let store = Store::open(&dir.path().join("scc.db"), &root).unwrap();
         (store, dir)
     }
+
+    #[test]
+    // trace:v1 id=test.scc.store.persistent-identity-survives-move verifies=REQ-SI-503JSBGP exercises=impl.scc.store.stable-identity
+    fn persistent_identity_survives_checkout_move() {
+        let dir = TempDir::new().unwrap();
+        let root_a = dir.path().join("aaa");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let db = dir.path().join("scc.db");
+        let s1 = Store::open(&db, &root_a).unwrap();
+        assert_eq!(s1.repo_id, "aaa");
+        // move the checkout: same database, new directory name
+        let root_b = dir.path().join("bbb");
+        std::fs::create_dir_all(&root_b).unwrap();
+        let s2 = Store::open(&db, &root_b).unwrap();
+        assert_eq!(s2.repo_id, "aaa", "move must not fork identity");
+        assert_eq!(
+            s2.meta_get("repo_id_source").unwrap().as_deref(),
+            Some("persistent")
+        );
+        // provenance path follows the checkout
+        let row: String = s2.conn.query_row(
+            "SELECT root FROM repositories WHERE id = 'aaa'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(row.ends_with("bbb"), "{row}");
+    }
+
+    #[test]
+    // trace:v1 id=test.scc.store.explicit-and-remote-adopt verifies=REQ-SI-503JSBGP exercises=impl.scc.store.adopt-stable-identity
+    fn explicit_and_remote_identity_adopt_on_fresh_db() {
+        let (mut s, _d) = tmp_store();
+        assert_eq!(s.repo_id, "repo");
+        assert!(s.adopt_stable_identity(Some("MyRepo"), None).unwrap());
+        assert_eq!(s.repo_id, "myrepo");
+        assert!(!s.adopt_stable_identity(Some("MyRepo"), None).unwrap());
+        let (mut t, _e) = tmp_store();
+        assert!(t.adopt_stable_identity(None, Some("git@github.com:acme/billing.git")).unwrap());
+        assert_eq!(t.repo_id, "github.com/acme/billing");
+        // explicit operator id is never overwritten by a later remote
+        assert_eq!(t.meta_get("repo_id_source").unwrap().as_deref(), Some("remote"));
+        // entities freeze identity: adoption refuses once ids are load-bearing
+        t.insert_entity(&Entity::new("x", "symbol", "f"), &["a.py".into()]).unwrap();
+        assert!(!t.adopt_stable_identity(Some("other"), None).unwrap());
+        assert_eq!(t.repo_id, "github.com/acme/billing");
+    }
+
 
     #[test]
     // trace:exempt reason=internal-detail

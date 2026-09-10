@@ -29,7 +29,7 @@
 
 use crate::lsp::{uri_to_path, LspResult, REQUEST_TIMEOUT};
 use crate::write::{evidence_id, rel_id};
-use scc_core::{Evidence, EvidenceType, Provenance, Relationship};
+use scc_core::{resolution::confidence, Evidence, EvidenceType, Provenance, Relationship};
 use scc_store::Store;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -67,6 +67,7 @@ enum QueryOutcome {
 }
 
 /// JSON-RPC/LSP client driving one typescript-language-server process.
+// trace:v1 id=impl.crates-scc-indexer-src-lsp-ts.ts-lsp-resolver work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub struct TsLspResolver {
     child: Option<Child>,
     writer: Box<dyn Write + Send>,
@@ -83,6 +84,7 @@ pub struct TsLspResolver {
     cold_retries: u32,
 }
 
+// trace:exempt reason=internal-detail
 impl Drop for TsLspResolver {
     fn drop(&mut self) {
         // Kill the child; the reader thread then observes EOF and exits.
@@ -159,6 +161,7 @@ pub fn start_tsserver(workspace_root: &Path) -> Result<TsLspResolver, String> {
     Ok(resolver)
 }
 
+// trace:exempt reason=internal-detail
 impl TsLspResolver {
     /// Build a resolver over arbitrary reader/writer transports and run the
     /// initialize handshake. `child` is optional (killed on drop).
@@ -538,6 +541,7 @@ impl TsLspResolver {
         Ok(out)
     }
 
+// trace:v1 id=impl.crates-scc-indexer-src-lsp-ts-ts-lsp-resolver.apply-upgrade work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn apply_upgrade(
         &self,
         store: &Store,
@@ -575,7 +579,7 @@ impl TsLspResolver {
             new_object,
             Provenance::Resolved,
         )
-        .with_confidence(0.99)
+        .with_confidence(confidence::LSP_EXACT)
         .with_evidence(vec![ev.id.clone()]);
         store
             .insert_relationship(&new_rel, file)
@@ -763,6 +767,7 @@ mod tests {
         assert!(!rels.iter().any(|r| r.provenance == Provenance::Extracted));
     }
 
+// trace:v1 id=impl.crates-scc-indexer-src-lsp-ts.seed-store work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn seed_store(root: &std::path::Path) -> Store {
         let db = root.join(".scc-test");
         std::fs::create_dir_all(&db).unwrap();
@@ -816,7 +821,7 @@ mod tests {
             ext,
             Provenance::Extracted,
         )
-        .with_confidence(0.8)
+        .with_confidence(confidence::CONFIRMED_EXTERNAL)
         .with_evidence(vec![ev.id]);
         store.insert_relationship(&rel, "src/main.ts").unwrap();
         store

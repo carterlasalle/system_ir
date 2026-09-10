@@ -123,6 +123,9 @@ pub struct LoopOptions {
 /// in tests); the CLI applies it after printing.
 // trace:v1 id=impl.scc.cli.bench-loop work=WORK-ripwire-lessons-phase5 satisfies=REQ-agent-loop-three-way,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn run_agent_loop(arms: &[LoopArm], opts: &LoopOptions) -> Result<LoopSummary, String> {
+    if opts.agent_cmd.is_some() {
+        crate::benchagent::require_paid_opt_in()?;
+    }
     let k = opts.k.max(1);
     let fixtures = locate_fixtures_dir().ok_or("cannot locate fixtures/ directory")?;
     let corpus_path = fixtures
@@ -1510,4 +1513,31 @@ mod tests {
             api_summary.per_task
         );
     }
+
+    #[test]
+    // trace:v1 id=test.scc.cli.bench-loop-paid-gate verifies=REQ-agent-loop-three-way exercises=impl.scc.cli.bench-loop
+    fn agent_loop_with_agent_cmd_refuses_without_opt_in() {
+        // Shares the benchagent env lock: this test removes the opt-in while
+        // mock tests set it (parallel threads, one process environment).
+        let _guard = crate::benchagent::PAID_TEST_ENV_LOCK.lock();
+        let prev = std::env::var("SCC_ALLOW_PAID_BENCHMARKS").ok();
+        std::env::remove_var("SCC_ALLOW_PAID_BENCHMARKS");
+        let opts = LoopOptions {
+            k: 1,
+            repo_filter: None,
+            ripwire_bin: None,
+            explore: true,
+            agent_cmd: Some("codex exec --json --skip-git-repo-check -C . -".into()),
+        };
+        let err = run_agent_loop(&[LoopArm::Scc], &opts).unwrap_err();
+        assert!(
+            err.contains("SCC_ALLOW_PAID_BENCHMARKS"),
+            "refusal must name the opt-in: {err}"
+        );
+        match prev {
+            Some(v) => std::env::set_var("SCC_ALLOW_PAID_BENCHMARKS", v),
+            None => std::env::remove_var("SCC_ALLOW_PAID_BENCHMARKS"),
+        }
+    }
+
 }

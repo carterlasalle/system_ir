@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,9 +39,30 @@ def _scc_bin() -> str | None:
 
 
 class TokenBudgetTest(unittest.TestCase):
-    def test_estimate_shared_tokens_is_quarter_bytes(self) -> None:
+    def test_estimate_shared_tokens_is_chars_ceiling(self) -> None:
+        # Mirror of Rust scc_core::estimate_tokens (chars().count().div_ceil(4)).
+        self.assertEqual(estimate_shared_tokens(""), 0)
         self.assertEqual(estimate_shared_tokens("abcd"), 1)
+        self.assertEqual(estimate_shared_tokens("abcde"), 2)
         self.assertEqual(estimate_shared_tokens("a" * 40), 10)
+
+    def test_estimate_shared_tokens_covers_content_kinds(self) -> None:
+        # ASCII code, Unicode (code points, like Rust chars), identifier-heavy
+        # code, JSON, Markdown, and long file paths all estimate positively
+        # and never exceed a chars/4 ceiling.
+        samples = [
+            "fn main() { println!(\"hi\"); }\n",
+            "日本語テスト✓🎉\n",
+            "very_long_identifier_name_xyz.viewDidLoadTableViewCellForRowAt();\n",
+            '{"route": "/api/v1/transcripts", "method": "GET", "auth": true}\n',
+            "# Title\n\n- item one\n- item two\n\n`code span`\n",
+            "crates/scc-context/src/surface/structural_source_selection_policy.rs\n",
+        ]
+        for s in samples:
+            est = estimate_shared_tokens(s)
+            self.assertGreater(est, 0, repr(s))
+            self.assertLessEqual(est, (len(s) + 3) // 4, repr(s))
+            self.assertEqual(est, (len(s) + 3) // 4, repr(s))
 
     def test_concatenation_is_capped_at_budget(self) -> None:
         """A large concat must not ship an over-budget prompt."""
@@ -444,11 +466,13 @@ class WriteMatrixPairingAndValidityTest(unittest.TestCase):
         try:
             rwm.run_variant = boom
             with self.assertRaises(RuntimeError):
-                rwm.main([
-                    "--out", str(out),
-                    "--variants", "raw",
-                    "--tasks", "http-service.health-check",
-                ])
+                with mock.patch.dict(os.environ, {"SCC_ALLOW_PAID_BENCHMARKS": "1"}), \
+                        mock.patch.object(rwm, "_run_preflight", return_value=0):
+                    rwm.main([
+                        "--out", str(out),
+                        "--variants", "raw",
+                        "--tasks", "http-service.health-check",
+                    ])
             payload = json.loads(out.read_text(encoding="utf-8"))
             self.assertFalse(payload["meta"].get("valid", True))
             self.assertIn("incomplete", payload["meta"].get("invalid_reason", "").lower())
@@ -468,11 +492,13 @@ class WriteMatrixPairingAndValidityTest(unittest.TestCase):
                 "error": "scc-artifact-generation-failed",
                 "status": "ARTIFACT_FAILED",
             }
-            rc = rwm.main([
-                "--out", str(out),
-                "--variants", "raw",
-                "--tasks", "http-service.health-check",
-            ])
+            with mock.patch.dict(os.environ, {"SCC_ALLOW_PAID_BENCHMARKS": "1"}), \
+                    mock.patch.object(rwm, "_run_preflight", return_value=0):
+                rc = rwm.main([
+                    "--out", str(out),
+                    "--variants", "raw",
+                    "--tasks", "http-service.health-check",
+                ])
             self.assertEqual(rc, 0)
             payload = json.loads(out.read_text(encoding="utf-8"))
             self.assertFalse(payload["meta"].get("valid", True))
@@ -487,6 +513,145 @@ class WriteMatrixPairingAndValidityTest(unittest.TestCase):
         self.assertIn('rev-parse", "HEAD"', src)
         self.assertNotIn("scc_revision", src)
         self.assertNotIn("[scc_bin, \"--version\"]", src)
+
+class PaidBenchmarkGateTest(unittest.TestCase):
+    """Paid-model safety interlock: normal invocation refuses before any
+    external process/model launch; --dry-run is allowed; explicit
+    SCC_ALLOW_PAID_BENCHMARKS=1 opts in."""
+
+    def _load_matrix(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "run_write_matrix", EXT / "run_write_matrix.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_normal_invocation_refuses_before_launch(self) -> None:
+        rwm = self._load_matrix()
+        out = Path(tempfile.mkdtemp(prefix="scc-matrix-gate-")) / "out.json"
+        try:
+            def boom(*_a, **_k):
+                raise AssertionError("must not reach agent launch without opt-in")
+
+            orig = rwm.run_variant
+            rwm.run_variant = boom
+            try:
+                with _drop_paid_env():
+                    rc = rwm.main([
+                        "--out", str(out),
+                        "--variants", "raw",
+                        "--tasks", "http-service.health-check",
+                    ])
+            finally:
+                rwm.run_variant = orig
+            self.assertEqual(rc, 2)
+            self.assertFalse(out.exists(), "refused run must not write results")
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    def test_dry_run_allowed_without_opt_in(self) -> None:
+        rwm = self._load_matrix()
+        out = Path(tempfile.mkdtemp(prefix="scc-matrix-dry-")) / "out.json"
+        try:
+            with _drop_paid_env():
+                rc = rwm.main([
+                    "--dry-run",
+                    "--out", str(out),
+                    "--variants", "raw",
+                    "--tasks", "http-service.health-check",
+                ])
+            self.assertEqual(rc, 0)
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            cell = payload["cells"]["raw/http-service.health-check"]
+            self.assertEqual(cell["status"], "DRY-RUN")
+            self.assertIsNone(cell["task_success"])
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    def test_paid_run_consults_preflight(self) -> None:
+        # opted-in but preflight refuses (no question): main must refuse
+        rwm = self._load_matrix()
+        out = Path(tempfile.mkdtemp(prefix="scc-matrix-preflight-")) / "out.json"
+        try:
+            with mock.patch.dict(os.environ, {"SCC_ALLOW_PAID_BENCHMARKS": "1"}), \
+                    mock.patch.object(rwm, "_run_preflight", return_value=2) as pre:
+                rc = rwm.main([
+                    "--out", str(out),
+                    "--variants", "raw",
+                    "--tasks", "http-service.health-check",
+                ])
+            self.assertEqual(rc, 2)
+            pre.assert_called_once()
+            asked = pre.call_args[0][0]
+            self.assertEqual(asked, "")
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    def test_preflight_refuses_without_question(self) -> None:
+        # preflight.py itself: no experimental question → REFUSE, no quota
+        r = subprocess.run(
+            [sys.executable, str(EXT / "preflight.py")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no experimental question", r.stdout)
+
+    def test_explicit_opt_in_proceeds(self) -> None:
+        rwm = self._load_matrix()
+        out = Path(tempfile.mkdtemp(prefix="scc-matrix-optin-")) / "out.json"
+        orig = rwm.run_variant
+        try:
+            rwm.run_variant = lambda *a, **k: {
+                "task_success": True,
+                "task_success_defined": True,
+                "run_completion": True,
+                "context_tokens": 10,
+                "wall_sec": 0.1,
+                "error": None,
+                "error_type": None,
+            }
+            with mock.patch.dict(os.environ, {"SCC_ALLOW_PAID_BENCHMARKS": "1"}), \
+                    mock.patch.object(rwm, "_run_preflight", return_value=0):
+                rc = rwm.main([
+                    "--out", str(out),
+                    "--variants", "raw",
+                    "--tasks", "http-service.health-check",
+                ])
+            self.assertEqual(rc, 0)
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertTrue(payload["cells"]["raw/http-service.health-check"]["task_success"])
+        finally:
+            rwm.run_variant = orig
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    def test_dry_run_cells_excluded_from_summary(self) -> None:
+        rwm = self._load_matrix()
+        cells = {
+            "raw/a": {"task_success": None, "status": "DRY-RUN"},
+            "scc-full/a": {"task_success": None, "status": "DRY-RUN"},
+        }
+        summary = rwm.compute_summary(cells, ["a"], ["raw", "scc-full"])
+        self.assertIsNone(summary["micro_task_success"])
+        self.assertIsNone(summary["paired_scc-full_minus_raw"])
+
+
+class _drop_paid_env:
+    """Context manager removing the paid-benchmark opt-in for gate tests."""
+
+    def __init__(self):
+        self._had = os.environ.get("SCC_ALLOW_PAID_BENCHMARKS")
+
+    def __enter__(self):
+        os.environ.pop("SCC_ALLOW_PAID_BENCHMARKS", None)
+        return self
+
+    def __exit__(self, *exc):
+        if self._had is not None:
+            os.environ["SCC_ALLOW_PAID_BENCHMARKS"] = self._had
+        return False
 
 
 if __name__ == "__main__":

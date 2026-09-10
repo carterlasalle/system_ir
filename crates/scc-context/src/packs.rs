@@ -1614,6 +1614,25 @@ pub fn verify(ctx: &ContextCompiler) -> ContextPack {
         }
     }
     sections.push(Section::new("FRESHNESS", fresh, 10));
+    // scan inventory (counts recorded at index time; never paths)
+    if let Some(raw) = ctx.store.meta_get("scan_stats").ok().flatten() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            sections.push(Section::new(
+                "FILES",
+                format!(
+                    "discovered={} indexed={} ignored={} unsupported={} oversized={} unreadable={}\n",
+                    n("discovered"),
+                    n("indexed"),
+                    n("ignored"),
+                    n("unsupported"),
+                    n("oversized"),
+                    n("unreadable")
+                ),
+                10,
+            ));
+        }
+    }
 
     // stale facts
     let mut stale_facts = String::new();

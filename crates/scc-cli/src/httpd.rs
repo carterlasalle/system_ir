@@ -12,6 +12,32 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+
+/// Fail closed on non-loopback binds: SCC serves index-mutating endpoints
+/// with no authentication, so LAN exposure needs explicit opt-in
+/// (`SCC_ALLOW_REMOTE_LISTEN=1`). Loopback and `localhost` always pass.
+// trace:v1 id=impl.crates-scc-cli-src-httpd.require-remote-opt-in work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+fn require_remote_opt_in(addr: &str) -> crate::Result<()> {
+    let loopback = match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => sa.ip().is_loopback(),
+        Err(_) => {
+            let host = addr.strip_prefix('[').and_then(|s| s.split(']').next());
+            let host = host.unwrap_or_else(|| addr.split(':').next().unwrap_or(addr));
+            host == "localhost" || host == "127.0.0.1" || host == "::1"
+        }
+    };
+    if loopback {
+        return Ok(());
+    }
+    if std::env::var("SCC_ALLOW_REMOTE_LISTEN").as_deref() == Ok("1") {
+        eprintln!("warning: unauthenticated SCC daemon on non-loopback {addr} (explicit opt-in)");
+        return Ok(());
+    }
+    Err(crate::CliError::Other(format!(
+        "refusing non-loopback bind {addr}: the SCC daemon has no authentication;          bind config.security.listen to 127.0.0.1 or set SCC_ALLOW_REMOTE_LISTEN=1 to opt in explicitly"
+    )))
+}
+
 // trace:v1 id=impl.crates-scc-cli-src-httpd.serve
 pub fn serve(root: &Path) -> crate::Result<()> {
     let config = crate::load_config(root)?;
@@ -26,6 +52,11 @@ pub fn serve(root: &Path) -> crate::Result<()> {
     } else {
         None
     };
+
+    // Remote listening is unauthenticated by design (loopback-only
+    // product): a non-loopback bind refuses unless the operator opts in
+    // explicitly. There is no auth token yet — see docs/SECURITY.md.
+    require_remote_opt_in(&addr)?;
 
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| crate::CliError::Other(format!("cannot bind {addr}: {e}")))?;
@@ -299,21 +330,10 @@ pub fn watch_loop(root: &Path) -> crate::Result<()> {
 // trace:v1 id=impl.scc.cli.hash-sweep work=WORK-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing-from-unique satisfies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no
 pub fn refresh_stale_by_hash(root: &Path) -> crate::Result<Vec<String>> {
     let store = crate::open_store(root)?;
-    let config = crate::load_config(root)?;
+    // Single notion of staleness: modified, deleted, AND added files
+    // (scan-diff lives in `stale_paths`, shared with verify/status).
     let mut paths = crate::stale_paths(&store)?;
-    let indexed: std::collections::HashSet<String> = store
-        .all_files()?
-        .into_iter()
-        .map(|(p, _, _, _, _)| p)
-        .collect();
     drop(store);
-    let scanned = scc_indexer::scan::scan_repo(root, &config.index)
-        .map_err(scc_indexer::IndexError::from)?;
-    for f in scanned {
-        if !indexed.contains(&f.path) {
-            paths.push(f.path);
-        }
-    }
     paths.sort();
     paths.dedup();
     if !paths.is_empty() {
@@ -398,6 +418,18 @@ fn hash_sweep_loop(root: &Path, quiet: bool) -> crate::Result<()> {
 mod tests {
     use super::*;
     use crate::benchctx::{copy_fixture, locate_fixtures_dir};
+
+    #[test]
+    // trace:v1 id=test.scc.cli.remote-listen-gate verifies=REQ-SI-503JSBGP exercises=impl.crates-scc-cli-src-httpd.require-remote-opt-in
+    fn remote_listen_fails_closed_without_opt_in() {
+        assert!(require_remote_opt_in("127.0.0.1:7777").is_ok());
+        assert!(require_remote_opt_in("localhost:7777").is_ok());
+        assert!(require_remote_opt_in("[::1]:7777").is_ok());
+        // unauthenticated daemon: non-loopback refuses without opt-in
+        assert!(require_remote_opt_in("0.0.0.0:7777").is_err());
+        std::env::remove_var("SCC_ALLOW_REMOTE_LISTEN");
+        assert!(require_remote_opt_in("192.168.1.10:7777").is_err());
+    }
 
     #[test]
     // trace:v1 id=test.scc.cli.hash-sweep verifies=REQ-implement-phase-7-of-scc-x-ripwire-lessons-1-one-hop-type-narrowing,REQ-implement-fix-pr-review-comments-without-collapsing-scc-type-script-no exercises=impl.scc.cli.hash-sweep

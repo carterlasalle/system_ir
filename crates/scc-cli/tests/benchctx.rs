@@ -5,7 +5,7 @@ mod common;
 
 #[test]
 fn benchmark_corpus_runs_and_meets_recall_gate() {
-    let summary = scc_cli::benchctx::run_context_benchmark(0.9).expect("benchmark gate");
+    let summary = scc_cli::benchctx::run_context_benchmark(0.9, 0.0).expect("benchmark gate");
     assert_eq!(summary.tasks, 21);
     assert!(summary.mean_recall >= 0.95, "recall {:.3}", summary.mean_recall);
     assert!(summary.mean_localization >= 0.9, "localization {:.3}", summary.mean_localization);
@@ -21,7 +21,7 @@ fn benchmark_corpus_runs_and_meets_recall_gate() {
 fn hallucination_gate_fails_when_nonexistent_entity_surfaces() {
     // craft a task whose pack legitimately contains a name we mark as a
     // hallucination — the gate must flag it
-    let summary = scc_cli::benchctx::run_context_benchmark(0.9).expect("benchmark gate");
+    let summary = scc_cli::benchctx::run_context_benchmark(0.9, 0.0).expect("benchmark gate");
     // the corpus is clean, so simulate a violation by checking the
     // hallucination scan logic directly against a known-real entity
     let fixtures = scc_cli::benchctx::locate_fixtures_dir().unwrap();

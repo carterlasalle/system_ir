@@ -11,7 +11,7 @@ use crate::model::{
 };
 use crate::resolve::{ResolvedCall, ResolvedImport, SymbolIndex};
 use scc_core::kinds;
-use scc_core::{entity_id, Evidence, Provenance, Relationship};
+use scc_core::{entity_id, resolution::confidence, Evidence, Provenance, Relationship};
 use scc_store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -972,6 +972,7 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
+// trace:v1 id=impl.crates-scc-indexer-src-write-writer.write-store-refs work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn write_store_refs(
         &self,
         path: &str,
@@ -1010,7 +1011,7 @@ impl<'a> Writer<'a> {
                 store_id.clone(),
                 Provenance::Extracted,
             )
-            .with_confidence(0.8)
+            .with_confidence(confidence::STRONG_LINK)
             .with_evidence(vec![ev.id.clone()]);
             self.store.insert_relationship(&rel, path)?;
 

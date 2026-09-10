@@ -194,8 +194,9 @@ services:
 
 | Benchmark | Result | Target |
 |---|---|---|
-| Task-context recall (21 tasks / 8 repos) | **1.000** | ≥ 0.95 |
-| Task-context localization | **1.000** | — |
+| Task-context recall (21 tasks / 8 repos) | **0.974** (2026-09-10) | ≥ 0.95 |
+| Task-context precision (21 tasks / 8 repos) | **0.310** (2026-09-10) | — (gate: `--min-precision`; recall-only by default) |
+| Task-context localization | **1.000** (2026-09-10) | — |
 | Hallucination violations | **0** | 0 |
 | Cold index 250k LOC | 96.5 s | < 120 s |
 | Peak RSS 250k LOC | 217 MiB | < 2 GB |

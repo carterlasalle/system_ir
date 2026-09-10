@@ -384,10 +384,14 @@ def copy_tree(src, dst):
 
 
 def estimate_shared_tokens(text):
-    """Deterministic chars/4 — the same rule as the adapters and the Rust arm."""
+    """Deterministic chars/4 ceiling — the Python mirror of Rust
+    `scc_core::estimate_tokens` (`chars().count().div_ceil(4)`; Python
+    `len()` counts the same Unicode scalar values). Every harness,
+    adapter, and matrix check must use this, never an inline `len//4`,
+    so an equal token budget means the same thing everywhere."""
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    return (len(text) + 3) // 4
 
 
 def _budget_flag(budget):
@@ -1031,6 +1035,18 @@ def main(argv):
     )
     args = parser.parse_args(argv)
 
+    # Paid-model safety interlock: this harness pipes prompts to a paid
+    # coding agent (default: codex). Refuse BEFORE any external process/model
+    # launch unless the operator opted in explicitly. Local-only plumbing
+    # can be exercised via run_write_matrix.py --dry-run.
+    if os.environ.get("SCC_ALLOW_PAID_BENCHMARKS") != "1":
+        sys.stderr.write(
+            "refusing: run_context_bench.py launches paid coding agents "
+            "(codex/claude via --agent-cmd); paid model benchmarks are "
+            "disabled by default and spend real API quota. Set "
+            "SCC_ALLOW_PAID_BENCHMARKS=1 to opt in explicitly.\n"
+        )
+        return 2
     tasks = load_tasks()
     tasks = filter_repos(tasks, args.repo)
     if not tasks:
