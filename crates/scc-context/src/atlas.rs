@@ -9,7 +9,7 @@
 //! are excluded and surfaced as warnings; low-confidence inference is
 //! excluded unless `include_low_confidence_inference` is set.
 
-use crate::packs::{entity_name, finish, Section};
+use crate::packs::{entity_name, finish, finish_soft, Section};
 use crate::{ContextCompiler, ContextPack};
 use scc_core::{
     language_by_id, Archetype, AtlasComponent, AtlasEntrypoint, AtlasFlow, AtlasHierarchyNode,
@@ -1776,8 +1776,16 @@ fn compute_coverage(ctx: &ContextCompiler) -> BTreeMap<String, String> {
 }
 
 /// Render the atlas as compact structured text (agent-facing).
+/// `full` is the human `--unbounded` mode: soft legacy render that may
+/// exceed the budget (reported, never silent). Agent/MCP paths always
+/// pass false.
 // trace:v1 id=impl.scc.atlas.render work=WORK-SCC-001 satisfies=REQ-state-function-access,REQ-SCC-CTX
-pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -> ContextPack {
+pub fn render_atlas(
+    ctx: &ContextCompiler,
+    atlas: &SystemAtlas,
+    budget: usize,
+    full: bool,
+) -> ContextPack {
     let mut pack = ContextPack::new("atlas", &atlas.revision);
     let mut sections: Vec<Section> = Vec::new();
 
@@ -2301,7 +2309,11 @@ pub fn render_atlas(ctx: &ContextCompiler, atlas: &SystemAtlas, budget: usize) -
     ));
 
     let warnings = atlas.warnings.clone();
-    finish(&mut pack, sections, budget, warnings);
+    if full {
+        finish_soft(&mut pack, sections, budget, warnings);
+    } else {
+        finish(&mut pack, sections, budget, warnings);
+    }
     pack.entity_ids = comp_ids(ctx);
     pack
 }
@@ -3100,7 +3112,7 @@ mod tests {
         );
 
         // rendered atlas lines
-        let pack = render_atlas(&ctx, &atlas, usize::MAX);
+        let pack = render_atlas(&ctx, &atlas, usize::MAX, false);
         for want in [
             "schema: User",
             "schema: User extends Base",
@@ -3489,7 +3501,7 @@ mod tests {
         );
 
         // rendered atlas carries the new section headers
-        let pack = render_atlas(&ctx, &atlas, usize::MAX);
+        let pack = render_atlas(&ctx, &atlas, usize::MAX, false);
         assert!(pack.content.contains("# PUBLIC API"), "{}", pack.content);
         assert!(
             pack.content.contains("# FRAMEWORK SEMANTICS"),

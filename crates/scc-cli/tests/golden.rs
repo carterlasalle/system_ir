@@ -326,6 +326,42 @@ fn atlas_budget_accounting_is_honest() {
 }
 
 #[test]
+// trace:v1 id=test.crates-scc-cli-tests-golden.atlas-unbounded-human-mode verifies=REQ-SI-503JSBGP exercises=impl.crates-scc-cli-src-commands.cmd-atlas
+fn atlas_unbounded_is_soft_and_reported() {
+    // Human `--unbounded`: the legacy soft render returns (excess reported
+    // via exceeded_soft_budget, critical sections kept); the default stays
+    // hard-capped. Guards the cache-key separation: bounded and unbounded
+    // packs must never share entries.
+    let repo = copy_fixture("http-service-python");
+    let dir = workdir(repo.path());
+    run_ok(&dir, &["index", "--quiet"]);
+    let full: serde_json::Value = serde_json::from_str(&run_ok(
+        &dir,
+        &["atlas", "--budget", "60", "--unbounded", "--json"],
+    ))
+    .unwrap();
+    assert!(
+        full["exceeded_soft_budget"].as_bool().unwrap(),
+        "unbounded excess must be reported: {full}"
+    );
+    assert!(
+        full["content"].as_str().unwrap().contains("# CONTRACTS"),
+        "unbounded keeps critical sections: {full}"
+    );
+    let hard: serde_json::Value =
+        serde_json::from_str(&run_ok(&dir, &["atlas", "--budget", "60", "--json"])).unwrap();
+    assert!(
+        hard["tokens"].as_u64().unwrap() <= 60,
+        "default stays hard-capped: {}",
+        hard["tokens"]
+    );
+    assert!(
+        !hard["exceeded_soft_budget"].as_bool().unwrap(),
+        "hard fit must hold: {hard}"
+    );
+}
+
+#[test]
 // trace:v1 id=test.crates-scc-cli-tests-golden.task-cache-hits-within-an-epoch-and-misses-across
 fn task_cache_hits_within_an_epoch_and_misses_across() {
     let repo = copy_fixture("http-service-python");

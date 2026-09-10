@@ -50,7 +50,12 @@ struct RenderOutcome {
 }
 
 // trace:exempt reason=internal-detail
-fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (String, RenderOutcome) {
+fn render(
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+    hard: bool,
+) -> (String, RenderOutcome) {
     let mut sections = sections;
     let mut outcome = RenderOutcome {
         original_tokens: estimate_tokens(&assemble(&sections)),
@@ -69,6 +74,35 @@ fn render(sections: Vec<Section>, budget: usize, warnings: Vec<String>) -> (Stri
             warnings.len(),
             budget
         );
+    }
+    if !hard {
+        // Soft legacy path (`--unbounded` human output only — never agents):
+        // drop low-priority sections, then report the excess honestly.
+        let mut content = assemble(&sections);
+        while estimate_tokens(&content) > budget {
+            let min_priority = sections.iter().map(|s| s.priority).min().unwrap_or(10);
+            if min_priority >= 9 {
+                break;
+            }
+            let idx = sections
+                .iter()
+                .position(|s| s.priority == min_priority)
+                .unwrap();
+            let dropped = sections.remove(idx).title;
+            if !outcome.dropped_sections.contains(&dropped) {
+                outcome.dropped_sections.push(dropped);
+            }
+            content = assemble(&sections);
+            if sections.is_empty() {
+                break;
+            }
+        }
+        for w in warnings {
+            content.push_str(&format!("\n⚠ WARNING: {w}\n"));
+        }
+        outcome.hard_truncated = false;
+        outcome.exceeded_soft_budget = estimate_tokens(&content) > budget;
+        return (content, outcome);
     }
     let content_budget = budget.saturating_sub(estimate_tokens(&warn_block));
     // Pathological floor: below ~16 tokens even a section title cannot
@@ -206,7 +240,40 @@ pub(crate) fn finish(
     budget: usize,
     warnings: Vec<String>,
 ) {
-    let (content, outcome) = render(sections, budget, warnings);
+    finish_hard(pack, sections, budget, warnings);
+}
+
+/// Hard-cap render: the delivered text always fits the budget.
+// trace:exempt reason=internal-detail
+pub(crate) fn finish_hard(
+    pack: &mut ContextPack,
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+) {
+    let (content, outcome) = render(sections, budget, warnings, true);
+    pack.content = content;
+    pack.budget = budget;
+    pack.tokens = estimate_tokens(&pack.content);
+    pack.original_tokens = outcome.original_tokens;
+    pack.dropped_sections = outcome.dropped_sections;
+    pack.hard_truncated = outcome.hard_truncated;
+    pack.exceeded_soft_budget = outcome.exceeded_soft_budget;
+    pack.truncated =
+        pack.hard_truncated || !pack.dropped_sections.is_empty() || pack.exceeded_soft_budget;
+}
+
+/// Soft legacy render for human `--unbounded` output: may exceed the
+/// budget, reported via `exceeded_soft_budget`, never silently cut.
+/// Agent/MCP paths must never call this.
+// trace:exempt reason=internal-detail
+pub(crate) fn finish_soft(
+    pack: &mut ContextPack,
+    sections: Vec<Section>,
+    budget: usize,
+    warnings: Vec<String>,
+) {
+    let (content, outcome) = render(sections, budget, warnings, false);
     pack.content = content;
     pack.budget = budget;
     pack.tokens = estimate_tokens(&pack.content);
@@ -1222,7 +1289,7 @@ fn compression_policy(goal: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 // trace:exempt reason=internal-detail
-pub fn component(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> ContextPack {
+pub fn component(ctx: &ContextCompiler, id_or_name: &str, budget: usize, full: bool) -> ContextPack {
     let mut pack = ContextPack::new("component", &ctx.revision());
     let comp = ctx
         .store
@@ -1395,7 +1462,11 @@ pub fn component(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> Cont
         5,
     ));
 
-    finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    if full {
+        finish_soft(&mut pack, sections, budget, ctx_warnings(ctx));
+    } else {
+        finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    }
     pack
 }
 
@@ -1461,7 +1532,7 @@ fn render_flow(ctx: &ContextCompiler, fid: &str, compact: bool) -> String {
 }
 
 // trace:exempt reason=internal-detail
-pub fn flow(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> ContextPack {
+pub fn flow(ctx: &ContextCompiler, id_or_name: &str, budget: usize, full: bool) -> ContextPack {
     let mut pack = ContextPack::new("flow", &ctx.revision());
     let f = ctx
         .view
@@ -1488,7 +1559,11 @@ pub fn flow(ctx: &ContextCompiler, id_or_name: &str, budget: usize) -> ContextPa
         sections.push(Section::new("ATTRIBUTES", attrs, 6));
     }
 
-    finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    if full {
+        finish_soft(&mut pack, sections, budget, ctx_warnings(ctx));
+    } else {
+        finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    }
     pack
 }
 
@@ -1503,6 +1578,7 @@ pub fn impact(
     symbols: &[String],
     diff_base: Option<&str>,
     budget: usize,
+    full: bool,
 ) -> ContextPack {
     let mut pack = ContextPack::new("impact", &ctx.revision());
     let mut files = files.to_vec();
@@ -1686,7 +1762,11 @@ pub fn impact(
     }
 
     pack.entity_ids = imp.components.clone();
-    finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    if full {
+        finish_soft(&mut pack, sections, budget, ctx_warnings(ctx));
+    } else {
+        finish(&mut pack, sections, budget, ctx_warnings(ctx));
+    }
     pack
 }
 
@@ -1695,7 +1775,7 @@ pub fn impact(
 // ---------------------------------------------------------------------------
 
 // trace:exempt reason=internal-detail
-pub fn verify(ctx: &ContextCompiler, budget: usize) -> ContextPack {
+pub fn verify(ctx: &ContextCompiler, budget: usize, full: bool) -> ContextPack {
     let mut pack = ContextPack::new("verify", &ctx.revision());
     let mut sections: Vec<Section> = Vec::new();
 
@@ -1913,7 +1993,11 @@ pub fn verify(ctx: &ContextCompiler, budget: usize) -> ContextPack {
     }
     sections.push(Section::new("VERDICT", verdict, 10));
 
-    finish(&mut pack, sections, budget, Vec::new());
+    if full {
+        finish_soft(&mut pack, sections, budget, Vec::new());
+    } else {
+        finish(&mut pack, sections, budget, Vec::new());
+    }
     pack
 }
 
@@ -2627,7 +2711,7 @@ mod tests {
             crate::ContextSettings::default(),
             Vec::new(),
         );
-        let pack = impact(&ctx, &["src/a.py".into()], &[], None, 50_000);
+        let pack = impact(&ctx, &["src/a.py".into()], &[], None, 50_000, false);
         assert!(
             pack.content.contains("FORGOTTEN PARTNERS"),
             "missing section: {}",
@@ -2745,7 +2829,7 @@ mod tests {
             Section::new("FLOWS", "flow\n".repeat(2000), 5),
             Section::new("INDEX STATUS", "ok\n".into(), 5),
         ];
-        let (content, outcome) = render(sections, 300, vec!["fresh".into()]);
+        let (content, outcome) = render(sections, 300, vec!["fresh".into()], true);
         assert!(
             scc_core::estimate_tokens(&content) <= 300,
             "hard cap violated: {}",
@@ -2761,7 +2845,7 @@ mod tests {
     fn render_single_priority_ten_section_fits() {
         // One huge priority-10 body: never dropped, line-truncated to fit.
         let sections = vec![Section::new("IDENTITY", "datum\n".repeat(5000), 10)];
-        let (content, outcome) = render(sections, 200, Vec::new());
+        let (content, outcome) = render(sections, 200, Vec::new(), true);
         assert!(
             scc_core::estimate_tokens(&content) <= 200,
             "hard cap violated: {}",

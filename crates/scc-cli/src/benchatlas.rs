@@ -895,7 +895,7 @@ pub fn score_repo(
     // atlas so agents read the strongest facts first under the token budget.
     let mut atlas = atlas::build_atlas(&comp.ctx());
     scc_context::rank::rank_startup_atlas(&mut atlas);
-    let pack = atlas::render_atlas(&comp.ctx(), &atlas, comp.ctx().settings.atlas_tokens);
+    let pack = atlas::render_atlas(&comp.ctx(), &atlas, comp.ctx().settings.atlas_tokens, false);
     let layers = build_layers(&comp.ctx(), &pack, &atlas);
     let text_norm = &layers.text;
 

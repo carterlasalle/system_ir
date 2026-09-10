@@ -158,13 +158,29 @@ pub fn cmd_overview(root: &Path, json: bool) -> crate::Result<()> {
 
 /// `scc atlas [--budget N] [--json]` — the full System Atlas.
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-atlas work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_atlas(root: &Path, budget: Option<usize>, json: bool, full: bool) -> crate::Result<()> {
+pub fn cmd_atlas(
+    root: &Path,
+    budget: Option<usize>,
+    json: bool,
+    full: bool,
+    unbounded: bool,
+) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
     let pack = if full {
-        comp.ctx().system_atlas_scoped(budget, scc_context::atlas::AtlasScope::Full)
+        comp.ctx().system_atlas_scoped(
+            budget,
+            scc_context::atlas::AtlasScope::Full,
+            unbounded,
+        )
+    } else if unbounded {
+        comp.ctx().system_atlas_scoped(
+            budget,
+            scc_context::atlas::AtlasScope::Production,
+            true,
+        )
     } else {
         comp.ctx().system_atlas(budget)
     };
@@ -963,12 +979,16 @@ pub fn cmd_context_subagent(
 }
 
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-component work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_context_component(root: &Path, id: &str, json: bool) -> crate::Result<()> {
+pub fn cmd_context_component(root: &Path, id: &str, json: bool, unbounded: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().component_context(id);
+    let pack = if unbounded {
+        comp.ctx().component_context_full(id)
+    } else {
+        comp.ctx().component_context(id)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&pack)?);
     } else {
@@ -978,12 +998,16 @@ pub fn cmd_context_component(root: &Path, id: &str, json: bool) -> crate::Result
 }
 
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-context-flow work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_context_flow(root: &Path, id: &str, json: bool) -> crate::Result<()> {
+pub fn cmd_context_flow(root: &Path, id: &str, json: bool, unbounded: bool) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().flow_context(id);
+    let pack = if unbounded {
+        comp.ctx().flow_context_full(id)
+    } else {
+        comp.ctx().flow_context(id)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&pack)?);
     } else {
@@ -999,12 +1023,17 @@ pub fn cmd_impact(
     symbols: &[String],
     diff: Option<&str>,
     json: bool,
+    unbounded: bool,
 ) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().impact_context(files, symbols, diff);
+    let pack = if unbounded {
+        comp.ctx().impact_context_full(files, symbols, diff)
+    } else {
+        comp.ctx().impact_context(files, symbols, diff)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&pack)?);
     } else {
@@ -1014,12 +1043,21 @@ pub fn cmd_impact(
 }
 
 // trace:v1 id=impl.crates-scc-cli-src-commands.cmd-verify work=WORK-wave-15-2-heterogeneous-hierarchy-edges-semantic-scoring-explain-rank-caching
-pub fn cmd_verify(root: &Path, warnings_only: bool, json: bool) -> crate::Result<()> {
+pub fn cmd_verify(
+    root: &Path,
+    warnings_only: bool,
+    json: bool,
+    unbounded: bool,
+) -> crate::Result<()> {
     let store = open_store(root)?;
     let config = load_config(root)?;
     let stale = crate::stale_paths(&store)?;
     let comp = compiler(&store, &config, stale)?;
-    let pack = comp.ctx().verify_context();
+    let pack = if unbounded {
+        comp.ctx().verify_context_full()
+    } else {
+        comp.ctx().verify_context()
+    };
     if warnings_only {
         for w in &pack.warnings {
             println!("⚠ {w}");

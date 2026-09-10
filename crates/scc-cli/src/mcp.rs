@@ -307,7 +307,7 @@ fn call_tool(root: &Path, name: &str, args: &serde_json::Value) -> crate::Result
             let budget = args.get("token_budget").and_then(|b| b.as_u64()).map(|b| b as usize);
             let full = args.get("scope").and_then(|s| s.as_str()).map(|s| s == "full").unwrap_or(false);
             if full {
-                Ok(comp.ctx().system_atlas_scoped(budget, scc_context::atlas::AtlasScope::Full).content)
+                Ok(comp.ctx().system_atlas_scoped(budget, scc_context::atlas::AtlasScope::Full, false).content)
             } else {
                 Ok(comp.ctx().system_atlas(budget).content)
             }

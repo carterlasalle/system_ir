@@ -291,7 +291,7 @@ impl<'a> ContextCompiler<'a> {
     /// line-truncated sections are recorded, never silent.
     // trace:exempt reason=internal-detail
     pub fn system_atlas(&self, budget: Option<usize>) -> ContextPack {
-        self.system_atlas_scoped(budget, atlas::AtlasScope::Production)
+        self.system_atlas_scoped(budget, atlas::AtlasScope::Production, false)
     }
 
     /// [`system_atlas`] with an explicit scope. The scope is part of the
@@ -301,6 +301,7 @@ impl<'a> ContextCompiler<'a> {
         &self,
         budget: Option<usize>,
         scope: atlas::AtlasScope,
+        full: bool,
     ) -> ContextPack {
         let budget = budget.unwrap_or(self.settings.atlas_tokens);
         let epoch = self.store.cache_epoch().unwrap_or_else(|_| "no-epoch".into());
@@ -309,6 +310,7 @@ impl<'a> ContextCompiler<'a> {
             h.update(b"atlas");
             h.update(budget.to_string().as_bytes());
             h.update(format!("{scope:?}").as_bytes());
+            h.update(if full { b"full" } else { b"hard" });
             h.update(self.settings.rank_salt.as_bytes());
             h.update(epoch.as_bytes());
             let mut stale: Vec<&String> = self.stale_paths.iter().collect();
@@ -325,7 +327,7 @@ impl<'a> ContextCompiler<'a> {
             }
         }
         let atlas = atlas::build_atlas_scoped(self, scope);
-        let pack = atlas::render_atlas(self, &atlas, budget);
+        let pack = atlas::render_atlas(self, &atlas, budget, full);
         if let Ok(json) = serde_json::to_string(&pack) {
             let _ = self.store.cache_put(&key, &json, &epoch);
         }
@@ -398,13 +400,23 @@ impl<'a> ContextCompiler<'a> {
     }
 
     // trace:exempt reason=internal-detail
+    pub fn component_context_full(&self, id: &str) -> ContextPack {
+        packs::component(self, id, self.settings.detail_tokens, true)
+    }
+
+// trace:exempt reason=internal-detail
     pub fn component_context(&self, id: &str) -> ContextPack {
-        packs::component(self, id, self.settings.detail_tokens)
+        packs::component(self, id, self.settings.detail_tokens, false)
     }
 
     // trace:exempt reason=internal-detail
+    pub fn flow_context_full(&self, id: &str) -> ContextPack {
+        packs::flow(self, id, self.settings.detail_tokens, true)
+    }
+
+// trace:exempt reason=internal-detail
     pub fn flow_context(&self, id: &str) -> ContextPack {
-        packs::flow(self, id, self.settings.detail_tokens)
+        packs::flow(self, id, self.settings.detail_tokens, false)
     }
 
     // trace:exempt reason=internal-detail
@@ -414,11 +426,26 @@ impl<'a> ContextCompiler<'a> {
         symbols: &[String],
         diff_base: Option<&str>,
     ) -> ContextPack {
-        packs::impact(self, files, symbols, diff_base, self.settings.detail_tokens)
+        packs::impact(self, files, symbols, diff_base, self.settings.detail_tokens, false)
+    }
+
+// trace:exempt reason=internal-detail
+    pub fn impact_context_full(
+        &self,
+        files: &[String],
+        symbols: &[String],
+        diff_base: Option<&str>,
+    ) -> ContextPack {
+        packs::impact(self, files, symbols, diff_base, self.settings.detail_tokens, true)
     }
 
     // trace:exempt reason=internal-detail
+    pub fn verify_context_full(&self) -> ContextPack {
+        packs::verify(self, self.settings.detail_tokens, true)
+    }
+
+// trace:exempt reason=internal-detail
     pub fn verify_context(&self) -> ContextPack {
-        packs::verify(self, self.settings.detail_tokens)
+        packs::verify(self, self.settings.detail_tokens, false)
     }
 }

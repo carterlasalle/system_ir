@@ -88,7 +88,10 @@ enum Commands {
         #[arg(long)]
         symbols: Vec<String>,
         #[arg(long)]
-        json: bool,
+        json: bool,        /// Human mode: skip hard token caps (soft legacy render, excess
+        /// reported not enforced). Agents must never use this.
+        #[arg(long)]
+        unbounded: bool,
     },
 
     /// Full System Atlas: complete architecture for agent session startup
@@ -101,7 +104,10 @@ enum Commands {
         /// Full scope: include test/fixture/benchmark evidence in the
         /// architecture sections (default is the production scope)
         #[arg(long)]
-        full: bool,
+        full: bool,        /// Human mode: skip hard token caps (soft legacy render, excess
+        /// reported not enforced). Agents must never use this.
+        #[arg(long)]
+        unbounded: bool,
         /// Resolve unresolved call edges through the language backends first
         #[arg(long)]
         resolve: bool,
@@ -113,7 +119,10 @@ enum Commands {
         #[arg(long)]
         warnings: bool,
         #[arg(long)]
-        json: bool,
+        json: bool,        /// Human mode: skip hard token caps (soft legacy render, excess
+        /// reported not enforced). Agents must never use this.
+        #[arg(long)]
+        unbounded: bool,
     },
 
     /// Show architectural drift findings
@@ -538,13 +547,19 @@ enum ContextSub {
     Component {
         id: String,
         #[arg(long)]
-        json: bool,
+        json: bool,        /// Human mode: skip hard token caps (soft legacy render, excess
+        /// reported not enforced). Agents must never use this.
+        #[arg(long)]
+        unbounded: bool,
     },
     /// Flow context pack
     Flow {
         id: String,
         #[arg(long)]
-        json: bool,
+        json: bool,        /// Human mode: skip hard token caps (soft legacy render, excess
+        /// reported not enforced). Agents must never use this.
+        #[arg(long)]
+        unbounded: bool,
     },
     /// Compress a task pack (structural; optional external summarizer)
     Compress {
@@ -709,8 +724,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 commands::cmd_context_task(&root, &goal, &files, &symbols, budget, json, hook)
             }
-            ContextSub::Component { id, json } => commands::cmd_context_component(&root, &id, json),
-            ContextSub::Flow { id, json } => commands::cmd_context_flow(&root, &id, json),
+            ContextSub::Component { id, json, unbounded } => commands::cmd_context_component(&root, &id, json, unbounded),
+            ContextSub::Flow { id, json, unbounded } => commands::cmd_context_flow(&root, &id, json, unbounded),
             ContextSub::Docs { dependency } => commands::cmd_context_docs(&root, &dependency),
             ContextSub::Subagent { goal, files, symbols, budget, json } => {
                 commands::cmd_context_subagent(&root, &goal, &files, &symbols, budget, json)
@@ -732,13 +747,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        Commands::Impact { diff, files, symbols, json } => {
-            commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json)
+        Commands::Impact { diff, files, symbols, json, unbounded } => {
+            commands::cmd_impact(&root, &files, &symbols, diff.as_deref(), json, unbounded)
         }
         Commands::Surface { task, budget, explain } => {
             commands::cmd_surface(&root, task.as_deref(), budget, explain)
         }
-        Commands::Atlas { budget, json, full, resolve } => {
+        Commands::Atlas { budget, json, full, unbounded, resolve } => {
             if resolve {
                 let rep = scc_cli::resolve_and_recompile(&root)?;
                 eprintln!(
@@ -746,9 +761,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rep.upgraded, rep.unresolved, rep.errors
                 );
             }
-            commands::cmd_atlas(&root, budget, json, full)
+            commands::cmd_atlas(&root, budget, json, full, unbounded)
         }
-        Commands::Verify { warnings, json } => commands::cmd_verify(&root, warnings, json),
+        Commands::Verify { warnings, json, unbounded } => commands::cmd_verify(&root, warnings, json, unbounded),
         Commands::Drift { json } => commands::cmd_drift(&root, json),
         Commands::System { member, json } => commands::cmd_system(&root, &member, json),
         Commands::Export { format } => commands::cmd_export(&root, &format),
