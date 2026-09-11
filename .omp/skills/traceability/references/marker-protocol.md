@@ -96,25 +96,37 @@ surfaces them. This is intended behavior, not an exclusion bug.
 
 | Type | Category | Description |
 |---|---|---|
+| `anti_pattern` | knowledge | A known approach to avoid. |
 | `ci_run` | provenance | A CI run. |
 | `commit` | provenance | A Git commit. |
 | `config` | realization | Configuration with contractual significance. |
+| `constraint` | knowledge | A durable limitation affecting implementation. |
+| `convention` | knowledge | A repository-specific preferred practice. |
 | `data` | realization | Data schema or dataset artifact. |
 | `decision` | decision/planning | An architecture decision record (ADR) or equivalent decision. |
 | `document` | verification/documentation | Human-facing documentation artifact. |
 | `evidence` | verification/documentation | Immutable runtime/CI evidence record. |
 | `external` | provenance | An external system record (Jira, Linear, Notion, ...). |
+| `fact` | knowledge | A canonical fact with one authoritative source. |
+| `finding` | knowledge | A discovered fact about the current system. |
 | `goal` | intent | Top-level business or product goal. |
 | `implementation` | realization | Source code realizing a requirement/decision. |
+| `learning` | knowledge | A reusable lesson from implementation or debugging. |
 | `nfr` | intent | A non-functional requirement. |
 | `operation` | realization | Deployment, runbook-adjacent operational behavior. |
 | `plan` | decision/planning | A plan or plan step; first-class ID (PLAN-X/P3). |
+| `plan_step` | decision/planning | A single step within a plan. |
 | `prd` | intent | Product requirements document. |
 | `prompt` | realization | Prompt or configuration encoding a product invariant. |
 | `pull_request` | provenance | A pull/merge request. |
+| `question` | decision/planning | A material open question blocking work. |
 | `requirement` | intent | A formal, stable, testable requirement. |
+| `rfc` | decision/planning | A request-for-comments design proposal. |
 | `runbook` | verification/documentation | Operational runbook procedure. |
+| `spec` | intent | A specification document. |
+| `task` | decision/planning | A durable engineering task with lifecycle state. |
 | `test` | verification/documentation | A verification test. |
+| `value` | knowledge | A canonical value with tracked dependents. |
 | `work` | decision/planning | A work item (issue, ticket, task) that produced artifacts. |
 
 ## Derived facts are never declared

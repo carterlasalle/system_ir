@@ -126,7 +126,9 @@ def test_reused_refresh_token_is_rejected():
 1. User: "Change refresh token reuse behavior to improve replay protection."
 2. Prompt hook surfaces `REQ-AUTH-017`, `ADR-0042`, `impl.auth.refresh`.
 3. Agent edits `rotate_refresh_token` without loading context → pre-edit hook
-   blocks once: `TRACE CONTEXT REQUIRED — Run: trace context impl.auth.refresh`.
+   coaches (default remind mode: `TRACE CONTEXT — Run: trace context
+   impl.auth.refresh`, write allowed, obligation recorded for Stop; in
+   `block` mode it denies once until context is loaded).
 4. Agent runs `trace context impl.auth.refresh`, reviews, retries — allowed.
 5. Post-edit hook: `impl.auth.refresh semantic hash changed.
    test.auth.refresh-reuse verification is now dirty.`

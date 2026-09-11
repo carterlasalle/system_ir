@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# trace:exempt reason=shell-adapter
 # TraceLayer hook adapter for Pi (earendil-works/pi).
 # Usage: trace-hook.sh <event> [pi]
 # Reads the Pi hook JSON payload from stdin, runs the deterministic trace
@@ -37,7 +38,11 @@ print(json.dumps(d))
 PY
 )"
 
-OUT="$(printf '%s' "$PAYLOAD" | uv run trace hook "$EVENT" --format json 2>/dev/null)"
+if command -v trace >/dev/null 2>&1; then
+  OUT="$(printf '%s' "$PAYLOAD" | trace hook "$EVENT" --format json 2>/dev/null)"
+else
+  OUT="$(printf '%s' "$PAYLOAD" | uv run trace hook "$EVENT" --format json 2>/dev/null)"
+fi
 RC=$?
 
 if [ "$RC" -eq 1 ]; then
