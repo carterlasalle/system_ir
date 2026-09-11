@@ -1,5 +1,5 @@
 {
-  "name": "@scc/sdk",
+  "name": "scc-sdk",
   "version": "0.1.0",
   "description": "Thin TypeScript SDK for the scc (System Context Compiler) CLI",
   "main": "dist/index.js",
@@ -12,7 +12,12 @@
     "url": "https://github.com/carterlasalle/system_ir.git",
     "directory": "sdk/typescript"
   },
-  "keywords": ["scc", "system-context", "coding-agents", "mcp"],
+  "keywords": [
+    "scc",
+    "system-context",
+    "coding-agents",
+    "mcp"
+  ],
   "publishConfig": {
     "access": "public",
     "provenance": true
