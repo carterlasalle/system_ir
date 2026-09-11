@@ -99,21 +99,31 @@ pub fn mmr_diversify(
     let lambda = lambda.clamp(0.0, 1.0);
     let mut selected: Vec<usize> = Vec::with_capacity(budget);
     let mut picked = vec![false; n];
+    // Incremental max-similarity (profiler receipt 2026-09-11: the naive
+    // re-scan over all selected per candidate was ~98% of the surface
+    // render). max() is commutative, so carrying each candidate's running
+    // max forward and comparing only against the newly selected item
+    // yields bit-identical values — and therefore identical picks — in
+    // O(budget*n) similarity calls instead of O(budget*n*selected).
+    let mut max_sim = vec![0.0_f64; n];
     while selected.len() < budget {
+        if let Some(&last) = selected.last() {
+            for i in 0..n {
+                if picked[i] {
+                    continue;
+                }
+                let s = similarity(&ranked[i].0, &ranked[last].0);
+                if s > max_sim[i] {
+                    max_sim[i] = s;
+                }
+            }
+        }
         let mut best: Option<(usize, f64)> = None;
         for i in 0..n {
             if picked[i] {
                 continue;
             }
-            let (id, score) = &ranked[i];
-            let mut sim = 0.0_f64;
-            for &j in &selected {
-                let s = similarity(id, &ranked[j].0);
-                if s > sim {
-                    sim = s;
-                }
-            }
-            let v = lambda * score - (1.0 - lambda) * sim;
+            let v = lambda * ranked[i].1 - (1.0 - lambda) * max_sim[i];
             if best.is_none_or(|(_, bv)| v > bv) {
                 best = Some((i, v));
             }
