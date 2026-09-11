@@ -57,6 +57,7 @@ pub fn scan_config_refs(content: &str, language: &str) -> Vec<ConfigRefHit> {
 /// file when no symbol is known) to the configuration entity, backed by a
 /// `config` evidence row. Idempotent: the same hit always maps to the same
 /// relationship and evidence ids. Returns the number of hits applied.
+// trace:v1 id=impl.crates-scc-indexer-src-configrefs.apply-config-refs work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
 pub fn apply_config_refs(
     store: &Store,
     file: &str,
@@ -80,6 +81,17 @@ pub fn apply_config_refs(
 
     let revision = store.meta_get("revision").ok().flatten();
 
+    // Recorded symbol names for this file (symbols are written before
+    // config refs run). Used to keep edge subjects attached to real
+    // entities: the lexical scan below returns bare method names
+    // (`__init__`) while the extractor records `Class.__init__`.
+    let recorded: std::collections::HashSet<String> = store
+        .symbols_in_file(file)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|r| r.1)
+        .collect();
+
     let mut applied = 0usize;
     for hit in hits {
         let key = hit.key.trim().to_string();
@@ -95,14 +107,25 @@ pub fn apply_config_refs(
             known_configs.insert(config_id.clone());
         }
 
-        // Subject: the enclosing symbol when the hit has one (either filled
-        // by the caller or recovered from the content), else the file.
+        // Subject: the enclosing symbol when the hit names a recorded
+        // one (either filled by the caller or recovered from the content),
+        // else the file. A bare method name resolves to its qualified form
+        // when unambiguous; anything unrecorded falls back to the file
+        // rather than emitting an edge to a non-entity (dangling subject).
         let caller = hit
             .caller_symbol
             .clone()
             .or_else(|| enclosing_symbol(content, language, hit.line));
         let subject = match &caller {
-            Some(c) => symbol_id(repo, file, c),
+            Some(c) if recorded.contains(c) => symbol_id(repo, file, c),
+            Some(c) => {
+                let suffix = format!(".{c}");
+                let mut hits = recorded.iter().filter(|n| n.ends_with(suffix.as_str()));
+                match (hits.next(), hits.next()) {
+                    (Some(full), None) => symbol_id(repo, file, full),
+                    _ => file_id.clone(),
+                }
+            }
             None => file_id.clone(),
         };
 
@@ -506,5 +529,57 @@ def helper():
             .filter(|r| r.predicate == scc_core::predicates::CONFIGURED_BY)
             .count();
         assert_eq!(rels, 2, "one configured_by per referencing file");
+    }
+
+    #[test]
+    // trace:v1 id=test.crates-scc-indexer-src-configrefs.bare-dunder-resolves-to-qualified-method work=WORK-SI-MMMJA4G6 verifies=REQ-SI-503JSBGP
+    fn bare_dunder_resolves_to_qualified_method() {
+        let (store, _t) = store_for();
+        let file = "src/api.py";
+        let content =
+            "import os\nclass Api:\n    def __init__(self):\n        self.x = os.getenv(\"K\")\n";
+        // the indexer records the qualified method name
+        let sym_id = scc_core::symbol_id(&store.repo_id, file, "Api.__init__");
+        store
+            .insert_entity(
+                &scc_core::Entity::new(sym_id.clone(), kinds::SYMBOL, "Api.__init__"),
+                &[file.to_string()],
+            )
+            .unwrap();
+        store
+            .insert_symbol(file, "Api.__init__", "method", None, 3, 4, false, None)
+            .unwrap();
+        let hits = scan_config_refs(content, "python");
+        apply_config_refs(&store, file, "python", content, hits).unwrap();
+        let rel = store
+            .all_relationships()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.predicate == scc_core::predicates::CONFIGURED_BY)
+            .expect("configured_by rel");
+        assert_eq!(rel.subject, sym_id, "bare __init__ attaches to Api.__init__");
+    }
+
+    #[test]
+    // trace:v1 id=test.crates-scc-indexer-src-configrefs.unrecorded-caller-falls-back-to-file work=WORK-SI-MMMJA4G6 verifies=REQ-SI-503JSBGP
+    fn unrecorded_caller_falls_back_to_file() {
+        let (store, _t) = store_for();
+        let file = "src/api.py";
+        let content =
+            "import os\nclass Api:\n    def __init__(self):\n        self.x = os.getenv(\"K\")\n";
+        // no symbols recorded: the lexical __init__ must not become an edge
+        // to a non-entity
+        let hits = scan_config_refs(content, "python");
+        apply_config_refs(&store, file, "python", content, hits).unwrap();
+        let rel = store
+            .all_relationships()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.predicate == scc_core::predicates::CONFIGURED_BY)
+            .expect("configured_by rel");
+        assert_eq!(
+            rel.subject,
+            scc_core::entity_id(&store.repo_id, kinds::FILE, file)
+        );
     }
 }

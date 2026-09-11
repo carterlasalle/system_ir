@@ -1,8 +1,11 @@
 //! Wave 9 first-class contracts + invocation surfaces + explicit
 //! uncertainty/coverage map (integration): indexing python-facts-service
 //! must render typed CONTRACTS lines (`http:`/`cli:`/`config:`), surface
-//! public_api + framework_callback entrypoints, and a MODEL COVERAGE
-//! section that states what the model knows AND what it does not.
+//! public_api entrypoints, and a MODEL COVERAGE section that states what
+//! the model knows AND what it does not. (No framework_callback surfaces
+//! here: the fixture's callbacks are lifecycle names, not callable
+//! symbols; the derivation itself is pinned by
+//! flows::invocation_surfaces_seed_from_semantic_facts.)
 
 mod common;
 
@@ -34,9 +37,14 @@ fn atlas_renders_typed_contracts_surfaces_and_coverage() {
     // ---- ENTRYPOINTS: invocation-surface seeds are additive ----
     assert!(atlas.contains("create_app [public_api]"), "export surface: {atlas}");
     assert!(atlas.contains("ping [public_api]"), "export surface: {atlas}");
+    // No framework_callback entrypoints on this fixture by design: its
+    // callbacks are lifecycle names (`@app.on_event("startup")`), not
+    // callable symbols, and symbol-typed edges to them are no longer
+    // fabricated (they used to dangle). The lifecycle wiring still shows
+    // as annotations on the owners.
     assert!(
-        atlas.contains("[framework_callback]"),
-        "callback surface: {atlas}"
+        !atlas.contains("[framework_callback]"),
+        "no fabricated callback surface: {atlas}"
     );
     // routes still render as routes
     assert!(atlas.contains("GET /ping [route]"), "route entrypoint: {atlas}");

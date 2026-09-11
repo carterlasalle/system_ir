@@ -29,7 +29,12 @@ fn python_facts_appear_in_system_ir() {
     assert!(count_pred("exports") >= 3, "exports rels: {}", count_pred("exports"));
     assert!(count_pred("annotates") >= 3, "annotates rels: {}", count_pred("annotates"));
     assert!(count_pred("registers") >= 2, "registers rels: {}", count_pred("registers"));
-    assert!(count_pred("handles_callback") >= 2, "handles_callback rels: {}", count_pred("handles_callback"));
+    // No handles_callback edges here by design: this fixture's callbacks are
+    // lifecycle names (`@app.on_event("startup")`), not callable symbols, so
+    // emitting symbol-typed edges to them fabricated dangling objects. The
+    // wiring survives as `annotates` (app.on_event -> startup_event); genuine
+    // symbol-to-symbol callbacks are covered by facts_go.
+    assert_eq!(count_pred("handles_callback"), 0, "handles_callback rels: {}", count_pred("handles_callback"));
     assert!(count_pred("configured_by") >= 1, "configured_by rels: {}", count_pred("configured_by"));
 }
 

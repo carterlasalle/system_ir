@@ -512,22 +512,20 @@ impl<'a> Writer<'a> {
                     }
                 }
                 crate::model::SemanticFact::Callback { owner, callback } => {
-                    if let Some((_, owner_id)) =
-                        written.symbol_ids.iter().find(|(n, _)| n == owner)
-                    {
-                        let cb_id = written
-                            .symbol_ids
-                            .iter()
-                            .find(|(n, _)| n == callback)
-                            .map(|(_, id)| id.clone())
-                            .unwrap_or_else(|| {
-                                entity_id(self.repo_id, scc_core::kinds::SYMBOL, callback)
-                            });
+                    // Both ends must be recorded symbols (mirrors the
+                    // Configuration arm below): a callback naming a string
+                    // literal (route path, lifecycle name) is not a symbol,
+                    // and fabricating an entity id for it emits a dangling
+                    // object. Skip rather than invent.
+                    if let (Some((_, owner_id)), Some((_, cb_id))) = (
+                        written.symbol_ids.iter().find(|(n, _)| n == owner),
+                        written.symbol_ids.iter().find(|(n, _)| n == callback),
+                    ) {
                         let rel = Relationship::new(
-                            rel_id(&["handles_callback", owner_id, &cb_id]),
+                            rel_id(&["handles_callback", owner_id, cb_id]),
                             owner_id.clone(),
                             scc_core::predicates::HANDLES_CALLBACK,
-                            cb_id,
+                            cb_id.clone(),
                             Provenance::Extracted,
                         );
                         self.store.insert_relationship(&rel, path)?;
@@ -667,22 +665,18 @@ impl<'a> Writer<'a> {
                     }
                 }
                 crate::model::SemanticFact::SchemaValidation {  owner, target, .. } => {
-                    if let Some((_, owner_id)) =
-                        written.symbol_ids.iter().find(|(n, _)| n == owner)
-                    {
-                        let tgt_id = written
-                            .symbol_ids
-                            .iter()
-                            .find(|(n, _)| n == target)
-                            .map(|(_, id)| id.clone())
-                            .unwrap_or_else(|| {
-                                entity_id(self.repo_id, scc_core::kinds::SYMBOL, target)
-                            });
+                    // Both ends must be recorded symbols (see the Callback
+                    // arm): a validation target naming a field or literal
+                    // rather than a symbol must not fabricate an entity.
+                    if let (Some((_, owner_id)), Some((_, tgt_id))) = (
+                        written.symbol_ids.iter().find(|(n, _)| n == owner),
+                        written.symbol_ids.iter().find(|(n, _)| n == target),
+                    ) {
                         let rel = Relationship::new(
-                            rel_id(&["validates_schema", owner_id, &tgt_id]),
+                            rel_id(&["validates_schema", owner_id, tgt_id]),
                             owner_id.clone(),
                             scc_core::predicates::VALIDATES,
-                            tgt_id,
+                            tgt_id.clone(),
                             Provenance::Extracted,
                         );
                         self.store.insert_relationship(&rel, path)?;
