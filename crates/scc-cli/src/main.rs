@@ -34,7 +34,7 @@ enum Commands {
     /// Index the repository (cold on first run, incremental afterwards)
     Index {
         /// Only refresh these paths (watch/post-edit)
-        #[arg(long, value_delimiter = ' ')]
+        #[arg(long, num_args = 1.., value_delimiter = ' ')]
         paths: Vec<String>,
         #[arg(long)]
         quiet: bool,
