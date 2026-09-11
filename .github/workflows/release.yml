@@ -18,7 +18,16 @@ permissions:
 # One-time setup (run once, then tags publish hands-free):
 # - PyPI: add a pending publisher for project `scc-sdk` on this repo + tag.
 # - npm: create an automation `NPM_TOKEN` (classic) and store it as a repo
-#   secret; or link an npm trusted publisher for `@scc/sdk` instead.
+#   secret. NOTE: the `scc` npm org is taken, so the TS SDK publishes
+#   unscoped as `scc-sdk` (same name as PyPI).
+#
+# Registries are immutable: PyPI and npm both reject re-uploading an
+# already-published version (PyPI 400 "File already exists", npm E409/E404
+# semantics). Every publish needs a fresh version — bump ALL of these
+# together before tagging:
+#   Cargo.toml (workspace.package.version), sdk/python/pyproject.toml,
+#   sdk/typescript/package.json, plugins/omp/scc/package.json,
+#   plugins/hermes/scc/plugin.yaml
 
 env:
   VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
