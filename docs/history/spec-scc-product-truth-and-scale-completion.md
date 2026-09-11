@@ -1,6 +1,6 @@
 # SCC product truth and scale completion
 
-<!-- trace:v1 id=SPEC-SI-B7YTHVY7 type=spec work=WORK-SI-MMMJA4G6 -->
+<!-- trace:v1 id=SPEC-SI-B7YTHVY7 type=document work=WORK-SI-MMMJA4G6 -->
 
 ## Problem
 
