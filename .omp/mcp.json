@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "scc": {
+      "args": [
+        "mcp"
+      ],
+      "command": "/Users/rocket/.cargo/bin/scc"
+    }
+  }
+}

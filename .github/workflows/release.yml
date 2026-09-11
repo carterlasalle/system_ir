@@ -1,0 +1,97 @@
+# trace:exempt reason=infra-config  # CI workflow declaration, not repo behavior; the jobs' behavior is traced at the source modules they run
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.1.0, without leading v)"
+        required: true
+
+# contents:write creates the GitHub Release; id-token:write mints Sigstore
+# provenance for npm (--provenance) and PyPI trusted publishing (no tokens).
+permissions:
+  contents: write
+  id-token: write
+
+# One-time setup (run once, then tags publish hands-free):
+# - PyPI: add a pending publisher for project `scc-sdk` on this repo + tag.
+# - npm: create an automation `NPM_TOKEN` (classic) and store it as a repo
+#   secret; or link an npm trusted publisher for `@scc/sdk` instead.
+
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
+
+jobs:
+  dist:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p scc-cli
+      - name: Package binary + SBOM
+        run: |
+          TAG="${VERSION#v}"
+          ARCH="$(uname -m)"
+          OUT="scc-${TAG}-$(uname -s)-${ARCH}"
+          mkdir -p dist
+          cp target/release/scc "dist/${OUT}"
+          cargo tree --edges normal --format '{p}' > "dist/sbom-${TAG}.txt"
+          (cd dist && shasum -a 256 "${OUT}" "sbom-${TAG}.txt" > "sha256-${TAG}-$(uname -s)-${ARCH}.txt")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+
+  release:
+    needs: [dist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Create GitHub Release
+        run: |
+          gh release create "${VERSION}" dist/* \
+            --title "${VERSION}" \
+            --notes "SCC ${VERSION}: CLI binaries (Linux/macOS), SBOM, checksums. Python SDK → PyPI (scc-sdk), TypeScript SDK → npm (@scc/sdk). Plugins ship embedded in the binary (\`scc setup omp|hermes\`)."
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build sdist + wheel
+        run: cd sdk/python && uv build
+      - name: Publish to PyPI (trusted publishing, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Build + publish @scc/sdk
+        run: |
+          cd sdk/typescript
+          npm install --no-audit --no-fund
+          npm run build
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

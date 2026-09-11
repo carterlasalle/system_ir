@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    // trace:v1 id=impl.crates-scc-core-src-identity.parses-scp-syntax-and work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
+    // trace:v1 id=impl.crates-scc-core-src-identity.parses-scp-syntax-and-strips-ports work=WORK-SI-MMMJA4G6 satisfies=REQ-SI-503JSBGP
     fn parses_scp_syntax_and_strips_ports() {
         assert_eq!(
             sanitize_remote_url("git@github.com:acme/billing.git").unwrap(),

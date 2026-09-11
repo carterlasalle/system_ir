@@ -2,5 +2,12 @@ Metadata-Version: 2.4
 Name: scc-sdk
 Version: 0.1.0
 Summary: Thin Python SDK for the scc (System Context Compiler) CLI
-License: MIT
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/carterlasalle/system_ir
+Project-URL: Repository, https://github.com/carterlasalle/system_ir
+Keywords: scc,system-context,coding-agents,mcp
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Software Development :: Libraries
 Requires-Python: >=3.9

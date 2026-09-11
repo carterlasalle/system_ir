@@ -1,0 +1,12 @@
+{
+  "name": "scc",
+  "version": "0.1.0",
+  "description": "System Context Compiler (SCC): injects evidence-backed system context into OMP sessions — startup architecture once per session, task context per prompt, post-edit incremental index, and compaction checkpoint/rehydration.",
+  "license": "Apache-2.0",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

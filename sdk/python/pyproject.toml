@@ -7,7 +7,19 @@ name = "scc-sdk"
 version = "0.1.0"
 description = "Thin Python SDK for the scc (System Context Compiler) CLI"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+keywords = ["scc", "system-context", "coding-agents", "mcp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/carterlasalle/system_ir"
+Repository = "https://github.com/carterlasalle/system_ir"
 
 [tool.setuptools]
 py-modules = ["scc_sdk"]

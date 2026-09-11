@@ -7,6 +7,16 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/carterlasalle/system_ir.git",
+    "directory": "sdk/typescript"
+  },
+  "keywords": ["scc", "system-context", "coding-agents", "mcp"],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc",
     "test": "node --test dist/test/*.test.js"
