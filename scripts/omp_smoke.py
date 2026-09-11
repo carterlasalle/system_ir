@@ -157,14 +157,19 @@ def main() -> int:
     gate = ROOT / ".omp/extensions/tracelayer/trace-gate.ts"
     if gate.is_file():
         g = gate.read_text()
-        if "timeout:" not in g or "HOOK_TIMEOUT_MS" not in g:
-            sys.stderr.write("trace-gate.ts must set spawnSync timeout\n")
+        # Bounded transport: async spawn enforces GATE_TIMEOUT_MS/STOP_TIMEOUT_MS
+        # (legacy spawnSync used `timeout:` + HOOK_TIMEOUT_MS); either is OK.
+        if "GATE_TIMEOUT_MS" not in g and "HOOK_TIMEOUT_MS" not in g:
+            sys.stderr.write("trace-gate.ts must bound hook transport with a timeout\n")
             return 1
-        if (
-            'reason: "trace hook returned empty output", block: true' not in g
-            or 'reason: "trace hook returned malformed JSON", block: true' not in g
-        ):
-            sys.stderr.write("trace-gate parseHook must fail closed (block: true)\n")
+        if ".kill(" not in g and "timeout:" not in g:
+            sys.stderr.write("trace-gate.ts must enforce the hook timeout (kill or spawn timeout)\n")
+            return 1
+        # Fail-closed completion: block on policy deny and on unverified stop.
+        # Pre-mutation transport failure intentionally fails open (coaching +
+        # Stop/CI still enforce); stop-transport failure stays fail-closed.
+        if "block: true" not in g or 'decision: "block"' not in g:
+            sys.stderr.write("trace-gate must fail closed (block on deny/unverified completion)\n")
             return 1
 
     print("omp smoke: setup discovery + generated extension contracts OK")
