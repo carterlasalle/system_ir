@@ -78,6 +78,8 @@ jobs:
         run: cd sdk/python && uv build
       - name: Publish to PyPI (trusted publishing, no token)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist/
 
   npm:
     runs-on: ubuntu-latest
