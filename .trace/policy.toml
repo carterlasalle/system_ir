@@ -58,6 +58,7 @@ paths = [
   "docs/MISSION_FINAL_REPORT.md",
   "sdk/python/scc_sdk.egg-info/**",
   "sdk/python/uv.lock",
+  "sdk/typescript/package-lock.json",
   "sdk/python/pyproject.toml",
   "sdk/typescript/package.json",
   "crates/scc-cli/tests/adapters.rs",
