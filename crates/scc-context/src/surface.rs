@@ -17,7 +17,7 @@ use scc_core::{
     SemanticParameter, SemanticSignature, SourceRange, SurfaceEntry, SurfaceKind,
     SurfaceOmission, SurfaceRank, SystemSurfaceMap, TaskSeed, Visibility,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Symbol-kind strings the indexer emits (write.rs core_symbol_kind),
 /// plus "trait" for tolerance.
@@ -83,6 +83,27 @@ pub fn compile_surface_map(compiler: &ContextCompiler) -> SystemSurfaceMap {
             .push((s.kind.as_str().to_string(), s.trigger.clone()));
     }
 
+    // Hoisted per-map tables (profiler receipt 2026-09-11: `view.flows()`
+    // clones all flows per entry and the ROUTE scan re-walks all entities
+    // per entry — ~15% of the render on system_ir). Computed once here;
+    // entry output is byte-identical.
+    let all_flows: Vec<scc_core::Flow> = view.flows();
+    let mut routes_by_handler: HashMap<&str, Vec<(String, String)>> = HashMap::new();
+    for r in view.entities_of_kind(kinds::ROUTE) {
+        if let (Some(h), Some(m), Some(path)) = (
+            r.attributes.get("handler").and_then(|v| v.as_str()),
+            r.attributes.get("method").and_then(|v| v.as_str()),
+            r.attributes.get("path").and_then(|v| v.as_str()),
+        ) {
+            if !path.is_empty() {
+                routes_by_handler
+                    .entry(h)
+                    .or_default()
+                    .push((m.to_string(), path.to_string()));
+            }
+        }
+    }
+
     let mut entries: Vec<SurfaceEntry> = Vec::new();
     for e in view.entities_of_kind(kinds::SYMBOL) {
         let Some(kind_str) = e.attributes.get("kind").and_then(|v| v.as_str()) else {
@@ -99,6 +120,8 @@ pub fn compile_surface_map(compiler: &ContextCompiler) -> SystemSurfaceMap {
             &comp_names,
             &subsys_of_comp,
             &surface_by_symbol,
+            &all_flows,
+            &routes_by_handler,
         ));
     }
     entries.sort_by(|a, b| {
@@ -578,16 +601,36 @@ fn finish_selection(
         .max(1)
         .min(pool.len());
     let diversified: Vec<(String, f64)> = if stages.mmr && policy.mmr {
-        let sim = |a: &str, b: &str| -> f64 {
-            let (Some(ea), Some(eb)) = (entry_of.get(a), entry_of.get(b)) else {
-                return 0.0;
+        // Integer group keys (profiler receipt 2026-09-11: the similarity
+        // closure's per-call BTree lookups + String compares over ~1e8
+        // pairs were ~24% of the render). Same 1.0/0.0 semantics.
+        let mut comp_ids: HashMap<&str, u32> = HashMap::new();
+        let mut path_ids: HashMap<&str, u32> = HashMap::new();
+        let mut group_of: HashMap<&str, (u32, u32)> = HashMap::new();
+        for (id, e) in &entry_of {
+            let c = match &e.component {
+                Some(c) => {
+                    let n = comp_ids.len() as u32;
+                    *comp_ids.entry(c.as_str()).or_insert(n + 1)
+                }
+                None => 0,
             };
-            let same_comp = ea.component.is_some() && ea.component == eb.component;
-            let same_path = !ea.path.is_empty() && ea.path == eb.path;
-            if same_comp || same_path {
-                1.0
+            let g = if e.path.is_empty() {
+                0
             } else {
-                0.0
+                let n = path_ids.len() as u32;
+                *path_ids.entry(e.path.as_str()).or_insert(n + 1)
+            };
+            group_of.insert(id.as_str(), (c, g));
+        }
+        let sim = |a: &str, b: &str| -> f64 {
+            match (group_of.get(a), group_of.get(b)) {
+                (Some((ca, pa)), Some((cb, pb)))
+                    if (*ca != 0 && *ca == *cb) || (*pa != 0 && *pa == *pb) =>
+                {
+                    1.0
+                }
+                _ => 0.0,
             }
         };
         let pool_by_id: BTreeMap<String, f64> = pool.iter().cloned().collect();
@@ -1180,6 +1223,8 @@ fn build_entry(
     comp_names: &BTreeMap<String, String>,
     subsys_of_comp: &BTreeMap<String, String>,
     surface_by_symbol: &BTreeMap<String, Vec<(String, String)>>,
+    all_flows: &[scc_core::Flow],
+    routes_by_handler: &HashMap<&str, Vec<(String, String)>>,
 ) -> SurfaceEntry {
     let view = &compiler.view;
     let name = e.name.clone();
@@ -1272,9 +1317,9 @@ fn build_entry(
     annotations.sort();
     annotations.dedup();
 
-    // flows
+    // flows (precomputed per map — see compile_surface_map)
     let mut flows: BTreeSet<String> = BTreeSet::new();
-    for f in view.flows() {
+    for f in all_flows {
         if f.steps
             .iter()
             .any(|s| step_matches(s, &e.id, &name, &qualified, &file))
@@ -1285,14 +1330,10 @@ fn build_entry(
 
     // contracts
     let mut contracts: BTreeSet<String> = BTreeSet::new();
-    // http: ROUTE handler == this symbol
-    for r in view.entities_of_kind(kinds::ROUTE) {
-        if r.attributes.get("handler").and_then(|v| v.as_str()) == Some(&e.id) {
-            let m = attr_str(r, "method").unwrap_or_default();
-            let p = attr_str(r, "path").unwrap_or_default();
-            if !p.is_empty() {
-                contracts.insert(format!("http: {}", format!("{} {}", m, p).trim()));
-            }
+    // http: ROUTE handler == this symbol (precomputed per map)
+    if let Some(routes) = routes_by_handler.get(e.id.as_str()) {
+        for (m, path) in routes {
+            contracts.insert(format!("http: {}", format!("{m} {path}").trim()));
         }
     }
     // cli flags
